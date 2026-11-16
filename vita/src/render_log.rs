@@ -1,12 +1,12 @@
-//! The renderer's log: a ring in memory holding the last 64 KiB of text,
-//! read by the debug server ("renderlog").
+//! The renderer's log: a ring in memory holding the last 64 KiB of text
+//! (`read`).
 //!
 //! It used to go to a file, but opening, writing and closing a file takes
 //! ~10 ms, on the display thread: at Final Fantasy's battle start, logging
 //! the ~30 decoded textures stalled the picture for a third of a second.
 //!
 //! Written by the display thread (and now and then by the texture worker:
-//! lines may interleave, nothing worse); read by the debug server's thread.
+//! lines may interleave, nothing worse); read by any thread.
 
 use core::cell::UnsafeCell;
 use core::fmt::{self, Write};
@@ -48,7 +48,7 @@ pub fn line(text: fmt::Arguments) {
     write(&bytes[..length]);
 }
 
-/// Debug server: copies the newest part of the log (at most `size` bytes,
+/// Copies the newest part of the log (at most `size` bytes,
 /// oldest first) to `out`; returns the length.
 ///
 /// # Safety

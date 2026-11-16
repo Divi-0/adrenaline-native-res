@@ -133,7 +133,7 @@ pub struct VramRequestTable {
     pub probe_ok: u32,
     pub probe_chosen: u32,
     pub probe_dma_lookup: u32,
-    /// GE block-transfer probe, on request only (debug "geprobe <mode>"):
+    /// GE block-transfer probe, on request only:
     /// the Vita side sets `ge_probe_request`, the plugin runs it once and
     /// sets it back to 0, with the result (0 = copied correctly, 1 = copied
     /// wrongly, < 0 = error) and its time in `probe_us[copy_method::GE - 1]`.

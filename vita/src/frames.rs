@@ -15,7 +15,7 @@ static BUFFER: TripleBuffer = TripleBuffer::new();
 /// The frames (one memory block); null until allocated.
 static FRAMES: AtomicPtr<Frame> = AtomicPtr::new(core::ptr::null_mut());
 
-/// The frames' memory (`allocate`), for tools/memcheck.py.
+/// The frames' memory (`allocate`), for the memory plan.
 #[no_mangle]
 #[used]
 #[allow(non_upper_case_globals)]
@@ -27,8 +27,7 @@ static ALLOCATED: AtomicBool = AtomicBool::new(false);
 static PRODUCER: SingleThreaded<Producer> = SingleThreaded::new(TripleBuffer::sides().0);
 static CONSUMER: SingleThreaded<Consumer> = SingleThreaded::new(TripleBuffer::sides().1);
 
-/// Debug recorder (debug/display.rs): when the shown frame / the newest
-/// frame was published (process time, low 32 bits).
+/// When the shown frame / the newest frame was published (process time, low 32 bits).
 pub static SHOWN_PUBLISHED_US: AtomicU32 = AtomicU32::new(0);
 pub static LAST_PUBLISHED_US: AtomicU32 = AtomicU32::new(0);
 

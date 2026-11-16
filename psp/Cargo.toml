@@ -3,9 +3,9 @@ name = "nativepsp-psp"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-description = "NativePSP's PSP side: the kernel module nativepsp.prx (the game's GE and display calls -> event ring, VRAM copies)"
+description = "NativeRes's PSP side: the kernel module nativepsp.prx (the game's GE and display calls -> event ring, VRAM copies)"
 
-# Built for mipsel-sony-psp only (tools/build-psp-plugin.sh), not for the PC.
+# Built for mipsel-sony-psp only (scripts/build-psp-plugin.sh), not for the PC.
 [[bin]]
 name = "nativepsp"
 path = "src/main.rs"

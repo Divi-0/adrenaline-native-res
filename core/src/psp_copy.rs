@@ -244,7 +244,7 @@ pub fn ge_probe_list(mode: u32, from: u32, to: u32, bytes: u32, list: &mut [u32;
 /// The line in Adrenaline's plugins.txt (ms0:/seplugins/plugins.txt) that
 /// loads the PSP plugin with every PSP game.
 pub const PLUGINS_TXT_LINE: &[u8] = b"game, ms0:/seplugins/nativepsp.prx, on";
-const PLUGINS_TXT_COMMENT: &[u8] = b"# NativePSP capture plugin, every PSP game (added by nativepsp.suprx)";
+const PLUGINS_TXT_COMMENT: &[u8] = b"# NativeRes capture plugin, every PSP game (added by nativepsp.suprx)";
 /// The plugin's file name, as found in any line about it.
 const PLUGIN_FILE: &[u8] = b"nativepsp.prx";
 
@@ -462,7 +462,7 @@ mod tests {
         let n = plugins_txt_with_ours(b"", &mut out).unwrap();
         let text = &out[..n];
         assert!(text.ends_with(b"game, ms0:/seplugins/nativepsp.prx, on\n"));
-        assert!(text.starts_with(b"# NativePSP"));
+        assert!(text.starts_with(b"# NativeRes"));
         // Again: already there.
         let mut again = [0u8; 512];
         assert_eq!(plugins_txt_with_ours(text, &mut again), None);
@@ -476,7 +476,7 @@ mod tests {
         let n = plugins_txt_with_ours(b"vsh, ms0:/seplugins/a.prx, on\r\ngame, ms0:/b.prx, on", &mut out).unwrap();
         assert_eq!(
             &out[..n],
-            &b"vsh, ms0:/seplugins/a.prx, on\r\ngame, ms0:/b.prx, on\r\n# NativePSP capture plugin, every PSP game (added by nativepsp.suprx)\r\ngame, ms0:/seplugins/nativepsp.prx, on\r\n"[..]
+            &b"vsh, ms0:/seplugins/a.prx, on\r\ngame, ms0:/b.prx, on\r\n# NativeRes capture plugin, every PSP game (added by nativepsp.suprx)\r\ngame, ms0:/seplugins/nativepsp.prx, on\r\n"[..]
         );
         // Too small a buffer: nothing.
         let mut small = [0u8; 16];

@@ -1,4 +1,4 @@
-// NativePSP: vertex program for textured 3D draws whose vertices are still in
+// NativeRes: vertex program for textured 3D draws whose vertices are still in
 // model space (NativePspDraw.transform, frame.rs GpuTransform): it does what
 // the capture's CPU path does per vertex (RowTransform::apply), then what
 // nativepsp_textured_v.cg does. Same outputs, so the same fragment programs.
@@ -31,7 +31,7 @@
 // Only vertices in front of the PSP's near plane come here (the capture
 // clips the others), so clip.w > 0.
 //
-// Compiled on the Vita: python tools/vita.py shaders (see nativepsp_shader.c).
+// Compiled on the Vita with the shader compiler app (README.md "Shaders").
 
 // The GE's pow for lighting, as PPSSPP's shader without bit operations:
 // 1 for e <= 0, else 0 for x <= 0, else a true pow ("close enough"; the GE

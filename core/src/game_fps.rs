@@ -4,7 +4,7 @@
 //! drawn by the GPU at 2x).
 //!
 //! Was menu.c's UpdateGameFps / DrawGameFps (vita2d's pgf text) until the
-//! renderer became a plugin (DESIGN.md stage 2 step 4): the plugin can't use
+//! renderer became a plugin: the plugin can't use
 //! Adrenaline's font, so the label is a small texture the CPU writes when
 //! the value changes.
 

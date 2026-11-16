@@ -46,8 +46,8 @@ struct State {
     logged_too_big: u32,
 }
 
-/// Times the display thread had to wait for the GPU (renderstats
-/// pool_waits; read and cleared by the debug server's thread).
+/// Times the display thread had to wait for the GPU (render statistics
+/// pool_waits; read and cleared by `take_waits`).
 static WAITS: AtomicU32 = AtomicU32::new(0);
 
 static STATE: SingleThreaded<State> = SingleThreaded::new(State {
@@ -203,7 +203,7 @@ pub fn scene_failed() {
 }
 
 /// Times the display thread waited for the GPU since the last call
-/// (renderstats pool_waits).
+/// (render statistics pool_waits).
 pub fn take_waits() -> u32 {
     WAITS.swap(0, Ordering::Relaxed)
 }

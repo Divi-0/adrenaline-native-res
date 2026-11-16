@@ -23,7 +23,7 @@
 //! all textures of that size) and a colour surface. Only reused as such,
 //! and the CPU never writes them. Cached memory like the others: uncached
 //! took 9-13 ms to allocate per 512 KiB, and the GPU's results read back
-//! exact (debug "unswizzlecheck"), so no dirty cache lines get written back
+//! exact, so no dirty cache lines get written back
 //! over them.
 //!
 //! Display thread only (the texture cache's).

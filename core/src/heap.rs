@@ -3,8 +3,8 @@
 //! texture objects of the texture cache and the GPU shader patcher's own
 //! bookkeeping (its host-memory callbacks).
 //!
-//! Why our own: as a plugin of our own (DESIGN.md "All Rust, one plugin",
-//! stage 2) there is no C library's heap to borrow; Adrenaline's newlib heap
+//! Why our own: as a plugin of our own there is no C library's heap to
+//! borrow; Adrenaline's newlib heap
 //! was what `calloc`/`free` used while we were linked into it.
 //!
 //! How: one block of memory, cut into pieces that each start with an 8-byte
@@ -187,8 +187,8 @@ impl Heap {
         self.bad_frees
     }
 
-    /// Checks every header against its neighbours (tests, and the debug
-    /// server): sizes add up to the whole, each previous-size word is right,
+    /// Checks every header against its neighbours (tests, and checks at
+    /// run time): sizes add up to the whole, each previous-size word is right,
     /// no two free pieces are neighbours, and the in-use total matches.
     pub fn consistent(&self, memory: &[u32]) -> bool {
         let mut piece = 0;

@@ -408,8 +408,8 @@ pub fn copy_requested_vram() {
 }
 
 /// GE block transfers (TRXKICK) as a VRAM copy (user, 2026-11-09: "can we
-/// do the memcpy there?"), measured only, on request (debug `geprobe
-/// <mode>`), never at boot. Two tries crashed the emulator (C1-2858-3): a
+/// do the memcpy there?"), measured only, on request
+/// (`PspLink::ge_probe_request`), never at boot. Two tries crashed the emulator (C1-2858-3): a
 /// list written to an invalid address (0x40000000 | kernel address), then a
 /// correct kernel-memory list copying VRAM into the copy area (0x0BE00000,
 /// which is also where the emulator keeps its own VRAM translation). So the
@@ -522,7 +522,7 @@ fn ge_probe_done(result: i32, took: u32) {
     set!(ge_probe_request, 0);
 }
 
-/// Debug `geprobe <mode>` 1-4, in the copy thread: result 0 = finished and
+/// The GE probe, mode 1-4, in the copy thread: result 0 = finished and
 /// copied correctly, 1 = copied wrongly, < 0 = error (-10 no user memory,
 /// -1 no GE functions, -2 timeout, else the GE's error code).
 fn probe_ge_on_request() {

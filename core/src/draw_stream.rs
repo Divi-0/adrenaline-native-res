@@ -61,7 +61,7 @@ use crate::vertex_cache::VertexCache;
 /// 0.1 MiB to spare): under the GE sync the game waits for the walk, and
 /// the walk waited for the recorder whenever the transform ring was full
 /// (2-4 times per frame; a faster walk only waited more). The limits in
-/// use are `JOB_LIMIT` / `TRANSFORM_LIMIT` (debug "streamlimits").
+/// use are `JOB_LIMIT` / `TRANSFORM_LIMIT`.
 pub const MAX_JOBS: usize = 1024;
 pub const MAX_CALLS: usize = 8192;
 pub const MAX_TRANSFORMS: usize = 192;
@@ -69,7 +69,7 @@ pub const MAX_WORDS: usize = 64 * 1024;
 
 /// Jobs and transforms the producer may have queued and not yet recorded
 /// (at most `MAX_JOBS` / `MAX_TRANSFORMS`; lower values only for live A/Bs
-/// against the old sizes, debug "streamlimits <transforms> <jobs>").
+/// against the old sizes).
 pub static JOB_LIMIT: AtomicU32 = AtomicU32::new(MAX_JOBS as u32);
 pub static TRANSFORM_LIMIT: AtomicU32 = AtomicU32::new(MAX_TRANSFORMS as u32);
 
@@ -80,7 +80,7 @@ const MAX_JOB_WORDS: usize = MAX_WORDS / 4;
 /// Published jobs no copier has taken yet beyond which the producer copies
 /// the oldest ones itself, down to half as many (`set_copier`). The copier
 /// polls every ~50 us and the producer queues a job every ~8 us (MTX's
-/// race). Debug "copierlag <jobs>"; live A/B 2026-11-08 (MTX paused race,
+/// race). Live A/B 2026-11-08 (MTX paused race,
 /// copier on all cores): 32 -> the capture copied ~360 jobs per frame, 97-98%
 /// of frames recorded; 64 -> ~240, 98-99%; 128 -> ~160, 95-98%; 256 -> ~20,
 /// 90-93% (the recorder waits for the copier).
@@ -91,11 +91,11 @@ pub static COPIER_LAG_JOBS: AtomicU32 = AtomicU32::new(64);
 pub static PRODUCER_COPIES: AtomicU32 = AtomicU32::new(0);
 
 /// Whether copiers read small ranges until two reads agree (`read_stable`;
-/// debug "stablecopy 0|1", on by default).
+/// on by default).
 pub static STABLE_COPIES: AtomicBool = AtomicBool::new(true);
 /// Ranges up to this many words are read again to check them: MTX's
 /// per-frame HUD text and particle quads (24-30 words) are what the game
-/// rewrites while we copy (debug "copywatch", 2026-11-08); big static meshes
+/// rewrites while we copy (`copy_watch`, 2026-11-08); big static meshes
 /// aren't, and reading them twice would cost the copier a lot.
 const STABLE_CHECK_WORDS: usize = 64;
 /// Reads after the first, at most, until two agree.

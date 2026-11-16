@@ -17,17 +17,17 @@
 //!   quad of Sony's picture; while ours is shown, we draw our target and the
 //!   GAME fps label instead (`targets::present_frame`);
 //! - `sceGxmEndScene`, `sceGxmDisplayQueueAddEntry` (vita2d_swap_buffers):
-//!   the buffer queued (its callback data's first word), then the debug
-//!   server's after-swap work (screenshot, recorder, flip log);
+//!   the buffer queued (its callback data's first word), then an
+//!   extension's after-swap work (`ext::after_swap`);
 //! - `sceCompatLCDCSync`: sleep until shortly before the PSP's next LCD
 //!   refresh instead of spinning, then the early copy of Sony's picture.
 //!
-//! The draw profile ("drawprofile") is taken at these points. Calls from
+//! The draw profile (`timings`) is taken at these points. Calls from
 //! other threads (states.c's LCD sync for a savestate picture) pass through.
 //!
-//! On ScePspemu: `sceCompatWriteSharedCtrl` (the PSP's buttons: the debug
-//! server's injected ones are added) and `sceKernelCreateThread` (threads
-//! for "threadload"). On AdrenalineUser: `sceKernelCreateThread`, which tells
+//! On ScePspemu: `sceCompatWriteSharedCtrl` (the PSP's buttons: an
+//! extension's injected ones are added) and `sceKernelCreateThread` (threads
+//! noted, `ext::note_thread`). On AdrenalineUser: `sceKernelCreateThread`, which tells
 //! when Adrenaline starts its threads (InitAdrenaline: the PSP side boots),
 //! our moment to start (plugin.rs).
 
@@ -80,7 +80,7 @@ const SONY_PICTURE_BYTES: u32 = 512 * 272 * 4;
 
 /// Stock vita2d's pool for per-frame GPU data (vita2d_init: 1 MiB), made
 /// by Adrenaline's display thread. Not ours, but the memory budget was
-/// measured with the fork, where it was ours (0.5 MiB): tools/memcheck.py
+/// measured with the fork, where it was ours (0.5 MiB): the memory plan
 /// counts it so the budget stays comparable.
 #[no_mangle]
 #[used]
@@ -147,14 +147,15 @@ fn not_ours_to_draw() -> bool {
 
 // ------------------------------------------------------------ the loop's timings
 
-/// The debug server's switches and the loop's timings (were menu.c's):
-/// "gamefps", "sonyearly", "sonywrites", "drawprofile".
+/// The loop's switches and timings (were menu.c's): the GAME fps label, the
+/// early copy of Sony's picture, when Sony's picture is copied, the draw
+/// profile.
 pub mod timings {
     use super::*;
 
-    /// Buckets of 1 ms after the LCD sync ("sonywrites").
+    /// Buckets of 1 ms after the LCD sync.
     pub const SONY_TIMING_BUCKETS: usize = 20;
-    /// Parts of the loop "drawprofile" times: our frame, the rest of the
+    /// Parts of the loop the draw profile times: our frame, the rest of the
     /// drawing, end scene + swap, the LCD sync.
     pub const DRAW_PROFILE_PARTS: usize = 4;
 

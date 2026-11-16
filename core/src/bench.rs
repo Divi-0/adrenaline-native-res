@@ -1,7 +1,7 @@
 //! Runs a dumped frame through the capture again and again, to time it.
 //!
-//! Used by `replay --bench` on the PC and by the Vita debug command
-//! `capturebench`, so both time exactly the same work. Memory comes from the
+//! Used by `replay --bench` on the PC, and on the Vita by whoever wants to
+//! time the same work there. Memory comes from the
 //! dump through the same `BlockCache` the Vita uses (a fresh one per event),
 //! but the blocks are copied from normal memory: the time measured is the
 //! capture's own work, without the slow reads of PSP RAM.
@@ -16,8 +16,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::block_cache::BlockCache;
 
-/// Measuring aid (debug "benchexp <mask>" on the Vita, then `capturebench`):
-/// each bit skips one part of the capture thread's per-draw work, so the
+/// Measuring aid: each bit skips one part of the capture thread's per-draw work, so the
 /// difference in time is what that part costs on the Vita (PC instruction
 /// counts don't predict Vita time). The frames come out wrong meanwhile.
 /// 0, the default, changes nothing. It is global: set it back to 0.
@@ -66,9 +65,9 @@ pub struct Totals {
     pub vertices: u32,
     /// The last run's `Frame::description_hash` and `vertex_hash` (`Full`
     /// only), taken here while everything the frame points to exists: its
-    /// cached draws point into the vertex cache's arena, which the Vita's
-    /// capturebench frees when the call returns (hashing the frame later
-    /// crashed, 2026-11-06).
+    /// cached draws point into the vertex cache's arena, which a caller may
+    /// free when the call returns (hashing the frame later crashed on the
+    /// Vita, 2026-11-06).
     pub description_hash: u64,
     pub vertex_hash: u64,
 }
@@ -186,7 +185,7 @@ mod tests {
         // for the modes that don't read vertices.
         let full = run(&dump, sorted, Mode::Full, 3, &mut capture, &mut frame).unwrap();
         assert_eq!((full.copies, full.draws, full.vertices), (2, 1, 6));
-        // The crash of 2026-11-06 (logs/crash-hunt/bench-cache): the Vita
+        // The crash of 2026-11-06: the Vita
         // hashed the bench frame after its vertex cache was freed. The bench
         // reports the hashes itself.
         assert_eq!((full.description_hash, full.vertex_hash), (frame.description_hash(), frame.vertex_hash()));

@@ -1,6 +1,5 @@
-//! NativePSP Shader Compiler: a small Vita app (development only), the Rust
-//! version of the C app that was tools/shadercompiler/main.c (DESIGN.md
-//! "All Rust, one plugin", stage 5).
+//! NativeRes Shader Compiler: a small Vita app, only needed to change the
+//! plugin's shaders.
 //!
 //! Compiles every .cg file in ux0:data/nativepsp/shaders/ with Sony's
 //! runtime Cg compiler (ur0:data/libshacccg.suprx, extracted by tools like
@@ -10,16 +9,15 @@
 //!
 //! done.txt has one line per file, `<name>.cg: OK <bytes> (<ms> ms)` or
 //! `<name>.cg: ERR <why>`, then a line starting with `#` (the heap's
-//! numbers and the total time). tools/vita.py shaders uploads the sources,
-//! starts this app over vitacompanion, waits for done.txt and downloads the
-//! .gxp files into renderer/vita/shaders/, which the plugin embeds. Users of
-//! the plugin never need libshacccg.
+//! numbers and the total time). Copy the sources there, start the app,
+//! wait for done.txt and copy the .gxp files into vita/shaders/, which the
+//! plugin embeds. Users of the plugin never need libshacccg.
 //!
 //! It is a separate app because loading libshacccg inside Adrenaline's PSP
 //! emulator process failed (0x8002D0F3, a missing preload) and once crashed
 //! Adrenaline. An app gets the system's preloaded modules libshacccg needs.
 //!
-//! Built by tools/build-shadercompiler.sh (cargo, the SDK's linker and
+//! Built by scripts/build-shadercompiler.sh (cargo, the SDK's linker and
 //! tools, no C library): the compiler's malloc/free are ours
 //! (`nativepsp_core::class_heap` over one 32 MiB block, as big as the C
 //! app's newlib heap).
@@ -559,8 +557,7 @@ pub extern "C" fn module_start(_args: u32, _argp: *mut c_void) -> i32 {
     }
 }
 
-/// A bug of ours: say so in done.txt (tools/vita.py prints it and fails),
-/// then quit.
+/// A bug of ours: say so in done.txt, then quit.
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     say(format_args!("PANIC: {info}\n"));

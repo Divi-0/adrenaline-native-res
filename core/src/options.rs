@@ -12,30 +12,25 @@
 //! ```
 //!
 //! The renderer's on/off switch is not here: it is Adrenaline's setting
-//! "NativePSP Renderer" (renderer/vita/src/adrenaline.rs).
+//! "NativeRes Renderer" (renderer/vita/src/adrenaline.rs).
 
 /// `startskip=` bits: parts of the plugin not started, to find which of
-/// them a crash at Adrenaline's start needs (the C1-2858-3 hunt, DESIGN.md).
+/// them a crash at Adrenaline's start needs.
 /// Read before the hooks are set. 0 (default): everything.
 pub mod start_skip {
     /// AdrenalineUser's file calls (io_hooks.rs: the bounce for PSP memory).
     pub const IO_HOOKS: u32 = 1;
     /// Installing the PSP plugin into <ms0>/seplugins (psp_plugin.rs).
     pub const PSP_PLUGIN: u32 = 2;
-    /// Our "NativePSP Renderer" entry in Adrenaline's menu (menu.rs).
+    /// Our "NativeRes Renderer" entry in Adrenaline's menu (menu.rs).
     pub const MENU: u32 = 4;
-    /// The debug server (TCP 7777; also what loads SceNet).
-    pub const DEBUG_SERVER: u32 = 8;
-    /// The log stream (TCP 7778).
-    pub const LOG_STREAM: u32 = 16;
+    // 8 and 16: an extension's parts (renderer/vita/src/ext.rs).
     /// The display loop's hooks (display_hooks.rs): no renderer at all.
     pub const DISPLAY_HOOKS: u32 = 32;
     /// The capture with its threads, the log writer and the options thread
     /// (ARM clock, menu entry).
     pub const CAPTURE: u32 = 64;
-    /// The log-only hooks on ScePspemu (pspemu_watch.rs: its heartbeat and
-    /// suspend handshake).
-    pub const PSPEMU_WATCH: u32 = 128;
+    // 128: an extension's part.
     /// Every bit there is.
     pub const ALL: u32 = 255;
 }
@@ -124,7 +119,7 @@ mod tests {
     #[test]
     fn crlf_spaces_and_comments() {
         // Notepad's CRLF, spaces around '=', comments on their own and after a value.
-        let options = Options::parse(b"# NativePSP\r\n  mip = 1  # blurry\r\n\tsmooth\t=\t1\r\n");
+        let options = Options::parse(b"# NativeRes\r\n  mip = 1  # blurry\r\n\tsmooth\t=\t1\r\n");
         assert_eq!((options.mip, options.smooth), (1, true));
     }
 

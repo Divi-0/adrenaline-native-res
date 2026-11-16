@@ -1,4 +1,4 @@
-//! NativePSP core: understands what a PSP game asks the PSP graphics engine
+//! NativeRes core: understands what a PSP game asks the PSP graphics engine
 //! (the "GE") to do.
 //!
 //! This crate has no Vita dependencies, so it builds and is tested on a PC.
@@ -46,7 +46,6 @@ pub mod ge_context;
 pub mod ge_state;
 pub mod ge_writes;
 pub mod heap;
-pub mod heartbeat;
 pub mod lighting;
 pub mod log_ring;
 pub mod memory;
@@ -65,7 +64,6 @@ pub mod span;
 pub mod stats;
 pub mod texture;
 pub mod texture_cache;
-pub mod thumb;
 pub mod transform;
 pub mod triple_buffer;
 pub mod vertex;

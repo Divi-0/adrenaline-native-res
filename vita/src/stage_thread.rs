@@ -2,13 +2,12 @@
 //! walk_stream`): the capture thread (stage A) follows the display lists,
 //! this thread works out the draws from what it walked (draw state,
 //! textures, palettes, queuing the vertices for the recorder thread). Off
-//! by default (debug "stagethread <n>").
+//! by default (`STAGE_THREAD_WANTED`).
 //!
-//! It serves one capture at a time: the live capture's or the benchmark's
-//! (`serve`), each with its own way to PSP memory: the live one reads PSP
-//! memory itself (its own block cache, VRAM only where the plugin's copy
-//! holds it, noted in `VRAM_READS` for the capture thread), the
-//! benchmark's reads the dump.
+//! It serves one capture at a time (`serve`), with its way to PSP memory:
+//! the live capture's reads PSP memory itself (its own block cache, VRAM
+//! only where the plugin's copy holds it, noted in `VRAM_READS` for the
+//! capture thread); another capture brings its own (`Source::External`).
 
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
@@ -16,7 +15,6 @@ use core::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, Ordering};
 
 use nativepsp_core::block_cache::{BlockCache, BlockSource, BLOCK_SIZE, BLOCK_WORDS};
 use nativepsp_core::capture::{Capture, StageBRun};
-use nativepsp_core::dump::{DumpBlocks, DumpView};
 use nativepsp_core::memory::{RAM_END, RAM_START};
 use nativepsp_core::vram_requests::{StageVramReads, VramRequests, VRAM_SIZE, VRAM_START};
 use nativepsp_core::walk_stream::WalkHooks;
@@ -35,10 +33,9 @@ const WAIT_TRY_US: u32 = 50;
 
 static SEMA: AtomicI32 = AtomicI32::new(-1);
 
-/// Set by the debug server ("stagethread <n>"): 0 = off (the capture in
-/// one stage, as before), 1 = the default cores (`CORES`), otherwise a
-/// mask of user cores as for "recorderthread" (8 = core 3, through
-/// adrenaline_kernel's checked call). Off by default (new, 2026-11-06).
+/// 0 = off (the capture in one stage), 1 = the default cores (`CORES`),
+/// otherwise a mask of user cores as for `RECORDER_THREAD_WANTED` (8 =
+/// core 3, only where `threads::set_cores` can). Off by default.
 pub static STAGE_THREAD_WANTED: AtomicU32 = AtomicU32::new(0);
 
 pub fn wanted() -> bool {
@@ -89,8 +86,10 @@ fn wait() {
 pub enum Source {
     /// PSP memory; VRAM as `requests` says the plugin's copy holds it.
     Live { requests: *const VramRequests },
-    /// A dump (capturebench): `view` and its sorted block index.
-    Bench { view: *const DumpView<'static>, sorted: *const u32, sorted_len: usize },
+    /// Memory of the caller's own: `run` runs stage B of the capture once
+    /// (`Capture::run_stage_b_thread` with that memory), on this thread;
+    /// `fresh` is true on the first run of a serving.
+    External { run: unsafe fn(capture: *mut Capture, fresh: bool) -> StageBRun },
 }
 
 /// What the thread serves; written only while it serves nothing else
@@ -259,7 +258,6 @@ unsafe extern "C" fn stage_thread(_args: u32, _argp: *mut c_void) -> i32 {
     // clears 16 KiB, and stage B is woken hundreds of times per frame);
     // emptied at every frame end and for every new serving.
     let mut live = BlockCache::new(StageBlocks { requests: core::ptr::null() });
-    let mut bench: Option<BlockCache<DumpBlocks<'static>>> = None;
     let mut serving = u32::MAX;
     let mut cpu_at_frame_end = crate::threads::run_us();
     loop {
@@ -279,15 +277,13 @@ unsafe extern "C" fn stage_thread(_args: u32, _argp: *mut c_void) -> i32 {
             // Safe: `serve` changes the source only while nothing is served.
             let source = *SERVED.source.get();
             let servings = SERVINGS.load(Ordering::SeqCst);
+            let mut fresh = false;
             if servings != serving {
                 serving = servings;
+                fresh = true;
                 live.forget();
-                match source {
-                    Source::Live { requests } => live.source.requests = requests,
-                    Source::Bench { view, sorted, sorted_len } => {
-                        let sorted = core::slice::from_raw_parts(sorted, sorted_len);
-                        bench = Some(BlockCache::new(DumpBlocks { view: &*view, sorted }));
-                    }
+                if let Source::Live { requests } = source {
+                    live.source.requests = requests;
                 }
             }
             // Until the stream is empty (or the frame's end reached): stage A
@@ -297,15 +293,13 @@ unsafe extern "C" fn stage_thread(_args: u32, _argp: *mut c_void) -> i32 {
                 // Safe: the served captures live in statics; this is their
                 // only stage B thread, and the source belongs to the served
                 // capture.
-                let run = match (source, bench.as_mut()) {
-                    (Source::Bench { .. }, Some(memory)) => {
-                        let run = Capture::run_stage_b_thread(capture, memory);
-                        if run == StageBRun::FrameEnded {
-                            memory.forget();
-                        }
-                        run
+                let run = match source {
+                    Source::External { run } => {
+                        let result = run(capture, fresh);
+                        fresh = false;
+                        result
                     }
-                    _ => {
+                    Source::Live { .. } => {
                         let run = Capture::run_stage_b_thread(capture, &mut live);
                         if run == StageBRun::FrameEnded {
                             live.forget();

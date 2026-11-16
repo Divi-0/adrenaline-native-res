@@ -1,4 +1,4 @@
-// NativePSP: vertex program for full-screen quads (render-target copies,
+// NativeRes: vertex program for full-screen quads (render-target copies,
 // presenting our picture, the GPU unswizzle) and textured draws without our
 // textured program (basic_programs.rs; vita2d's texture program until
 // stage 2).
@@ -6,7 +6,7 @@
 // aPosition: x, y in 960x544 pixels, z (the vertex's w, 1, is not read);
 // aTexcoord: texture coordinates. wvp: the projection.
 //
-// Compiled on the Vita: python tools/vita.py shaders.
+// Compiled on the Vita with the shader compiler app (README.md "Shaders").
 
 void main(
 	float3 aPosition,

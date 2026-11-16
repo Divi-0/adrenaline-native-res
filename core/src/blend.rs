@@ -305,7 +305,7 @@ pub fn translate(ge: &GeState) -> Option<Blend> {
     // MIN and MAX ignore the factors (on the GE as in GL; PPSSPP passes them
     // through unused): One/One is exact on any GPU, also where the GE's
     // factors (destination alpha, FIX) would count as approximated. MTX's
-    // menu (logs/mtx-menu-1.bin): MAX with destination colour / alpha.
+    // menu: MAX with destination colour / alpha.
     if matches!(equation, Equation::Min | Equation::Max) {
         return Some(Blend {
             equation,
@@ -575,7 +575,7 @@ mod tests {
         assert!(!shader_can_alpha_test(&untested, true));
     }
 
-    /// MTX's menu (logs/mtx-menu-1.bin): MAX with destination colour and
+    /// MTX's menu: MAX with destination colour and
     /// destination alpha factors counted as an approximated blend, though
     /// MIN/MAX ignore the factors. Exact as One/One.
     #[test]

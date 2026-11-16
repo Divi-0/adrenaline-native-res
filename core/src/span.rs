@@ -47,7 +47,7 @@ mod tests {
 
     #[test]
     fn a_word_of_all_ones_is_not_inside() {
-        // The crash of 2026-11-14 (logs/crash-menu-1114): menu.rs read a
+        // The crash of 2026-11-14: menu.rs read a
         // data word 0xFFFFFFFF as a pointer to "Settings\0"; 0xFFFFFFFF + 9
         // wrapped to 8 and passed `address + bytes <= end`.
         assert!(!inside(0xFFFF_FFFF, 9, TEXT.0, TEXT.1));

@@ -67,7 +67,7 @@ const MAX_PASSES: usize = 64;
 pub const FULL_CHECK_FRAMES: u32 = 8;
 /// Words a mini hash samples (`sample_hash`), at most.
 pub const SAMPLE_WORDS: usize = 16;
-/// How a mini hash samples now (debug "minisamples"): 1..=8 words spread
+/// How a mini hash samples now: 1..=8 words spread
 /// over the run, or `SAMPLE_BURSTS`: the first and the last 8 words (two
 /// bursts). 4 by default (user's choice, 2026-11-07): each sample is an
 /// uncached load of PSP RAM, ~0.75 ms of recorder time per frame in MTX's
@@ -78,8 +78,8 @@ pub const DEFAULT_SAMPLES: usize = 4;
 /// `SAMPLE_COUNT` for two bursts of 8 words.
 pub const SAMPLE_BURSTS: usize = 16;
 
-/// Whether runs are looked up by their mini hash at all (`find_quick`;
-/// debug "quickhits 0|1"). Off (the default since 2026-11-08), every run is
+/// Whether runs are looked up by their mini hash at all (`find_quick`).
+/// Off (the default since 2026-11-08), every run is
 /// read whole and checked by its full hash, every frame, as PPSSPP hashes
 /// whole vertex data (DrawEngineCommon::ComputeMiniHash samples draw calls,
 /// not words). MTX reuses vertex buffers for other content of the same

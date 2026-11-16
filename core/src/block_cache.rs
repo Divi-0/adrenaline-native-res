@@ -94,8 +94,7 @@ pub struct BlockCache<S: BlockSource> {
     pub copies: u32,
     /// Single lines copied from the source so far.
     pub line_copies: u32,
-    /// Fill whole blocks at once instead of lines (for comparing; debug
-    /// "copylines 0" on the Vita).
+    /// Fill whole blocks at once instead of lines (for comparing).
     pub whole_blocks: bool,
     /// Pieces of blocks read straight from the source (`read_words`).
     pub direct_reads: u32,

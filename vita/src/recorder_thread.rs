@@ -4,8 +4,8 @@
 //! the draws' states, this thread decodes, transforms and stores their
 //! vertices, both for the same frame at the same time.
 //!
-//! It serves one draw stream at a time: the live capture's, or the
-//! benchmark's while `capturebench` runs (`serve`). Without the thread
+//! It serves one draw stream at a time: the live capture's, or another
+//! capture's (`serve`). Without the thread
 //! (it couldn't be created) the capture records the vertices itself.
 
 use core::ffi::c_void;
@@ -19,7 +19,7 @@ use crate::sys;
 /// (busy ~21-25 of 33 ms), and the display's render must not wait for it
 /// at publish time. 0x70 (the capture's) made ~26% of frames miss the
 /// refresh after next (3/1 wobble); 0xA1 halves the webcam's 3/1 pairs at
-/// no game-side cost (DESIGN.md "Recorder and copier below the display").
+/// no game-side cost.
 const PRIORITY: i32 = 0xA1;
 const STACK_SIZE: u32 = 0x10000;
 /// Cores 0, 1 and 2 (SCE_KERNEL_CPU_MASK_USER_0 | _1 | _2). Was 1 and 2
@@ -52,7 +52,7 @@ static IN_USE: AtomicPtr<DrawStream> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Microseconds the producer spent waiting (for room in the stream or for
 /// the consumer to finish) and the consumer spent recording, since the last
-/// `take_times`: which half of the capture holds the other up (capturebench).
+/// `take_times`: which half of the capture holds the other up.
 static PRODUCER_WAIT_US: AtomicU32 = AtomicU32::new(0);
 static CONSUMER_BUSY_US: AtomicU32 = AtomicU32::new(0);
 
@@ -67,24 +67,21 @@ pub fn take_times() -> (u32, u32) {
     (PRODUCER_WAIT_US.swap(0, Ordering::Relaxed), CONSUMER_BUSY_US.swap(0, Ordering::Relaxed))
 }
 
-/// Set by the debug server ("recorderthread <n>"): whether the capture
-/// records the vertices on this thread, and on which cores. 0 = off,
+/// Whether the capture records the vertices on this thread, and on which cores. 0 = off,
 /// 1 = the default cores (`CORES`), otherwise a mask of user cores
 /// (2 = core 1, 4 = core 2, 6 = cores 1+2, 7 = cores 0-2, 8 = core 3,
 /// 15 = all four; core 0 alone can't be chosen: 1 means the default).
-/// Core 3 needs adrenaline_kernel's checked call (`threads::set_cores`);
-/// refused, the thread goes back to the default. On by default since 2026-11-05
-/// (user's decision; it doubles MTX's shown frame rate). A build with it on
-/// crashed Adrenaline once during capturebench (2026-11-04, C1-2858-3),
-/// cause not found yet.
+/// Core 3 only where `threads::set_cores` can; refused, the thread goes
+/// back to the default. On by default since 2026-11-05 (it doubles MTX's
+/// shown frame rate).
 pub static RECORDER_THREAD_WANTED: AtomicU32 = AtomicU32::new(1);
 
-/// Whether the debug server asked for the thread.
+/// Whether the thread is wanted.
 pub fn wanted() -> bool {
     RECORDER_THREAD_WANTED.load(Ordering::Relaxed) != 0
 }
 
-/// The affinity mask the debug server asked for (`CORES` when it gave none).
+/// The affinity mask asked for (`CORES` when none was given).
 fn wanted_cores() -> i32 {
     match RECORDER_THREAD_WANTED.load(Ordering::Relaxed) {
         0 | 1 => CORES,
@@ -184,7 +181,7 @@ unsafe extern "C" fn recorder_thread(_args: u32, _argp: *mut c_void) -> i32 {
     let sema = SEMA.load(Ordering::Relaxed);
     let mut cores = CORES;
     loop {
-        // The cores can be changed at runtime (debug "recorderthread <n>").
+        // The cores can be changed at runtime.
         let wanted = wanted_cores();
         if wanted != cores && wanted != 0 {
             // Core 3 included goes through adrenaline_kernel (`threads::set_cores`).

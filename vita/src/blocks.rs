@@ -7,14 +7,12 @@
 //! for C2-12828-1, 2026-11-05). So:
 //!
 //! - Every block we allocate goes through `alloc_block` /
-//!   `free_block`, which keep a table of the live ones. The debug
-//!   server's "memory" lists them with the free memory, so a live run shows
-//!   exactly where the memory goes.
+//!   `free_block`, which keep a table of the live ones (`report`, with the
+//!   free memory), so a live run shows exactly where the memory goes.
 //! - Each allocation site states its size in the build as a constant named
 //!   `nativepsp_plan_<kind>_<name>` (a `#[no_mangle]` static, so it keeps
-//!   that name in the ELF). tools/memcheck.py reads those from the ELF and
-//!   checks, before every deploy, that the build fits the memory measured
-//!   on the Vita ("memory" -> tools/memory-budget.json).
+//!   that name in the ELF), so a tool can read them from the ELF and check
+//!   that the build fits the memory measured on the Vita.
 
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
@@ -120,7 +118,7 @@ impl Table {
     }
 }
 
-/// Allocations come from several threads (display, capture, debug server)
+/// Allocations come from several threads (display, capture, others)
 /// and are rare: a spin lock is enough.
 pub struct SpinLocked<T> {
     locked: AtomicBool,
@@ -226,10 +224,10 @@ fn free_memory() -> sys::SceKernelFreeMemorySizeInfo {
     info
 }
 
-/// "memory", one line: the totals (ours = our blocks in main memory, the
-/// pool tools/memcheck.py checks; CDRAM and phycont separately), then
+/// One line: the totals (ours = our blocks in main memory, the pool the
+/// memory budget is about; CDRAM and phycont separately), then
 /// "block=<name>/<count>/<bytes>/<peak bytes>" per block name. Sizes in
-/// bytes, so tools/memcheck.py can do exact sums. NUL-terminated; returns
+/// bytes, for exact sums. NUL-terminated; returns
 /// the text's length.
 ///
 /// # Safety

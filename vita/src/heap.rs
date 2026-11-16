@@ -15,8 +15,8 @@ use crate::{render_log, sys};
 
 /// Texture objects (100 bytes + 8 header; MTX's race start has ~400
 /// textures: ~43 KiB) and the shader patcher's host memory (a few hundred
-/// bytes per patched program). Main memory is short (tools/memcheck.py):
-/// renderstats' heap_peak shows what is really used.
+/// bytes per patched program). Main memory is short: `report`'s peak
+/// shows what is really used.
 const HEAP_BYTES: usize = 128 * 1024;
 #[no_mangle]
 #[used]
@@ -112,7 +112,7 @@ pub fn free(memory: *mut c_void) {
 }
 
 /// "heap <used>/<bytes> peak=<bytes> allocations=<n> failed=<n> bad_frees=<n>"
-/// (renderstats).
+/// (render statistics).
 pub fn report(text: &mut impl core::fmt::Write) {
     STATE.with(|state| {
         let heap = &state.heap;

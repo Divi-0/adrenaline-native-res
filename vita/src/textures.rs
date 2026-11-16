@@ -9,17 +9,16 @@
 //! - `frame_done` once it knows whether the frame waits.
 //!
 //! Threads: the cache belongs to the display thread. The worker only sees
-//! the job it is handed (`WORKER`), and the debug server only the counters
+//! the job it is handed (`WORKER`), and other threads only the counters
 //! (`STATS`).
 
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
-use core::fmt::{self, Write};
+use core::fmt;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, Ordering};
 
 use nativepsp_core::frame::{Frame, TextureDescriptor, MAX_TEXTURES};
-use nativepsp_core::report::TextBuffer;
 use nativepsp_core::texture::{self, DecodeError};
 use nativepsp_core::texture_cache::gpu::{GpuFormat, GpuTexture, TextureShape};
 use nativepsp_core::texture_cache::refresh::{run_refresh, RefreshJob, RefreshResult};
@@ -37,14 +36,22 @@ const WORKER_PRIORITY: i32 = 0xA8;
 const WORKER_STACK_SIZE: u32 = 0x8000;
 
 /// The display thread's part.
-struct DisplayState {
-    cache: TextureCache,
+pub struct DisplayState {
+    pub cache: TextureCache,
     /// The staging buffer (`STAGING_SIZE` bytes), null until allocated.
-    staging: *mut u8,
+    pub staging: *mut u8,
     worker_tried: bool,
-    lookups: [Lookup; MAX_TEXTURES],
-    /// The last frame's start, for `texture_bench`'s lookup pass.
-    last_start: Option<FrameStart>,
+    pub lookups: [Lookup; MAX_TEXTURES],
+    /// The last frame's start (for another lookup pass over that frame).
+    pub last_start: Option<FrameStart>,
+}
+
+/// The display thread's texture cache and staging buffer.
+///
+/// # Safety
+/// Display thread only, no other reference to it alive.
+pub unsafe fn display_state() -> &'static mut DisplayState {
+    DISPLAY.get()
 }
 
 static DISPLAY: SingleThreaded<DisplayState> = SingleThreaded::new(DisplayState {
@@ -56,7 +63,7 @@ static DISPLAY: SingleThreaded<DisplayState> = SingleThreaded::new(DisplayState 
 });
 
 /// Two staging buffers (the display thread's and the refresh worker's),
-/// for tools/memcheck.py.
+/// for the memory plan.
 #[no_mangle]
 #[used]
 #[allow(non_upper_case_globals)]
@@ -104,9 +111,9 @@ pub fn ready() -> bool {
 pub struct FrameInfo {
     /// The frame loop's frame count (the cache counts ages in it).
     pub render_count: u32,
-    /// Menu "NativePSP Texture Filter": always bilinear.
+    /// Menu "NativeRes Texture Filter": always bilinear.
     pub smooth: bool,
-    /// Debug "tracetex": the texture address whose lookups are logged (0: none).
+    /// The texture address whose lookups are logged (0: none).
     pub trace_address: u32,
     /// When the display loop began (the texture work deadline counts from it).
     pub loop_start_us: u32,
@@ -173,9 +180,9 @@ pub fn frame_times() -> FrameTimes {
     unsafe { DISPLAY.get() }.cache.frame_times()
 }
 
-/// The texture counters for the debug server's "renderstats", shared with
-/// the debug server's thread.
-struct SharedTextureStats {
+/// The texture counters for the render statistics, shared with the thread
+/// that reads them (`take_counters`).
+pub struct SharedTextureStats {
     decode_us: AtomicU32,
     refresh_us: AtomicU32,
     hashed_bytes: AtomicU32,
@@ -189,7 +196,7 @@ struct SharedTextureStats {
     scans: AtomicU32,
 }
 
-static STATS: SharedTextureStats = SharedTextureStats {
+pub static STATS: SharedTextureStats = SharedTextureStats {
     decode_us: AtomicU32::new(0),
     refresh_us: AtomicU32::new(0),
     hashed_bytes: AtomicU32::new(0),
@@ -204,7 +211,7 @@ static STATS: SharedTextureStats = SharedTextureStats {
 };
 
 impl SharedTextureStats {
-    fn add(&self, stats: &TextureStats) {
+    pub fn add(&self, stats: &TextureStats) {
         let add = |counter: &AtomicU32, value: u64| counter.fetch_add(value as u32, Ordering::Relaxed);
         add(&self.decode_us, stats.decode_us);
         add(&self.refresh_us, stats.refresh_us);
@@ -220,7 +227,7 @@ impl SharedTextureStats {
     }
 }
 
-/// The texture cache's counters for "renderstats".
+/// The texture cache's counters for the render statistics.
 pub struct Counters {
     pub decode_us: u32,
     pub refresh_us: u32,
@@ -238,7 +245,7 @@ pub struct Counters {
     pub scans: u32,
 }
 
-/// The counters since the last call (debug server's thread).
+/// The counters since the last call (any thread).
 pub fn take_counters() -> Counters {
     let take = |counter: &AtomicU32| counter.swap(0, Ordering::Relaxed);
     Counters {
@@ -343,13 +350,13 @@ unsafe extern "C" fn worker_thread(_args: u32, _argp: *mut c_void) -> i32 {
 // The host
 // ------------------------------------------------------------------------
 
-/// Appends a line to the render log (debug "renderlog").
+/// Appends a line to the render log.
 fn log_line(text: fmt::Arguments) {
     crate::render_log::line(text);
 }
 
 /// Holds no state: what it reaches is the Vita's, or `WORKER`'s.
-struct VitaHost;
+pub struct VitaHost;
 
 
 fn as_object(texture: GpuTexture) -> *mut gpu_textures::TextureObject {
@@ -506,78 +513,6 @@ impl Host for VitaHost {
     fn log(&mut self, text: fmt::Arguments) {
         log_line(text);
     }
-}
-
-/// Debug "texbench" (display thread, at a drawn frame; pause the game
-/// first): where the texture phase's time goes, over `frame`'s textures in
-/// PSP RAM. Times (us) of: 100 clock reads; staging them all (copies out of
-/// uncached PSP memory); staging and hashing them; one more lookup pass of
-/// the cache over the frame (as `nativepsp_textures_for_frame`, mostly
-/// hits), with its finds / hint misses. Writes a line into `out`
-/// (NUL-terminated). Display thread only, after `ready` said true.
-pub fn texture_bench(frame: &Frame, out: &mut [u8]) {
-    use nativepsp_core::texture_cache::staging::{stage, StagedLayout};
-    // Safe: only the display thread calls this; the reference ends here.
-    let display = unsafe { DISPLAY.get() };
-    if display.staging.is_null() || out.is_empty() {
-        return;
-    }
-    // Safe: the staging buffer holds STAGING_SIZE bytes, used only here.
-    let staging = unsafe { core::slice::from_raw_parts_mut(display.staging, STAGING_SIZE) };
-    let host = VitaHost;
-    let in_ram = |t: &TextureDescriptor| (0x0880_0000..0x0A00_0000).contains(&(t.address & 0x0FFF_FFFF));
-    let started = sys::now_us();
-    for _ in 0..100 {
-        core::hint::black_box(sys::now_us());
-    }
-    let clock_us = sys::now_us() - started;
-    let (mut count, mut bytes) = (0u32, 0u64);
-    let started = sys::now_us();
-    for texture in frame.textures().iter().filter(|t| in_ram(t)) {
-        let staged = stage(&host, texture, &StagedLayout::of(texture), staging);
-        if staged > 0 {
-            count += 1;
-            bytes += staged as u64;
-        }
-    }
-    let stage_us = sys::now_us() - started;
-    let mut hashes = 0u32;
-    let started = sys::now_us();
-    for texture in frame.textures().iter().filter(|t| in_ram(t)) {
-        let staged = stage(&host, texture, &StagedLayout::of(texture), staging) as usize;
-        if staged > 0 {
-            hashes ^= texture::hash_texture(&staging[..staged]);
-        }
-    }
-    let both_us = sys::now_us() - started;
-    core::hint::black_box(hashes);
-    let (mut lookup_us, mut finds, mut scans) = (0, 0, 0);
-    if let Some(start) = display.last_start {
-        let _ = display.cache.take_stats();
-        let started = sys::now_us();
-        display.cache.textures_for_frame(&mut VitaHost, staging, frame, start, &mut display.lookups);
-        lookup_us = sys::now_us() - started;
-        let stats = display.cache.take_stats();
-        STATS.add(&stats);
-        (finds, scans) = (stats.finds, stats.scans);
-    }
-    let size = out.len();
-    let mut text = TextBuffer::new(&mut out[..size - 1]);
-    let _ = writeln!(
-        text,
-        "OK texbench: {} textures in RAM, {} KiB; 100 clock reads {} us; stage {} us; stage+hash {} us; lookup pass {} us ({} textures, {} finds, {} scans)",
-        count,
-        bytes / 1024,
-        clock_us,
-        stage_us,
-        both_us,
-        lookup_us,
-        frame.textures().len(),
-        finds,
-        scans
-    );
-    let len = text.len();
-    out[len] = 0;
 }
 
 /// Display loop (menu.c): 1 if Sony's picture is to be copied right after

@@ -1,5 +1,5 @@
 //! The display thread's part of the renderer: draws a recorded PSP frame at
-//! 960x544 (phase 2 of DESIGN.md).
+//! 960x544.
 //!
 //! Adrenaline's display loop (menu.c) calls `NativePspRenderFrame` once per
 //! loop, before its own scene. It takes the newest recorded frame
@@ -28,14 +28,13 @@ use crate::targets::{self, Targets, SONY_PICTURE, SONY_PICTURE_STRIDE, TARGET_CO
 use crate::textures::{self, FrameInfo};
 use crate::{ext, frame_pool, gxm, options, palettes, render_log, sys, SingleThreaded};
 
-/// Menu option "NativePSP Texture Filter" (menu.c points at this byte): 0 =
+/// Menu option "NativeRes Texture Filter" (menu.c points at this byte): 0 =
 /// as the game asks (mostly nearest, so every texel becomes a hard 2x2 block
 /// at 960x544), 1 = always bilinear (softer text and sprites, closer to the
 /// upscaled original).
 pub static SMOOTH_TEXTURES: AtomicU8 = AtomicU8::new(0);
 
-/// Debug "drawonly <first> <count>" (count 0 = off): only these draws of a
-/// frame are drawn, to find which draw makes a part of the picture (pause
+/// Only these draws of a frame are drawn (count 0 = off), to find which draw makes a part of the picture (pause
 /// the game: the frame is redrawn).
 pub static DRAW_ONLY_FIRST: AtomicU32 = AtomicU32::new(0);
 pub static DRAW_ONLY_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -45,42 +44,41 @@ pub static DRAW_ONLY_COUNT: AtomicU32 = AtomicU32::new(0);
 /// (MTX race frame 12.3 -> 14.6 ms): so only while the game reads it
 /// (`blend::keep_target_alpha`: a target sampled with its alpha, or a
 /// destination-alpha blend, within the last 120 frames); otherwise every
-/// draw writes alpha as before. Debug "alphamask 0|1|2": 0 never kept, 1
-/// (default) while read, 2 always.
+/// draw writes alpha as before. 0 never kept, 1 (default) while read, 2
+/// always.
 pub static ALPHA_MASK: AtomicI32 = AtomicI32::new(1);
 
-/// Debug ("gputime 1"): wait for the GPU after each target scene and count
-/// the time in renderstats' gpu=. Slows rendering down; for measuring only.
-/// "gputime 2": the GPU drained before the scene too.
+/// 1: wait for the GPU after each target scene and count the time in the
+/// render statistics' gpu=. Slows rendering down; for measuring only.
+/// 2: the GPU drained before the scene too.
 pub static MEASURE_GPU: AtomicI32 = AtomicI32::new(0);
 /// Process time (low 32 bits) when the last drawn frame's rendering
-/// started / ended, and when `NativePspRenderFrame` was entered (debug
-/// server's frame recorder and flip log).
+/// started / ended, and when `NativePspRenderFrame` was entered.
 pub static RENDER_START_US: AtomicU32 = AtomicU32::new(0);
 pub static RENDER_END_US: AtomicU32 = AtomicU32::new(0);
 pub static LOOP_START_US: AtomicU32 = AtomicU32::new(0);
 /// Draws of the last frame drawn.
 pub static DRAWN_DRAW_COUNT: AtomicU32 = AtomicU32::new(0);
 
-/// Debugging (debug command "tracetex <psp address>", 0 = off): the texture
+/// A PSP texture address (0 = off): the texture
 /// cache logs every lookup of the textures at that address: cached or not,
 /// decoded, waiting, the data hash and the VRAM copy state.
 pub static TRACE_TEXTURE: AtomicU32 = AtomicU32::new(0);
 
-/// Debug "vertexcache 0|1|2": make the arenas (once, at the first drawn
+/// Make the arenas (once, at the first drawn
 /// frame that wants them; never freed, frames may point into them): 1 = 1
 /// MiB of main memory, 2 = phycont memory with the raw arena. 2 by default
 /// since 2026-11-06.
 pub static VERTEX_CACHE_WANTED: AtomicI32 = AtomicI32::new(2);
 
-/// Debug "gpudraw 0": the frames are captured, recorded and taken as
+/// The frames are captured, recorded and taken as
 /// always, but not drawn (the game's own picture is shown): tells what our
 /// GPU drawing costs the game (2026-11-09: MTX runs ~27 fps while driving
 /// with the renderer on, 30 with it off, its own time between GE sync and
 /// flip is what grows).
 pub static GPU_DRAW: AtomicI32 = AtomicI32::new(1);
 
-/// Debug "stalecopy 0|1" (1 = default). MTX Mototrax blends the previous
+/// 1 (default) or 0. MTX Mototrax blends the previous
 /// frame's picture over each new one (motion blur, strong in water: 70 %).
 /// That framebuffer's target holds the last frame WE drew into it; when the
 /// capture skipped the frame before (it records the newest when behind), it
@@ -91,12 +89,11 @@ pub static GPU_DRAW: AtomicI32 = AtomicI32::new(1);
 /// instead of 3, 5, ...
 pub static STALE_COPY: AtomicI32 = AtomicI32::new(1);
 
-/// Debug "cpupictures 0|1": `shows_cpu_written_picture` on (1, default) or
-/// off.
+/// `shows_cpu_written_picture` on (1, default) or off.
 pub static CPU_PICTURE_CHECK: AtomicU8 = AtomicU8::new(1);
 
-/// Debug: draw the frame we have once more (paused game, a debug switch
-/// changed what is drawn).
+/// Draw the frame we have once more (paused game, a switch changed what
+/// is drawn).
 static FORCE_REDRAW: AtomicI32 = AtomicI32::new(0);
 
 pub fn redraw_paused() {
@@ -214,7 +211,7 @@ impl FrameLoop {
             self.frame_pending = false;
             return false;
         }
-        // The vertex cache's arena, once asked for (debug "vertexcache 1").
+        // The vertex cache's arena, once asked for.
         let arenas_wanted = VERTEX_CACHE_WANTED.load(Ordering::Relaxed);
         if arenas_wanted != 0 && !self.arena_tried && GPU_TRANSFORM_READY.load(Ordering::Acquire) != 0 {
             self.arena_tried = true;
@@ -264,8 +261,8 @@ impl FrameLoop {
 
         // Nothing of ours shown yet (renderer just switched on): draw the
         // frame we have even if it isn't new, if the game hasn't shown
-        // another since (it is paused, e.g. by vita.py compare, which
-        // otherwise only ever got the game's own picture).
+        // another since (it is paused: we would otherwise only ever show
+        // the game's own picture).
         let newest = frame.frame_number.wrapping_add(1) == COMPLETED_FRAME_COUNT.load(Ordering::Acquire);
         self.frame_pending |= is_new || (targets.shown.is_none() && newest);
         if FORCE_REDRAW.swap(0, Ordering::Relaxed) != 0 {
@@ -367,7 +364,7 @@ impl FrameLoop {
         // menus load the next screen's pictures while the old screen's last
         // frame is on its way; decoded now they showed as noise or wrong
         // tiles): the frame is left out, at most MAX_MOVED_ON_HELD in a row
-        // (texture_cache moved_on; debug "quickchecks 0" switches the checks
+        // (texture_cache moved_on; `QUICK_CHECKS` off switches the checks
         // off).
         let moved_on = textures::moved_on();
         if moved_on != 0 && self.moved_on_held < MAX_MOVED_ON_HELD {
@@ -400,7 +397,7 @@ impl FrameLoop {
         let loop_start = now();
         stats().begin_us += loop_start - begin_start;
         self.draw_draws(frame);
-        draw::draw_tests(); // debug indextest, miptest, alphalog
+        draw::draw_tests(); // GPU tests, alpha log
         let end_start = now();
         stats().loop_us += end_start - loop_start;
         // vita2d draws with GXM's defaults (all at z 0.5, no depth test, no culling).

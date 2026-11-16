@@ -1,6 +1,5 @@
-//! The Vita side of NativePSP: the taiHEN plugin (plugin/), which sits
-//! in stock Adrenaline's process (tools/build-plugin.sh, DESIGN.md "All
-//! Rust, one plugin").
+//! The Vita side of NativeRes: the taiHEN plugin (plugin/), which sits
+//! in stock Adrenaline's process (scripts/build-plugin.sh).
 //!
 //! - `plugin`: module_start; waits for AdrenalineUser, sets the hooks,
 //!   starts our threads when Adrenaline starts its own.

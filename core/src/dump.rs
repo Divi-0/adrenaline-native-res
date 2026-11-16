@@ -204,7 +204,7 @@ impl BlockSource for DumpBlocks<'_> {
     }
 
     /// As the Vita's live capture: main RAM and VRAM may be left to the
-    /// recorder thread (`DrawStream::set_reader`; the Vita's capturebench
+    /// recorder thread (`DrawStream::set_reader`; a benchmark on the Vita
     /// gives it `read_range` then, so it times what the live capture
     /// thread does). Both are in the dump as far as the frame read them.
     fn defer(&mut self, address: u32, bytes: u32) -> bool {

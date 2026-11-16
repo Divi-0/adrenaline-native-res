@@ -2,8 +2,7 @@
 //! shared area in PSP memory, and functions inside Sony's emulator.
 //!
 //! This is the seam between our code and Adrenaline. Everything here is
-//! found the way a plugin for an unchanged Adrenaline finds it (DESIGN.md
-//! "All Rust, one plugin"): the emulator's functions by their offsets in
+//! found the way a plugin for an unchanged Adrenaline finds it: the emulator's functions by their offsets in
 //! ScePspemu's code, Adrenaline's settings by their magic words in
 //! AdrenalineUser's data, savestates through the requests Adrenaline's menu
 //! sends. The display loop itself is seen through hooks (display_hooks.rs).
@@ -26,7 +25,7 @@ struct AdrenalineConfig {
     /// Settings > Memory Stick location (`MemoryStickLocation`).
     ms_location: u8,
     rest: [u8; 23],
-    /// Settings > "NativePSP Renderer" (the fork's menu, below Graphics
+    /// Settings > "NativeRes Renderer" (the fork's menu, below Graphics
     /// Filtering): 0 = on (default; older files have 0 in this former
     /// padding), 1 = off. Stock Adrenaline keeps the byte when it saves.
     nativepsp_renderer_off: u8,
@@ -47,7 +46,7 @@ pub const FILTER_BILINEAR: u8 = 1;
 const CONFIG_MAGIC: [u32; 2] = [0x3148_3943, 0x8451_860B];
 
 /// The highest Graphics Filtering stock Adrenaline offers (FILTER_LCD3X ..
-/// 8); the fork once saved 9 for "NativePSP".
+/// 8); the fork once saved 9 for "NativeRes".
 pub const FILTER_LAST: u8 = 8;
 
 /// `SceAdrenaline::psp_cmd` requests (adrenaline_vita.h,
@@ -235,14 +234,14 @@ pub fn graphics_filtering() -> Option<u8> {
     config().map(|config| unsafe { read_volatile(addr_of!((*config).graphics_filtering)) })
 }
 
-/// Settings > "NativePSP Renderer", or None before Adrenaline's settings
+/// Settings > "NativeRes Renderer", or None before Adrenaline's settings
 /// are found.
 pub fn renderer_switch() -> Option<bool> {
     // Safe: a byte the menu may change; any value read is fine.
     config().map(|config| unsafe { read_volatile(addr_of!((*config).nativepsp_renderer_off)) } == 0)
 }
 
-/// Sets "NativePSP Renderer" without saving it (Adrenaline saves it with
+/// Sets "NativeRes Renderer" without saving it (Adrenaline saves it with
 /// its other settings the next time its menu changes one).
 pub fn set_renderer_switch(on: bool) {
     if let Some(config) = config() {

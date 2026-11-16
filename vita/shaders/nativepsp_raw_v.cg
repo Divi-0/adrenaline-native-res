@@ -1,6 +1,6 @@
-// NativePSP: vertex program for 3D draws whose vertices the GPU reads in the
-// PSP's own layout ("raw vertices", NATIVEPSP_DRAW_RAW_VERTICES; DESIGN.md
-// "Raw vertices, step 1"). The attribute formats do the reading: they are
+// NativeRes: vertex program for 3D draws whose vertices the GPU reads in the
+// PSP's own layout ("raw vertices", NATIVEPSP_DRAW_RAW_VERTICES). The
+// attribute formats do the reading: they are
 // chosen per PSP vertex format when the program is patched (one patched
 // program per format, nativepsp_render.c RawProgramFor). This program does
 // what the capture's CPU path does with such a vertex (raw_vertex.rs is the
@@ -14,7 +14,7 @@
 //   for formats without texture coordinates).
 // aColorBytes: the two bytes of a 16-bit colour (5650, 5551, 4444), 0..255
 //   each: reading the 16-bit field as one number came out wrong on the GPU
-//   (debug rawtest, 2026-11-08), bytes come out right.
+//   (measured on the Vita, 2026-11-08), bytes come out right.
 // aColor32: an 8888 colour, 0..1 per channel.
 // uFormat: y = the colour format (VERTEX_TYPE bits 2..4): 0 none, 4 5650,
 //   5 5551, 6 4444, 7 8888.
@@ -48,10 +48,10 @@
 // write for the same PSP depth. No division by w here: a vertex behind the
 // camera stays finite until the GPU clips its triangle.
 //
-// Compiled on the Vita: python tools/vita.py shaders (see nativepsp_shader.c).
+// Compiled on the Vita with the shader compiler app (README.md "Shaders").
 //
 // RAW_PLAIN (nativepsp_raw_plain_v.cg, generated from this file by
-// tools/shader-variants.sh: keep them in step): the same without skinning
+// scripts/shader-variants.sh: keep them in step): the same without skinning
 // and directional lights (no aNormal, aWeights0/1, uNormalRows, uLights,
 // uSkin, uBones), for draws that need neither (nearly all but the riders).
 // The full program costs every vertex its skinning and lighting code even

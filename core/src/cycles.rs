@@ -1,16 +1,15 @@
 //! CPU cycles (or a PMU event) per part of the capture's work, for
-//! measuring on the Vita (debug "capturebench <runs> cycles", "livecycles").
+//! measuring on the Vita.
 //!
-//! The clock is a function the Vita side registers (`set_clock`): a system
-//! call into adrenaline_kernel that reads the core's cycle counter in kernel
-//! mode (`adrNativePspReadCycleCounter`; reading it in user mode crashed,
-//! DESIGN.md "Cycle counter"). One read costs a system call (~1 us), so
+//! The clock is a function registered from outside (`set_clock`), e.g. a
+//! system call that reads the core's cycle counter in kernel mode (reading
+//! it in user mode crashed). One read costs a system call (~1 us), so
 //! parts are whole jobs and runs, and [`CALIBRATION`] measures what an
 //! empty part costs, to subtract per entry. The measured thread must stay
 //! on one core (every core has its own counter). Only the parts in
 //! [`MEASURED`] are read: live, reading all of them (~13,000 capture-thread
 //! parts per race frame) slowed the capture until it skipped frames, so
-//! "livecycles" measures one thread's parts. Not measuring, a part costs
+//! live, measure one thread's parts. Not measuring, a part costs
 //! one load of that mask.
 
 use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
@@ -36,7 +35,7 @@ pub const HASH: usize = 6;
 pub const INDICES: usize = 7;
 /// An empty part: the cost of measuring one entry.
 pub const CALIBRATION: usize = 8;
-// The capture thread (measured in capturebench's produce mode, where the
+// The capture thread (measured in `bench::Mode::Produce`, where the
 // recorder thread only discards the jobs):
 /// A whole `display_list::walk`.
 pub const WALK: usize = 9;
@@ -178,7 +177,7 @@ pub fn clear() {
 mod tests {
     use super::*;
 
-    /// The crash of 2026-11-06 (logs/crash-hunt/cycles-bench): the counter
+    /// The crash of 2026-11-06: the counter
     /// read in user mode trapped. Now nothing reads it unless measuring was
     /// started and a clock (the kernel call) registered.
     #[test]

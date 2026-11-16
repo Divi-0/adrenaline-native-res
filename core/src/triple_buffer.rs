@@ -20,7 +20,7 @@ const NEW: u32 = 4;
 pub struct TripleBuffer {
     /// Index of the ready slot, | NEW.
     ready: AtomicU32,
-    /// When each slot's frame was published (for the debug recorder).
+    /// When each slot's frame was published.
     published_us: [AtomicU32; SLOTS],
 }
 

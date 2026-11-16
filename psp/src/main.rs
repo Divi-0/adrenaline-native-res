@@ -1,7 +1,6 @@
-//! NativePSP's PSP side: the kernel module nativepsp.prx that runs with every
+//! NativeRes's PSP side: the kernel module nativepsp.prx that runs with every
 //! PSP game (loaded by Adrenaline's plugins.txt; the Vita plugin
-//! nativepsp.suprx carries it and installs it). Was psp-plugin/main.c (C)
-//! until stage 4 of "All Rust, one plugin" (DESIGN.md).
+//! nativepsp.suprx carries it and installs it).
 //!
 //! Observe only: it hooks the calls a game uses to hand display lists to the
 //! PSP graphics engine (GE) and to show a finished frame, and records each
@@ -422,10 +421,9 @@ pub unsafe extern "C" fn module_stop(_args: u32, _argp: *mut c_void) -> i32 {
     0
 }
 
-/// Nothing in the plugin may panic (tools/build-psp-plugin.sh checks that
+/// Nothing in the plugin may panic (scripts/build-psp-plugin.sh checks that
 /// no panic path is linked); if one did, the game's thread stops here with
-/// a mark the Vita side shows in `vramprobe` / the capture log
-/// (`thread=.../bad0ba1c`).
+/// a mark the Vita side shows in the capture log (`thread=.../bad0ba1c`).
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     set!(copy_thread_error, 0xBAD0_BA1C);

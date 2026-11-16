@@ -49,7 +49,7 @@ pub static nativepsp_plan_fixed_unswizzle: u32 = sys::pages(
 );
 
 /// Compares a texture the GPU unswizzled with the data it came from (waits
-/// for the GPU, ~100 ms). Debug command "unswizzlecheck <n>": the next n.
+/// for the GPU, ~100 ms): the next n.
 /// First run, 2026-10-30: 3 of 3 Final Fantasy snapshots exact.
 pub static UNSWIZZLE_CHECKS: AtomicI32 = AtomicI32::new(0);
 
@@ -125,7 +125,7 @@ fn swizzled_texel(width: u32, x: u32, y: u32) -> usize {
     (((y / 8) * (width / 8) + x / 8) * 64 + (y % 8) * 8 + x % 8) as usize
 }
 
-/// Debug "unswizzlecheck": compares `target` (after the GPU) with `raw`.
+/// Compares `target` (after the GPU) with `raw`.
 fn check_unswizzled(texture: &TextureDescriptor, raw: *const u16, target: &TextureObject) {
     // Safe: the display thread's context; both textures hold width x height
     // 16-bit texels.

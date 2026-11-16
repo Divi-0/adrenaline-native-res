@@ -230,8 +230,8 @@ impl RowTransform {
     /// columns x z + column 3. ARMv7 NEON multiplies and adds with a
     /// rounding after each (VMLA is not fused), in the same order as above,
     /// so the results are the same to the bit (but for denormals, which
-    /// NEON flushes to zero; `capturebench` compares the frame's hashes
-    /// with the PC's).
+    /// NEON flushes to zero; the frame's hashes on the Vita and on the PC
+    /// are compared).
     #[cfg(target_arch = "arm")]
     #[inline(always)]
     fn clip(&self, [x, y, z]: [f32; 3]) -> [f32; 4] {

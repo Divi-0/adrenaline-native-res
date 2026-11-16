@@ -48,7 +48,7 @@ const PRIM_TRIANGLES: u16 = 3;
 const PRIM_TRIANGLE_STRIP: u16 = 4;
 const PRIM_SPRITES: u16 = 6;
 
-/// Debug "redrawbench": parts of the per-draw work left out, to measure
+/// Parts of the per-draw work left out, to measure
 /// each one's CPU cost. 0 = draw normally. Bits: 1 no vertex stream /
 /// sceGxmDraw, 2 no programs / uniforms, 4 no texture state, 8 stop right
 /// after the indices, 16 no draw function (scissor/depth/cull only), 32
@@ -56,50 +56,49 @@ const PRIM_SPRITES: u16 = 6;
 /// bench runs (pictures are wrong then).
 pub static REDRAW_SKIP: AtomicU32 = AtomicU32::new(0);
 
-/// Debug "drawchecks 0|1" (off by default since 2026-11-10, user's call
-/// after the frame pool ended the GPU crashes: ~0.6-0.8 ms of display CPU
-/// per frame). Before each textured draw goes to the GPU, the bytes its
+/// Draw checks (off by default since 2026-11-10, after the frame pool
+/// ended the GPU crashes: ~0.6-0.8 ms of display CPU per frame). Before each textured draw goes to the GPU, the bytes its
 /// vertex streams would be read from (first vertex + highest index x
 /// stride, plus one vertex) must lie in the memory mapped for that kind of
 /// draw: PSP RAM (zero copy), the raw arena, the vertex cache arena, or the
 /// vertices just copied into the frame pool; the sprite corner table too. A
-/// draw outside is skipped and logged (renderlog "drawcheck: ..."). Made
+/// draw outside is skipped and logged (render log "drawcheck: ..."). Made
 /// after a GPU crash (2026-11-09): a GPU reading out of bounds was one
 /// suspect.
 pub static DRAW_CHECKS: AtomicI32 = AtomicI32::new(0);
 pub static DRAW_CHECK_FAILURES: AtomicU32 = AtomicU32::new(0);
 
-/// Debug "alphashader 0|1" (measuring only, 1 = default): 0 draws
+/// 1 (default); 0, for measuring only, draws
 /// alpha-tested draws with the plain textured program (no discard; wrong
 /// picture), to see what the discard costs the GPU.
 pub static ALPHA_SHADER: AtomicI32 = AtomicI32::new(1);
 
-/// Per-draw timing (renderstats convert_us / indices_us), debug "drawtiming
-/// 0|1", off by default: one sceKernelGetProcessTimeWide costs ~2.4 us on
+/// Per-draw timing (render statistics convert_us / indices_us), off by
+/// default: one sceKernelGetProcessTimeWide costs ~2.4 us on
 /// the Vita, and the draw loop took four per textured draw (~5 ms per MTX
 /// race frame went to measuring). Off, those two figures stay 0.
 pub static DRAW_TIMING: AtomicI32 = AtomicI32::new(0);
 
-/// Debug "cull 0|1|2": back-face culling off, on (default), or with the
+/// Back-face culling off, on (default), or with the
 /// windings swapped (to check which GXM winding is which).
 pub static CULL_MODE: AtomicU8 = AtomicU8::new(1);
 
-/// Debug "alphalog": for the next drawn frame, the draws that still get the
-/// discard program, counted by their tests and blend words (renderlog).
+/// For the next drawn frame, the draws that still get the
+/// discard program, counted by their tests and blend words (render log).
 pub static ALPHA_LOG: AtomicI32 = AtomicI32::new(0);
 
 /// Raw draws neither skinned nor lit with lights get the plain raw program:
 /// the full program costs every vertex its skinning and lighting code,
-/// switched off by uniforms or not (GPU time). Debug "rawplain 0|1".
+/// switched off by uniforms or not (GPU time). 1 = on (default).
 pub static RAW_PLAIN: AtomicI32 = AtomicI32::new(1);
 
-/// Debug "gpuclip <rows>" (measuring only, 0 = off): our scene draws only
+/// Measuring only (0 = off): our scene draws only
 /// its top <rows> pixel rows, to see how the GPU time scales with the area
 /// drawn.
 pub static GPU_CLIP_ROWS: AtomicI32 = AtomicI32::new(0);
 
-/// Debug "indextest <frames>" and "miptest <frames> [bias]": see
-/// `draw_index_test` and `draw_mip_test`.
+/// The GPU tests over the next frames: see `draw_index_test` and
+/// `draw_mip_test`.
 pub static INDEX_TEST_FRAMES: AtomicI32 = AtomicI32::new(0);
 pub static MIP_TEST_FRAMES: AtomicI32 = AtomicI32::new(0);
 /// The raw lod_bias field for the mip test (-1: as sceGxmTextureInitLinear
@@ -166,15 +165,17 @@ const FORGOTTEN: GxmState = GxmState {
 
 const ALPHA_LOG_KINDS: usize = 32;
 
-struct Draws {
-    programs: Programs,
+/// The display thread's drawing state: our programs and the GXM state as
+/// last set.
+pub struct Draws {
+    pub programs: Programs,
     state: GxmState,
     /// This frame's decision: draws keep the target's alpha (the PSP's
     /// stencil) unless they write it.
-    keep_target_alpha: bool,
+    pub keep_target_alpha: bool,
     /// The alpha-test program's range uniform as last set (bits).
     alpha_test_cache: [u32; 4],
-    /// Debug "alphalog": (tests, blend, count).
+    /// The alpha log (`ALPHA_LOG`): (tests, blend, count).
     alpha_log: [(u32, u32, u32); ALPHA_LOG_KINDS],
     alpha_log_kinds: usize,
     /// The 960x544 projection with the doubling and the depth folded in
@@ -200,8 +201,11 @@ static DRAWS: SingleThreaded<Draws> = SingleThreaded::new(Draws {
     test_block_tried: false,
 });
 
-fn draws() -> &'static mut Draws {
-    // Safe: display thread only (every entry point below).
+/// The drawing state. Display thread only (every entry point below, and
+/// whatever an extension draws on that thread); no reference kept across
+/// calls into this module.
+pub fn draws() -> &'static mut Draws {
+    // Safe: display thread only, see above.
     unsafe { DRAWS.get() }
 }
 
@@ -235,13 +239,14 @@ fn floats<T>(value: &T) -> *const f32 {
 }
 
 /// Sets `count` floats from `data` into uniform buffer `buffer`.
-fn set_uniform(buffer: *mut c_void, parameter: *const ProgramParameter, count: u32, data: *const f32) {
+pub fn set_uniform(buffer: *mut c_void, parameter: *const ProgramParameter, count: u32, data: *const f32) {
     // Safe: a reserved buffer, a parameter of the program in use, `count`
     // floats readable at `data`.
     unsafe { gxm::sceGxmSetUniformDataF(buffer, parameter, 0, count, data) };
 }
 
-fn reserve_vertex_uniforms() -> *mut c_void {
+/// A fresh default vertex uniform buffer for the next draw.
+pub fn reserve_vertex_uniforms() -> *mut c_void {
     let mut buffer = null_mut();
     // Safe: the display thread's context.
     unsafe { gxm::sceGxmReserveVertexDefaultUniformBuffer(context(), &mut buffer) };
@@ -294,8 +299,8 @@ const DEPTH_FUNCTIONS: [u32; 8] = [
 /// and keeps the destination (factor 1 - source alpha or 1, added; alpha
 /// blends the same way). A test that only rejects alpha 0 then needs no
 /// discard: the fragments it throws away change nothing. Worth it: the
-/// discard program costs the GPU (2026-11-10, MTX race, debug "alphashader
-/// 0": ~30 ms per frame with it, ~14-18 without); a discarding draw can't
+/// discard program costs the GPU (2026-11-10, MTX race, `ALPHA_SHADER` 0:
+/// ~30 ms per frame with it, ~14-18 without); a discarding draw can't
 /// use the PowerVR GPU's early hidden-surface removal.
 fn alpha_zero_changes_nothing(draw: &Draw) -> bool {
     let writes_depth = draw.tests & test_flags::DEPTH_TEST != 0 && draw.tests & test_flags::DEPTH_WRITE_DISABLED == 0;
@@ -321,7 +326,7 @@ impl Draws {
     /// applied as position x matrix (translation in the last row), so the
     /// scaling multiplies rows 0-2 and the depth's offset adds half of row 2
     /// to row 3.
-    fn native_matrix(&mut self) -> *const f32 {
+    pub fn native_matrix(&mut self) -> *const f32 {
         let matrix = self.native_matrix.get_or_insert_with(|| {
             let ortho = &basic_programs::ORTHO;
             let mut matrix = [0.0f32; 16];
@@ -336,7 +341,7 @@ impl Draws {
         matrix.as_ptr()
     }
 
-    fn use_programs(&mut self, vertex: *const c_void, wvp: *const ProgramParameter, matrix: *const f32, fragment: *const c_void) {
+    pub fn use_programs(&mut self, vertex: *const c_void, wvp: *const ProgramParameter, matrix: *const f32, fragment: *const c_void) {
         if vertex != self.state.vertex_program {
             // Safe: programs made by the patcher, the display's context.
             unsafe { gxm::sceGxmSetVertexProgram(context(), vertex) };
@@ -351,7 +356,7 @@ impl Draws {
         }
     }
 
-    fn set_depth(&mut self, function: u32, write: u32) {
+    pub fn set_depth(&mut self, function: u32, write: u32) {
         if self.state.depth == Some((function, write)) {
             return;
         }
@@ -424,7 +429,7 @@ impl Draws {
 
     /// Sets the fragment program's one colour uniform: the tint of the basic
     /// texture-tint program, or our program's fog colour and colour scale.
-    fn use_fragment_color(&mut self, parameter: *const ProgramParameter, color: [f32; 4]) {
+    pub fn use_fragment_color(&mut self, parameter: *const ProgramParameter, color: [f32; 4]) {
         let color_bits = bits(&color);
         if self.tint_is(parameter, &color_bits) {
             return;
@@ -578,7 +583,7 @@ impl Draws {
     /// The viewport for raw draws with `transform` (nativepsp_raw_v.cg sends
     /// z / w out as (z / w - 1) / 2, so the GPU clips at the PSP's near
     /// plane): depth = offset + scale * that = 0.5 + 0.5 * the PSP depth,
-    /// what every other draw writes (measured with debug rawtest,
+    /// what every other draw writes (measured on the Vita,
     /// 2026-11-08). x and y as GXM's default for our 960x544 targets.
     fn use_raw_viewport(&mut self, transform: &GpuTransform) {
         let (center, scale) = (transform.depth[0], transform.depth[1]);
@@ -831,7 +836,7 @@ impl Draws {
         };
         let out: *const c_void;
         let mut sprites = false;
-        // What the GPU may read stream 0 from (debug "drawchecks"): the
+        // What the GPU may read stream 0 from: the
         // mapped region, and bytes per index step / for the last vertex.
         let mut check_region: *const u8 = null();
         let mut check_region_bytes = 0u32;
@@ -968,10 +973,10 @@ impl Draws {
                 gxm::sceGxmTextureSetMagFilter(&mut gxm_texture, filter);
                 gxm::sceGxmTextureSetUAddrMode(&mut gxm_texture, address(draw_flags::CLAMP_U));
                 gxm::sceGxmTextureSetVAddrMode(&mut gxm_texture, address(draw_flags::CLAMP_V));
-                // Mip levels (menu "NativePSP Distant Textures"): the GPU picks
+                // Mip levels (menu "NativeRes Distant Textures"): the GPU picks
                 // the level; blended between two with the GE's "mip linear"
                 // filters; the bias from the capture (lod bias field 31 + 8 x
-                // levels, measured with debug miptest). Textures without
+                // levels, measured with `draw_mip_test`). Textures without
                 // levels have a mip count of 0.
                 if draw.flags & draw_flags::MIPS != 0 && gxm::sceGxmTextureGetMipmapCount(&gxm_texture) > 1 {
                     let mip_filter = if draw.flags & draw_flags::MIP_LINEAR != 0 {
@@ -1077,7 +1082,7 @@ impl Draws {
         }
     }
 
-    /// The GPU-readable block of the debug tests (indextest, miptest): 1 MiB
+    /// The GPU-readable block of the GPU tests (index, mip): 1 MiB
     /// phycont, non-cached (no stale CPU cache lines for the GPU), made at
     /// the first test and kept. Null if there is no memory.
     fn test_block(&mut self) -> *mut u8 {
@@ -1108,7 +1113,7 @@ impl Draws {
         self.test_block
     }
 
-    /// Debug "indextest <frames>": are 16-bit index values from 64000 on
+    /// Are 16-bit index values from 64000 on
     /// drawn? gxm.h says SCE_GXM_INDEX_SOURCE_INDEX_16BIT values "must be
     /// lower than 64000", but the vertex cache's windows are 65536 vertices,
     /// so cached draws use 64000-65535 too. Five equal white squares in a
@@ -1169,7 +1174,7 @@ impl Draws {
         self.use_default_viewport();
     }
 
-    /// Debug "miptest <frames>": the memory layout GXM wants for a linear
+    /// The memory layout GXM wants for a linear
     /// texture's mip levels. A 64x64 texture with 7 levels, each level one
     /// colour (0 red, 1 green, 2 blue, 3 yellow, 4 cyan, 5 magenta, 6
     /// white), laid out as texture::mip_level_offset says. Row 1: ABGR8888;
@@ -1340,7 +1345,7 @@ fn gpu_depth(psp_depth: f32) -> f32 {
 /// vectorized this into NEON code that moves single 16-bit lanes between
 /// NEON and ARM registers, which is slow on the Cortex-A9 (a draw has only a
 /// few runs); with it the Rust draw loop took ~0.2 ms more per MTX race frame
-/// than the C one (redrawbench, 2026-11-13).
+/// than the C one (measured 2026-11-13).
 fn run_corners(runs: &[u16]) -> u32 {
     let mut corners = 0;
     for run in runs.chunks_exact(3) {
@@ -1467,7 +1472,7 @@ pub fn draw_colored(frame: &Frame, draw: &Draw, draw_index: usize) {
     draws().draw_colored(frame, draw, draw_index);
 }
 
-/// After a frame's draws: the debug tests (indextest, miptest) and the
+/// After a frame's draws: the GPU tests (index, mip) and the
 /// alpha log.
 pub fn draw_tests() {
     let draws = draws();
@@ -1497,7 +1502,7 @@ pub fn end_draws() {
     draws.set_cull(gxm::CULL_NONE);
 }
 
-/// The lod_bias field sceGxmTextureInitLinear left (debug miptest reports it).
+/// The lod_bias field sceGxmTextureInitLinear left (the mip test reports it).
 pub fn mip_test_default_bias() -> u32 {
     MIP_TEST_DEFAULT_BIAS.load(Ordering::Relaxed)
 }
@@ -1518,38 +1523,4 @@ pub fn make_arenas(phycont: bool) {
         }
     }
     arenas::make_vertex_arena(phycont as i32);
-}
-
-/// Debug "drawbench": true if our textured program (blending off) can be
-/// used. The bench then calls `bench_scene` in each of its scenes.
-pub fn bench_ready() -> bool {
-    let draws = draws();
-    draws.programs.textured_ready() && !draws.programs.blend_program(Kind::Textured, 0, draws.keep_target_alpha).is_null()
-}
-
-/// Debug "drawbench", at the start of each of its scenes: no depth test, our
-/// textured program with plain fog/scale uniforms.
-pub fn bench_scene() {
-    let draws = draws();
-    draws.set_depth(gxm::DEPTH_FUNC_ALWAYS, gxm::DEPTH_WRITE_DISABLED);
-    let fragment = draws.programs.blend_program(Kind::Textured, 0, draws.keep_target_alpha);
-    let (vertex, wvp, fog) = (draws.programs.textured.vertex, draws.programs.textured.wvp, draws.programs.textured.fog_and_scale);
-    let matrix = draws.native_matrix();
-    draws.use_programs(vertex, wvp, matrix, fragment);
-    draws.use_fragment_color(fog, [0.0, 0.0, 0.0, 1.0]);
-}
-
-/// Debug "drawbench" (+matrix): a fresh vertex uniform buffer with the
-/// matrix, as a per-draw transform would.
-pub fn bench_matrix() {
-    let draws = draws();
-    let wvp = draws.programs.textured.wvp;
-    let matrix = draws.native_matrix();
-    set_uniform(reserve_vertex_uniforms(), wvp, 16, matrix);
-}
-
-/// Debug "drawbench", at the end of each of its scenes: depth writes back
-/// on, as vita2d expects.
-pub fn bench_scene_end() {
-    draws().set_depth(gxm::DEPTH_FUNC_ALWAYS, gxm::DEPTH_WRITE_ENABLED);
 }

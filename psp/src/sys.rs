@@ -13,7 +13,7 @@
 //!
 //! **No gp-relative data.** Our hooks run inside the game's system calls,
 //! where $gp is not ours (the C plugin was built with -G0 for this):
-//! tools/build-psp-plugin.sh turns LLVM's small-data sections off and
+//! scripts/build-psp-plugin.sh turns LLVM's small-data sections off and
 //! checks the ELF for gp-relative relocations.
 
 use core::arch::{asm, global_asm};

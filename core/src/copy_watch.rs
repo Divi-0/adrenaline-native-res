@@ -1,4 +1,4 @@
-//! Measuring aid (debug "copywatch 0|1", off by default): does the game
+//! Measuring aid (`ON`, off by default): does the game
 //! rewrite the memory we copy for a frame before that frame is finished?
 //!
 //! Every range the draw stream copies (`DrawStream::copy`, `copy_one`) is
@@ -15,7 +15,7 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
-/// Whether ranges are noted (debug "copywatch").
+/// Whether ranges are noted.
 pub static ON: AtomicBool = AtomicBool::new(false);
 
 /// Ranges noted per frame at most (MTX's race copies ~2,200).

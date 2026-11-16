@@ -137,7 +137,7 @@ pub mod draw_flags {
     /// index runs are `[RECTANGLES, sprites, first corner]`.
     pub const RAW_SPRITES: u32 = 1 << 14;
     /// The texture has mip levels (`texture_flags::LEVELS_SHIFT`, menu
-    /// option "NativePSP Distant Textures" not "Sharp"): sampled with them,
+    /// option "NativeRes Distant Textures" not "Sharp"): sampled with them,
     /// the GPU choosing the level, plus the bias in `MIP_BIAS_SHIFT`.
     pub const MIPS: u32 = 1 << 15;
     /// With `MIPS`: the GPU blends between two levels (the GE's "mip
@@ -1081,8 +1081,8 @@ impl Frame {
     }
 
     /// Every field of every triangle corner, depth and fog included: with
-    /// `description_hash`, `capturebench` on the Vita shows that code only
-    /// the Vita runs (NEON) gives the same frame as the PC.
+    /// `description_hash`, a dumped frame captured on the Vita and on the PC
+    /// shows that code only the Vita runs (NEON) gives the same frame.
     /// Draws without `draw_flags::FOG` that have a vertex whose fog isn't 1.
     /// Always 0: the Vita copies a draw's vertices to the GPU as they are,
     /// and its program fogs every draw by the vertices' fog (1 = none).

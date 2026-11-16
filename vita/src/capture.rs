@@ -41,9 +41,9 @@ const PRIORITY: i32 = 0x70;
 /// (~1 KiB) are copied around on the stack.
 const STACK_SIZE: u32 = 0x10000;
 
-/// Debug "geprobe <mode>": asks the plugin's copy thread for one GE probe
-/// of that mode (renderer/psp, probe_ge_on_request; "vramprobe" shows
-/// the result).
+/// Asks the plugin's copy thread for one GE probe
+/// of that mode (psp/, probe_ge_on_request; `vram_probe` reads the
+/// result).
 pub fn request_ge_probe(mode: u32) {
     let table = vram_table();
     // Safe: the table is mapped PSP memory the plugin also uses.
@@ -54,12 +54,12 @@ pub fn request_ge_probe(mode: u32) {
     }
 }
 
-/// Debug "vramprobe": the plugin's copy-method probe: bytes, microseconds
+/// The plugin's copy-method probe: bytes, microseconds
 /// per method (`probe_us[method - 1]`, core psp_link), which copied
 /// correctly (bits), the method chosen, the DMA lookup that found a function.
 pub fn vram_probe(out: *mut u32) {
     let table = vram_table();
-    // Safe: the table is mapped PSP memory; the debug server passes 17 words.
+    // Safe: the table is mapped PSP memory; the caller passes 17 words.
     unsafe {
         *out = read_volatile(addr_of!((*table).probe_bytes));
         for method in 0..8 {
@@ -94,7 +94,7 @@ pub fn vram_state() -> VramState {
     }
 }
 
-/// Time the capture's block copies for the log (debug "copytiming 0|1"):
+/// Time the capture's block copies for the log:
 /// the two clock reads per copy cost ~180 us per frame in FF1's menu.
 pub static COPY_TIMING: AtomicI32 = AtomicI32::new(0);
 /// The frame number of the last frame the capture completed. Texture data
@@ -105,37 +105,37 @@ pub static CAPTURED_FRAME_NUMBER: AtomicU32 = AtomicU32::new(0);
 /// `frame_number + 1` of a frame while the game hasn't shown another since.
 pub static COMPLETED_FRAME_COUNT: AtomicU32 = AtomicU32::new(0);
 
-/// Debug "gputransform 0|1": whether textured 3D draws are left to the
+/// Whether textured 3D draws are left to the
 /// GPU's transform (`Capture::set_gpu_transform`; on by default). Only
 /// used once the display side has its program for it
 /// (`GPU_TRANSFORM_READY`).
 pub static GPU_TRANSFORM_WANTED: AtomicU32 = AtomicU32::new(1);
 
-/// Debug "copylines 0|1": whether the capture's block cache copies PSP
+/// Whether the capture's block cache copies PSP
 /// memory a line (256 bytes) at a time as it is read (1, default) or whole
 /// 1 KiB blocks (0, as before 2026-11-05; for comparing).
 pub static COPY_LINES: AtomicU32 = AtomicU32::new(1);
 
-/// Debug "deferredcopy 0|1": whether the recorder thread copies the draws'
+/// Whether the recorder thread copies the draws'
 /// vertex memory itself (`DrawStream::set_reader`), instead of the capture
 /// thread. Only with the recorder thread. Off by default since 2026-11-07:
 /// a recorder thread behind the game copied vertices the game had already
 /// overwritten (MTX's title menu: torn riders, garbage over the menu).
 pub static DEFERRED_COPY_WANTED: AtomicU32 = AtomicU32::new(0);
 
-/// Debug "quickhits 0|1": whether the vertex cache finds runs by their mini
+/// Whether the vertex cache finds runs by their mini
 /// hash (`nativepsp_core::vertex_cache::QUICK_HITS`).
 pub fn set_quick_hits(on: u32) {
     nativepsp_core::vertex_cache::QUICK_HITS.store(on != 0, Ordering::Relaxed);
 }
 
-/// Debug "quickchecks 0|1": whether cached textures get a few-word check at
+/// Whether cached textures get a few-word check at
 /// their first use in a frame (`nativepsp_core::texture_cache::QUICK_CHECKS`).
 pub fn set_quick_checks(on: u32) {
     nativepsp_core::texture_cache::QUICK_CHECKS.store(on != 0, Ordering::Relaxed);
 }
 
-/// Debug "copierlag <jobs>": how far the copier thread may fall behind
+/// How far the copier thread may fall behind
 /// before the capture thread copies the oldest jobs itself
 /// (`nativepsp_core::draw_stream::COPIER_LAG_JOBS`; at least 2).
 pub fn set_copier_lag(jobs: u32) {
@@ -143,14 +143,14 @@ pub fn set_copier_lag(jobs: u32) {
     nativepsp_core::draw_stream::COPIER_LAG_JOBS.store(jobs, Ordering::Relaxed);
 }
 
-/// Debug "copywatch 0|1": note every copied range and check at each frame's
+/// Note every copied range and check at each frame's
 /// end whether the game rewrote it (`nativepsp_core::copy_watch`; log
 /// `rewritten=`). Off by default.
 pub fn set_copy_watch(on: u32) {
     nativepsp_core::copy_watch::ON.store(on != 0, Ordering::Relaxed);
 }
 
-/// Debug "stablecopy 0|1": copiers read small ranges until two reads agree
+/// Copiers read small ranges until two reads agree
 /// (`nativepsp_core::draw_stream::STABLE_COPIES`; on by default).
 pub fn set_stable_copies(on: u32) {
     nativepsp_core::draw_stream::STABLE_COPIES.store(on != 0, Ordering::Relaxed);
@@ -161,13 +161,13 @@ fn clock_us() -> u32 {
     sys::now_us() as u32
 }
 
-/// Debug "lights 0|1": lit draws with lights drawn lit (1, default) or with
+/// Lit draws with lights drawn lit (1, default) or with
 /// their vertex colours as they are (0) (`nativepsp_core::lighting::LIGHTS_ON`).
 pub fn set_lights(on: u32) {
     nativepsp_core::lighting::LIGHTS_ON.store(on != 0, Ordering::Relaxed);
 }
 
-/// Debug "minisamples <1..8>": words a vertex-cache mini hash samples
+/// Words a vertex-cache mini hash samples
 /// (`nativepsp_core::vertex_cache::SAMPLE_COUNT`).
 pub fn set_mini_samples(count: u32) {
     let count = (count as usize).clamp(1, nativepsp_core::vertex_cache::SAMPLE_WORDS);
@@ -241,7 +241,7 @@ pub static GPU_TRANSFORM_READY: AtomicU32 = AtomicU32::new(0);
 pub static VERTEX_ARENA: AtomicPtr<FrameVertex> = AtomicPtr::new(core::ptr::null_mut());
 pub static VERTEX_ARENA_VERTICES: AtomicU32 = AtomicU32::new(0);
 
-/// The vertex cache's tables (`make_vertex_cache`), for tools/memcheck.py:
+/// The vertex cache's tables (`make_vertex_cache`), for the memory plan:
 /// in phycont memory, whose blocks come in whole MiB, since the cache is on
 /// by default (2026-11-06) and main memory is short.
 const VERTEX_CACHE_TABLE_BYTES: usize = (core::mem::size_of::<VertexCache>() + 0xF_FFFF) & !0xF_FFFF;
@@ -307,7 +307,7 @@ pub static RAW_ARENA_BYTES: AtomicU32 = AtomicU32::new(0);
 pub static INDEX_RING: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 pub static INDEX_RING_BYTES: AtomicU32 = AtomicU32::new(0);
 
-/// Debug "rawvertices 0|1": 3D runs as raw PSP vertices for the GPU
+/// 3D runs as raw PSP vertices for the GPU
 /// (`nativepsp_core::raw_arena::ENABLED`), where the draw allows it.
 pub fn set_raw_vertices(on: u32) {
     nativepsp_core::raw_arena::ENABLED.store(on != 0, Ordering::Relaxed);
@@ -326,7 +326,7 @@ fn display_targets() -> [u32; 4] {
     [0, 1, 2, 3].map(|k| published[k].load(Ordering::Relaxed))
 }
 
-/// Debug "vramrequests 0|1": whether the plugin is asked to copy VRAM ranges
+/// Whether the plugin is asked to copy VRAM ranges
 /// (textures, display lists in VRAM) for us (1, default). 0 is a measuring
 /// aid: the plugin's copies run in the game's own (emulated) CPU time; without
 /// them VRAM lists and textures can't be read, so frames come out broken.
@@ -336,7 +336,7 @@ pub fn set_vram_requests(on: u32) {
     VRAM_REQUESTS_WANTED.store(on != 0, Ordering::Relaxed);
 }
 
-/// Menu "NativePSP Distant Textures" (Adrenaline config byte
+/// Menu "NativeRes Distant Textures" (Adrenaline config byte
 /// MIP_MODE, pushed by the display every frame): see
 /// `nativepsp_core::texture::MIP_MODE`.
 pub fn set_mip_mode(mode: u32) {
@@ -349,7 +349,7 @@ pub fn set_alpha_test_ready(ready: u32) {
     nativepsp_core::blend::ALPHA_TEST_IN_SHADER.store(ready != 0, Ordering::Relaxed);
 }
 
-/// Debug "zerocopy 0|1": big raw runs drawn by the GPU straight from PSP RAM
+/// Big raw runs drawn by the GPU straight from PSP RAM
 /// (`nativepsp_core::raw_arena::ZERO_COPY`). Switched on by the display once
 /// it has mapped PSP RAM for the GPU (arenas.rs `map_psp_ram_for_gpu`), the
 /// default since 2026-11-09.
@@ -381,7 +381,7 @@ struct CopyStats {
 /// after `allocate`.
 pub struct CaptureBox(*mut Capture);
 
-/// Its block, whole MiB (phycont blocks come in MiB), for tools/memcheck.py.
+/// Its block, whole MiB (phycont blocks come in MiB), for the memory plan.
 const CAPTURE_BLOCK_BYTES: usize = (core::mem::size_of::<Capture>() + 0xF_FFFF) & !0xF_FFFF;
 #[no_mangle]
 #[used]
@@ -433,7 +433,7 @@ impl core::ops::DerefMut for CaptureBox {
     }
 }
 
-/// Debug "streamlimits <transforms> <jobs>": the draw stream's limits in
+/// The draw stream's limits in
 /// use (`draw_stream::TRANSFORM_LIMIT` / `JOB_LIMIT`, at most the ring
 /// sizes), for A/Bs against the old 64 / 512.
 pub fn set_stream_limits(transforms: u32, jobs: u32) {
@@ -712,7 +712,7 @@ impl SharedRing {
     }
 }
 
-/// Debug "gesync 0|1": whether the plugin waits in the game's GE sync until
+/// Whether the plugin waits in the game's GE sync until
 /// the capture has read the lists the game waited for (on by default, user's
 /// choice 2026-11-08: MTX refilled its HUD buffer for a later frame before
 /// our walk reached the HUD). Costs the game time whenever the capture is
@@ -907,7 +907,7 @@ fn log_frame(state: &mut CaptureState, timing: &mut FrameTiming, flip: &RawEvent
         walk.0, walk.1, copies_wait.0, copies_wait.1, stream_wait.0, stream_wait.1
     );
     let _ = report::write_frame(&mut text, &state.last_frame);
-    // Debug "copywatch 1": copied ranges the game rewrote before the frame's
+    // Copied ranges the game rewrote before the frame's
     // end (`nativepsp_core::copy_watch`): changed/checked, the first one
     // (address+words, ms from its copy), the youngest changed one's age.
     if nativepsp_core::copy_watch::ON.load(Ordering::Relaxed) {
@@ -959,7 +959,7 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
     log::flush();
     nativepsp_core::copy_watch::set_clock(Some(clock_us));
     // Whether the draws' vertices are recorded on another core
-    // (recorder_thread.rs; switched by the debug server).
+    // (recorder_thread.rs; can be switched at run time).
     let mut threaded = false;
     // Whether the draw stream has a reader (the recorder or the copier
     // thread copies deferrable memory), and whether the copier thread copies.
@@ -980,7 +980,7 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
     let mut ring_version_reported = false;
 
     // Whether stage B of the capture runs on its own thread
-    // (stage_thread.rs; switched at frame ends by the debug server).
+    // (stage_thread.rs; switched at frame ends).
     let mut staged = false;
 
     loop {
@@ -995,7 +995,7 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
             }
         }
         // Who copies the draws' vertex memory: the copier thread right after
-        // the walk queues each draw (copy_thread.rs, debug "copythread", the
+        // the walk queues each draw (copy_thread.rs, the
         // default), this thread at walk time ("copythread 0"), or the
         // recorder thread when it records the draw ("copythread 0" and
         // "deferredcopy 1"). The copier and deferred copies need the recorder
@@ -1070,8 +1070,8 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
             capturing = true;
         }
 
-        // Whether the plugin should wait for us in the game's GE sync (debug
-        // "gesync"): only while we record frames from it.
+        // Whether the plugin should wait for us in the game's GE sync
+        // (`GE_SYNC_WANTED`): only while we record frames from it.
         let sync_wanted = GE_SYNC_WANTED.load(Ordering::Relaxed) != 0 && have_frames && renderer_enabled();
         ring.set_sync_wanted(sync_wanted);
         ring.request_sync_events();
@@ -1228,10 +1228,4 @@ pub fn start() {
 /// For `dump_file`: the memory view that reads a dumped frame's textures.
 pub fn texture_memory(state: &mut CaptureState) -> BlockCache<VitaBlocks<'_>> {
     state.memory(false)
-}
-
-/// Debug "benchexp <mask>": `nativepsp_core::bench::EXPERIMENT` (measuring
-/// aid; 0 = normal).
-pub fn set_experiment(mask: u32) {
-    nativepsp_core::bench::EXPERIMENT.store(mask, Ordering::Relaxed);
 }

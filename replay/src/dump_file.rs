@@ -124,7 +124,7 @@ fn read_original(cursor: &mut Cursor) -> Result<Option<OriginalPicture>, String>
 
 impl DumpFile {
     pub fn parse(bytes: &[u8]) -> Result<DumpFile, String> {
-        let header = Header::read(bytes).ok_or("not a NativePSP dump (or another version)")?;
+        let header = Header::read(bytes).ok_or("not a NativeRes dump (or another version)")?;
         let mut cursor = Cursor { bytes, position: HEADER_BYTES };
 
         let snapshot = cursor.take(header.snapshot_bytes as usize)?.to_vec();

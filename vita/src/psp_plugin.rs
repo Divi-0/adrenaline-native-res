@@ -1,5 +1,5 @@
-//! The PSP side (renderer/psp -> nativepsp.prx, built by
-//! tools/build-psp-plugin.sh) is carried inside this plugin, so the user
+//! The PSP side (psp/ -> nativepsp.prx, built by
+//! scripts/build-psp-plugin.sh) is carried inside this plugin, so the user
 //! installs one file. At Adrenaline's start, before its PSP side boots,
 //! `install` puts it where Adrenaline's PSP side loads plugins from:
 //! `<ms0>/seplugins/nativepsp.prx` (written only when it differs from the

@@ -50,7 +50,7 @@ pub mod approx {
     pub const SEPARATE_SPECULAR: u32 = 1 << 4;
     /// Generated texture coordinates (TEXTURE_MAP_MODE 1/2).
     pub const TEXGEN: u32 = 1 << 5;
-    /// Lit with lights while debug "lights 0" left them out.
+    /// Lit with lights while `lighting::LIGHTS_ON` left them out.
     pub const LIGHTS_LEFT_OUT: u32 = 1 << 6;
     /// Alpha test with blending off: normal blending stands in for it
     /// (`blend::translate`; transparent texels still write depth).
@@ -1042,7 +1042,7 @@ fn prepare_now(
         // Lit without lights: `AmbientLighting`; with lights: the
         // transform's `Lights`, approximated only where the GE would add a
         // separate specular colour after texturing.
-        // (Lit with lights while debug "lights 0" switched them off: drawn
+        // (Lit with lights while `LIGHTS_ON` switched them off: drawn
         // unlit, counted.)
         ambient_lighting = AmbientLighting::of(ge);
         let lit = ge.register(op::LIGHTING_ENABLE) & 1 != 0;

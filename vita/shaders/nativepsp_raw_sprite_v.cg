@@ -1,4 +1,4 @@
-// NativePSP: vertex program for raw 3D sprites (PRIM type 6, rectangles;
+// NativeRes: vertex program for raw 3D sprites (PRIM type 6, rectangles;
 // NATIVEPSP_DRAW_RAW_SPRITES, frame.rs draw_flags::RAW_SPRITES). A PSP
 // sprite is two vertices: A (one corner) and B (the opposite one). The raw
 // arena holds each sprite's pair four times (one pair per corner); the
@@ -19,7 +19,7 @@
 // aPosition, aTexcoord: A's; aPositionB, aTexcoordB, aColorBytesB,
 // aColor32B: B's (formats as nativepsp_raw_v.cg); aCorner: 0..3.
 //
-// Compiled on the Vita: python tools/vita.py shaders (see nativepsp_shader.c).
+// Compiled on the Vita with the shader compiler app (README.md "Shaders").
 
 float High(float value, float inverse)
 {

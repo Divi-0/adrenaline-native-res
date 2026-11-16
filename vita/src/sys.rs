@@ -192,7 +192,7 @@ extern "C" {
     pub fn sceKernelGetSystemInfo(info: *mut SceKernelSystemInfo) -> i32;
     pub fn sceKernelGetProcessTimeWide() -> u64;
     /// Resets the idle timers (0 = SCE_KERNEL_POWER_TICK_DEFAULT): no
-    /// standby for now (debug "powertick").
+    /// standby for now.
     pub fn sceKernelPowerTick(tick_type: i32) -> i32;
 
     pub fn scePowerGetArmClockFrequency() -> i32;
@@ -213,7 +213,7 @@ extern "C" {
 
     pub fn sceSysmoduleLoadModule(id: u32) -> i32;
 
-    // SceNet (initialized by the debug server's thread)
+    // SceNet (loaded and initialized by whoever uses it)
     pub fn sceNetInit(param: *mut SceNetInitParam) -> i32;
     pub fn sceNetRecv(socket: i32, data: *mut c_void, size: u32, flags: i32) -> i32;
     pub fn sceNetSocket(name: *const u8, domain: i32, socket_type: i32, protocol: i32) -> i32;
@@ -249,7 +249,7 @@ pub fn psp_to_vita(address: u32) -> usize {
 }
 
 /// `bytes` rounded up to whole 4 KiB pages, as the kernel allocates them:
-/// for the `nativepsp_plan_*` statics that tell tools/memcheck.py how much
+/// for the `nativepsp_plan_*` statics that tell the memory plan how much
 /// memory an allocation site takes (see blocks.rs).
 pub const fn pages(bytes: usize) -> u32 {
     ((bytes + 0xFFF) & !0xFFF) as u32

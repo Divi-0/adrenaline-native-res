@@ -179,8 +179,8 @@ impl Capture {
     }
 
     /// Makes a `Capture` in zeroed memory at `place`, without building one
-    /// on the stack first (it is ~0.5 MiB; the Vita's `capturebench` makes
-    /// its own in a block of phycont memory while it runs): what `reset`
+    /// on the stack first (it is ~0.5 MiB; a second capture, e.g. for
+    /// timing a dumped frame, lives in a memory block of its own): what `reset`
     /// doesn't set is valid as zero bytes (counters, flags, null pointers as
     /// `None`; ring contents are written before they are read).
     ///
@@ -619,7 +619,7 @@ impl Capture {
                     frame.raw_vertices_len = raw.bytes().len() as u32;
                 }
                 // Its index runs as triangle lists, so the display doesn't
-                // build them (~1 ms of its CPU per race frame, redrawbench).
+                // build them (~1 ms of its CPU per race frame, measured).
                 if let Some(ring) = cache.index_ring.as_mut() {
                     frame.write_ring_indices(ring);
                 }

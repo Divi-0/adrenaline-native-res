@@ -1,9 +1,10 @@
 //! Our own settings: distant textures, texture filter, the game's fps
 //! label and the ARM clock. Read once from
 //! ux0:data/nativepsp/config.txt (nativepsp_core::options; we never write
-//! it), changed later only by the debug server; nothing is saved.
+//! it), changed later only at run time (the setters below); nothing is
+//! saved.
 //!
-//! The renderer's on/off switch is Adrenaline's setting "NativePSP
+//! The renderer's on/off switch is Adrenaline's setting "NativeRes
 //! Renderer" (below Graphics Filtering; saved with Adrenaline's settings).
 //! With it on, the display loop draws whatever Graphics Filtering is
 //! selected (menu.c); the selected filter is never changed (user,
@@ -21,10 +22,10 @@ const PATH: &[u8] = b"ux0:data/nativepsp/config.txt\0";
 const MAX_BYTES: usize = 1024;
 
 /// The renderer paused while Adrenaline saves or loads a state
-/// (debug/state_ops.rs), whatever the switch says.
+/// (`set_paused`), whatever the switch says.
 static PAUSED: AtomicBool = AtomicBool::new(false);
 
-/// Distant textures (`mip=`, debug "mipmode", the fork's menu entry): 0
+/// Distant textures (`mip=`, the fork's menu entry): 0
 /// sharp, 1 blurry like the PSP, 2 mipmapped.
 pub static MIP_MODE: AtomicU8 = AtomicU8::new(0);
 
@@ -46,16 +47,16 @@ pub fn skipped(part: u32) -> bool {
     START_SKIP.load(Relaxed) & part != 0
 }
 
-/// The ARM clock our thread keeps (`armclock=`, debug "armclock").
+/// The ARM clock our thread keeps (`armclock=`).
 static ARM_CLOCK: AtomicI32 = AtomicI32::new(444);
 
-/// 1 if the renderer is on: Adrenaline's "NativePSP Renderer" (on until
+/// 1 if the renderer is on: Adrenaline's "NativeRes Renderer" (on until
 /// its settings are found) and not paused.
 pub fn renderer_enabled() -> i32 {
     (!PAUSED.load(Relaxed) && adrenaline::renderer_switch().unwrap_or(true)) as i32
 }
 
-/// Sets "NativePSP Renderer" (debug "renderer"; not saved).
+/// Sets "NativeRes Renderer" (not saved).
 pub fn set_renderer(on: bool) {
     adrenaline::set_renderer_switch(on);
 }
@@ -116,7 +117,7 @@ fn load() {
     keep_arm_clock(options.arm_clock);
 }
 
-/// Our settings thread: applies the file, puts "NativePSP Renderer" into
+/// Our settings thread: applies the file, puts "NativeRes Renderer" into
 /// Adrenaline's menu and keeps Graphics Filtering in line (menu.rs, every
 /// 50 ms), and keeps the ARM clock (the system can lower it again, e.g.
 /// after standby; checked every 10 s).

@@ -416,7 +416,7 @@ fn pixels_written_after_the_frame_was_drawn_wait_for_the_next_frame() {
     assert_eq!(test.host.decodes, 2);
 }
 
-/// rider -> bike select, first visit (renderlog "moved on", 20 textures in
+/// rider -> bike select, first visit ("moved on", 20 textures in
 /// one frame): the frame drew picture 1, but by the time the display reads
 /// the textures the game has loaded picture 2 there. Whatever we decode is
 /// not what the frame showed: noticed (`shows_other_pixels`), so the
@@ -692,7 +692,7 @@ fn a_texture_that_failed_for_memory_is_retried_later() {
     assert!(matches!(test.use_texture(&other), Lookup::Ready(_)), "changed data: at once");
 }
 
-/// A texture with mip levels (menu "NativePSP Distant Textures") becomes
+/// A texture with mip levels (menu "NativeRes Distant Textures") becomes
 /// one GPU texture with all its levels, each staged from its own address
 /// and decoded into its level; its memory counts every level.
 #[test]

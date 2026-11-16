@@ -1,4 +1,4 @@
-// NativePSP: vertex program for textured PSP draws.
+// NativeRes: vertex program for textured PSP draws.
 //
 // aPosition: x, y in vita2d's 960x544 units, z, and w. The position is
 // multiplied by w after the projection, so the GPU divides by it again:
@@ -8,7 +8,7 @@
 // texture function applied), RGBA bytes read as 0..1.
 // aFog: PSP fog factor, 1 = no fog, 0 = fog colour (see nativepsp_textured_f.cg).
 //
-// Compiled on the Vita: python tools/vita.py shaders (see nativepsp_shader.c).
+// Compiled on the Vita with the shader compiler app (README.md "Shaders").
 
 void main(
 	float4 aPosition,

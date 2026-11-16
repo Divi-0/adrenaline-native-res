@@ -187,7 +187,7 @@ mod tests {
         assert_eq!(fold_vram_mirror(0x0890_0000), 0x0890_0000);
     }
 
-    /// The crash of 2026-11-06 (logs/crash-hunt/r1-444-cache, tools/vitacore.py):
+    /// The crash of 2026-11-06 (from the Vita's core dump):
     /// AdrenalineDraw copied 128 bytes of a texture from PSP 0x048066E1 (Vita
     /// 0x6C8066E1, unmapped): a data abort. Such reads must land in VRAM.
     #[test]

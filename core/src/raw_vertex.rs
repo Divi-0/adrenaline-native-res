@@ -16,7 +16,7 @@
 //!
 //! Triangles are cut at the PSP's near plane (clip z = -w) like the CPU path
 //! cuts them (`transform::clip_triangle`); the GPU clips at the same plane
-//! (its clip volume is -w <= z <= w, measured with debug "rawtest";
+//! (its clip volume is -w <= z <= w, measured on the Vita;
 //! the shader puts its far plane out of reach).
 
 use crate::frame::{Frame, FrameVertex, GpuLights, GpuTransform, RawColors};

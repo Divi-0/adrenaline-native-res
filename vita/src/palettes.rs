@@ -33,7 +33,7 @@ struct State {
 static STATE: SingleThreaded<State> =
     SingleThreaded::new(State { tables: PaletteTables::new(), memory: core::ptr::null_mut(), failed: false, logged_full: 0 });
 
-/// Tables filled since the last `take_filled` (renderstats
+/// Tables filled since the last `take_filled` (render statistics
 /// palettes=).
 static FILLED: AtomicU32 = AtomicU32::new(0);
 
@@ -82,7 +82,7 @@ pub fn palette_for(frame: &Frame, texture: &TextureDescriptor, now: u32) -> *con
     unsafe { state.memory.add(index * TABLE_BYTES / 4) as *const c_void }
 }
 
-/// Tables filled since the last call (renderstats palettes=).
+/// Tables filled since the last call (render statistics palettes=).
 pub fn take_filled() -> u32 {
     FILLED.swap(0, Ordering::Relaxed)
 }

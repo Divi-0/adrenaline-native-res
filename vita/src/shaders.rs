@@ -1,9 +1,8 @@
 //! Our GPU programs, embedded as compiled GXP binaries.
 //!
-//! The sources are `renderer/vita/shaders/*.cg` (Cg, the only language the
-//! Vita's GPU takes); `python tools/vita.py shaders` compiles them on the Vita
-//! (the NativePSP Shader Compiler app, renderer/shadercompiler) and puts
-//! the .gxp files next to them. A changed
+//! The sources are `vita/shaders/*.cg` (Cg, the only language the Vita's
+//! GPU takes); the NativeRes Shader Compiler app (shadercompiler/)
+//! compiles them on the Vita, and the .gxp files go next to them. A changed
 //! .gxp is picked up by the next build (`include_bytes!` tracks the file).
 //!
 //! Each program is a static named like its file (programs.rs registers them).

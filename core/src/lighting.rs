@@ -29,7 +29,7 @@ use crate::command::op;
 use crate::frame::GpuLights;
 use crate::ge_state::{float24, GeState};
 
-/// Debug "lights 0|1": lit draws with lights drawn lit (true, default) or
+/// Lit draws with lights drawn lit (true, default) or
 /// with their vertex colours as they are (false, as before lighting step 2).
 /// Read when a draw's transform is worked out.
 pub static LIGHTS_ON: AtomicBool = AtomicBool::new(true);

@@ -54,7 +54,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let trace = args.iter().any(|arg| arg == "--trace");
     // NATIVEPSP_LIGHTS=0: lit draws with their vertex colours as they are
-    // (as debug "lights 0" on the Vita), for comparing costs.
+    // (`lighting::LIGHTS_ON` off), for comparing costs.
     if std::env::var("NATIVEPSP_LIGHTS").is_ok_and(|value| value == "0") {
         nativepsp_core::lighting::LIGHTS_ON.store(false, std::sync::atomic::Ordering::Relaxed);
     }
@@ -125,11 +125,9 @@ fn new_vertex_cache() -> Option<&'static mut VertexCache> {
     }
     let arena = Box::leak(vec![FrameVertex::default(); ARENA_VERTICES].into_boxed_slice());
     let cache = Box::leak(Box::new(VertexCache::new(arena)));
-    // Raw PSP vertices for the GPU (`--raw` or NATIVEPSP_RAW=1, as debug
-    // "rawvertices 1" on the Vita): a raw arena as big as the Vita's.
-    // Without: the old path (the regression hashes are the old path's;
-    // logs/prof/raw-vs-old.sh compares the two), though raw is on by
-    // default on the Vita.
+    // Raw PSP vertices for the GPU (`--raw` or NATIVEPSP_RAW=1, as on the
+    // Vita by default): a raw arena as big as the Vita's. Without: the old
+    // path (the regression hashes are the old path's).
     let raw = std::env::args().any(|arg| arg == "--raw") || std::env::var("NATIVEPSP_RAW").is_ok_and(|value| value == "1");
     nativepsp_core::raw_arena::ENABLED.store(raw, std::sync::atomic::Ordering::Relaxed);
     nativepsp_core::raw_arena::SPRITES.store(raw, std::sync::atomic::Ordering::Relaxed);
@@ -399,7 +397,7 @@ fn print_sublists(dump_path: &str) -> Result<(), String> {
 }
 
 /// Times the capture over the dump's events, `runs` times per mode, with
-/// the same code as the Vita's `capturebench` command (`core::bench`).
+/// the same code a benchmark on the Vita uses (`core::bench`).
 /// `--runs`: the frame's index runs (`draw_flags::INDEX_RUNS`) by primitive
 /// type, with their triangles, and how many GPU draw calls they would take
 /// drawn straight from fixed index tables: list and sprite runs that follow
@@ -448,7 +446,7 @@ fn print_index_runs(frame: &nativepsp_core::frame::Frame) {
 
 fn bench(dump_path: &str, runs: u32, only: Option<&str>) -> Result<(), String> {
     let bytes = std::fs::read(dump_path).map_err(|error| format!("{dump_path}: {error}"))?;
-    let dump = DumpView::parse(&bytes).ok_or("not a complete NativePSP dump (or another version)")?;
+    let dump = DumpView::parse(&bytes).ok_or("not a complete NativeRes dump (or another version)")?;
     let mut index = vec![0u32; dump.block_count()];
     let sorted = dump.sort_blocks(&mut index).ok_or("block index too small")?;
     let mut capture = Box::new(Capture::new());
@@ -466,7 +464,7 @@ fn bench(dump_path: &str, runs: u32, only: Option<&str>) -> Result<(), String> {
             totals.copies, totals.draws, totals.vertices
         );
         if mode == Mode::Full {
-            // The same as the Vita's capturebench prints for this dump.
+            // The hashes the Vita's capture of this dump must give too.
             println!("{:>12}  hashes {:016x} {:016x}", "", frame.description_hash(), frame.vertex_hash());
         }
     }

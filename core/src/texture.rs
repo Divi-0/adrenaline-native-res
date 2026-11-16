@@ -67,7 +67,7 @@ pub fn is_palette_format(format: u8) -> bool {
 
 /// Describes the texture level 0 the GE would currently sample from.
 /// Palette fields are left empty; the caller fills them in.
-/// Menu option "NativePSP Distant Textures" (Adrenaline's config byte
+/// Menu option "NativeRes Distant Textures" (Adrenaline's config byte
 /// `nativepsp_mip_mode`, set by the display every frame): 0 "Sharp" (level 0
 /// only, the default), 1 "Blurry (like PSP)" (the game's mip levels, one
 /// level blurrier than the GPU would pick at our 2x size: the PSP's choice),
@@ -160,7 +160,7 @@ pub fn level_descriptor(base: &TextureDescriptor, levels: &TextureLevels, level:
 
 /// Byte offset of mip level `level` in a GPU texture of `width` x `height`
 /// texels of `texel_bytes` each: GXM's layout for linear textures (measured
-/// with debug "miptest", nativepsp_render.c MipLevelOffset): the levels one
+/// on the Vita): the levels one
 /// after another, each level's rows rounded up to 8 texels.
 pub fn mip_level_offset(width: u32, height: u32, texel_bytes: u32, level: u32) -> u32 {
     let (mut w, mut h, mut offset) = (width, height, 0);
@@ -966,7 +966,7 @@ mod tests {
         assert_eq!(describe_levels_in_mode(&ge, &base, 1).unwrap().count, 2);
     }
 
-    /// GXM's layout as measured (debug "miptest"): levels back to back, rows
+    /// GXM's layout as measured on the Vita: levels back to back, rows
     /// rounded up to 8 texels; and a level as a texture of its own.
     #[test]
     fn mip_level_offsets_and_level_textures() {

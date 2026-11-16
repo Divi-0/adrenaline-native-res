@@ -1,4 +1,4 @@
-//! "NativePSP Renderer" in Adrenaline's own menu (Settings, right below
+//! "NativeRes Renderer" in Adrenaline's own menu (Settings, right below
 //! Graphics Filtering), added from outside as a plugin on stock Adrenaline
 //! can: no C of ours in Adrenaline (user, 2026-11-14).
 //!
@@ -51,7 +51,7 @@ struct Text(*const u8);
 // Safe: points at a constant string.
 unsafe impl Sync for Text {}
 
-static RENDERER_NAME: Text = Text(b"NativePSP Renderer\0".as_ptr());
+static RENDERER_NAME: Text = Text(b"NativeRes Renderer\0".as_ptr());
 /// 0 = On (`nativepsp_renderer_off` 0), 1 = Off.
 static RENDERER_OPTIONS: [Text; 2] = [Text(b"On\0".as_ptr()), Text(b"Off\0".as_ptr())];
 
@@ -66,7 +66,7 @@ const MENU_ENTRY_TYPE_TEXT: i32 = 0;
 static USER_FILTER: AtomicU8 = AtomicU8::new(0);
 /// The filter we last put into Adrenaline's settings (NONE: nothing yet):
 /// a different value there means someone else set it (Reset Adrenaline
-/// Settings, the debug server), which becomes the user's choice.
+/// Settings, `set_user_filter`), which becomes the user's choice.
 static LAST_SET: AtomicU8 = AtomicU8::new(NONE);
 const NONE: u8 = 0xFF;
 
@@ -80,7 +80,7 @@ fn module_ranges() -> Option<[(usize, usize); 2]> {
 /// True if `address` points at the NUL-terminated `text` inside the module.
 fn is_text(ranges: &[(usize, usize); 2], address: usize, text: &[u8]) -> bool {
     // Words are any numbers: a range check that can't wrap (a word
-    // 0xFFFFFFFF crashed us, logs/crash-menu-1114).
+    // 0xFFFFFFFF crashed us, 2026-11-14).
     if !ranges.iter().any(|&(start, end)| span::inside(address as u32, text.len() as u32, start as u32, end as u32)) {
         return false;
     }
@@ -143,7 +143,7 @@ fn install() -> bool {
             })
         });
         let (Some(filter), Some(blank)) = (filter, blank) else {
-            render_log::line(format_args!("menu: no room for \"NativePSP Renderer\" ({} entries)\n", count));
+            render_log::line(format_args!("menu: no room for \"NativeRes Renderer\" ({} entries)\n", count));
             return true;
         };
         for index in (filter + 1..blank).rev() {
@@ -164,7 +164,7 @@ fn install() -> bool {
             },
         );
         render_log::line(format_args!(
-            "menu: \"NativePSP Renderer\" at entry {} of {} (entries {:08x}, blank line {} gone), filter {}\n",
+            "menu: \"NativeRes Renderer\" at entry {} of {} (entries {:08x}, blank line {} gone), filter {}\n",
             filter + 1,
             count,
             entries as usize,
@@ -224,7 +224,7 @@ pub fn user_filter() -> u8 {
     USER_FILTER.load(Relaxed)
 }
 
-/// Sets the user's Graphics Filtering (debug "filter"; not saved).
+/// Sets the user's Graphics Filtering (not saved).
 pub fn set_user_filter(filter: u8) {
     if let Some(config) = adrenaline::config_address() {
         // Safe: a byte of Adrenaline's settings; `sync` takes it as the

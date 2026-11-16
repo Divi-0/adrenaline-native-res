@@ -175,7 +175,7 @@ unsafe fn load_burst(to: *mut u8, from: *const u8, bytes: usize) {
     core::ptr::copy_nonoverlapping(from, to, bytes);
 }
 
-/// Debug "copytest": `psp_copy` against a word-by-word copy,
+/// A test of `psp_copy` against a word-by-word copy,
 /// from PSP RAM at `address` (block-aligned, 4 KiB readable), for every
 /// size up to 300 bytes from word offsets 0..64 into a block and up to the
 /// block's end (where `copy_tail` may not over-read). Returns how many

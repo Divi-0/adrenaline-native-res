@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds the NativePSP Shader Compiler app (shadercompiler/, Rust) into
+# Builds the NativeRes Shader Compiler app (shadercompiler/, Rust) into
 # target/nativepsp_shadercompiler.vpk. Only needed to change the shaders:
 # the compiled .gxp files are in vita/shaders/ (see README.md "Shaders").
 #
@@ -28,6 +28,6 @@ arm-vita-eabi-gcc -Wl,-q -nostartfiles -nostdlib \
 vita-elf-create "$OUT/nativepsp_shadercompiler.elf" "$OUT/nativepsp_shadercompiler.velf"
 # Unsafe (no -s): it loads a module from ur0:data.
 vita-make-fself -c "$OUT/nativepsp_shadercompiler.velf" "$OUT/eboot.bin"
-vita-mksfoex -s APP_VER=01.00 -s TITLE_ID=NPSP00001 "NativePSP Shader Compiler" "$OUT/param.sfo"
+vita-mksfoex -s APP_VER=01.00 -s TITLE_ID=NPSP00001 "NativeRes Shader Compiler" "$OUT/param.sfo"
 vita-pack-vpk -s "$OUT/param.sfo" -b "$OUT/eboot.bin" target/nativepsp_shadercompiler.vpk
 ls -l "$OUT/eboot.bin" target/nativepsp_shadercompiler.vpk

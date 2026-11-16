@@ -1,5 +1,5 @@
 //! GPU memory for raw PSP vertices: runs the GPU reads in the PSP's own
-//! layout (DESIGN.md "Proposal: raw PSP vertices on the GPU", step 1).
+//! layout.
 //!
 //! Instead of decoding a 3D run's vertices into `FrameVertex`es, the
 //! recorder copies its bytes here as they are, and the display draws them
@@ -20,14 +20,14 @@
 //! cache protects its runs. If the ring would overwrite them the run goes the
 //! old way (counted in `RawStats::full`).
 
-/// Whether 3D runs go to the GPU as raw PSP vertices (debug "rawvertices
-/// 0|1"). On by default since 2026-11-09 (user, after the live checks: MTX
+/// Whether 3D runs go to the GPU as raw PSP vertices. On by default since
+/// 2026-11-09 (after the live checks: MTX
 /// race start ~27.4 fps raw vs ~21.8 the old way, 5-minute soak clean).
 /// Without a raw arena (no raw vertex program) runs go the old way anyway.
 pub static ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
-/// Zero copy (debug "zerocopy 0|1"; on on the Vita since 2026-11-09, user's
-/// call after the race-start A/B and a soak: the display switches it on once
+/// Zero copy (on on the Vita since 2026-11-09, after the race-start A/B
+/// and a soak: the display switches it on once
 /// it has mapped PSP RAM for the GPU; off here, so the replay never uses it):
 /// big raw runs in main RAM aren't copied at all, neither by the copier nor
 /// into this arena; the GPU reads them straight from PSP RAM, which the

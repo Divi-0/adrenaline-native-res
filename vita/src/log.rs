@@ -1,21 +1,19 @@
-//! The capture log: one line per frame, streamed to a PC over TCP 7778
-//! (`log_stream`; tools/logkeep.sh keeps it in logs/live/capture.txt).
-//! Nothing is written on the Vita (user, 2026-11-13: every debug log and
-//! dump goes over the network, so the memory card doesn't fill up; the
-//! fallback file had grown to 75 MB once). While no PC listens, the lines
-//! wait in the ring; when it is full, newer lines are dropped and counted
-//! (the next session's first line says how many).
+//! The capture log: one line per frame, handed to whatever an extension
+//! sends it to (`ext::log_send`). Nothing is written on the Vita (the
+//! memory card would fill up: a log file had grown to 75 MB once). While
+//! nothing takes the lines, they wait in the ring; when it is full, newer
+//! lines are dropped and counted (the next session's first line says how
+//! many).
 //!
 //! The capture thread only appends to the ring (`nativepsp_core::log_ring`);
 //! a low-priority writer thread does the sending, which can block for
 //! milliseconds (that made the capture miss the display loop once a second
 //! when it was file I/O).
 //!
-//! Why the network (2026-11-09): during MTX race soaks ux0 file access
-//! wedged for every process, twice, with this writer stuck inside a write
-//! (and the emulator's ms0: bridge too); a soak without our file writes
-//! stayed clean. Streamed, the log also survives such a wedge or a crash on
-//! the PC.
+//! Why no file (2026-11-09): during MTX race soaks ux0 file access wedged
+//! for every process, twice, with this writer stuck inside a write (and
+//! the emulator's ms0: bridge too); a soak without our file writes stayed
+//! clean.
 
 use core::ffi::c_void;
 use core::fmt::Write;
@@ -39,7 +37,7 @@ static WAKEUP: AtomicI32 = AtomicI32::new(-1);
 /// Bytes sent to the PC (wrapping).
 static STREAMED: AtomicU32 = AtomicU32::new(0);
 
-/// Debug "threadstate": the log's progress: (bytes sent to the PC, bytes
+/// The log's progress: (bytes sent to the PC, bytes
 /// waiting, bytes dropped).
 pub fn progress() -> (u32, u32, u32) {
     (STREAMED.load(Ordering::Relaxed), RING.used() as u32, RING.dropped())
@@ -66,7 +64,7 @@ unsafe extern "C" fn writer_thread(_args: u32, _argp: *mut c_void) -> i32 {
 /// failures) are kept from here on, so a start that hangs before the game
 /// leaves a trace (2026-11-09).
 pub fn start_writer() {
-    append(b"# NativePSP started, no game yet\n");
+    append(b"# NativeRes started, no game yet\n");
     // Safe: plain system calls with valid arguments.
     unsafe {
         let sema = sys::sceKernelCreateSema(b"NativePspLogWakeup\0".as_ptr(), 0, 0, 1, core::ptr::null_mut());
@@ -130,7 +128,7 @@ pub fn open(title_id: &[u8], session: u32) {
     let mut line = [0u8; 160];
     let mut text = TextBuffer::new(&mut line);
     let title = core::str::from_utf8(title_id).unwrap_or("?");
-    let _ = writeln!(text, "# NativePSP capture, title {title}, session {session:08x}, {} log bytes dropped so far", RING.dropped());
+    let _ = writeln!(text, "# NativeRes capture, title {title}, session {session:08x}, {} log bytes dropped so far", RING.dropped());
     let length = text.len();
     append(&line[..length]);
     flush();

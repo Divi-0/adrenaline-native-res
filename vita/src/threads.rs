@@ -3,7 +3,7 @@
 use crate::sys::{self, SceUID};
 
 /// CPU time `thread` has run, in microseconds (advances at context
-/// switches: good over many of them, e.g. a whole capturebench). 0 for a
+/// switches: good over many of them, e.g. a whole benchmark). 0 for a
 /// bad id.
 pub fn run_us_of(thread: SceUID) -> u64 {
     // Safe: all zeroes is a valid SceKernelThreadInfo (numbers, a null

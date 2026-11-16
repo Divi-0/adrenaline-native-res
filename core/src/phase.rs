@@ -4,8 +4,7 @@
 //! user code no profiler. So the capture thread notes which part of its
 //! work it is in (one store per change, [`enter`] / [`leave`]), and a
 //! sampler thread on another core reads [`CURRENT`] every few microseconds
-//! while `capturebench` runs (debug "capturebench <runs> profile"): the
-//! samples per phase split the time up. Only the capture thread (the draw
+//! while the capture runs: the samples per phase split the time up. Only the capture thread (the draw
 //! stream's producer) notes phases.
 //!
 //! Only while a profile runs ([`ENABLED`]): with the capture in two stages
@@ -43,8 +42,7 @@ pub const TRANSFORM: u8 = 8;
 pub const COPY: u8 = 9;
 /// Scanning indices (`index_bounds`).
 pub const INDICES: u8 = 10;
-/// The live capture thread sleeping until the next poll (debug
-/// "liveprofile"): nothing to do.
+/// The live capture thread sleeping until the next poll: nothing to do.
 pub const IDLE: u8 = 11;
 /// The producer waiting for the recorder thread (room in the draw stream,
 /// the frame's end) or for the copier (GE sync handshake).

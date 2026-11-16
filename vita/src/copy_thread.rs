@@ -10,7 +10,7 @@
 //! the capture queues it; when it falls behind, the capture thread copies
 //! the oldest jobs itself (`draw_stream::COPIER_LAG_JOBS`). Reads from
 //! another core add bandwidth: core 3 copied ~100 MB/s while the capture and
-//! recorder threads lost only 0.2-0.6 ms (debug `core3test 3`).
+//! recorder threads lost only 0.2-0.6 ms.
 //!
 //! Live, MTX's paused race (2026-11-08): frames recorded 81% without the
 //! thread, 99% with it on cores 0-2 (none over 45 ms), 97% on all four cores
@@ -33,7 +33,7 @@ use crate::sys;
 /// (busy ~21-25 of 33 ms), and the display's render must not wait for it
 /// at publish time. 0x70 (the capture's) made ~26% of frames miss the
 /// refresh after next (3/1 wobble); 0xA1 halves the webcam's 3/1 pairs at
-/// no game-side cost (DESIGN.md "Recorder and copier below the display").
+/// no game-side cost.
 const PRIORITY: i32 = 0xA1;
 const STACK_SIZE: u32 = 0x4000;
 /// Cores 0-2: the default, and where the thread starts; it moves itself to
@@ -47,14 +47,13 @@ const IDLE_POLLS: u32 = 20;
 /// How long it sleeps without being woken (it checks then anyway).
 const IDLE_TIMEOUT_US: u32 = 2000;
 
-/// Set by the debug server ("copythread <n>"): 0 = off (the capture thread
-/// copies), 1 = on, cores 0-2 (the default), otherwise a mask of user cores
-/// as for "recorderthread" (8 = core 3, 15 = all four). Needs the recorder
-/// thread. Core 3 refused (no adrenaline_kernel call), the thread stays on
-/// cores 0-2.
+/// 0 = off (the capture thread copies), 1 = on, cores 0-2 (the default),
+/// otherwise a mask of user cores as for `RECORDER_THREAD_WANTED` (8 =
+/// core 3, 15 = all four). Needs the recorder thread. Core 3 refused
+/// (`threads::set_cores`), the thread stays on cores 0-2.
 pub static COPY_THREAD_WANTED: AtomicU32 = AtomicU32::new(1);
 
-/// Whether the copier thread is wanted (debug "copythread").
+/// Whether the copier thread is wanted.
 pub fn wanted() -> bool {
     COPY_THREAD_WANTED.load(Ordering::Relaxed) != 0
 }
@@ -158,7 +157,7 @@ unsafe extern "C" fn copy_thread(_args: u32, _argp: *mut c_void) -> i32 {
     let sema = SEMA.load(Ordering::Relaxed);
     let mut cores = CREATION_CORES;
     loop {
-        // The cores can be changed at runtime (debug "copythread <n>").
+        // The cores can be changed at runtime.
         let wanted = wanted_cores();
         if wanted != cores && wanted != 0 {
             // Core 3 included goes through adrenaline_kernel (`threads::set_cores`).

@@ -71,8 +71,7 @@ pub const HASH_VOLATILE_EVERY: u32 = 4;
 /// times `CACHE_SIZE`, so that few textures share a bucket.
 const HINT_BUCKETS: usize = 4096;
 /// Whether cached textures are compared with the frame's capture-time
-/// samples (`Frame::texture_samples`; debug "quickchecks 0|1", on by
-/// default).
+/// samples (`Frame::texture_samples`; on by default).
 pub static QUICK_CHECKS: AtomicBool = AtomicBool::new(true);
 /// Re-check budget per frame.
 pub const VERIFY_BYTES_PER_FRAME: u32 = 128 * 1024;
@@ -229,9 +228,9 @@ pub struct FrameStart {
     pub frame_number: u32,
     /// Counts drawn frames; the ages in this module are in these.
     pub render_count: u32,
-    /// Menu option "NativePSP Texture Filter": 1 = smooth.
+    /// Menu option "NativeRes Texture Filter": 1 = smooth.
     pub smooth: bool,
-    /// Debug command "tracetex <psp address>": log every lookup of the
+    /// Log every lookup of the
     /// textures at this address. 0 = off, [`TRACE_VRAM`]: waits and decodes
     /// of all VRAM textures, and frames drawn again.
     pub trace_address: u32,
@@ -244,7 +243,7 @@ pub struct FrameStart {
     pub render_targets: [u32; MAX_RENDER_TARGETS],
 }
 
-/// Counters for the debug server's "renderstats".
+/// Counters of the texture cache's work.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TextureStats {
     pub decode_us: u64,
@@ -973,7 +972,7 @@ impl TextureCache {
             let data = &staging[..staged_size as usize];
             // Palette textures: their colours come per frame (palette tables).
             result = host.decode(texture, format, &layout.as_texture, data, palette, self.smooth, 0);
-            // Mip levels 1.. (menu "NativePSP Distant Textures"): each staged
+            // Mip levels 1.. (menu "NativeRes Distant Textures"): each staged
             // from its own address and decoded into its place. Only level 0
             // is hashed: a game rewrites a texture's levels with it.
             let levels = crate::frame::texture_level_count(wanted) as usize;

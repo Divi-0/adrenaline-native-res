@@ -8,7 +8,7 @@
 //! - the index ring: the capture writes draws' index runs there as triangle
 //!   lists (`Frame::ring_indices`), so the draw loop passes a pointer
 //!   instead of building them (~1 ms of display CPU per race frame,
-//!   redrawbench 2026-11-10). MTX's race start: ~97,000 corners (~195 KiB)
+//!   measured 2026-11-10). MTX's race start: ~97,000 corners (~195 KiB)
 //!   per frame, kept for 6 frames.
 //! - the vertex cache's arena (`nativepsp_core::vertex_cache`): decoded
 //!   vertices kept across frames, drawn by the GPU straight from there.
@@ -38,7 +38,7 @@ pub static nativepsp_plan_phycont_raw_arena: u32 = sys::pages(RAW_ARENA_SIZE);
 /// 8 windows of 192 KiB. In phycont memory (blocks of whole MiB: 2 MiB)
 /// since the plugin runs on stock Adrenaline, whose vita2d pool takes
 /// 0.5 MiB more main memory than the fork's did (user, 2026-11-14: main
-/// memory was 0.46 MiB short of tools/memcheck.py's safety); main memory
+/// memory was 0.46 MiB short of its safety margin); main memory
 /// only if phycont is short.
 const INDEX_RING_SIZE: usize = 8 * 196_608;
 const INDEX_RING_PHYCONT_BYTES: usize = 2 * 1024 * 1024;
@@ -48,7 +48,7 @@ const _: () = assert!(INDEX_RING_SIZE <= INDEX_RING_PHYCONT_BYTES);
 #[allow(non_upper_case_globals)]
 pub static nativepsp_plan_phycont_index_ring: u32 = sys::pages(INDEX_RING_PHYCONT_BYTES);
 
-/// Debug "vertexcache 1": 32768 vertices of main memory (short). Not CDRAM:
+/// 32768 vertices of main memory (short). Not CDRAM:
 /// with 2 MiB of CDRAM, Adrenaline crashed (C2-12828-1) twice, and both
 /// times the next start hung at a black screen until the Vita was rebooted
 /// (2026-11-05).

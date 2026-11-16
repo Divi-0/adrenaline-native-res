@@ -1,5 +1,4 @@
-//! Where the display thread's time goes; read and reset by the debug server
-//! ("renderstats", `report`).
+//! Where the display thread's time goes; read and reset by `report`.
 
 use core::fmt::Write;
 
@@ -41,8 +40,8 @@ pub struct RenderStats {
     pub begin_us: u64,
     /// The draw loop.
     pub loop_us: u64,
-    /// In it: vertices and indices copied into the frame pool (debug
-    /// "drawtiming 1" only).
+    /// In it: vertices and indices copied into the frame pool
+    /// (`draw::DRAW_TIMING` only).
     pub convert_us: u64,
     /// Of that: the index copies.
     pub indices_us: u64,
@@ -108,8 +107,8 @@ impl RenderStats {
     };
 }
 
-/// The display thread's counters (and the debug server's read-and-reset,
-/// racy as ever: counters only).
+/// The display thread's counters (and `report`'s read-and-reset from
+/// another thread, racy as ever: counters only).
 static STATS: SingleThreaded<RenderStats> = SingleThreaded::new(RenderStats::ZERO);
 
 /// The display thread's stats. Hold the reference only briefly (no call
@@ -119,7 +118,7 @@ pub fn stats() -> &'static mut RenderStats {
     unsafe { STATS.get() }
 }
 
-/// Debug "renderstats": render timing since the last call, as text into
+/// Render timing since the last call, as text into
 /// `out` (`size` bytes, NUL-terminated); resets the counters. Returns the
 /// length.
 ///

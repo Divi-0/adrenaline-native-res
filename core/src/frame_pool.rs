@@ -7,7 +7,7 @@
 //! scenes (our scene takes ~30 ms of GPU time against a 16.7 ms loop).
 //! Overwritten indices make the GPU read outside mapped memory, which the
 //! driver reports as "GPU Driver detects GPU Crash" (the crashes of
-//! 2026-11-09/10, DESIGN.md).
+//! 2026-11-09/10).
 //!
 //! How: everything allocated between two scene ends is a *segment*. The
 //! scene's end has the GPU write the segment's number into a notification

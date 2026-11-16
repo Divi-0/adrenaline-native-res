@@ -28,9 +28,9 @@ use crate::basic_programs::{self, TextureVertex};
 use crate::{draw, gxm, render_log, sys, SingleThreaded};
 
 /// Double buffering. Was 3 ("plus one for games that use more"); 2 since
-/// 2026-11-05 to save 2 MiB of main memory (tools/memcheck.py). A game that
-/// draws into more framebuffers makes us reuse a target it used just
-/// before: counted in renderstats (target_evictions) and logged.
+/// 2026-11-05 to save 2 MiB of main memory. A game that draws into more
+/// framebuffers makes us reuse a target it used just before: counted in
+/// the render statistics (target_evictions) and logged.
 pub const TARGET_COUNT: usize = 2;
 pub const TARGET_WIDTH: u32 = 960;
 pub const TARGET_HEIGHT: u32 = 544;
@@ -49,7 +49,7 @@ const LINEAR_INDICES: usize = nativepsp_core::frame::MAX_VERTICES;
 #[allow(non_upper_case_globals)]
 pub static nativepsp_plan_fixed_linear_indices: u32 = sys::pages(LINEAR_INDICES * 2);
 
-/// Set to 1 by `NativePspPresentFrame`; the debug server's frame recorder
+/// Set to 1 by `NativePspPresentFrame`; whoever watches the shown frames
 /// reads and clears it after each swap.
 pub static FRAME_DRAWN: AtomicI32 = AtomicI32::new(0);
 /// The PSP frame number (`Frame::frame_number`) `NativePspPresentFrame`
@@ -184,7 +184,7 @@ pub struct Targets {
     pub targets: [Target; TARGET_COUNT],
     /// What `NativePspPresentFrame` shows.
     pub shown: Option<usize>,
-    /// Debug log lines left: targets reused too early, failed scenes.
+    /// Log lines left: targets reused too early, failed scenes.
     eviction_logs: u32,
     begin_logs: u32,
 }

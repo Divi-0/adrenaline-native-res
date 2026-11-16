@@ -3,7 +3,7 @@ name = "nativepsp-vita"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-description = "NativePSP's Vita side: the renderer the taiHEN plugin adrenaline-native-res.suprx runs (plugin/ builds it)"
+description = "NativeRes's Vita side: the renderer the taiHEN plugin adrenaline-native-res.suprx runs (plugin/ builds it)"
 
 # A library only: plugin/ links it into the plugin. (Building it as a
 # staticlib here too made link-time optimisation keep every public function:

@@ -1,6 +1,5 @@
 //! The shader patcher all our GPU programs are made with, our two basic
-//! programs and the 960x544 projection. Until stage 2 of DESIGN.md "All Rust,
-//! one plugin" these were vita2d's (Adrenaline's drawing library); a plugin
+//! programs and the 960x544 projection. These were vita2d's (Adrenaline's drawing library); a plugin
 //! of our own can't reach vita2d, so they are ours now, the same programs:
 //!
 //! - colour (nativepsp_color_v/_f.cg): untextured draws, and the clear of a

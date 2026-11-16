@@ -4,8 +4,8 @@
 //! For frames the GE didn't draw (MTX's intro movie, loading screens) the
 //! screen shows Sony's picture (`SCE_PSPEMU_FRAMEBUFFER`), which the loop
 //! copies with one DMA and draws. Sony rewrites that picture top to bottom
-//! across the whole PSP frame, starting at the LCD sync: measured with debug
-//! `sonywrites` during MTX's intro movie (2026-11-10), rows 0-31 changed
+//! across the whole PSP frame, starting at the LCD sync: measured during
+//! MTX's intro movie (2026-11-10), rows 0-31 changed
 //! 0-3 ms after the sync, rows 240-271 14-17 ms after it. A copy at time `t`
 //! after the sync therefore holds the new picture above the row being
 //! written at `t` and the old one below it: a seam at that row.
@@ -13,8 +13,7 @@
 //! Copied after `NativePspRenderFrame` (which may wait up to 5 ms for a
 //! frame of ours, `FRAME_WAIT_US`, and is preempted by the capture threads),
 //! the copy came 1-7 ms after the sync in more than half the loops
-//! (`sonywrites` render_end during the movie: 179 of 359 loops 5-7 ms after
-//! it): a seam ~90 rows down, "split horizontally in the top section"
+//! (during the movie: 179 of 359 loops 5-7 ms after it): a seam ~90 rows down, "split horizontally in the top section"
 //! (user). Copied right after the sync (as the stock loop does), it came
 //! within 1 ms (360 of 360 copies): a seam in the top 17 rows at most.
 
@@ -25,7 +24,7 @@ pub const PSP_FRAME_US: u32 = 16_683;
 pub const PSP_ROWS: u32 = 272;
 
 /// How long after the LCD sync the loop's early copy has started
-/// (`sonywrites` copies: all in the 0-1 ms bucket).
+/// (measured: all copies in the 0-1 ms bucket).
 pub const EARLY_COPY_US: u32 = 1_000;
 
 /// A seam above this row is hidden at the screen's top edge (the first
@@ -123,7 +122,7 @@ mod tests {
 
     use super::*;
 
-    /// `sonywrites` during MTX's intro movie, renderer on (2026-11-10): how
+    /// Measured during MTX's intro movie, renderer on (2026-11-10): how
     /// long after the LCD sync `NativePspRenderFrame` returned in loops that
     /// showed Sony's picture, by 1 ms bucket. Where the copy used to be.
     const RENDER_END_HISTOGRAM: [(u32, u32); 6] = [(0, 147), (1, 28), (2, 2), (4, 3), (5, 10), (6, 169)];
