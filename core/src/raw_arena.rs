@@ -37,6 +37,13 @@ pub static ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicB
 /// 2026-11-09: 10-30 words), are copied as before (`ZERO_COPY_MIN_BYTES`).
 pub static ZERO_COPY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Whether indexed PRIMs keep their indices as raw draws
+/// (`recorder::record_raw_converted`: the vertex span copied once, the
+/// indices converted into a triangle list) instead of having every corner's
+/// vertex gathered into the arena (`recorder::record_raw_gathered`, kept for
+/// sparse spans). Monster Hunter Freedom draws everything indexed.
+pub static INDEXED_DRAWS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
 /// Whether the display can draw raw sprites (`draw_flags::RAW_SPRITES`):
 /// set once its sprite program exists (nativeres_render.c); without it 3D
 /// rectangles stay on the CPU path.
@@ -86,6 +93,11 @@ pub struct RawStats {
     /// Runs left in PSP RAM (zero copy, not in `runs`) and their bytes.
     pub psp_ram: u32,
     pub psp_ram_bytes: u32,
+    /// Indexed raw runs: with their indices converted
+    /// (`recorder::record_raw_converted`), and gathered vertex by vertex
+    /// (`record_raw_gathered`: the switch off, or a sparse span).
+    pub converted: u32,
+    pub gathered: u32,
 }
 
 /// Where a run was put: its byte offset in the arena and the window it

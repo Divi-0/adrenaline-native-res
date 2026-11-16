@@ -284,6 +284,9 @@ pub struct CacheStats {
     /// Raw runs left in PSP RAM (zero copy) and their bytes.
     pub raw_psp_ram: u32,
     pub raw_psp_ram_bytes: u32,
+    /// Indexed raw runs converted / gathered (`raw_arena::RawStats`).
+    pub raw_converted: u32,
+    pub raw_gathered: u32,
 }
 
 pub struct VertexCache {
@@ -409,6 +412,8 @@ impl VertexCache {
             self.stats.raw_lit = stats.lit;
             self.stats.raw_psp_ram = stats.psp_ram;
             self.stats.raw_psp_ram_bytes = stats.psp_ram_bytes;
+            self.stats.raw_converted = stats.converted;
+            self.stats.raw_gathered = stats.gathered;
         }
         core::mem::take(&mut self.stats)
     }

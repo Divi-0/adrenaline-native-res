@@ -100,6 +100,10 @@ pub fn write_frame(out: &mut impl Write, stats: &FrameStats) -> fmt::Result {
         if cache.raw_psp_ram > 0 {
             write!(out, " zerocopy={}/{}k", cache.raw_psp_ram, cache.raw_psp_ram_bytes / 1024)?;
         }
+        // Indexed raw runs: indices converted / vertices gathered.
+        if cache.raw_converted + cache.raw_gathered > 0 {
+            write!(out, " indexed={}/{}", cache.raw_converted, cache.raw_gathered)?;
+        }
     }
 
     // PRIMs decoded on the CPU by reason (`recorder::fallback`):

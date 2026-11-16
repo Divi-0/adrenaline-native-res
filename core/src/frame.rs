@@ -118,16 +118,21 @@ pub mod draw_flags {
     /// (`Frame::raw_vertices`, `raw_arena`), in the layout of
     /// `Draw::vertex_format`, read by the GPU as they are
     /// (nativeres_raw_v.cg). `first_vertex` is the byte offset of the
-    /// arena window the index runs count vertices from (`vertex_count` 0).
-    /// Always with `INDEX_RUNS`, a transform (its `raw_uv`) and an entry of
-    /// `Frame::raw_colors` (`Draw::raw_colors`), which finish the decoding. Only vertices in front of the near plane are drawn: the
-    /// GPU clips triangles there (the CPU doesn't look at the positions).
+    /// arena window the indices count vertices from (`vertex_count` 0).
+    /// The indices are index runs (`INDEX_RUNS`: PRIMs whose vertices follow
+    /// each other), or, for indexed PRIMs, a plain triangle list
+    /// (`recorder::record_raw_converted`: the PSP's indices converted, each
+    /// counted from the window; `Geometry::finish_raw_listed_draw`). Always
+    /// with a transform (its `raw_uv`) and an entry of `Frame::raw_colors`
+    /// (`Draw::raw_colors`), which finish the decoding. Only vertices in
+    /// front of the near plane are drawn: the GPU clips triangles there (the
+    /// CPU doesn't look at the positions).
     pub const RAW_VERTICES: u32 = 1 << 12;
     /// With `RAW_VERTICES`: the vertices are in PSP RAM, not the raw arena
     /// (zero copy, `raw_arena::ZERO_COPY`): `first_vertex` is the PSP
-    /// address the index runs count vertices from (any alignment; the
-    /// display maps PSP RAM for the GPU). The CPU never saw them, so
-    /// `Frame::screen_corners` gives none.
+    /// address the indices (runs or a list) count vertices from (any
+    /// alignment; the display maps PSP RAM for the GPU). The CPU never saw
+    /// them, so `Frame::screen_corners` gives none.
     pub const RAW_PSP_RAM: u32 = 1 << 13;
     /// With `RAW_VERTICES`: rectangles (PRIM type 6, 3D) as raw sprites.
     /// Each sprite's two PSP vertices (A, the first corner, and B, the
@@ -873,21 +878,25 @@ impl Frame {
         &self.draws[..self.draw_count as usize]
     }
 
-    /// Writes the corners of every draw with index runs into `ring` as a
-    /// triangle list (the display's `DrawIndices` order: `run_indices`),
-    /// notes where in `draw_ring_index` and points `ring_indices` at the
-    /// ring. Draws whose list doesn't fit get `NO_RING_INDICES`. Returns how
-    /// many didn't fit.
+    /// Writes the corners of every draw with index runs or raw vertices into
+    /// `ring` as a triangle list (index runs written out in the display's
+    /// `DrawIndices` order, `run_indices`; a raw draw's plain indices, the
+    /// converted ones of indexed PRIMs, copied as they are), notes where in
+    /// `draw_ring_index` and points `ring_indices` at the ring, so the GPU
+    /// reads them there. Draws whose list doesn't fit get `NO_RING_INDICES`
+    /// (the display copies them then). Returns how many didn't fit.
     pub fn write_ring_indices(&mut self, ring: &mut crate::raw_arena::RawArena) -> u32 {
         let mut full = 0;
         for i in 0..self.draw_count as usize {
             let draw = self.draws[i];
             self.draw_ring_index[i] = NO_RING_INDICES;
-            if draw.flags & draw_flags::INDEX_RUNS == 0 {
-                continue;
+            let stored = &self.indices[draw.first_index as usize..][..draw.index_count as usize];
+            let runs = draw.flags & draw_flags::INDEX_RUNS != 0;
+            if !runs && draw.flags & draw_flags::RAW_VERTICES == 0 {
+                continue; // the display copies the CPU path's indices with their vertices
             }
-            let runs = &self.indices[draw.first_index as usize..][..draw.index_count as usize];
-            let corners: u32 = runs.chunks_exact(3).map(|run| 3 * run_triangles(run[0], run[1])).sum();
+            let corners: u32 =
+                if runs { stored.chunks_exact(3).map(|run| 3 * run_triangles(run[0], run[1])).sum() } else { draw.index_count };
             if corners == 0 {
                 continue;
             }
@@ -895,11 +904,17 @@ impl Frame {
                 full += 1;
                 continue;
             };
-            let mut at = 0;
-            for run in runs.chunks_exact(3) {
-                for corner in run_indices(run) {
-                    out[at..at + 2].copy_from_slice(&corner.to_le_bytes());
-                    at += 2;
+            if runs {
+                let mut at = 0;
+                for run in stored.chunks_exact(3) {
+                    for corner in run_indices(run) {
+                        out[at..at + 2].copy_from_slice(&corner.to_le_bytes());
+                        at += 2;
+                    }
+                }
+            } else {
+                for (bytes, index) in out.chunks_exact_mut(2).zip(stored) {
+                    bytes.copy_from_slice(&index.to_le_bytes());
                 }
             }
             self.draw_ring_index[i] = placed.offset / 2;
@@ -1246,6 +1261,11 @@ impl Geometry<'_> {
         *self.index_count
     }
 
+    /// The index words added from `first` on.
+    pub fn indices_from(&self, first: u32) -> &[u16] {
+        &self.indices[first as usize..*self.index_count as usize]
+    }
+
     /// The vertices added from `start` on.
     pub fn vertices_from(&self, start: u32) -> &[FrameVertex] {
         &self.vertices[start as usize..*self.vertex_count as usize]
@@ -1321,6 +1341,42 @@ impl Geometry<'_> {
                 }
             }
         }
+        self.add_raw_draw(draw);
+    }
+
+    /// Finishes a raw draw of indexed PRIMs whose indices (added since
+    /// `draw` started) are a plain triangle list counted from `place`: the
+    /// byte offset of a raw arena window, or with `in_psp_ram` a PSP address
+    /// (zero copy, `draw_flags::RAW_PSP_RAM`). Joined to the draw before
+    /// when that one is the same, listed too and counts from the same place
+    /// (the indices then go on as they are).
+    pub fn finish_raw_listed_draw(&mut self, mut draw: Draw, place: u32, in_psp_ram: bool) {
+        draw.flags |= draw_flags::RAW_VERTICES;
+        if in_psp_ram {
+            draw.flags |= draw_flags::RAW_PSP_RAM;
+        }
+        draw.flags &= !(draw_flags::CACHED_VERTICES | draw_flags::INDEX_RUNS);
+        draw.first_vertex = place;
+        draw.vertex_count = 0;
+        draw.index_count = *self.index_count - draw.first_index;
+        if draw.index_count == 0 {
+            return;
+        }
+        if let Some(previous) = self.draws[..*self.draw_count as usize].last_mut() {
+            if previous.same_state(&draw)
+                && previous.first_vertex == draw.first_vertex
+                && previous.first_index + previous.index_count == draw.first_index
+            {
+                previous.index_count += draw.index_count;
+                return;
+            }
+        }
+        self.add_raw_draw(draw);
+    }
+
+    /// Adds a finished raw draw as a new draw (its vertices aren't in
+    /// `Frame::vertices`); drops its indices if the draw list is full.
+    fn add_raw_draw(&mut self, draw: Draw) {
         if *self.draw_count as usize == MAX_DRAWS {
             *self.overflowed = 1;
             *self.index_count = draw.first_index;
@@ -1352,13 +1408,7 @@ impl Geometry<'_> {
                 return;
             }
         }
-        if *self.draw_count as usize == MAX_DRAWS {
-            *self.overflowed = 1;
-            *self.index_count = draw.first_index;
-            return;
-        }
-        self.draws[*self.draw_count as usize] = draw;
-        *self.draw_count += 1;
+        self.add_raw_draw(draw);
     }
 
     /// Drops the vertices from `count` on (a run that went back to the
@@ -1783,7 +1833,14 @@ mod tests {
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
             .collect();
         assert_eq!(written, expected);
-        assert_eq!(frame.draw_ring_index[1], NO_RING_INDICES, "no runs: not in the ring");
+        assert_eq!(frame.draw_ring_index[1], NO_RING_INDICES, "CPU path: not in the ring");
+        // A raw draw's plain indices (converted indexed PRIMs) are copied.
+        frame.draws[1].flags = draw_flags::RAW_VERTICES;
+        assert_eq!(frame.write_ring_indices(&mut ring), 0);
+        let at = frame.draw_ring_index[1] as usize;
+        assert_ne!(at, NO_RING_INDICES as usize);
+        let plain: Vec<u16> = ring.bytes()[2 * at..2 * (at + 3)].chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+        assert_eq!(plain, [0, 1, 2]);
         assert_eq!(frame.ring_indices, ring.bytes().as_ptr() as *const u16);
     }
 

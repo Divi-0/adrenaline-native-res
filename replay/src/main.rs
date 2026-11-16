@@ -12,6 +12,7 @@
 //! (`--no-cache` or `NATIVERES_NO_CACHE=1`: none; `--raw` or
 //! `NATIVERES_RAW=1`: 3D runs as raw PSP vertices, `raw_arena`). With `--twice` the frame is replayed a second
 //! time with the cache already filled, and that second frame is drawn.
+//! `--gather`: indexed raw draws gather their vertices (the old way).
 //!
 //! With `--trace`, prints the GE state of every draw (texture function,
 //! blending, tests, ...), to explain differences.
@@ -131,6 +132,10 @@ fn new_vertex_cache() -> Option<&'static mut VertexCache> {
     let raw = std::env::args().any(|arg| arg == "--raw") || std::env::var("NATIVERES_RAW").is_ok_and(|value| value == "1");
     nativeres_core::raw_arena::ENABLED.store(raw, std::sync::atomic::Ordering::Relaxed);
     nativeres_core::raw_arena::SPRITES.store(raw, std::sync::atomic::Ordering::Relaxed);
+    // `--gather`: indexed raw draws gather each corner's vertex, as before
+    // their indices were kept (`raw_arena::INDEXED_DRAWS`).
+    let gather = std::env::args().any(|arg| arg == "--gather");
+    nativeres_core::raw_arena::INDEXED_DRAWS.store(!gather, std::sync::atomic::Ordering::Relaxed);
     // Like the Vita once its alpha-test program exists: textured draws are
     // alpha-tested in the shader (this rasterizer tests every draw).
     // NATIVERES_BLEND_ALPHA_TEST=1: blending stands in as before (A/B).

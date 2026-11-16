@@ -238,7 +238,7 @@ impl FrameStats {
             contexts_missing: 0,
             contexts_pipelined: 0,
             transfers_skipped: 0,
-            cache: crate::vertex_cache::CacheStats { hits: 0, misses: 0, stored: 0, full: 0, cpu_only: 0, changing: 0, quick: 0, repeated: 0, raw_runs: 0, raw_bytes: 0, raw_full: 0, raw_lit: 0, raw_psp_ram: 0, raw_psp_ram_bytes: 0 },
+            cache: crate::vertex_cache::CacheStats { hits: 0, misses: 0, stored: 0, full: 0, cpu_only: 0, changing: 0, quick: 0, repeated: 0, raw_runs: 0, raw_bytes: 0, raw_full: 0, raw_lit: 0, raw_psp_ram: 0, raw_psp_ram_bytes: 0, raw_converted: 0, raw_gathered: 0 },
             skipped_3d_draws: 0,
             skipped_point_line_draws: 0,
             unreadable_draws: 0,

@@ -538,6 +538,7 @@ fn queue_batch(
         memory: [(calls[0].vertex_address, vertices), (0, 0)],
         hash_vertices: !raw,
         zero_copy_vertices: raw && crate::raw_arena::zero_copy_wanted(calls[0].vertex_address, vertices, format),
+        index_bounds: None,
         palette: palette.take_unstored(),
         given_palette: palette.given_words(),
     };
@@ -596,6 +597,7 @@ fn queue_draw(
     let format = ge.vertex_format();
     let vertex_size = ge.vertex_layout().size;
     let index_format = format.index_format();
+    let mut producer_bounds = None;
     let memory_ranges = if index_format == IndexFormat::None {
         [(call.vertex_address, call.count * vertex_size), (0, 0)]
     } else {
@@ -607,6 +609,7 @@ fn queue_draw(
             index_bounds(memory, index_format, call.index_address, count)
         };
         crate::phase::leave(previous);
+        producer_bounds = bounds;
         let vertices = bounds.map_or((call.vertex_address, 0), |(lowest, highest)| {
             (call.vertex_address.wrapping_add(lowest.saturating_mul(vertex_size)), (highest - lowest + 1).saturating_mul(vertex_size))
         });
@@ -632,8 +635,17 @@ fn queue_draw(
             format.index_format() == crate::vertex::IndexFormat::None
                 && (call.primitive_type == primitive::RECTANGLES || !goes_raw(&prepared, inputs.lighting(), format))
         }),
-        // Single PRIMs are mostly small; their vertices are copied.
-        zero_copy_vertices: false,
+        // Single PRIMs are mostly small; their vertices are copied. An
+        // indexed batch's vertex span can stay in PSP RAM where its indices
+        // will be converted (`record_raw_converted`).
+        zero_copy_vertices: transform.is_some_and(|(inputs, _)| {
+            index_format != IndexFormat::None
+                && crate::raw_arena::INDEXED_DRAWS.load(core::sync::atomic::Ordering::Relaxed)
+                && goes_raw(&prepared, inputs.lighting(), format)
+                && calls.iter().all(|call| (primitive::TRIANGLES..=primitive::TRIANGLE_FAN).contains(&call.primitive_type))
+                && crate::raw_arena::zero_copy_wanted(memory_ranges[1].0, memory_ranges[1].1, format)
+        }),
+        index_bounds: producer_bounds,
         palette: palette.take_unstored(),
         given_palette: palette.given_words(),
     };
@@ -784,7 +796,8 @@ fn run_job_now(
         ),
         _ => {
             if let Some(transform) = transform {
-                if record_raw_indexed(geometry, memory, format, &layout, transform, &job.prepared, job.material_color, calls, cache.as_deref_mut()) {
+                let indexed = (&job.prepared, job.material_color, job.index_bounds);
+                if record_raw_indexed(geometry, memory, format, &layout, transform, indexed, calls, cache.as_deref_mut()) {
                     return;
                 }
             }
@@ -818,8 +831,7 @@ fn record_raw_indexed(
     format: VertexFormat,
     layout: &VertexLayout,
     transform: &Transform,
-    prepared: &Prepared,
-    material_color: u32,
+    (prepared, material_color, bounds): (&Prepared, u32, Option<(u32, u32)>),
     calls: &[PrimCall],
     cache: Option<&mut VertexCache>,
 ) -> bool {
@@ -833,7 +845,7 @@ fn record_raw_indexed(
         return false;
     };
     let draw = Draw { first_vertex: geometry.vertex_count(), first_index: geometry.index_count(), ..prepared.draw };
-    record_raw_draw(geometry, memory, format, layout, transform, calls, &fields, cache, draw)
+    record_raw_draw(geometry, memory, format, layout, transform, (calls, bounds), &fields, cache, draw)
 }
 
 /// A batch's vertices: chunks of up to RUN_VERTICES vertices read, decoded
@@ -869,7 +881,7 @@ fn record_batch_vertices(
         let chunk = &calls[start..end];
         let mut draw = Draw { first_vertex: geometry.vertex_count(), first_index: geometry.index_count(), ..prepared.draw };
         if let Some(fields) = raw_colors.as_ref() {
-            if record_raw_draw(geometry, memory, format, layout, transform, chunk, fields, cache.as_deref_mut(), draw) {
+            if record_raw_draw(geometry, memory, format, layout, transform, (chunk, None), fields, cache.as_deref_mut(), draw) {
                 start = end;
                 continue;
             }
@@ -1214,7 +1226,7 @@ fn record_vertices_now(
         // Raw PSP vertices for the GPU where the draw allows it, as a
         // batch's runs (MTX: ~440 single PRIMs per race frame).
         if let Some(fields) = raw_colors_if_enabled(prepared, material_color, transform, format) {
-            if record_raw_draw(geometry, memory, format, layout, transform, &[call], &fields, cache.as_deref_mut(), draw) {
+            if record_raw_draw(geometry, memory, format, layout, transform, (&[call], None), &fields, cache.as_deref_mut(), draw) {
                 return;
             }
         }
@@ -1891,9 +1903,10 @@ fn raw_colors_if_enabled(
 }
 
 /// Records `calls` as one raw draw (`record_raw_run`) from `draw` (the
-/// prepared draw at the geometry's current end). False if it can't (no raw
-/// arena, or the run can't go raw): nothing is recorded then, and the
-/// caller records the PRIMs the old way.
+/// prepared draw at the geometry's current end); `bounds`: indexed PRIMs'
+/// lowest and highest index as the producer found them (`Job::index_bounds`).
+/// False if it can't (no raw arena, or the run can't go raw): nothing is
+/// recorded then, and the caller records the PRIMs the old way.
 #[allow(clippy::too_many_arguments)]
 fn record_raw_draw(
     geometry: &mut Geometry,
@@ -1901,7 +1914,7 @@ fn record_raw_draw(
     format: VertexFormat,
     layout: &VertexLayout,
     transform: &Transform,
-    calls: &[PrimCall],
+    (calls, bounds): (&[PrimCall], Option<(u32, u32)>),
     colors: &crate::frame::RawColors,
     cache: Option<&mut VertexCache>,
     mut draw: Draw,
@@ -1909,18 +1922,20 @@ fn record_raw_draw(
     let Some(raw) = cache.and_then(|cache| cache.raw.as_mut()) else {
         return false;
     };
-    match record_raw_run(geometry, memory, format, layout, transform, calls, colors, raw) {
+    match record_raw_run(geometry, memory, format, layout, transform, (calls, bounds), colors, raw) {
         Some(placed) => {
             draw.transform = placed.transform;
-            // The vertices as the GPU reads them: an indexed run's were
-            // gathered in index order (`record_raw_gathered`), so no index
-            // bits (one program per vertex layout).
+            // The vertices as the GPU reads them: plain vertices (an indexed
+            // run's indices were converted or its vertices gathered), so no
+            // index bits (one program per vertex layout).
             draw.vertex_format = format.0 & !INDEX_FORMAT_BITS;
             draw.raw_colors = placed.colors;
             draw.bones = placed.bones;
-            match placed.window {
-                RawPlace::Arena(window) => geometry.finish_raw_draw(draw, window),
-                RawPlace::PspRam(address) => geometry.finish_raw_psp_draw(draw, address, layout.size),
+            match (placed.window, placed.listed) {
+                (RawPlace::Arena(window), false) => geometry.finish_raw_draw(draw, window),
+                (RawPlace::PspRam(address), false) => geometry.finish_raw_psp_draw(draw, address, layout.size),
+                (RawPlace::Arena(window), true) => geometry.finish_raw_listed_draw(draw, window, false),
+                (RawPlace::PspRam(address), true) => geometry.finish_raw_listed_draw(draw, address, true),
             }
             true
         }
@@ -2039,13 +2054,13 @@ fn record_raw_run(
     format: VertexFormat,
     layout: &VertexLayout,
     transform: &Transform,
-    calls: &[PrimCall],
+    (calls, bounds): (&[PrimCall], Option<(u32, u32)>),
     colors: &crate::frame::RawColors,
     raw: &mut crate::raw_arena::RawArena,
 ) -> Option<RawRun> {
     refusing(raw, fallback::REFUSED);
     if format.index_format() != IndexFormat::None {
-        return record_raw_gathered(geometry, memory, format, layout, transform, calls, colors, raw);
+        return record_raw_indexed_run(geometry, memory, format, layout, transform, (calls, bounds), colors, raw);
     }
     // All vertices up to the last PRIM's last whole triangle (as `record_3d_run`).
     let (last, before) = calls.split_last()?;
@@ -2105,7 +2120,7 @@ fn record_raw_run(
         }
         first += call.count;
     }
-    Some(RawRun { transform: number, colors: colors_number, bones, window })
+    Some(RawRun { transform: number, colors: colors_number, bones, window, listed: false })
 }
 
 /// A raw draw's transform entry (with the shared weight folded in, or
@@ -2171,7 +2186,7 @@ fn record_raw_gathered(
     format: VertexFormat,
     layout: &VertexLayout,
     transform: &Transform,
-    calls: &[PrimCall],
+    (calls, bounds): (&[PrimCall], Option<(u32, u32)>),
     colors: &crate::frame::RawColors,
     raw: &mut crate::raw_arena::RawArena,
 ) -> Option<RawRun> {
@@ -2196,10 +2211,7 @@ fn record_raw_gathered(
     let index_words = (index_skew + count * index_size).div_ceil(4) as usize;
     refusing(raw, fallback::UNREADABLE);
     memory.borrow_words(index_start & !3, index_words)?;
-    let scanning = crate::phase::recorder::enter(crate::phase::recorder::INDICES);
-    let bounds = index_bounds(memory, index_format, index_start, count);
-    crate::phase::recorder::leave(scanning);
-    let (lowest, highest) = bounds?;
+    let (lowest, highest) = bounds_of_job(memory, index_format, index_start, count, bounds)?;
     let span_start = calls[0].vertex_address.wrapping_add(lowest * stride);
     let span_skew = span_start & 3;
     let span_length = (highest - lowest) * stride + format.bytes_used(layout);
@@ -2228,7 +2240,211 @@ fn record_raw_gathered(
         first += take;
     }
     raw.stats.lit += lit as u32;
-    Some(RawRun { transform: number, colors: colors_number, bones, window: RawPlace::Arena(placed.window) })
+    raw.stats.gathered += 1;
+    Some(RawRun { transform: number, colors: colors_number, bones, window: RawPlace::Arena(placed.window), listed: false })
+}
+
+/// The lowest and highest index of a job's `count` indices at
+/// `index_start`: the producer's (`Job::index_bounds`, the vertex range it
+/// had copied), or scanned now where the job has none (a draw recorded at
+/// once, a dump's state).
+fn bounds_of_job(
+    memory: &mut impl PspMemory,
+    format: IndexFormat,
+    index_start: u32,
+    count: u32,
+    bounds: Option<(u32, u32)>,
+) -> Option<(u32, u32)> {
+    if bounds.is_some() {
+        return bounds;
+    }
+    let scanning = crate::phase::recorder::enter(crate::phase::recorder::INDICES);
+    let bounds = index_bounds(memory, format, index_start, count);
+    crate::phase::recorder::leave(scanning);
+    bounds
+}
+
+/// A span this many times larger than the corners it serves is gathered
+/// instead of copied whole (`record_raw_indexed_run`): copying it would move
+/// more bytes than gathering the corners' vertices.
+const SPARSE_SPAN: u32 = 4;
+
+/// Indexed PRIMs as a raw draw: their indices converted
+/// (`record_raw_converted`) where `raw_arena::INDEXED_DRAWS` is on and the
+/// vertex span isn't much larger than what the PRIMs use; else (and where
+/// the conversion can't) each corner's vertex gathered
+/// (`record_raw_gathered`).
+#[allow(clippy::too_many_arguments)]
+fn record_raw_indexed_run(
+    geometry: &mut Geometry,
+    memory: &mut impl PspMemory,
+    format: VertexFormat,
+    layout: &VertexLayout,
+    transform: &Transform,
+    (calls, bounds): (&[PrimCall], Option<(u32, u32)>),
+    colors: &crate::frame::RawColors,
+    raw: &mut crate::raw_arena::RawArena,
+) -> Option<RawRun> {
+    if crate::raw_arena::INDEXED_DRAWS.load(core::sync::atomic::Ordering::Relaxed) {
+        let count: u32 = calls.iter().map(|call| call.count).sum();
+        let (lowest, highest) = bounds_of_job(memory, format.index_format(), calls[0].index_address, count, bounds)?;
+        let corners: u32 = calls.iter().map(|call| 3 * triangle_count(call.primitive_type, call.count)).sum();
+        let span = highest - lowest + 1;
+        let span_start = calls[0].vertex_address.wrapping_add(lowest.wrapping_mul(layout.size));
+        let span_length = (highest - lowest) * layout.size + format.bytes_used(layout);
+        // Left in PSP RAM, a span costs no copy however sparse it is.
+        let in_psp_ram = memory.zero_copy(span_start, span_length);
+        if in_psp_ram || span <= SPARSE_SPAN * corners {
+            let converting = crate::phase::recorder::enter(crate::phase::recorder::CONVERT);
+            let run = record_raw_converted(geometry, memory, format, layout, transform, calls, colors, raw, (lowest, highest), in_psp_ram);
+            crate::phase::recorder::leave(converting);
+            return run;
+        }
+    }
+    record_raw_gathered(geometry, memory, format, layout, transform, (calls, bounds), colors, raw)
+}
+
+/// Indexed PRIMs (triangles, strips, fans; `calls`) as a raw draw that keeps
+/// their indices, as PPSSPP's hardware path keeps them (DrawEngineCommon:
+/// the vertex range from the lowest to the highest index decoded once, the
+/// indices rebased to it): the vertices from index `lowest` to `highest`
+/// copied into the raw arena in one piece (or left in PSP RAM: `in_psp_ram`,
+/// zero copy), and each PRIM's whole triangles written as a triangle list of
+/// 16-bit vertex numbers, `first + index - lowest`, `first` being the span's
+/// first vertex in its window (0 in PSP RAM). The corners come in
+/// `frame::run_indices`' order (lists 3t, 3t+1, 3t+2; strips
+/// `strip_triangle`; fans 0, t+1, t+2): the triangles gathering gives, in the
+/// same order and winding (`draw_flags::CULL`).
+///
+/// The bounds are the producer's, the indices the copier's (copied a little
+/// later): an index outside them means the game rewrote the list meanwhile,
+/// and the draw is turned down as unreadable. `None` where it can't (nothing
+/// recorded but arena room and table entries).
+#[allow(clippy::too_many_arguments)]
+fn record_raw_converted(
+    geometry: &mut Geometry,
+    memory: &mut impl PspMemory,
+    format: VertexFormat,
+    layout: &VertexLayout,
+    transform: &Transform,
+    calls: &[PrimCall],
+    colors: &crate::frame::RawColors,
+    raw: &mut crate::raw_arena::RawArena,
+    (lowest, highest): (u32, u32),
+    in_psp_ram: bool,
+) -> Option<RawRun> {
+    let corners: u32 = calls.iter().map(|call| 3 * triangle_count(call.primitive_type, call.count)).sum();
+    if corners == 0 || highest - lowest >= 65_536 {
+        return None;
+    }
+    let stride = layout.size;
+    let index_format = format.index_format();
+    let index_start = calls[0].index_address;
+    let count: u32 = calls.iter().map(|call| call.count).sum();
+    let index_skew = index_start & 3;
+    let index_words = (index_skew + count * index_format.size()).div_ceil(4) as usize;
+    let span_start = calls[0].vertex_address.wrapping_add(lowest.wrapping_mul(stride));
+    let span_skew = span_start & 3;
+    let span_length = (highest - lowest) * stride + format.bytes_used(layout);
+
+    // The span: copied into the arena, or left where it is.
+    let lit = colors.rules[0] == crate::raw_vertex::lighting::LIGHTS;
+    let (place, first) = if in_psp_ram {
+        raw.stats.psp_ram += 1;
+        raw.stats.psp_ram_bytes += span_length;
+        (RawPlace::PspRam(span_start), 0)
+    } else {
+        refusing(raw, fallback::UNREADABLE);
+        let words = memory.borrow_words(span_start & !3, (span_skew + span_length).div_ceil(4) as usize)?;
+        // Safe to view as bytes: `words` covers the span (borrowed for it).
+        let bytes = unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4) };
+        refusing(raw, fallback::ARENA_FULL);
+        let copying = crate::phase::recorder::enter(crate::phase::recorder::ARENA);
+        let placed = raw.put(&bytes[span_skew as usize..(span_skew + span_length) as usize], stride);
+        crate::phase::recorder::leave(copying);
+        let placed = placed?;
+        (RawPlace::Arena(placed.window), placed.first_vertex(stride))
+    };
+
+    // The corners first: a single weight that every vertex they use shares
+    // is folded into the rows (as gathering does; the span may hold other
+    // vertices with other weights).
+    refusing(raw, fallback::TABLES_FULL);
+    let first_index = geometry.index_count();
+    let out = geometry.reserve_indices(corners as usize)?;
+    refusing(raw, fallback::UNREADABLE);
+    let words = memory.borrow_words(index_start & !3, index_words)?;
+    // Safe to view as bytes: `words` covers every index.
+    let bytes = unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4) };
+    let indices = &bytes[index_skew as usize..];
+    let converted = match index_format {
+        IndexFormat::U8 => convert_indices::<1>(indices, calls, (lowest, highest), first, out),
+        IndexFormat::U16 => convert_indices::<2>(indices, calls, (lowest, highest), first, out),
+        _ => convert_indices::<4>(indices, calls, (lowest, highest), first, out),
+    };
+    if !converted {
+        return None;
+    }
+    let mut shared = None;
+    if !in_psp_ram && format.has_weights() && format.weight_count() == 1 {
+        let words = memory.borrow_words(span_start & !3, (span_skew + span_length).div_ceil(4) as usize)?;
+        // Safe to view as bytes: `words` covers the span.
+        let bytes = unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4) };
+        let span = &bytes[span_skew as usize..(span_skew + span_length) as usize];
+        let corners = &geometry.indices_from(first_index);
+        shared = shared_weight_of_corners(span, stride, format.weight_format(), corners, first).filter(|&weight| !lit || weight > 0.0);
+    }
+    let (number, colors_number, bones) = raw_entry(geometry, format, transform, colors, shared)?;
+    raw.stats.lit += lit as u32;
+    raw.stats.converted += 1;
+    Some(RawRun { transform: number, colors: colors_number, bones, window: place, listed: true })
+}
+
+/// `record_raw_converted`'s indices: each PRIM's whole triangles from
+/// `indices` (the PRIMs' indices one after the other, `SIZE` bytes each,
+/// little-endian) as `first + index - lowest` into `out`, in
+/// `frame::run_indices`' corner order. False if an index lies outside
+/// `lowest..=highest` (`out` is then partly written).
+fn convert_indices<const SIZE: usize>(
+    indices: &[u8],
+    calls: &[PrimCall],
+    (lowest, highest): (u32, u32),
+    first: u32,
+    out: &mut [u16],
+) -> bool {
+    let index = |position: u32| -> u32 {
+        let at = position as usize * SIZE;
+        match SIZE {
+            1 => indices[at] as u32,
+            2 => u16::from_le_bytes([indices[at], indices[at + 1]]) as u32,
+            _ => u32::from_le_bytes([indices[at], indices[at + 1], indices[at + 2], indices[at + 3]]),
+        }
+    };
+    let range = highest - lowest;
+    let mut written = 0;
+    let mut start = 0; // the PRIM's first index, counted from the job's first
+    for call in calls {
+        let corner_of = |offset: u32| -> Option<u16> {
+            let value = index(start + offset).wrapping_sub(lowest);
+            (value <= range).then_some((first + value) as u16)
+        };
+        for t in 0..triangle_count(call.primitive_type, call.count) {
+            let corners = match call.primitive_type {
+                primitive::TRIANGLES => [3 * t, 3 * t + 1, 3 * t + 2],
+                primitive::TRIANGLE_STRIP => crate::frame::strip_triangle(t),
+                _ => [0, t + 1, t + 2], // TRIANGLE_FAN
+            };
+            for corner in corners {
+                let Some(number) = corner_of(corner) else {
+                    return false;
+                };
+                out[written] = number;
+                written += 1;
+            }
+        }
+        start += call.count;
+    }
+    true
 }
 
 /// `record_raw_gathered`'s copy: each index's vertex, in index order, into
@@ -2277,7 +2493,12 @@ fn gather_vertices(
             // Safe to view as bytes: `words` covers the span.
             let bytes = unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4) };
             for &index in &indices[..chunk] {
-                let from = (span_skew + (index - lowest) * stride) as usize;
+                // Indices outside the span (the game rewrote them after the
+                // producer found the bounds): turned down as unreadable.
+                let from = (span_skew as usize).wrapping_add((index.wrapping_sub(lowest) as usize).wrapping_mul(stride as usize));
+                if from >= bytes.len() {
+                    return None;
+                }
                 // The span's last vertex may end after its last used byte.
                 let length = (stride as usize).min(bytes.len() - from);
                 out[written..written + length].copy_from_slice(&bytes[from..from + length]);
@@ -2292,13 +2513,15 @@ fn gather_vertices(
 }
 
 /// What `record_raw_run` gives the draw: its `Draw::transform`,
-/// `Draw::raw_colors` and `Draw::bones`, and where its index runs count
-/// vertices from (`Draw::first_vertex`).
+/// `Draw::raw_colors` and `Draw::bones`, where its indices count vertices
+/// from (`Draw::first_vertex`), and whether they are a plain triangle list
+/// (`listed`: converted indices) or index runs.
 struct RawRun {
     transform: u32,
     colors: u32,
     bones: u32,
     window: RawPlace,
+    listed: bool,
 }
 
 /// Where a raw run's vertices are.
@@ -2394,6 +2617,22 @@ fn shared_weight_of(bytes: &[u8], stride: u32, weight_format: usize) -> Option<f
         2 => u16::from_le_bytes([first[0], first[1]]) as f32 * (1.0 / 32768.0),
         _ => f32::from_le_bytes([first[0], first[1], first[2], first[3]]),
     })
+}
+
+/// `shared_weight_of` over the vertices a converted draw's corners use
+/// (`record_raw_converted`): `corners` are vertex numbers, `first` the
+/// span's first vertex (`span` starts with it).
+fn shared_weight_of_corners(span: &[u8], stride: u32, weight_format: usize, corners: &[u16], first: u32) -> Option<f32> {
+    let size = [0, 1, 2, 4][weight_format & 3];
+    let weight_at = |corner: u16| {
+        let at = (corner as u32).checked_sub(first)? as usize * stride as usize;
+        span.get(at..at + size)
+    };
+    let weight = weight_at(*corners.first()?)?;
+    if !corners.iter().all(|&corner| weight_at(corner) == Some(weight)) {
+        return None;
+    }
+    shared_weight_of(weight, stride, weight_format)
 }
 
 fn shared_weight(words: &[u32], skew: u32, stride: u32, used: usize) -> Option<f32> {
@@ -4386,7 +4625,7 @@ mod tests {
         let first_index = frame.indices().len();
         let run = {
             let (mut geometry, _) = frame.split();
-            record_raw_gathered(&mut geometry, &mut memory, format, &layout, &transform, &calls, &colors, &mut raw).expect("gathered")
+            record_raw_gathered(&mut geometry, &mut memory, format, &layout, &transform, (&calls, None), &colors, &mut raw).expect("gathered")
         };
         assert_eq!(run.bones, 0, "the shared weight is folded, no bones");
         let RawPlace::Arena(window) = run.window else { panic!("in the arena") };
@@ -4414,6 +4653,89 @@ mod tests {
             assert!(!sprites_suit_raw(VertexFormat(plain.0 | index_bits), 4), "index format {}", index_bits >> 11);
         }
         assert!(!sprites_suit_raw(plain, 0), "no whole sprite");
+    }
+
+    /// Indexed PRIMs as `record_raw_converted` and `record_raw_gathered`
+    /// record them (a list, a strip and a fan using different parts of one
+    /// buffer, for each index size): the corners name the same vertices in
+    /// the same order. Float positions, x = the vertex's number.
+    #[test]
+    fn converted_indices_draw_the_triangles_gathering_draws() {
+        let ge = ge_for_3d();
+        let values: [u32; 15] = [3, 4, 5, 9, 8, 7, 10, 12, 11, 13, 14, 19, 15, 16, 17];
+        // Lists 3t..; strips with every second triangle's first two swapped;
+        // fans from their first vertex.
+        let wanted: Vec<f32> =
+            [3, 4, 5, 9, 8, 7, 10, 12, 11, 11, 12, 13, 11, 13, 14, 19, 15, 16, 19, 16, 17].iter().map(|&x| x as f32).collect();
+        for (index_bits, size) in [(1u32, 1u32), (2, 2), (3, 4)] {
+            let format = VertexFormat((3 << 7) | (index_bits << 11));
+            let layout = format.layout();
+            assert_eq!(layout.size, 12);
+            let transform = Transform::new(&ge, format);
+            let mut words = Vec::new();
+            for i in 0..20u32 {
+                words.extend([(i as f32).to_bits(), 0, 0]);
+            }
+            let mut bytes: Vec<u8> = values.iter().flat_map(|value| value.to_le_bytes()[..size as usize].to_vec()).collect();
+            bytes.resize(bytes.len().div_ceil(4) * 4, 0);
+            words.extend(bytes.chunks_exact(4).map(|word| u32::from_le_bytes(word.try_into().unwrap())));
+            let indices = VERTICES + 20 * 12;
+            let call = |primitive_type, count, at: u32| PrimCall { primitive_type, count, vertex_address: VERTICES, index_address: indices + at * size };
+            let calls = [call(primitive::TRIANGLES, 6, 0), call(primitive::TRIANGLE_STRIP, 5, 6), call(primitive::TRIANGLE_FAN, 4, 11)];
+            let colors = raw_color_fields(&Prepared { gpu_transform: true, ..Prepared::EMPTY }, 0xFFFF_FFFF, &transform, format).expect("raw");
+            let mut corners_x = Vec::new();
+            for convert in [true, false] {
+                let mut memory = Lending { base: VERTICES, words: words.clone() };
+                let mut raw = crate::raw_arena::RawArena::new(Box::leak(vec![0u8; crate::raw_arena::WINDOW_BYTES as usize].into_boxed_slice()));
+                raw.put(&[0; 36], 12).unwrap(); // not at the window's start
+                let mut frame = new_boxed_frame();
+                let run = {
+                    let (mut geometry, _) = frame.split();
+                    if convert {
+                        record_raw_converted(&mut geometry, &mut memory, format, &layout, &transform, &calls, &colors, &mut raw, (3, 19), false)
+                    } else {
+                        record_raw_gathered(&mut geometry, &mut memory, format, &layout, &transform, (&calls, Some((3, 19))), &colors, &mut raw)
+                    }
+                    .expect("recorded")
+                };
+                assert_eq!(run.listed, convert);
+                let RawPlace::Arena(window) = run.window else { panic!("in the arena") };
+                let numbers: Vec<u16> =
+                    if convert { frame.indices().to_vec() } else { frame.indices().chunks_exact(3).flat_map(crate::frame::run_indices).collect() };
+                let x_of = |vertex: u16| {
+                    let at = window as usize + 12 * vertex as usize;
+                    f32::from_le_bytes(raw.bytes()[at..at + 4].try_into().unwrap())
+                };
+                corners_x.push(numbers.into_iter().map(x_of).collect::<Vec<f32>>());
+            }
+            assert_eq!(corners_x[0], wanted, "converted, {size}-byte indices");
+            assert_eq!(corners_x[1], wanted, "gathered, {size}-byte indices");
+        }
+    }
+
+    /// The producer found the bounds; the copier copied the indices later.
+    /// An index outside the bounds (the game rewrote the list in between)
+    /// must turn the conversion down, not index past the copied span.
+    #[test]
+    fn an_index_outside_the_producers_bounds_turns_the_conversion_down() {
+        let ge = ge_for_3d();
+        let format = VertexFormat((3 << 7) | (1 << 11));
+        let layout = format.layout();
+        let transform = Transform::new(&ge, format);
+        let mut words = Vec::new();
+        for i in 0..8u32 {
+            words.extend([(i as f32).to_bits(), 0, 0]);
+        }
+        words.push(u32::from_le_bytes([2, 3, 7, 0])); // 7: past the bounds below
+        let calls = [PrimCall { primitive_type: primitive::TRIANGLES, count: 3, vertex_address: VERTICES, index_address: VERTICES + 8 * 12 }];
+        let colors = raw_color_fields(&Prepared { gpu_transform: true, ..Prepared::EMPTY }, 0xFFFF_FFFF, &transform, format).expect("raw");
+        let mut raw = crate::raw_arena::RawArena::new(Box::leak(vec![0u8; crate::raw_arena::WINDOW_BYTES as usize].into_boxed_slice()));
+        let mut frame = new_boxed_frame();
+        let (mut geometry, _) = frame.split();
+        let mut memory = Lending { base: VERTICES, words: words.clone() };
+        assert!(record_raw_converted(&mut geometry, &mut memory, format, &layout, &transform, &calls, &colors, &mut raw, (2, 5), false).is_none());
+        let mut memory = Lending { base: VERTICES, words };
+        assert!(record_raw_gathered(&mut geometry, &mut memory, format, &layout, &transform, (&calls, Some((2, 5))), &colors, &mut raw).is_none());
     }
 
     /// MTX's puddle squares (user's savestate 8, 2026-11-10): the water is

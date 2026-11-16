@@ -694,17 +694,14 @@ impl Draws {
         let stored = frame.indices.get(first..first.checked_add(draw.index_count as usize)?)?;
         let stats = stats();
         let runs = draw.flags & draw_flags::INDEX_RUNS != 0;
-        let mut corners = draw.index_count;
-        if runs {
-            corners = run_corners(stored);
-            // Written out by the capture already (the index ring).
-            let at = if frame.ring_indices.is_null() { NO_RING_INDICES } else { *frame.draw_ring_index.get(draw_index)? };
-            if at != NO_RING_INDICES && at as u64 + corners as u64 <= frame.ring_indices_len as u64 {
-                stats.ring_draws += 1;
-                stats.indices_us += draw_clock().wrapping_sub(start);
-                // Safe: inside the ring (checked above).
-                return Some((unsafe { frame.ring_indices.add(at as usize) }, corners));
-            }
+        let corners = if runs { run_corners(stored) } else { draw.index_count };
+        // Written out by the capture already (the index ring).
+        let at = if frame.ring_indices.is_null() { NO_RING_INDICES } else { *frame.draw_ring_index.get(draw_index)? };
+        if at != NO_RING_INDICES && at as u64 + corners as u64 <= frame.ring_indices_len as u64 {
+            stats.ring_draws += 1;
+            stats.indices_us += draw_clock().wrapping_sub(start);
+            // Safe: inside the ring (checked above).
+            return Some((unsafe { frame.ring_indices.add(at as usize) }, corners));
         }
         let out = frame_pool_alloc(corners * 2, 2) as *mut u16;
         if !out.is_null() {

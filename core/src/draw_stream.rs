@@ -218,6 +218,8 @@ pub(crate) struct Job {
     transform: Option<u32>,
     /// See `QueuedDraw::hash_vertices`.
     hash_vertices: bool,
+    /// See `QueuedDraw::index_bounds`.
+    pub index_bounds: Option<(u32, u32)>,
     /// Its PRIM calls: ring index and count.
     first_call: u32,
     call_count: u32,
@@ -244,6 +246,7 @@ impl Job {
         format: 0,
         transform: None,
         hash_vertices: false,
+        index_bounds: None,
         first_call: 0,
         call_count: 0,
         ranges: [CopiedRange::NONE; 3],
@@ -268,9 +271,15 @@ pub(crate) struct QueuedDraw<'a> {
     /// The copier hashes the vertex range (`CopiedRange::hash`) for the
     /// vertex cache: runs that aren't recorded raw (`recorder::goes_raw`).
     pub hash_vertices: bool,
-    /// The vertex range (`memory[0]`) is left in PSP RAM for the GPU
+    /// The vertex range (`memory[0]`, or `memory[1]` after an indexed
+    /// draw's indices) is left in PSP RAM for the GPU
     /// (`raw_arena::zero_copy_wanted`): not copied by anyone.
     pub zero_copy_vertices: bool,
+    /// Indexed draws: the lowest and highest index, as the producer found
+    /// them (`recorder::index_bounds`; the vertex range copied is theirs),
+    /// so the recorder needn't scan the indices again. The indices are
+    /// copied a little later: the recorder checks each against these.
+    pub index_bounds: Option<(u32, u32)>,
     /// A palette the draw placed in the frame (`recorder::LoadedPalette`),
     /// whose words are copied with the draw's memory and stored by the
     /// consumer.
@@ -615,6 +624,7 @@ impl DrawStream {
                 material_color: draw.material_color,
                 format: draw.format,
                 palette: draw.palette,
+                index_bounds: draw.index_bounds,
                 ..Job::EMPTY
             };
             // Safe: the consumer is idle, so the geometry and the vertex
@@ -667,7 +677,9 @@ impl DrawStream {
         for (range, &(address, bytes)) in ranges.iter_mut().zip(draw.memory.iter().chain([&palette_memory])) {
             *range = self.copy(&mut rings.words, memory, address, bytes);
         }
-        ranges[0].zero_copy = draw.zero_copy_vertices && ranges[0].deferred;
+        // The vertices are the second range after an indexed draw's indices.
+        let vertex_range = if draw.memory[1].1 > 0 { 1 } else { 0 };
+        ranges[vertex_range].zero_copy = draw.zero_copy_vertices && ranges[vertex_range].deferred;
         // Not copied yet (the slot's previous job is recorded, so nobody
         // reads the flag now; published below with release).
         self.copy_done[self.job_position as usize % MAX_JOBS].store(false, Ordering::Relaxed);
@@ -678,6 +690,7 @@ impl DrawStream {
             format: draw.format,
             transform,
             hash_vertices: draw.hash_vertices,
+            index_bounds: draw.index_bounds,
             first_call: first_call as u32,
             call_count: draw.calls.len() as u32,
             ranges,
