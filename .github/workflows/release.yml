@@ -28,7 +28,6 @@ jobs:
         run: |
           mkdir dist
           cp target/adrenaline-native-res.suprx dist/
-          cd dist && sha256sum adrenaline-native-res.suprx > SHA256SUMS
 
       - uses: actions/upload-artifact@v4
         with:
@@ -41,5 +40,4 @@ jobs:
         with:
           files: |
             dist/adrenaline-native-res.suprx
-            dist/SHA256SUMS
           generate_release_notes: true
