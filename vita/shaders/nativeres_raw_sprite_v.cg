@@ -17,7 +17,9 @@
 // Not lit with lights, not skinned (the capture leaves those to the CPU).
 //
 // aPosition, aTexcoord: A's; aPositionB, aTexcoordB, aColorBytesB,
-// aColor32B: B's (formats as nativeres_raw_v.cg); aCorner: 0..3.
+// aColor32B: B's (formats as nativeres_raw_v.cg); aCorner: 0..3. Positions
+// go through world, view and projection one after the other, as in
+// nativeres_raw_v.cg (uFormat.x, uWorld, uView, uProj, uFog).
 //
 // Compiled on the Vita with the shader compiler app (README.md "Shaders").
 
@@ -61,8 +63,10 @@ void main(
 	float4 aColor32B,
 	float aCorner,
 	uniform float4x4 wvp,
-	uniform float4 uRows[4],
-	uniform float4 uFogRow,
+	uniform float4 uWorld[3],
+	uniform float4 uView[3],
+	uniform float4 uProj[4],
+	uniform float4 uFog,
 	uniform float4 uViewport,
 	uniform float2 uUvScale,
 	uniform float4 uFormat,
@@ -80,10 +84,14 @@ void main(
 	// The separate specular colour (LIGHTMODE 1), added after texturing by
 	// the fragment program; 0 unless lit with it.
 	vSpecular = float3(0.0f, 0.0f, 0.0f);
-	float4 pa = float4(aPosition, 1.0f);
-	float4 pb = float4(aPositionB, 1.0f);
-	float4 ca = float4(dot(uRows[0], pa), dot(uRows[1], pa), dot(uRows[2], pa), dot(uRows[3], pa));
-	float4 cb = float4(dot(uRows[0], pb), dot(uRows[1], pb), dot(uRows[2], pb), dot(uRows[3], pb));
+	float4 pa = float4(aPosition * uFormat.x, 1.0f);
+	float4 pb = float4(aPositionB * uFormat.x, 1.0f);
+	float4 wa = float4(dot(uWorld[0], pa), dot(uWorld[1], pa), dot(uWorld[2], pa), 1.0f);
+	float4 wb = float4(dot(uWorld[0], pb), dot(uWorld[1], pb), dot(uWorld[2], pb), 1.0f);
+	float4 va = float4(dot(uView[0], wa), dot(uView[1], wa), dot(uView[2], wa), 1.0f);
+	float4 vb = float4(dot(uView[0], wb), dot(uView[1], wb), dot(uView[2], wb), 1.0f);
+	float4 ca = float4(dot(uProj[0], va), dot(uProj[1], va), dot(uProj[2], va), dot(uProj[3], va));
+	float4 cb = float4(dot(uProj[0], vb), dot(uProj[1], vb), dot(uProj[2], vb), dot(uProj[3], vb));
 	// The corner's x (and u) from B for corners 1 and 3, y (and v, fog)
 	// from B for corners 2 and 3.
 	float xFromB = (aCorner == 1.0f || aCorner == 3.0f) ? 1.0f : 0.0f;
@@ -102,7 +110,7 @@ void main(
 	float2 uvA = aTexcoord * uRawUv.xy + uRawUv.zw;
 	float2 uvB = aTexcoordB * uRawUv.xy + uRawUv.zw;
 	vTexcoord = float2(lerp(uvA.x, uvB.x, xFromB), lerp(uvA.y, uvB.y, yFromB)) * uUvScale;
-	vFog = lerp(dot(uFogRow, pa), dot(uFogRow, pb), yFromB);
+	vFog = lerp((va.z * uFog.x + uFog.y) * uFog.z, (vb.z * uFog.x + uFog.y) * uFog.z, yFromB);
 
 	// B's colour, with nativeres_raw_v.cg's rules (lighting 0..2).
 	float mode = uFormat.y;

@@ -47,7 +47,7 @@ use crate::frame::{Draw, Frame};
 use crate::memory::{physical, PspMemory};
 use crate::recorder::{self, PaletteFill, PrimCall, Prepared};
 use crate::stats::FrameStats;
-use crate::transform::{Transform, TransformBuilder, TransformInputs};
+use crate::transform::{TransformBuilder, TransformInputs};
 use crate::vertex_cache::VertexCache;
 
 /// Ring sizes. (A frame of MTX Mototrax's Los Angeles race: ~3,000 jobs,
@@ -632,8 +632,9 @@ impl DrawStream {
             let mut geometry = unsafe { Frame::geometry_raw(frame) };
             let cache = unsafe { (*self.vertex_cache.get()).as_deref_mut() };
             // Worked out on its own (rare): the consumer's builder stays as it is.
-            let transform = draw.transform.map(|(inputs, _)| Transform::from_inputs(inputs));
-            recorder::run_job(&mut geometry, stats, &job, draw.calls, transform.as_ref(), memory, cache);
+            let mut builder = TransformBuilder::new();
+            let transform = draw.transform.map(|(inputs, _)| recorder::JobTransform::new(inputs, &mut builder));
+            recorder::run_job(&mut geometry, stats, &job, draw.calls, transform, memory, cache);
             return;
         }
         let mut recorded = self.known_recorded;
@@ -768,10 +769,11 @@ impl DrawStream {
             let rings = unsafe { &*rings };
             let calls = &rings.calls[job.first_call as usize..][..job.call_count as usize];
             // Safe: the builder is the consumer's (as the geometry above).
+            // It works the CPU's transform out only for draws that need it
+            // (`recorder::JobTransform`).
             let builder = unsafe { &mut *self.transform_builder.get() };
-            let building = crate::phase::recorder::enter(crate::phase::recorder::TRANSFORM);
-            let transform = job.transform.map(|position| builder.build(&rings.transforms[position as usize % MAX_TRANSFORMS]));
-            crate::phase::recorder::leave(building);
+            let transform =
+                job.transform.map(|position| recorder::JobTransform::new(&rings.transforms[position as usize % MAX_TRANSFORMS], builder));
             recorder::run_job(&mut geometry, stats, job, calls, transform, &mut memory, cache.as_deref_mut());
             recorded = recorded.wrapping_add(1);
             self.recorded.store(recorded, Ordering::Release);

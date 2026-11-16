@@ -56,6 +56,7 @@ pub mod phase;
 pub mod psp_copy;
 pub mod psp_link;
 pub mod raw_arena;
+pub mod raw_blocks;
 pub mod raw_vertex;
 pub mod recorder;
 pub mod report;

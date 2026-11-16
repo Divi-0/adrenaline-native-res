@@ -41,7 +41,7 @@
 use crate::color::lerp_rgba;
 use crate::command::op;
 use crate::ge_state::{float24, GeState, Matrices, BONE_COUNT, TRANSFORM_REGISTERS};
-use crate::frame::{FrameVertex, GpuTransform};
+use crate::frame::{FrameVertex, GpuLights, GpuTransform, RawCamera};
 use crate::lighting::{LightingRegisters, Lights, ModelLights};
 use crate::vertex::{Raw3d, Vertex, VertexFormat, MAX_WEIGHTS};
 
@@ -379,6 +379,12 @@ fn finite(value: f32) -> f32 {
     }
 }
 
+/// A 4x3 matrix (4 columns of 3 rows, as the GE uploads it) row by row,
+/// for dot products with (x, y, z, 1).
+pub fn rows_of_4x3(m: &[f32; 12]) -> [[f32; 4]; 3] {
+    core::array::from_fn(|r| [m[r], m[3 + r], m[6 + r], m[9 + r]])
+}
+
 /// A 4x3 matrix (4 columns of 3 rows) as 4x4, with (0, 0, 0, 1) as the last row.
 fn widen(m: &[f32; 12]) -> [f32; 16] {
     [m[0], m[1], m[2], 0.0, m[3], m[4], m[5], 0.0, m[6], m[7], m[8], 0.0, m[9], m[10], m[11], 1.0]
@@ -492,6 +498,59 @@ impl TransformInputs {
     /// `Some` exactly then).
     pub fn lighting(&self) -> Option<&LightingRegisters> {
         self.lighting.as_ref()
+    }
+
+    /// When the matrices, VERTEX_TYPE and registers last changed, and when
+    /// the lighting did (numbers from `TransformCache`; 0 for inputs made
+    /// with `of`): equal numbers, equal parts.
+    pub fn changes(&self) -> (u32, u32) {
+        (self.base_change, self.lighting_change)
+    }
+
+    /// The bones the format's weights use (4x3 each, column by column, as
+    /// uploaded); empty without weights.
+    pub fn bones(&self) -> &[[f32; 12]] {
+        &self.bones[..self.bone_count]
+    }
+
+    /// The world matrix as `RawTransform::world`: its rows.
+    pub fn raw_world(&self) -> [[f32; 4]; 3] {
+        rows_of_4x3(&self.world)
+    }
+
+    /// The view and projection matrices and the transform registers as
+    /// `RawCamera` (raw draws: the vertex program does the rest, as
+    /// `Transform::rebuild` does it on the CPU).
+    pub fn raw_camera(&self) -> RawCamera {
+        let float = |opcode: u8| float24(self.register(opcode));
+        let offset = |opcode: u8| (self.register(opcode) & 0xFFFF) as f32 / 16.0;
+        let p = &self.projection;
+        // Fog as `Transform::fog_row` folds it: (view z + end) x scale.
+        let fog = if self.has_fog() {
+            [1.0, finite(float(op::FOG_END)), finite(float(op::FOG_SCALE)), 0.0]
+        } else {
+            [0.0, 1.0, 1.0, 0.0]
+        };
+        RawCamera {
+            view: rows_of_4x3(&self.view),
+            projection: core::array::from_fn(|r| [p[r], p[4 + r], p[8 + r], p[12 + r]]),
+            viewport: [
+                float(op::VIEWPORT_X_CENTER) - offset(op::SCREEN_OFFSET_X),
+                float(op::VIEWPORT_Y_CENTER) - offset(op::SCREEN_OFFSET_Y),
+                float(op::VIEWPORT_X_SCALE),
+                float(op::VIEWPORT_Y_SCALE),
+            ],
+            depth: [float(op::VIEWPORT_Z_CENTER) / 65535.0, float(op::VIEWPORT_Z_SCALE) / 65535.0, 0.0, 0.0],
+            fog,
+            texture: [float(op::TEXTURE_SCALE_U), float(op::TEXTURE_SCALE_V), float(op::TEXTURE_OFFSET_U), float(op::TEXTURE_OFFSET_V)],
+        }
+    }
+
+    /// The light set of a draw the GPU lights with these inputs' lights
+    /// (`Lights::gpu`; `None` without lights).
+    pub fn gpu_lights(&self, has_vertex_color: bool, opaque: bool) -> Option<GpuLights> {
+        let registers = self.lighting.as_ref()?;
+        Some(Lights::from_registers(registers, &self.world, &self.view).gpu(has_vertex_color, opaque))
     }
 
     /// Copies these inputs into `target` with only the bones they use (the

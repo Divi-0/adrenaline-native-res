@@ -29,11 +29,19 @@ pub const TEXTURE_LOOKUP_SLOTS: usize = 2 * MAX_TEXTURES;
 pub const MAX_FRAME_PALETTES: usize = 1024;
 /// Slots of `Frame::palette_slots` (twice MAX_FRAME_PALETTES: short probes).
 pub const PALETTE_SLOTS: usize = 2 * MAX_FRAME_PALETTES;
-/// Entries of `Frame::transforms` (192 KiB; every frame slot has them).
-/// MTX's race start uses 42; Monster Hunter Freedom's village ~300+ (one per
-/// placed object: indexed raw draws). When the table is full, the CPU
+/// Entries of `Frame::transforms` (48 KiB; every frame slot has them): only
+/// draws decoded on the CPU and left to the GPU's 3D program use them since
+/// raw draws have their own (`raw_transforms`, 2026-11-16; MTX's race start
+/// used 42 when raw draws were in here too). When the table is full, the CPU
 /// transforms.
-pub const MAX_TRANSFORMS: usize = 1024;
+pub const MAX_TRANSFORMS: usize = 256;
+/// Entries of `Frame::raw_transforms` (64 KiB): one per object a frame's raw
+/// draws place (world matrix). Monster Hunter Freedom's village ~300+.
+/// When the table is full, runs go the old way.
+pub const MAX_RAW_TRANSFORMS: usize = 1024;
+/// Entries of `Frame::raw_cameras` (11 KiB): view, projection, viewport and
+/// the other registers raw draws share; a frame mostly has one or two.
+pub const MAX_RAW_CAMERAS: usize = 64;
 /// Entries of `Frame::light_sets` (44 KiB; every frame slot has them): the
 /// lighting of GPU-lit draws (`GpuLights`), consecutive equal ones stored
 /// once. When the table is full, the CPU lights the vertices.
@@ -322,6 +330,65 @@ pub struct GpuTransform {
     pub raw_uv: [f32; 4],
 }
 
+/// What a raw draw's vertex program multiplies its vertices with, apart from
+/// the object (`RawTransform`): the GE's view and projection matrices and the
+/// registers the transform reads, as they are (`raw_blocks`). Shared by every
+/// object a camera sees; a new entry only when one of them changes.
+///
+/// A raw vertex goes as the PSP's GE (and PPSSPP's vertex shaders,
+/// VertexShaderGenerator.cpp) takes it: the raw position times the format's
+/// scale, skinned (`Draw::bones`), world, view, projection, one after the
+/// other (`raw_blocks::clip_vertex`):
+///
+/// ```text
+/// model = skin(position x scale)              (or position x scale)
+/// world = world rows . (model, 1)
+/// view  = view rows . (world, 1)
+/// clip  = projection rows . (view, 1)
+/// x     = viewport[0] + viewport[2] * clip.x / clip.w   (as GpuTransform)
+/// depth = depth[0] + depth[1] * clip.z / clip.w
+/// fog   = (view.z * fog[0] + fog[1]) * fog[2]
+/// u, v  = raw u, v x format scale x texture[0..2] + texture[2..4]
+/// ```
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RawCamera {
+    /// The view matrix (4x3), row by row.
+    pub view: [[f32; 4]; 3],
+    /// The projection matrix (4x4), row by row.
+    pub projection: [[f32; 4]; 4],
+    /// Viewport origin x, y (the screen offset taken off) and scale x, y.
+    pub viewport: [f32; 4],
+    /// Depth centre and scale (already divided by 65535), then two zeros.
+    pub depth: [f32; 4],
+    /// With fog: 1, FOG_END, FOG_SCALE, 0, so fog = (view z + end) x scale;
+    /// without: 0, 1, 1, 0 (fog 1 = none).
+    pub fog: [f32; 4],
+    /// TEXTURE_SCALE u, v and TEXTURE_OFFSET u, v.
+    pub texture: [f32; 4],
+}
+
+/// One object of a frame's raw draws (`Draw::transform` of a draw with
+/// `draw_flags::RAW_VERTICES`): its world matrix, the camera that sees it
+/// and, for draws lit by the GPU, its lights. Written by `raw_blocks` only
+/// when the GE's world matrix, registers or lights changed.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RawTransform {
+    /// The world matrix (4x3), row by row.
+    pub world: [[f32; 4]; 3],
+    /// Its `Frame::raw_cameras` entry (an index, not + 1).
+    pub camera: u16,
+    /// Its `Frame::light_sets` entry + 1 (0: not lit by the GPU).
+    pub light_set: u16,
+    /// What it was written from (`raw_blocks`): the transform inputs' change
+    /// numbers and the lighting's key, so the next draw with the same inputs
+    /// finds it without comparing anything.
+    pub inputs_change: u32,
+    pub lighting_change: u32,
+    pub lighting_key: u32,
+}
+
 /// How a raw draw's vertices get their colour (`raw_vertex`,
 /// nativeres_raw_v.cg): what the CPU path's `base_color` and `frame_color`
 /// do. Colours as whole numbers 0..255 per channel (RGBA), so the shader's
@@ -380,7 +447,9 @@ pub struct GpuLights {
     /// the shader adds the specular part after texturing.
     pub material_specular: [f32; 4],
     /// 1 where the ambient, diffuse, specular colour (x, y, z) is the
-    /// vertex colour (MATERIAL_UPDATE, vertices with a colour), w 0.
+    /// vertex colour (MATERIAL_UPDATE, vertices with a colour); w 1 =
+    /// REVERSE_NORMAL: raw draws turn their normals around (the 3D program
+    /// has its normal rows negated instead and doesn't read w).
     pub from_vertex: [f32; 4],
 }
 
@@ -412,6 +481,16 @@ impl RawColors {
     pub fn words(&self) -> &[u32; RAW_COLORS_WORDS] {
         // Safe: as `GpuTransform::words`.
         unsafe { &*(self as *const RawColors as *const [u32; RAW_COLORS_WORDS]) }
+    }
+}
+
+const RAW_CAMERA_WORDS: usize = core::mem::size_of::<RawCamera>() / 4;
+
+impl RawCamera {
+    /// Its floats as bits.
+    pub fn words(&self) -> &[u32; RAW_CAMERA_WORDS] {
+        // Safe: as `GpuTransform::words` (size checked below).
+        unsafe { &*(self as *const RawCamera as *const [u32; RAW_CAMERA_WORDS]) }
     }
 }
 
@@ -609,6 +688,13 @@ pub struct Frame {
     /// The texture cache compares it with the data it decoded. Part of the
     /// catalog; entries of textures not in the frame are stale.
     pub texture_samples: [u32; MAX_TEXTURES],
+    /// The objects and cameras of raw draws (`Draw::transform` of draws with
+    /// `draw_flags::RAW_VERTICES`, `RawTransform::camera`). Part of the
+    /// geometry.
+    pub raw_transform_count: u32,
+    pub raw_transforms: [RawTransform; MAX_RAW_TRANSFORMS],
+    pub raw_camera_count: u32,
+    pub raw_cameras: [RawCamera; MAX_RAW_CAMERAS],
 }
 
 /// `Frame::draw_ring_index` of a draw whose list isn't in the ring.
@@ -624,7 +710,9 @@ const _: () = assert!(core::mem::size_of::<TextureDescriptor>() == 32);
 const _: () = assert!(core::mem::offset_of!(Frame, draws) == 2_490_404);
 // The transform table at the end (the header checks the same).
 const _: () = assert!(core::mem::offset_of!(Frame, transforms) == 3_295_276);
-const _: () = assert!(core::mem::offset_of!(Frame, vertex_cache) == 3_491_888);
+const _: () = assert!(core::mem::offset_of!(Frame, vertex_cache) == 3_344_432);
+const _: () = assert!(core::mem::size_of::<RawCamera>() == 44 * 4);
+const _: () = assert!(core::mem::size_of::<RawTransform>() == 64);
 const _: () = assert!(core::mem::size_of::<FramePalette>() == 12);
 const _: () = assert!(core::mem::size_of::<TextureLevels>() == 56);
 
@@ -652,6 +740,8 @@ impl Frame {
         self.ring_indices = core::ptr::null();
         self.raw_colors_count = 0;
         self.bone_float_count = 0;
+        self.raw_transform_count = 0;
+        self.raw_camera_count = 0;
         self.palette_count = 0;
         self.palette_slots = [0; PALETTE_SLOTS];
     }
@@ -710,6 +800,10 @@ impl Frame {
             palette_hashes,
             texture_levels,
             texture_samples,
+            raw_transform_count,
+            raw_transforms,
+            raw_camera_count,
+            raw_cameras,
             ..
         } = self;
         (
@@ -729,6 +823,10 @@ impl Frame {
                 raw_colors,
                 bone_float_count,
                 bone_floats,
+                raw_transform_count,
+                raw_transforms,
+                raw_camera_count,
+                raw_cameras,
                 palette_words,
                 palette_hashes,
             },
@@ -772,6 +870,10 @@ impl Frame {
             raw_colors: &mut *addr_of_mut!((*frame).raw_colors),
             bone_float_count: &mut *addr_of_mut!((*frame).bone_float_count),
             bone_floats: &mut *addr_of_mut!((*frame).bone_floats),
+            raw_transform_count: &mut *addr_of_mut!((*frame).raw_transform_count),
+            raw_transforms: &mut *addr_of_mut!((*frame).raw_transforms),
+            raw_camera_count: &mut *addr_of_mut!((*frame).raw_camera_count),
+            raw_cameras: &mut *addr_of_mut!((*frame).raw_cameras),
             palette_words: &mut *addr_of_mut!((*frame).palette_words),
             palette_hashes: &mut *addr_of_mut!((*frame).palette_hashes),
         }
@@ -976,8 +1078,22 @@ impl Frame {
     /// A draw's transform (`Draw::transform`), if its vertices are in model
     /// space.
     pub fn transform_of(&self, draw: &Draw) -> Option<&GpuTransform> {
+        if draw.flags & draw_flags::RAW_VERTICES != 0 {
+            return None; // `raw_transform_of`
+        }
         let index = (draw.transform as usize).checked_sub(1)?;
         self.transforms[..self.transform_count as usize].get(index)
+    }
+
+    /// A raw draw's object and camera (`Draw::transform`, `RawTransform`).
+    pub fn raw_transform_of(&self, draw: &Draw) -> Option<(&RawTransform, &RawCamera)> {
+        if draw.flags & draw_flags::RAW_VERTICES == 0 {
+            return None;
+        }
+        let index = (draw.transform as usize).checked_sub(1)?;
+        let transform = self.raw_transforms[..self.raw_transform_count as usize].get(index)?;
+        let camera = self.raw_cameras[..self.raw_camera_count as usize].get(transform.camera as usize)?;
+        Some((transform, camera))
     }
 
     /// A draw's triangle corners in screen space, as the GPU draws them
@@ -985,12 +1101,12 @@ impl Frame {
     /// decoded and cut at the near plane, `raw_vertex::RawCorners`).
     pub fn screen_corners<'a>(&'a self, draw: &Draw) -> impl Iterator<Item = FrameVertex> + 'a {
         let transform = self.transform_of(draw).copied();
-        let raw = match transform {
-            Some(transform) if draw.flags & draw_flags::RAW_VERTICES != 0 && draw.flags & draw_flags::RAW_PSP_RAM == 0 => Some(crate::raw_vertex::RawCorners::new(
+        let raw = match self.raw_transform_of(draw) {
+            Some((transform, camera)) if draw.flags & draw_flags::RAW_PSP_RAM == 0 => Some(crate::raw_vertex::RawCorners::new(
                 self,
                 draw.first_vertex,
                 draw.vertex_format,
-                transform,
+                (*transform, *camera),
                 self.raw_colors_of(draw).copied().unwrap_or_default(),
                 self.bones_of(draw),
                 self.draw_indices(draw),
@@ -1157,6 +1273,10 @@ pub struct Geometry<'a> {
     raw_colors: &'a mut [RawColors; MAX_RAW_COLORS],
     bone_float_count: &'a mut u32,
     bone_floats: &'a mut [f32; MAX_BONE_FLOATS],
+    raw_transform_count: &'a mut u32,
+    raw_transforms: &'a mut [RawTransform; MAX_RAW_TRANSFORMS],
+    raw_camera_count: &'a mut u32,
+    raw_cameras: &'a mut [RawCamera; MAX_RAW_CAMERAS],
     palette_words: &'a mut [u32; MAX_PALETTE_WORDS],
     palette_hashes: &'a mut [u32; MAX_FRAME_PALETTES],
 }
@@ -1164,6 +1284,8 @@ pub struct Geometry<'a> {
 /// How many of the newest table entries `Geometry::add_raw_colors` checks
 /// for the same one (draws alternate between a few materials).
 const RAW_COLORS_RECENT: usize = 8;
+/// The same for `Geometry::add_raw_camera`.
+const RAW_CAMERAS_RECENT: usize = 8;
 
 impl Geometry<'_> {
     /// Stores the words of the palette at `place` (`Catalog::add_palette`)
@@ -1177,27 +1299,39 @@ impl Geometry<'_> {
         self.palette_hashes[place.index as usize] = crate::texture::hash_words(stored);
     }
 
-    /// Stores `bones` (the fast path's 4x3 bones, column by column) for the
-    /// shader, each as 3 rows of 4 floats (`Draw::bones`), and
-    /// returns where they start in `Frame::bone_floats`; the last bones
-    /// stored again if equal. `None` if the pool is full.
+    /// Stores `bones` (4x3, column by column, as uploaded) for the vertex
+    /// programs, each as 3 rows of 4 floats (`Draw::bones`), and returns
+    /// where they start in `Frame::bone_floats`; the last bones stored again
+    /// if equal. `None` if the pool is full.
+    ///
+    /// Written behind the newest ones first, then compared with them by
+    /// their bits (one pass; float compares stall the A9's pipeline, see
+    /// `GPU_TRANSFORM_WORDS`): MTX's riders change bones before nearly every
+    /// part.
     pub fn add_bones(&mut self, bones: &[[f32; 12]]) -> Option<u32> {
         let count = *self.bone_float_count as usize;
         let size = 12 * bones.len();
-        let as_rows = |bone: &[f32; 12]| -> [f32; 12] {
-            core::array::from_fn(|i| {
-                let (row, column) = (i / 4, i % 4);
-                bone[column * 3 + row]
-            })
-        };
-        if count >= size && bones.iter().enumerate().all(|(b, bone)| self.bone_floats[count - size + 12 * b..][..12] == as_rows(bone)) {
-            return Some((count - size) as u32);
-        }
         if count + size > MAX_BONE_FLOATS {
-            return None;
+            // No room behind them: only the newest ones can still be used.
+            let same = count >= size
+                && bones.iter().enumerate().all(|(b, bone)| {
+                    let stored = &self.bone_floats[count - size + 12 * b..][..12];
+                    (0..12).all(|i| stored[i].to_bits() == bone[(i % 4) * 3 + i / 4].to_bits())
+                });
+            return same.then(|| (count - size) as u32);
         }
         for (b, bone) in bones.iter().enumerate() {
-            self.bone_floats[count + 12 * b..][..12].copy_from_slice(&as_rows(bone));
+            let rows = &mut self.bone_floats[count + 12 * b..][..12];
+            for (i, value) in rows.iter_mut().enumerate() {
+                // Row i / 4, column i % 4.
+                *value = bone[(i % 4) * 3 + i / 4];
+            }
+        }
+        if count >= size {
+            let (stored, new) = self.bone_floats[count - size..count + size].split_at(size);
+            if stored.iter().zip(new).all(|(a, b)| a.to_bits() == b.to_bits()) {
+                return Some((count - size) as u32);
+            }
         }
         *self.bone_float_count += size as u32;
         Some(count as u32)
@@ -1238,6 +1372,57 @@ impl Geometry<'_> {
         self.light_sets[count] = *lights;
         *self.light_set_count += 1;
         Some(count as u32 + 1)
+    }
+
+    /// The newest raw transform (`Frame::raw_transforms`) and its
+    /// `Draw::transform` number, if the frame has one (`raw_blocks`).
+    pub fn last_raw_transform(&self) -> Option<(u32, &RawTransform)> {
+        let count = *self.raw_transform_count as usize;
+        count.checked_sub(1).map(|last| (count as u32, &self.raw_transforms[last]))
+    }
+
+    /// Replaces the newest raw transform's bookkeeping (`raw_blocks`: the
+    /// same entry found again for other inputs).
+    pub fn restamp_last_raw_transform(&mut self, inputs_change: u32, lighting_change: u32) {
+        if let Some(last) = (*self.raw_transform_count as usize).checked_sub(1) {
+            self.raw_transforms[last].inputs_change = inputs_change;
+            self.raw_transforms[last].lighting_change = lighting_change;
+        }
+    }
+
+    /// Adds a raw transform; its `Draw::transform` number. `None` if the
+    /// table is full (the run goes the old way).
+    pub fn push_raw_transform(&mut self, transform: RawTransform) -> Option<u32> {
+        let count = *self.raw_transform_count as usize;
+        if count == MAX_RAW_TRANSFORMS {
+            return None;
+        }
+        self.raw_transforms[count] = transform;
+        *self.raw_transform_count += 1;
+        Some(count as u32 + 1)
+    }
+
+    /// The `RawTransform::camera` index for `camera`: one of the newest
+    /// entries if it is the same (by bits; MTX switches between a few texture
+    /// scales: 45 entries per race-start frame with only the newest checked),
+    /// else a new one. `None` if the table is full.
+    pub fn add_raw_camera(&mut self, camera: &RawCamera) -> Option<u16> {
+        let count = *self.raw_camera_count as usize;
+        let recent = count.saturating_sub(RAW_CAMERAS_RECENT);
+        if let Some(found) = (recent..count).rev().find(|&index| self.raw_cameras[index].words() == camera.words()) {
+            return Some(found as u16);
+        }
+        if count == MAX_RAW_CAMERAS {
+            return None;
+        }
+        self.raw_cameras[count] = *camera;
+        *self.raw_camera_count += 1;
+        Some(count as u16)
+    }
+
+    /// The light set `number` (+ 1, as `GpuTransform::light_set`) holds.
+    pub fn light_set(&self, number: u32) -> Option<&GpuLights> {
+        self.light_sets[..*self.light_set_count as usize].get((number as usize).checked_sub(1)?)
     }
 
     pub fn add_transform(&mut self, transform: &GpuTransform) -> Option<u32> {

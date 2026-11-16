@@ -54,19 +54,18 @@ pub const ZERO_COPY_MIN_BYTES: u32 = 1024;
 
 /// Whether a raw batch's vertices (`bytes` at `address`, in `format`) are
 /// left in PSP RAM for the GPU (`ZERO_COPY`): main RAM (PSP 0x08000000 ..
-/// 0x0A000000, not VRAM), at least `ZERO_COPY_MIN_BYTES`, and a format whose
-/// runs need no look at the vertices on the CPU (single-weight formats
-/// look at the weights to fold a shared one into the rows).
-pub fn zero_copy_wanted(address: u32, bytes: u32, format: crate::vertex::VertexFormat) -> bool {
-    ZERO_COPY.load(core::sync::atomic::Ordering::Relaxed) && zero_copy_suits(address, bytes, format)
+/// 0x0A000000, not VRAM) and at least `ZERO_COPY_MIN_BYTES`. (Single-weight
+/// formats were left out until 2026-11-16: the CPU read their weights to
+/// fold a shared one into the matrix; the program skins them now,
+/// `raw_blocks`.)
+pub fn zero_copy_wanted(address: u32, bytes: u32, _format: crate::vertex::VertexFormat) -> bool {
+    ZERO_COPY.load(core::sync::atomic::Ordering::Relaxed) && zero_copy_suits(address, bytes)
 }
 
 /// `zero_copy_wanted` without the switch.
-fn zero_copy_suits(address: u32, bytes: u32, format: crate::vertex::VertexFormat) -> bool {
+fn zero_copy_suits(address: u32, bytes: u32) -> bool {
     let physical = address & 0x1FFF_FFFF;
-    (0x0800_0000..0x0A00_0000).contains(&physical)
-        && bytes >= ZERO_COPY_MIN_BYTES
-        && !(format.has_weights() && format.weight_count() == 1)
+    (0x0800_0000..0x0A00_0000).contains(&physical) && bytes >= ZERO_COPY_MIN_BYTES
 }
 
 /// Bytes per window: 65,536 vertices of the smallest PSP vertex (an 8-bit
@@ -222,15 +221,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn zero_copy_suits_big_runs_in_main_ram_the_cpu_needn_t_read() {
-        use crate::vertex::VertexFormat;
-        let world = VertexFormat(0x11a); // MTX's world: no weights ("x1" in the format bits)
-        assert!(zero_copy_suits(0x0890_0002, 4096, world));
-        assert!(zero_copy_suits(0x4890_0000, 4096, world), "uncached address");
-        assert!(!zero_copy_suits(0x0890_0000, 512, world), "small: copied");
-        assert!(!zero_copy_suits(0x0410_0000, 4096, world), "VRAM");
-        assert!(!zero_copy_suits(0x0890_0000, 4096, VertexFormat(0x33a)), "one weight: its weights are read");
-        assert!(zero_copy_suits(0x0890_0000, 4096, VertexFormat(0x433a)), "two weights: skinned in the shader");
+    fn zero_copy_suits_big_runs_in_main_ram() {
+        assert!(zero_copy_suits(0x0890_0002, 4096));
+        assert!(zero_copy_suits(0x4890_0000, 4096), "uncached address");
+        assert!(!zero_copy_suits(0x0890_0000, 512), "small: copied");
+        assert!(!zero_copy_suits(0x0410_0000, 4096), "VRAM");
     }
 
     fn arena(windows: usize) -> RawArena {

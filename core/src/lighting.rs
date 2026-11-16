@@ -364,7 +364,9 @@ impl Lights {
             ..GpuLights::default()
         };
         let update = if has_vertex_color { self.material_update } else { 0 };
-        gpu.from_vertex = [flag(update & 1 != 0), flag(update & 2 != 0), flag(update & 4 != 0), 0.0];
+        // w: REVERSE_NORMAL, for raw draws (the 3D program gets negated
+        // normal rows instead, `normal_rows`).
+        gpu.from_vertex = [flag(update & 1 != 0), flag(update & 2 != 0), flag(update & 4 != 0), flag(self.reverse_normal)];
         for (index, light) in self.lights[..self.count].iter().enumerate() {
             let [x, y, z] = light.position;
             gpu.to_light[index] = [x, y, z, 0.0];

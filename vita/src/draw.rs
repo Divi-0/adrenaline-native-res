@@ -23,7 +23,9 @@ use core::ptr::{null, null_mut};
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, Ordering};
 
 use nativeres_core::blend::{BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_WRITES_ALPHA};
-use nativeres_core::frame::{draw_flags, test_flags, Draw, Frame, FrameVertex, GpuLights, GpuTransform, RawColors, NO_RING_INDICES};
+use nativeres_core::frame::{
+    draw_flags, test_flags, Draw, Frame, FrameVertex, GpuLights, GpuTransform, RawCamera, RawColors, RawTransform, NO_RING_INDICES,
+};
 use nativeres_core::texture;
 use nativeres_core::vertex::VertexFormat;
 
@@ -138,6 +140,8 @@ struct GxmState {
     /// uniforms were set for.
     transform: *const GpuTransform,
     uv_scale: [f32; 2],
+    /// The object (with its camera) the raw programs' uniforms were set for.
+    raw_transform: *const RawTransform,
     /// The colour rules the raw programs' uniforms were set for.
     raw_colors: *const RawColors,
     /// The bones the raw program's uniforms were set for (`Draw::bones`; 0:
@@ -158,6 +162,7 @@ const FORGOTTEN: GxmState = GxmState {
     cull: None,
     transform: null(),
     uv_scale: [0.0; 2],
+    raw_transform: null(),
     raw_colors: null(),
     bones: 0,
     raw_viewport: None,
@@ -580,13 +585,13 @@ impl Draws {
         }
     }
 
-    /// The viewport for raw draws with `transform` (nativeres_raw_v.cg sends
+    /// The viewport for raw draws seen by `camera` (nativeres_raw_v.cg sends
     /// z / w out as (z / w - 1) / 2, so the GPU clips at the PSP's near
     /// plane): depth = offset + scale * that = 0.5 + 0.5 * the PSP depth,
     /// what every other draw writes (measured on the Vita,
     /// 2026-11-08). x and y as GXM's default for our 960x544 targets.
-    fn use_raw_viewport(&mut self, transform: &GpuTransform) {
-        let (center, scale) = (transform.depth[0], transform.depth[1]);
+    fn use_raw_viewport(&mut self, camera: &RawCamera) {
+        let (center, scale) = (camera.depth[0], camera.depth[1]);
         let offset = 0.5 + 0.5 * (center + scale);
         if self.state.raw_viewport == Some([offset, scale]) {
             return;
@@ -607,10 +612,11 @@ impl Draws {
         self.state.raw_viewport = None;
     }
 
-    /// The raw (or sprite) program for `draw` with its transform, colour
-    /// rules and `fragment`. Uniforms only when one of them, the program (the
-    /// format) or the texture coordinate scale changed; the lights only for
-    /// draws lit by the GPU, bones only for the full raw program.
+    /// The raw (or sprite) program for `draw` with its object and camera
+    /// (`RawTransform`, `RawCamera`), colour rules and `fragment`. Uniforms
+    /// only when one of them, the program (the format), the bones or the
+    /// texture coordinate scale changed; the lights only for draws lit by the
+    /// GPU, bones only for the raw programs (the plain one has one at most).
     #[allow(clippy::too_many_arguments)]
     fn use_raw_transform(
         &mut self,
@@ -618,14 +624,14 @@ impl Draws {
         draw: &Draw,
         set: RawSetChoice,
         program: *mut c_void,
-        transform: &GpuTransform,
+        (transform, camera): (&RawTransform, &RawCamera),
         colors: &RawColors,
         uv_scale: [f32; 2],
         fragment: *const c_void,
     ) {
-        let (uniforms, extra) = match set {
-            RawSetChoice::Full => (self.programs.raw.uniforms, Some(raw_extra(&self.programs.raw))),
-            RawSetChoice::Plain => (self.programs.raw_plain.uniforms, None),
+        let (uniforms, skinning) = match set {
+            RawSetChoice::Full => (self.programs.raw.uniforms, Some(raw_skinning(&self.programs.raw))),
+            RawSetChoice::Plain => (self.programs.raw_plain.uniforms, Some(raw_skinning(&self.programs.raw_plain))),
             RawSetChoice::Sprites => (self.programs.sprites.uniforms, None),
         };
         let switched = program as *const c_void != self.state.vertex_program;
@@ -633,54 +639,61 @@ impl Draws {
         self.use_programs(program, uniforms.wvp, matrix, fragment);
         let bones_changed = set != RawSetChoice::Sprites && draw.bones != self.state.bones;
         if switched
-            || !core::ptr::eq(transform, self.state.transform)
+            || !core::ptr::eq(transform, self.state.raw_transform)
             || !core::ptr::eq(colors, self.state.raw_colors)
             || bones_changed
             || uv_scale != self.state.uv_scale
         {
             let buffer = reserve_vertex_uniforms();
-            let format = [0.0, ((draw.vertex_format >> 2) & 7) as f32, 0.0, 0.0];
-            let mut raw_uv = transform.raw_uv;
-            if draw.vertex_format & 3 == 0 {
-                raw_uv[0] = 0.0; // no texture coordinates: only the offset
-                raw_uv[1] = 0.0;
-            }
-            set_raw_uniforms(buffer, &uniforms, matrix, transform, uv_scale, &format, &raw_uv, colors);
-            if set == RawSetChoice::Plain {
-                set_uniform(buffer, self.programs.raw_plain.scale, 4, floats(&colors.scale));
-            }
-            if let Some(extra) = extra {
-                set_uniform(buffer, extra.scale, 4, floats(&colors.scale));
-                set_uniform(buffer, extra.normal_rows, 12, floats(&transform.normal_rows));
-                if let Some(lights) = light_set(frame, transform) {
-                    set_uniform(buffer, extra.lights, LIGHT_FLOATS, floats(lights));
+            let format = VertexFormat(draw.vertex_format);
+            let format_uniform = [format.position_scale(), ((draw.vertex_format >> 2) & 7) as f32, 0.0, 0.0];
+            let raw_uv = nativeres_core::raw_blocks::raw_uv(camera, format);
+            set_raw_uniforms(buffer, &uniforms, matrix, (transform, camera), uv_scale, &format_uniform, &raw_uv, colors);
+            if let Some(skinning) = skinning {
+                set_uniform(buffer, skinning.scale, 4, floats(&colors.scale));
+                let full = set == RawSetChoice::Full;
+                if full {
+                    if let Some(lights) = raw_light_set(frame, transform) {
+                        set_uniform(buffer, skinning.lights, LIGHT_FLOATS, floats(lights));
+                    }
                 }
-                // Skinned in the shader: the format's bones, zeros for the rest.
-                let mut skin = [0.0f32; 4];
-                let weight_type = (draw.vertex_format >> 9) & 3;
-                let bone_count = ((draw.vertex_format >> 14) & 7) + 1;
-                let first = draw.bones as usize;
-                let wanted = 12 * bone_count as usize;
-                if draw.bones != 0
-                    && weight_type != 0
-                    && first - 1 + wanted <= (frame.bone_float_count as usize).min(frame.bone_floats.len())
-                {
-                    const WEIGHT_SCALES: [f32; 4] = [1.0, 1.0 / 128.0, 1.0 / 32768.0, 1.0];
-                    self.bones = [0.0; 24 * 4];
-                    self.bones[..wanted].copy_from_slice(&frame.bone_floats[first - 1..first - 1 + wanted]);
-                    skin[0] = 1.0;
-                    skin[1] = WEIGHT_SCALES[weight_type as usize];
-                    set_uniform(buffer, extra.bones, 24 * 4, self.bones.as_ptr());
-                }
-                set_uniform(buffer, extra.skin, 4, skin.as_ptr());
+                self.set_raw_bones(frame, draw, full, buffer, &skinning);
             }
-            self.state.transform = transform;
+            self.state.raw_transform = transform;
             self.state.raw_colors = colors;
-            // Sprites have no bones: the raw program sets its bones again.
+            // Sprites have no bones: the raw programs set theirs again.
             self.state.bones = if set == RawSetChoice::Sprites { u32::MAX } else { draw.bones };
             self.state.uv_scale = uv_scale;
         }
-        self.use_raw_viewport(transform);
+        self.use_raw_viewport(camera);
+    }
+
+    /// The raw programs' bones and uSkin (nativeres_raw_v.cg): the full
+    /// program gets all 8 (the format's, zeros for the rest) and skins where
+    /// uSkin.x is 1; the plain one gets bone 0 and adds uSkin.z to the
+    /// weight, so formats without weights get weight 1 and the identity.
+    fn set_raw_bones(&mut self, frame: &Frame, draw: &Draw, full: bool, buffer: *mut c_void, skinning: &RawSkinning) {
+        const WEIGHT_SCALES: [f32; 4] = [1.0, 1.0 / 128.0, 1.0 / 32768.0, 1.0];
+        const IDENTITY_ROWS: [f32; 12] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let weight_type = (draw.vertex_format >> 9) & 3;
+        let bone_count = if full { ((draw.vertex_format >> 14) & 7) + 1 } else { 1 };
+        let first = draw.bones as usize;
+        let wanted = 12 * bone_count as usize;
+        let mut skin = [0.0f32; 4];
+        let floats_used = if full { 24 * 4 } else { 12 };
+        if draw.bones != 0 && weight_type != 0 && first - 1 + wanted <= (frame.bone_float_count as usize).min(frame.bone_floats.len()) {
+            self.bones[..floats_used].fill(0.0);
+            self.bones[..wanted].copy_from_slice(&frame.bone_floats[first - 1..first - 1 + wanted]);
+            skin[0] = 1.0;
+            skin[1] = WEIGHT_SCALES[weight_type as usize];
+        } else if full {
+            self.bones[..floats_used].fill(0.0); // not skinned: uSkin.x 0
+        } else {
+            self.bones[..12].copy_from_slice(&IDENTITY_ROWS);
+            skin[2] = 1.0;
+        }
+        set_uniform(buffer, skinning.bones, floats_used as u32, self.bones.as_ptr());
+        set_uniform(buffer, skinning.skin, 4, skin.as_ptr());
     }
 
     /// The draw's triangle corners as an index buffer the GPU can read and
@@ -819,8 +832,9 @@ impl Draws {
             tested = false;
             fragment = self.programs.blend_program(Kind::Textured, draw.blend, keep);
         }
-        // Vertices in model space: the 3D program transforms them.
-        let transform = if draw.transform != 0 {
+        // Vertices in model space: the 3D program transforms them (raw
+        // draws: their own blocks, `raw_transform_of` below).
+        let transform = if draw.transform != 0 && draw.flags & draw_flags::RAW_VERTICES == 0 {
             if fragment.is_null() || self.programs.textured.vertex_3d.is_null() || draw.transform > frame.transform_count {
                 return; // can't happen: the capture only makes these once the program exists
             }
@@ -849,11 +863,12 @@ impl Draws {
                 n if n <= frame.raw_colors_count => frame.raw_colors.get(n as usize - 1),
                 _ => None,
             };
-            // Neither skinned nor lit with lights: the plain program.
+            // At most one weight and not lit with lights: the plain program.
+            let several_weights = (draw.vertex_format >> 9) & 3 != 0 && (draw.vertex_format >> 14) & 7 != 0;
             let set = if sprites {
                 RawSetChoice::Sprites
             } else if RAW_PLAIN.load(Ordering::Relaxed) != 0
-                && draw.bones == 0
+                && !several_weights
                 && colors.is_some_and(|colors| colors.rules[0] < 2.5)
                 && self.programs.raw_plain.ready()
             {
@@ -868,8 +883,8 @@ impl Draws {
                 RawSetChoice::Full => self.programs.raw.program_for(draw.vertex_format),
             };
             let in_psp_ram = draw.flags & draw_flags::RAW_PSP_RAM != 0;
-            let (Some(transform), Some(colors)) = (transform, colors) else {
-                return; // can't happen: raw draws only come with the arena, the program and colour rules
+            let (Some(blocks), Some(colors)) = (frame.raw_transform_of(draw), colors) else {
+                return; // can't happen: raw draws only come with the arena, the program, their blocks and colour rules
             };
             if program.is_null() {
                 // Every program place taken by other formats (or no shaders):
@@ -911,7 +926,7 @@ impl Draws {
             }
             stats().convert_us += draw_clock().wrapping_sub(convert_start);
             if !skip(2) {
-                self.use_raw_transform(frame, draw, set, program, transform, colors, uv_scale, fragment);
+                self.use_raw_transform(frame, draw, set, program, blocks, colors, uv_scale, fragment);
                 self.textured_fragment_uniforms(tested, fog_and_scale(draw), alpha_range, draw.blend);
             }
         } else if !fragment.is_null() {
@@ -1284,18 +1299,18 @@ enum RawSetChoice {
     Sprites,
 }
 
-/// The full raw program's uniforms beyond the shared ones.
+/// The raw programs' uniforms beyond the ones the sprite program shares
+/// (the plain program has no lights).
 #[derive(Clone, Copy)]
-struct RawExtra {
+struct RawSkinning {
     scale: *const ProgramParameter,
-    normal_rows: *const ProgramParameter,
     lights: *const ProgramParameter,
     skin: *const ProgramParameter,
     bones: *const ProgramParameter,
 }
 
-fn raw_extra(set: &crate::programs::RawSet) -> RawExtra {
-    RawExtra { scale: set.scale, normal_rows: set.normal_rows, lights: set.lights, skin: set.skin, bones: set.bones }
+fn raw_skinning(set: &crate::programs::RawSet) -> RawSkinning {
+    RawSkinning { scale: set.scale, lights: set.lights, skin: set.skin, bones: set.bones }
 }
 
 /// The uniforms all raw programs (and the sprite program) share.
@@ -1304,16 +1319,18 @@ fn set_raw_uniforms(
     buffer: *mut c_void,
     uniforms: &RawUniforms,
     matrix: *const f32,
-    transform: &GpuTransform,
+    (transform, camera): (&RawTransform, &RawCamera),
     uv_scale: [f32; 2],
     format: &[f32; 4],
     raw_uv: &[f32; 4],
     colors: &RawColors,
 ) {
     set_uniform(buffer, uniforms.wvp, 16, matrix);
-    set_uniform(buffer, uniforms.rows, 16, floats(&transform.rows));
-    set_uniform(buffer, uniforms.fog_row, 4, floats(&transform.fog_row));
-    set_uniform(buffer, uniforms.viewport, 4, floats(&transform.viewport));
+    set_uniform(buffer, uniforms.world, 12, floats(&transform.world));
+    set_uniform(buffer, uniforms.view, 12, floats(&camera.view));
+    set_uniform(buffer, uniforms.projection, 16, floats(&camera.projection));
+    set_uniform(buffer, uniforms.fog, 4, floats(&camera.fog));
+    set_uniform(buffer, uniforms.viewport, 4, floats(&camera.viewport));
     set_uniform(buffer, uniforms.uv_scale, 2, uv_scale.as_ptr());
     set_uniform(buffer, uniforms.format, 4, format.as_ptr());
     set_uniform(buffer, uniforms.raw_uv, 4, raw_uv.as_ptr());
@@ -1328,7 +1345,15 @@ const LIGHT_FLOATS: u32 = (core::mem::size_of::<GpuLights>() / 4) as u32;
 
 /// The lights of a GPU-lit transform (`GpuTransform::light_set`, 0: none).
 fn light_set<'a>(frame: &'a Frame, transform: &GpuTransform) -> Option<&'a GpuLights> {
-    let set = transform.light_set[0] as u32;
+    light_set_number(frame, transform.light_set[0] as u32)
+}
+
+/// The lights of a raw draw lit by the GPU (`RawTransform::light_set`, 0: none).
+fn raw_light_set<'a>(frame: &'a Frame, transform: &RawTransform) -> Option<&'a GpuLights> {
+    light_set_number(frame, transform.light_set as u32)
+}
+
+fn light_set_number(frame: &Frame, set: u32) -> Option<&GpuLights> {
     if set == 0 || set > frame.light_set_count {
         return None;
     }

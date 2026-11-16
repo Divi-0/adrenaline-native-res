@@ -19,7 +19,8 @@
 //! (its clip volume is -w <= z <= w, measured on the Vita;
 //! the shader puts its far plane out of reach).
 
-use crate::frame::{Frame, FrameVertex, GpuLights, GpuTransform, RawColors};
+use crate::frame::{Frame, FrameVertex, GpuLights, GpuTransform, RawCamera, RawColors, RawTransform};
+use crate::raw_blocks;
 use crate::transform::{clip_triangle, ClipVertex};
 use crate::vertex::{VertexBytes, VertexFormat, VertexLayout};
 
@@ -119,7 +120,8 @@ impl RawColors {
 
 impl GpuTransform {
     /// A raw vertex (raw position, texture coordinates, its colour from
-    /// `colors`) in clip space, with its texture coordinates, colour and fog.
+    /// `colors`) in clip space, with its texture coordinates, colour and fog,
+    /// as raw draws were transformed before `raw_blocks` (the tests compare).
     pub fn raw_clip_vertex(&self, colors: &RawColors, position: [f32; 3], texcoord: [f32; 2], color: Option<u32>) -> ClipVertex {
         let [x, y, z] = position;
         let dot = |r: &[f32; 4]| r[0] * x + r[1] * y + r[2] * z + r[3];
@@ -200,7 +202,8 @@ pub fn skin(bones: &[f32], fields: &RawFields) -> ([f32; 3], [f32; 3]) {
 }
 
 /// A raw draw's triangle corners in screen space (three per triangle), its
-/// triangles cut at the near plane (`Frame::screen_corners`).
+/// triangles cut at the near plane (`Frame::screen_corners`), worked out as
+/// the vertex programs do it (`raw_blocks`).
 pub struct RawCorners<'a, I: Iterator<Item = u16>> {
     indices: I,
     bytes: &'a [u8],
@@ -208,11 +211,15 @@ pub struct RawCorners<'a, I: Iterator<Item = u16>> {
     stride: usize,
     format: VertexFormat,
     layout: VertexLayout,
-    transform: GpuTransform,
+    transform: RawTransform,
+    camera: RawCamera,
+    /// `raw_blocks::raw_uv`.
+    uv: [f32; 4],
     colors: RawColors,
-    /// The light set of a draw lit by the GPU (`lighting::LIGHTS`).
-    lights: Option<GpuLights>,
-    /// The bones of a draw skinned in the shader (12 floats each; empty: not).
+    /// The light set of a draw lit by the GPU (`lighting::LIGHTS`) and the
+    /// rows taking its normals to world space (`raw_blocks::normal_rows`).
+    lights: Option<(GpuLights, [[f32; 4]; 3])>,
+    /// The bones of a skinned draw (12 floats each; empty: not).
     bones: &'a [f32],
     /// Raw sprites (`draw_flags::RAW_SPRITES`): index k is pair k, corner k % 4.
     sprites: bool,
@@ -223,11 +230,12 @@ pub struct RawCorners<'a, I: Iterator<Item = u16>> {
 }
 
 impl<'a, I: Iterator<Item = u16>> RawCorners<'a, I> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         frame: &'a Frame,
         window: u32,
         vertex_format: u32,
-        transform: GpuTransform,
+        (transform, camera): (RawTransform, RawCamera),
         colors: RawColors,
         bones: &'a [f32],
         indices: I,
@@ -235,7 +243,10 @@ impl<'a, I: Iterator<Item = u16>> RawCorners<'a, I> {
     ) -> Self {
         let format = VertexFormat(vertex_format);
         let layout = format.layout();
-        let lights = (colors.rules[0] == lighting::LIGHTS).then(|| frame.light_set_of(&transform).copied()).flatten();
+        let lights = (colors.rules[0] == lighting::LIGHTS)
+            .then(|| frame.light_sets[..frame.light_set_count as usize].get((transform.light_set as usize).checked_sub(1)?).copied())
+            .flatten()
+            .map(|lights| (lights, raw_blocks::normal_rows(&transform, &lights)));
         RawCorners {
             colors,
             lights,
@@ -247,6 +258,8 @@ impl<'a, I: Iterator<Item = u16>> RawCorners<'a, I> {
             format,
             layout,
             transform,
+            camera,
+            uv: raw_blocks::raw_uv(&camera, format),
             sprites,
             pending: [FrameVertex::default(); 6],
             pending_count: 0,
@@ -257,10 +270,10 @@ impl<'a, I: Iterator<Item = u16>> RawCorners<'a, I> {
     fn clip_vertex(&self, index: u16) -> Option<ClipVertex> {
         let offset = self.window + index as usize * self.stride;
         let fields = decode_raw(self.bytes, offset, self.format, &self.layout)?;
-        let (position, normal) = if self.bones.is_empty() { (fields.position, fields.normal) } else { skin(self.bones, &fields) };
-        let mut vertex = self.transform.raw_clip_vertex(&self.colors, position, fields.texcoord, fields.color);
-        if let Some(lights) = &self.lights {
-            vertex.color = self.colors.lit_color(lights, &self.transform.normal_rows, fields.color, normal);
+        let (model, normal) = raw_blocks::model_space(self.format, self.bones, fields.position, &fields.weights, fields.normal);
+        let mut vertex = raw_blocks::clip_vertex(&self.transform, &self.camera, &self.colors, &self.uv, model, fields.texcoord, fields.color);
+        if let Some((lights, normal_rows)) = &self.lights {
+            vertex.color = self.colors.lit_color(lights, normal_rows, fields.color, normal);
         }
         Some(vertex)
     }
@@ -275,8 +288,9 @@ impl<'a, I: Iterator<Item = u16>> RawCorners<'a, I> {
         let offset = self.window + 2 * index as usize * self.stride;
         let corner = |offset: usize| -> Option<FrameVertex> {
             let fields = decode_raw(self.bytes, offset, self.format, &self.layout)?;
-            let clip = self.transform.raw_clip_vertex(&self.colors, fields.position, fields.texcoord, fields.color);
-            (clip.z >= -clip.w && clip.w > 0.0).then(|| self.transform.clip_to_screen(&clip))
+            let (model, _) = raw_blocks::model_space(self.format, &[], fields.position, &[], fields.normal);
+            let clip = raw_blocks::clip_vertex(&self.transform, &self.camera, &self.colors, &self.uv, model, fields.texcoord, fields.color);
+            (clip.z >= -clip.w && clip.w > 0.0).then(|| raw_blocks::clip_to_screen(&self.camera, &clip))
         };
         let (a, b) = (corner(offset)?, corner(offset + self.stride)?);
         let (x_from, y_from) = if index % 4 & 1 != 0 { (b, a) } else { (a, a) };
@@ -312,7 +326,7 @@ impl<I: Iterator<Item = u16>> Iterator for RawCorners<'_, I> {
                 _ => &[],
             };
             for (slot, &corner) in order.iter().enumerate() {
-                self.pending[slot] = self.transform.clip_to_screen(&cut[corner]);
+                self.pending[slot] = raw_blocks::clip_to_screen(&self.camera, &cut[corner]);
             }
             self.pending_count = order.len();
         }

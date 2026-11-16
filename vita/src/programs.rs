@@ -131,8 +131,9 @@ pub struct RawSet {
     normal: *const ProgramParameter,
     weights0: *const ProgramParameter,
     weights1: *const ProgramParameter,
+    /// The plain program's first weight (aWeight).
+    weight: *const ProgramParameter,
     pub uniforms: RawUniforms,
-    pub normal_rows: *const ProgramParameter,
     pub lights: *const ProgramParameter,
     pub skin: *const ProgramParameter,
     pub bones: *const ProgramParameter,
@@ -146,8 +147,10 @@ pub struct RawSet {
 #[derive(Clone, Copy)]
 pub struct RawUniforms {
     pub wvp: *const ProgramParameter,
-    pub rows: *const ProgramParameter,
-    pub fog_row: *const ProgramParameter,
+    pub world: *const ProgramParameter,
+    pub view: *const ProgramParameter,
+    pub projection: *const ProgramParameter,
+    pub fog: *const ProgramParameter,
     pub viewport: *const ProgramParameter,
     pub uv_scale: *const ProgramParameter,
     pub format: *const ProgramParameter,
@@ -161,8 +164,10 @@ pub struct RawUniforms {
 impl RawUniforms {
     const NONE: RawUniforms = RawUniforms {
         wvp: null(),
-        rows: null(),
-        fog_row: null(),
+        world: null(),
+        view: null(),
+        projection: null(),
+        fog: null(),
         viewport: null(),
         uv_scale: null(),
         format: null(),
@@ -176,8 +181,10 @@ impl RawUniforms {
     fn find(program: *const gxm::Program) -> RawUniforms {
         RawUniforms {
             wvp: parameter(program, b"wvp\0"),
-            rows: parameter(program, b"uRows\0"),
-            fog_row: parameter(program, b"uFogRow\0"),
+            world: parameter(program, b"uWorld\0"),
+            view: parameter(program, b"uView\0"),
+            projection: parameter(program, b"uProj\0"),
+            fog: parameter(program, b"uFog\0"),
             viewport: parameter(program, b"uViewport\0"),
             uv_scale: parameter(program, b"uUvScale\0"),
             format: parameter(program, b"uFormat\0"),
@@ -192,8 +199,10 @@ impl RawUniforms {
     fn all_found(&self) -> bool {
         [
             self.wvp,
-            self.rows,
-            self.fog_row,
+            self.world,
+            self.view,
+            self.projection,
+            self.fog,
             self.viewport,
             self.uv_scale,
             self.format,
@@ -268,8 +277,8 @@ impl RawSet {
             normal: null(),
             weights0: null(),
             weights1: null(),
+            weight: null(),
             uniforms: RawUniforms::NONE,
-            normal_rows: null(),
             lights: null(),
             skin: null(),
             bones: null(),
@@ -305,22 +314,25 @@ impl RawSet {
         self.color_bytes = parameter(program, b"aColorBytes\0");
         self.color32 = parameter(program, b"aColor32\0");
         self.normal = parameter(program, b"aNormal\0");
-        self.normal_rows = parameter(program, b"uNormalRows\0");
         self.lights = parameter(program, b"uLights\0");
         self.weights0 = parameter(program, b"aWeights0\0");
         self.weights1 = parameter(program, b"aWeights1\0");
+        self.weight = parameter(program, b"aWeight\0");
         self.skin = parameter(program, b"uSkin\0");
         self.bones = parameter(program, b"uBones\0");
         self.scale = parameter(program, b"uScale\0");
         self.uniforms = RawUniforms::find(program);
-        let skinned_lit = [self.normal, self.normal_rows, self.lights, self.weights0, self.weights1, self.skin, self.bones];
+        let lit = [self.normal, self.lights, self.weights0, self.weights1];
         if self.position.is_null()
             || self.texcoord.is_null()
             || self.color_bytes.is_null()
             || self.color32.is_null()
             || self.scale.is_null()
+            || self.skin.is_null()
+            || self.bones.is_null()
             || !self.uniforms.all_found()
-            || (!self.plain && skinned_lit.iter().any(|parameter| parameter.is_null()))
+            || (self.plain && self.weight.is_null())
+            || (!self.plain && lit.iter().any(|parameter| parameter.is_null()))
         {
             render_log::line(format_args!("raw program{}: parameters missing\n", self.label()));
             return false;
@@ -356,16 +368,22 @@ impl RawSet {
         let weights1 = if weights > 4 { weights - 4 } else { 1 } as u8;
         let weights1_offset = if weights > 4 { 4 * WEIGHT_SIZES[weight_type] } else { 0 };
         let weights1_format = if weights > 4 { WEIGHT_FORMATS[weight_type] } else { gxm::ATTRIBUTE_FORMAT_U8 };
-        let attributes = [
-            attribute(0, layout.position_offset, POSITION_FORMATS[((format >> 7) & 3) as usize], 3, self.position),
-            attribute(0, texcoord_offset, TEXCOORD_FORMATS[(format & 3) as usize], 2, self.texcoord),
-            attribute(0, color_offset, gxm::ATTRIBUTE_FORMAT_U8, 2, self.color_bytes),
-            attribute(0, color_offset, gxm::ATTRIBUTE_FORMAT_U8N, 4, self.color32),
-            attribute(0, normal_offset, POSITION_FORMATS[((format >> 5) & 3) as usize], 3, self.normal),
-            attribute(0, 0, WEIGHT_FORMATS[weight_type], weights0, self.weights0),
-            attribute(0, weights1_offset, weights1_format, weights1, self.weights1),
-        ];
-        let used = if self.plain { 4 } else { 7 };
+        let position = attribute(0, layout.position_offset, POSITION_FORMATS[((format >> 7) & 3) as usize], 3, self.position);
+        let mut attributes = [position; 7];
+        attributes[1] = attribute(0, texcoord_offset, TEXCOORD_FORMATS[(format & 3) as usize], 2, self.texcoord);
+        attributes[2] = attribute(0, color_offset, gxm::ATTRIBUTE_FORMAT_U8, 2, self.color_bytes);
+        attributes[3] = attribute(0, color_offset, gxm::ATTRIBUTE_FORMAT_U8N, 4, self.color32);
+        let used = if self.plain {
+            // The first weight (one byte from byte 0 without weights: the
+            // program multiplies it by 0 then).
+            attributes[4] = attribute(0, 0, WEIGHT_FORMATS[weight_type], 1, self.weight);
+            5
+        } else {
+            attributes[4] = attribute(0, normal_offset, POSITION_FORMATS[((format >> 5) & 3) as usize], 3, self.normal);
+            attributes[5] = attribute(0, 0, WEIGHT_FORMATS[weight_type], weights0, self.weights0);
+            attributes[6] = attribute(0, weights1_offset, weights1_format, weights1, self.weights1);
+            7
+        };
         let stream = [VertexStream { stride: layout.size as u16, index_source: gxm::INDEX_SOURCE_INDEX_16BIT }];
         let program = vertex_program(
             self.id,

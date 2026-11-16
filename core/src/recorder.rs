@@ -23,7 +23,7 @@ use crate::draw_stream::{DrawStream, Job, JobKind, QueuedDraw};
 use crate::frame::{draw_flags, test_flags, Catalog, Draw, Frame, FrameVertex, Geometry, PalettePlace, TextureDescriptor};
 use crate::ge_state::GeState;
 use crate::lighting::{pack_normal, pack_s8_normal, pack_scaled_normal};
-use crate::transform::VertexLighting;
+use crate::transform::{TransformBuilder, TransformInputs, VertexLighting};
 use crate::memory::{physical, PspMemory};
 use crate::snapshot::{Reader, Writer};
 use crate::stats::FrameStats;
@@ -141,12 +141,12 @@ pub mod fallback {
 /// none), which knows why it turned the draw down last (`RawArena::refusal`).
 fn fallback_reason(
     prepared: &Prepared,
-    transform: Option<&Transform>,
+    inputs: Option<&TransformInputs>,
     format: VertexFormat,
     primitive_type: u32,
     raw: Option<&crate::raw_arena::RawArena>,
 ) -> usize {
-    let Some(transform) = transform.filter(|_| !format.is_through()) else {
+    let Some(inputs) = inputs.filter(|_| !format.is_through()) else {
         return fallback::THROUGH;
     };
     let Some(raw) = raw.filter(|_| crate::raw_arena::ENABLED.load(core::sync::atomic::Ordering::Relaxed)) else {
@@ -156,7 +156,7 @@ fn fallback_reason(
         fallback::MORPH
     } else if !prepared.gpu_transform {
         fallback::UNTEXTURED
-    } else if !may_go_raw(prepared, transform.lights.as_ref().map(|lights| lights.gpu_ready()), format) {
+    } else if !may_go_raw(prepared, inputs.lighting().map(|lighting| lighting.gpu_ready()), format) {
         fallback::LIGHTS
     } else if primitive_type == primitive::RECTANGLES {
         fallback::SPRITES
@@ -751,12 +751,35 @@ fn store_palette(geometry: &mut Geometry, fill: PaletteFill, memory: &mut impl P
     geometry.fill_palette(fill.place, &words[..readable]);
 }
 
+/// A 3D job's transform: its inputs, which is all a raw draw needs
+/// (`raw_blocks`: the vertex program multiplies), and the CPU's `Transform`,
+/// worked out from them only for draws decoded on the CPU (`built`).
+pub(crate) struct JobTransform<'a> {
+    pub inputs: &'a TransformInputs,
+    builder: &'a mut TransformBuilder,
+}
+
+impl<'a> JobTransform<'a> {
+    pub(crate) fn new(inputs: &'a TransformInputs, builder: &'a mut TransformBuilder) -> Self {
+        JobTransform { inputs, builder }
+    }
+
+    /// The CPU's transform (`TransformBuilder::build`: redone only where the
+    /// inputs changed since the last one built).
+    fn built(&mut self) -> &Transform {
+        let building = crate::phase::recorder::enter(crate::phase::recorder::TRANSFORM);
+        let transform = self.builder.build(self.inputs);
+        crate::phase::recorder::leave(building);
+        transform
+    }
+}
+
 pub(crate) fn run_job(
     geometry: &mut Geometry,
     stats: &mut FrameStats,
     job: &Job,
     calls: &[PrimCall],
-    transform: Option<&Transform>,
+    transform: Option<JobTransform>,
     memory: &mut impl PspMemory,
     cache: Option<&mut VertexCache>,
 ) {
@@ -770,7 +793,7 @@ fn run_job_now(
     stats: &mut FrameStats,
     job: &Job,
     calls: &[PrimCall],
-    transform: Option<&Transform>,
+    mut transform: Option<JobTransform>,
     memory: &mut impl PspMemory,
     mut cache: Option<&mut VertexCache>,
 ) {
@@ -781,7 +804,7 @@ fn run_job_now(
     }
     let format = VertexFormat(job.format);
     let layout = format.layout();
-    match (job.kind, transform) {
+    match (job.kind, transform.as_mut()) {
         (JobKind::Batch, Some(transform)) => record_batch_vertices(
             geometry,
             stats,
@@ -794,10 +817,10 @@ fn run_job_now(
             calls,
             cache,
         ),
-        _ => {
-            if let Some(transform) = transform {
+        (_, mut transform) => {
+            if let Some(transform) = transform.as_deref() {
                 let indexed = (&job.prepared, job.material_color, job.index_bounds);
-                if record_raw_indexed(geometry, memory, format, &layout, transform, indexed, calls, cache.as_deref_mut()) {
+                if record_raw_indexed(geometry, memory, format, &layout, transform.inputs, indexed, calls, cache.as_deref_mut()) {
                     return;
                 }
             }
@@ -808,7 +831,7 @@ fn run_job_now(
                     memory,
                     format,
                     &layout,
-                    transform,
+                    transform.as_deref_mut(),
                     &job.prepared,
                     job.material_color,
                     call,
@@ -830,7 +853,7 @@ fn record_raw_indexed(
     memory: &mut impl PspMemory,
     format: VertexFormat,
     layout: &VertexLayout,
-    transform: &Transform,
+    inputs: &TransformInputs,
     (prepared, material_color, bounds): (&Prepared, u32, Option<(u32, u32)>),
     calls: &[PrimCall],
     cache: Option<&mut VertexCache>,
@@ -841,11 +864,11 @@ fn record_raw_indexed(
     {
         return false;
     }
-    let Some(fields) = raw_colors_if_enabled(prepared, material_color, transform, format) else {
+    let Some(fields) = raw_colors_if_enabled(prepared, material_color, inputs.lighting(), format) else {
         return false;
     };
     let draw = Draw { first_vertex: geometry.vertex_count(), first_index: geometry.index_count(), ..prepared.draw };
-    record_raw_draw(geometry, memory, format, layout, transform, (calls, bounds), &fields, cache, draw)
+    record_raw_draw(geometry, memory, format, layout, inputs, (calls, bounds), &fields, cache, draw)
 }
 
 /// A batch's vertices: chunks of up to RUN_VERTICES vertices read, decoded
@@ -860,7 +883,7 @@ fn record_batch_vertices(
     memory: &mut impl PspMemory,
     format: VertexFormat,
     layout: &VertexLayout,
-    transform: &Transform,
+    job_transform: &mut JobTransform,
     prepared: &Prepared,
     material_color: u32,
     calls: &[PrimCall],
@@ -869,7 +892,8 @@ fn record_batch_vertices(
     let color_of = |color: Option<u32>| prepared.frame_color(prepared.base_color(color, material_color));
     let colors = prepared.color_key(material_color);
     // Raw PSP vertices for the GPU (`raw_arena`), where the draw allows it.
-    let raw_colors = raw_colors_if_enabled(prepared, material_color, transform, format);
+    let inputs = job_transform.inputs;
+    let raw_colors = raw_colors_if_enabled(prepared, material_color, inputs.lighting(), format);
     let mut start = 0;
     while start < calls.len() {
         let mut end = start + 1;
@@ -881,14 +905,15 @@ fn record_batch_vertices(
         let chunk = &calls[start..end];
         let mut draw = Draw { first_vertex: geometry.vertex_count(), first_index: geometry.index_count(), ..prepared.draw };
         if let Some(fields) = raw_colors.as_ref() {
-            if record_raw_draw(geometry, memory, format, layout, transform, (chunk, None), fields, cache.as_deref_mut(), draw) {
+            if record_raw_draw(geometry, memory, format, layout, inputs, (chunk, None), fields, cache.as_deref_mut(), draw) {
                 start = end;
                 continue;
             }
         }
         let raw = cache.as_deref().and_then(|cache| cache.raw.as_ref());
-        let reason = fallback_reason(prepared, Some(transform), format, chunk[0].primitive_type, raw);
+        let reason = fallback_reason(prepared, Some(inputs), format, chunk[0].primitive_type, raw);
         let gpu = GpuRun { wanted: prepared.gpu_transform, cache: cache.as_deref_mut(), colors, lighting: prepared.gpu_lighting() };
+        let transform = job_transform.built();
         let previous = crate::phase::recorder::enter(crate::phase::recorder::CPU_DECODE);
         let run = record_3d_run(geometry, memory, format, layout, transform, chunk, draw.first_vertex, &color_of, gpu);
         crate::phase::recorder::leave(previous);
@@ -914,7 +939,7 @@ fn record_batch_vertices(
                         memory,
                         format,
                         layout,
-                        Some(transform),
+                        Some(&mut *job_transform),
                         prepared,
                         material_color,
                         call,
@@ -1186,7 +1211,7 @@ fn record_vertices(
     memory: &mut impl PspMemory,
     format: VertexFormat,
     layout: &VertexLayout,
-    transform: Option<&Transform>,
+    transform: Option<&mut JobTransform>,
     prepared: &Prepared,
     material_color: u32,
     call: PrimCall,
@@ -1205,7 +1230,7 @@ fn record_vertices_now(
     memory: &mut impl PspMemory,
     format: VertexFormat,
     layout: &VertexLayout,
-    transform: Option<&Transform>,
+    transform: Option<&mut JobTransform>,
     prepared: &Prepared,
     material_color: u32,
     call: PrimCall,
@@ -1213,27 +1238,29 @@ fn record_vertices_now(
 ) {
     let PrimCall { primitive_type, count, .. } = call;
     let mut draw = Draw { first_vertex: geometry.vertex_count(), first_index: geometry.index_count(), ..prepared.draw };
+    let inputs = transform.as_ref().map(|transform| transform.inputs);
     if primitive_type == primitive::RECTANGLES {
         // Rectangles are never culled (PPSSPP: no cull for GE_PRIM_RECTANGLES).
         draw.flags = (draw.flags | draw_flags::RECTANGLES) & !(draw_flags::CULL | draw_flags::CULL_CCW);
         // 3D: raw sprites for the GPU where the draw allows it.
-        if let Some(transform) = transform {
-            if record_raw_sprites(geometry, memory, format, layout, transform, prepared, material_color, call, cache.as_deref_mut(), draw) {
+        if let Some(inputs) = inputs {
+            if record_raw_sprites(geometry, memory, format, layout, inputs, prepared, material_color, call, cache.as_deref_mut(), draw) {
                 return;
             }
         }
-    } else if let (Some(transform), IndexFormat::None) = (transform, format.index_format()) {
+    } else if let (Some(inputs), IndexFormat::None) = (inputs, format.index_format()) {
         // Raw PSP vertices for the GPU where the draw allows it, as a
         // batch's runs (MTX: ~440 single PRIMs per race frame).
-        if let Some(fields) = raw_colors_if_enabled(prepared, material_color, transform, format) {
-            if record_raw_draw(geometry, memory, format, layout, transform, (&[call], None), &fields, cache.as_deref_mut(), draw) {
+        if let Some(fields) = raw_colors_if_enabled(prepared, material_color, inputs.lighting(), format) {
+            if record_raw_draw(geometry, memory, format, layout, inputs, (&[call], None), &fields, cache.as_deref_mut(), draw) {
                 return;
             }
         }
     }
     // Everything below decodes the vertices on the CPU.
     let raw = cache.as_deref().and_then(|cache| cache.raw.as_ref());
-    count_fallback(stats, fallback_reason(prepared, transform, format, primitive_type, raw), 1, count);
+    count_fallback(stats, fallback_reason(prepared, inputs, format, primitive_type, raw), 1, count);
+    let transform = transform.map(|transform| transform.built());
     let decoding = crate::phase::recorder::enter(crate::phase::recorder::CPU_DECODE);
     record_on_cpu(geometry, stats, memory, format, layout, transform, prepared, material_color, call, cache, draw);
     crate::phase::recorder::leave(decoding);
@@ -1821,13 +1848,18 @@ fn record_3d_run_now(
 /// (`Prepared::gpu_lighting`: directional lights, the plain colour
 /// function), and only formats with normals. Skinned formats (any number of
 /// weights) are skinned in the shader where the run's weights differ.
-fn raw_color_fields(prepared: &Prepared, material_color: u32, transform: &Transform, format: VertexFormat) -> Option<crate::frame::RawColors> {
+fn raw_color_fields(
+    prepared: &Prepared,
+    material_color: u32,
+    lights: Option<&crate::lighting::LightingRegisters>,
+    format: VertexFormat,
+) -> Option<crate::frame::RawColors> {
     use crate::frame::RawColors;
     use crate::raw_vertex::{channels, lighting, replace};
-    if !may_go_raw(prepared, transform.lights.as_ref().map(|lights| lights.gpu_ready()), format) {
+    if !may_go_raw(prepared, lights.map(|lights| lights.gpu_ready()), format) {
         return None;
     }
-    if transform.lights.is_some() {
+    if lights.is_some() {
         let opaque = prepared.gpu_lighting()?;
         // White without a vertex colour (the light set's materials are used
         // then); alpha forced only for unblended draws, as the light set does.
@@ -1893,13 +1925,13 @@ fn goes_raw(prepared: &Prepared, lighting: Option<&crate::lighting::LightingRegi
 fn raw_colors_if_enabled(
     prepared: &Prepared,
     material_color: u32,
-    transform: &Transform,
+    lights: Option<&crate::lighting::LightingRegisters>,
     format: VertexFormat,
 ) -> Option<crate::frame::RawColors> {
     if !crate::raw_arena::ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
         return None;
     }
-    raw_color_fields(prepared, material_color, transform, format)
+    raw_color_fields(prepared, material_color, lights, format)
 }
 
 /// Records `calls` as one raw draw (`record_raw_run`) from `draw` (the
@@ -1913,7 +1945,7 @@ fn record_raw_draw(
     memory: &mut impl PspMemory,
     format: VertexFormat,
     layout: &VertexLayout,
-    transform: &Transform,
+    inputs: &TransformInputs,
     (calls, bounds): (&[PrimCall], Option<(u32, u32)>),
     colors: &crate::frame::RawColors,
     cache: Option<&mut VertexCache>,
@@ -1922,7 +1954,7 @@ fn record_raw_draw(
     let Some(raw) = cache.and_then(|cache| cache.raw.as_mut()) else {
         return false;
     };
-    match record_raw_run(geometry, memory, format, layout, transform, (calls, bounds), colors, raw) {
+    match record_raw_run(geometry, memory, format, layout, inputs, (calls, bounds), colors, raw) {
         Some(placed) => {
             draw.transform = placed.transform;
             // The vertices as the GPU reads them: plain vertices (an indexed
@@ -1959,7 +1991,7 @@ fn record_raw_sprites(
     memory: &mut impl PspMemory,
     format: VertexFormat,
     layout: &VertexLayout,
-    transform: &Transform,
+    inputs: &TransformInputs,
     prepared: &Prepared,
     material_color: u32,
     call: PrimCall,
@@ -1971,7 +2003,7 @@ fn record_raw_sprites(
     if !drawable || !sprites_suit_raw(format, sprites) {
         return false;
     }
-    let Some(colors) = raw_colors_if_enabled(prepared, material_color, transform, format) else {
+    let Some(colors) = raw_colors_if_enabled(prepared, material_color, inputs.lighting(), format) else {
         return false;
     };
     // The sprite program has neither lights nor FIX A (nativeres_raw_sprite_v.cg).
@@ -1994,7 +2026,7 @@ fn record_raw_sprites(
     let bytes = unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4) };
     let source = &bytes[skew as usize..];
     let pair = 2 * stride as usize;
-    let Some(number) = geometry.add_transform(&transform.rows().gpu_transform()) else {
+    let Some(number) = crate::raw_blocks::raw_transform(geometry, inputs, None) else {
         return false;
     };
     let Some(colors_number) = geometry.add_raw_colors(&colors) else {
@@ -2053,14 +2085,14 @@ fn record_raw_run(
     memory: &mut impl PspMemory,
     format: VertexFormat,
     layout: &VertexLayout,
-    transform: &Transform,
+    inputs: &TransformInputs,
     (calls, bounds): (&[PrimCall], Option<(u32, u32)>),
     colors: &crate::frame::RawColors,
     raw: &mut crate::raw_arena::RawArena,
 ) -> Option<RawRun> {
     refusing(raw, fallback::REFUSED);
     if format.index_format() != IndexFormat::None {
-        return record_raw_indexed_run(geometry, memory, format, layout, transform, (calls, bounds), colors, raw);
+        return record_raw_indexed_run(geometry, memory, format, layout, inputs, (calls, bounds), colors, raw);
     }
     // All vertices up to the last PRIM's last whole triangle (as `record_3d_run`).
     let (last, before) = calls.split_last()?;
@@ -2078,22 +2110,12 @@ fn record_raw_run(
     let skew = address & 3;
     let length = stride * (used - 1) + format.bytes_used(layout);
     // Zero copy: the GPU reads the vertices from PSP RAM; the CPU doesn't
-    // look at them (`raw_arena::zero_copy_wanted` leaves out the formats
-    // that would need it).
-    let in_psp_ram = memory.zero_copy(address, length) && !(format.has_weights() && format.weight_count() == 1);
+    // look at them.
+    let in_psp_ram = memory.zero_copy(address, length);
     refusing(raw, fallback::UNREADABLE);
     let words = if in_psp_ram { &[][..] } else { memory.borrow_words(address & !3, (skew + length).div_ceil(4) as usize)? };
-    // Skinned formats: one bone whose weight every vertex shares (MTX: most
-    // of its skinned parts) is folded into the rows, as the GPU path does it
-    // (lit: only a positive weight, else the normals would turn around);
-    // otherwise the shader skins (`GpuTransform::raw_skin`).
-    let lit = colors.rules[0] == crate::raw_vertex::lighting::LIGHTS;
-    let shared = (format.has_byte_weights() && format.weight_count() == 1 && !in_psp_ram)
-        .then(|| shared_weight(words, skew, stride, used as usize))
-        .flatten()
-        .filter(|&weight| !lit || weight > 0.0);
     refusing(raw, fallback::TABLES_FULL);
-    let (number, colors_number, bones) = raw_entry(geometry, format, transform, colors, shared)?;
+    let (number, colors_number, bones) = raw_entry(geometry, format, inputs, colors)?;
     let runs = calls.iter().filter(|call| triangle_count(call.primitive_type, call.count) > 0).count();
     refusing(raw, fallback::ARENA_FULL);
     let (window, mut first) = if in_psp_ram {
@@ -2123,18 +2145,18 @@ fn record_raw_run(
     Some(RawRun { transform: number, colors: colors_number, bones, window, listed: false })
 }
 
-/// A raw draw's transform entry (with the shared weight folded in, or
-/// skinning in the shader), raw colours and bones: `(Draw::transform,
-/// Draw::raw_colors, Draw::bones)`.
+/// A raw draw's transform (`raw_blocks::raw_transform`: its object, camera
+/// and, lit by the GPU, light set), raw colours and bones (skinned formats,
+/// one weight too: the program skins): `(Draw::transform, Draw::raw_colors,
+/// Draw::bones)`.
 fn raw_entry(
     geometry: &mut Geometry,
     format: VertexFormat,
-    transform: &Transform,
+    inputs: &TransformInputs,
     colors: &crate::frame::RawColors,
-    shared: Option<f32>,
 ) -> Option<(u32, u32, u32)> {
     let previous = crate::phase::recorder::enter(crate::phase::recorder::RAW_ENTRY);
-    let entry = raw_entry_now(geometry, format, transform, colors, shared);
+    let entry = raw_entry_now(geometry, format, inputs, colors);
     crate::phase::recorder::leave(previous);
     entry
 }
@@ -2142,28 +2164,13 @@ fn raw_entry(
 fn raw_entry_now(
     geometry: &mut Geometry,
     format: VertexFormat,
-    transform: &Transform,
+    inputs: &TransformInputs,
     colors: &crate::frame::RawColors,
-    shared: Option<f32>,
 ) -> Option<(u32, u32, u32)> {
     let lit = colors.rules[0] == crate::raw_vertex::lighting::LIGHTS;
-    let skinned = format.has_weights() && shared.is_none();
-    let rows = match shared {
-        Some(weight) => transform.weighted_rows(weight),
-        None if skinned => transform.skinned_row_transform(),
-        None => transform.rows(),
-    };
-    let mut entry = rows.gpu_transform();
-    let bones = if skinned { geometry.add_bones(transform.gpu_bones())? + 1 } else { 0 };
-    if lit {
-        let lights = transform.lights.as_ref()?;
-        let opaque = colors.rules[1] != 0.0;
-        // Skinned in the shader: the normals are skinned there too, so only
-        // the world matrix takes them on.
-        entry.normal_rows = if skinned { lights.normal_rows(None) } else { transform.gpu_normal_rows(lights) };
-        entry.light_set[0] = geometry.add_light_set(&lights.gpu(format.has_color(), opaque))? as f32;
-    }
-    let number = geometry.add_transform(&entry)?;
+    let bones = if format.has_weights() { geometry.add_bones(inputs.bones())? + 1 } else { 0 };
+    let lighting = lit.then(|| (format.has_color(), colors.rules[1] != 0.0));
+    let number = crate::raw_blocks::raw_transform(geometry, inputs, lighting)?;
     let colors_number = geometry.add_raw_colors(colors)?;
     Some((number, colors_number, bones))
 }
@@ -2173,19 +2180,17 @@ fn raw_entry_now(
 /// triangles, strips and fans they then are (index runs as for
 /// `record_raw_run`). PPSSPP decodes the index range and keeps the
 /// indices; gathering keeps our raw draws on index runs. The vertices come
-/// from the job's copy (lowest..highest index, `queue_draw`). One weight
-/// that every gathered vertex shares is folded into the rows (Monster
-/// Hunter Freedom places its static models with one 16-bit weight per
-/// vertex: uploading their bones per job filled the bone table); other
-/// skinned formats skin in the shader. `None` if anything is unreadable or
-/// doesn't fit (arena room may be left used).
+/// from the job's copy (lowest..highest index, `queue_draw`). Skinned
+/// formats (Monster Hunter Freedom places its static models with one 16-bit
+/// weight per vertex) are skinned by the program. `None` if anything is
+/// unreadable or doesn't fit (arena room may be left used).
 #[allow(clippy::too_many_arguments)]
 fn record_raw_gathered(
     geometry: &mut Geometry,
     memory: &mut impl PspMemory,
     format: VertexFormat,
     layout: &VertexLayout,
-    transform: &Transform,
+    inputs: &TransformInputs,
     (calls, bounds): (&[PrimCall], Option<(u32, u32)>),
     colors: &crate::frame::RawColors,
     raw: &mut crate::raw_arena::RawArena,
@@ -2223,14 +2228,10 @@ fn record_raw_gathered(
     let gathering = crate::phase::recorder::enter(crate::phase::recorder::GATHER);
     let gathered = gather_vertices(memory, format, calls, used_of, index_start, index_words, span_start, span_words, lowest, stride, out);
     crate::phase::recorder::leave(gathering);
-    let written = gathered?;
+    gathered?;
     let lit = colors.rules[0] == crate::raw_vertex::lighting::LIGHTS;
-    let shared = (format.has_weights() && format.weight_count() == 1)
-        .then(|| shared_weight_of(&out[..written], stride, format.weight_format()))
-        .flatten()
-        .filter(|&weight| !lit || weight > 0.0);
     refusing(raw, fallback::TABLES_FULL);
-    let (number, colors_number, bones) = raw_entry(geometry, format, transform, colors, shared)?;
+    let (number, colors_number, bones) = raw_entry(geometry, format, inputs, colors)?;
     let runs = calls.iter().filter(|call| used_of(call) >= 3).count();
     let out_indices = geometry.reserve_indices(3 * runs)?;
     let mut first = placed.first_vertex(stride);
@@ -2280,7 +2281,7 @@ fn record_raw_indexed_run(
     memory: &mut impl PspMemory,
     format: VertexFormat,
     layout: &VertexLayout,
-    transform: &Transform,
+    inputs: &TransformInputs,
     (calls, bounds): (&[PrimCall], Option<(u32, u32)>),
     colors: &crate::frame::RawColors,
     raw: &mut crate::raw_arena::RawArena,
@@ -2296,12 +2297,12 @@ fn record_raw_indexed_run(
         let in_psp_ram = memory.zero_copy(span_start, span_length);
         if in_psp_ram || span <= SPARSE_SPAN * corners {
             let converting = crate::phase::recorder::enter(crate::phase::recorder::CONVERT);
-            let run = record_raw_converted(geometry, memory, format, layout, transform, calls, colors, raw, (lowest, highest), in_psp_ram);
+            let run = record_raw_converted(geometry, memory, format, layout, inputs, calls, colors, raw, (lowest, highest), in_psp_ram);
             crate::phase::recorder::leave(converting);
             return run;
         }
     }
-    record_raw_gathered(geometry, memory, format, layout, transform, (calls, bounds), colors, raw)
+    record_raw_gathered(geometry, memory, format, layout, inputs, (calls, bounds), colors, raw)
 }
 
 /// Indexed PRIMs (triangles, strips, fans; `calls`) as a raw draw that keeps
@@ -2326,7 +2327,7 @@ fn record_raw_converted(
     memory: &mut impl PspMemory,
     format: VertexFormat,
     layout: &VertexLayout,
-    transform: &Transform,
+    inputs: &TransformInputs,
     calls: &[PrimCall],
     colors: &crate::frame::RawColors,
     raw: &mut crate::raw_arena::RawArena,
@@ -2366,11 +2367,7 @@ fn record_raw_converted(
         (RawPlace::Arena(placed.window), placed.first_vertex(stride))
     };
 
-    // The corners first: a single weight that every vertex they use shares
-    // is folded into the rows (as gathering does; the span may hold other
-    // vertices with other weights).
     refusing(raw, fallback::TABLES_FULL);
-    let first_index = geometry.index_count();
     let out = geometry.reserve_indices(corners as usize)?;
     refusing(raw, fallback::UNREADABLE);
     let words = memory.borrow_words(index_start & !3, index_words)?;
@@ -2385,16 +2382,7 @@ fn record_raw_converted(
     if !converted {
         return None;
     }
-    let mut shared = None;
-    if !in_psp_ram && format.has_weights() && format.weight_count() == 1 {
-        let words = memory.borrow_words(span_start & !3, (span_skew + span_length).div_ceil(4) as usize)?;
-        // Safe to view as bytes: `words` covers the span.
-        let bytes = unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4) };
-        let span = &bytes[span_skew as usize..(span_skew + span_length) as usize];
-        let corners = &geometry.indices_from(first_index);
-        shared = shared_weight_of_corners(span, stride, format.weight_format(), corners, first).filter(|&weight| !lit || weight > 0.0);
-    }
-    let (number, colors_number, bones) = raw_entry(geometry, format, transform, colors, shared)?;
+    let (number, colors_number, bones) = raw_entry(geometry, format, inputs, colors)?;
     raw.stats.lit += lit as u32;
     raw.stats.converted += 1;
     Some(RawRun { transform: number, colors: colors_number, bones, window: place, listed: true })
@@ -2598,43 +2586,8 @@ fn store_direct_run<const COLOR: u32, const SKINNED: bool, const GPU: bool>(
 /// The weight all `used` vertices of a single-weight run share (8-bit
 /// weights, the first byte of each vertex, as `store_direct_run` reads
 /// them), or `None` if they differ. Reads one byte per vertex: cheap next
-/// to decoding, so it's done for cache hits too.
-/// The one weight (first field) every vertex in `bytes` has, any weight
-/// format (1 = 8-bit /128, 2 = 16-bit /32768, 3 = float, as PPSSPP
-/// decodes them): `None` if they differ.
-fn shared_weight_of(bytes: &[u8], stride: u32, weight_format: usize) -> Option<f32> {
-    let size = [0, 1, 2, 4][weight_format & 3];
-    let stride = stride as usize;
-    if size == 0 || stride == 0 || bytes.len() < size {
-        return None;
-    }
-    let first = &bytes[..size];
-    if !bytes.chunks_exact(stride).all(|vertex| &vertex[..size] == first) {
-        return None;
-    }
-    Some(match weight_format {
-        1 => first[0] as f32 * (1.0 / 128.0),
-        2 => u16::from_le_bytes([first[0], first[1]]) as f32 * (1.0 / 32768.0),
-        _ => f32::from_le_bytes([first[0], first[1], first[2], first[3]]),
-    })
-}
-
-/// `shared_weight_of` over the vertices a converted draw's corners use
-/// (`record_raw_converted`): `corners` are vertex numbers, `first` the
-/// span's first vertex (`span` starts with it).
-fn shared_weight_of_corners(span: &[u8], stride: u32, weight_format: usize, corners: &[u16], first: u32) -> Option<f32> {
-    let size = [0, 1, 2, 4][weight_format & 3];
-    let weight_at = |corner: u16| {
-        let at = (corner as u32).checked_sub(first)? as usize * stride as usize;
-        span.get(at..at + size)
-    };
-    let weight = weight_at(*corners.first()?)?;
-    if !corners.iter().all(|&corner| weight_at(corner) == Some(weight)) {
-        return None;
-    }
-    shared_weight_of(weight, stride, weight_format)
-}
-
+/// to decoding, so it's done for cache hits too. (The CPU path's runs; raw
+/// draws are skinned by the program, `raw_blocks`.)
 fn shared_weight(words: &[u32], skew: u32, stride: u32, used: usize) -> Option<f32> {
     // Safe to view as bytes: `words` covers the run's span (`record_3d_run`).
     let bytes = unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4) };
@@ -4600,8 +4553,7 @@ mod tests {
     /// PRIM): the CPU path took ~150 ms per village frame on the Vita.
     /// Indexed PRIMs go raw: the arena holds the vertices the indices name,
     /// in index order, one index run per PRIM; the one 16-bit weight every
-    /// vertex has is folded into the rows (no bones: the bone table filled
-    /// up with one upload per placed object).
+    /// vertex has is skinned by the program (its bone in the bone table).
     #[test]
     fn indexed_prims_gather_their_vertices_into_raw_runs() {
         let ge = ge_for_3d();
@@ -4609,7 +4561,7 @@ mod tests {
         let format = VertexFormat((2 << 9) | (3 << 7) | (1 << 11));
         let layout = format.layout();
         assert_eq!(layout.size, 16);
-        let transform = Transform::new(&ge, format);
+        let inputs = crate::transform::TransformInputs::of(&ge, format);
         let mut words = Vec::new();
         for i in 0..10u32 {
             words.extend([0x8000, (i as f32).to_bits(), 0f32.to_bits(), 0f32.to_bits()]); // weight 1.0
@@ -4619,15 +4571,15 @@ mod tests {
         let indices = VERTICES + 160;
         let strip = |index_address| PrimCall { primitive_type: primitive::TRIANGLE_STRIP, count: 3, vertex_address: VERTICES, index_address };
         let calls = [strip(indices), strip(indices + 3)];
-        let colors = raw_color_fields(&Prepared { gpu_transform: true, ..Prepared::EMPTY }, 0xFFFF_FFFF, &transform, format).expect("raw");
+        let colors = raw_color_fields(&Prepared { gpu_transform: true, ..Prepared::EMPTY }, 0xFFFF_FFFF, inputs.lighting(), format).expect("raw");
         let mut raw = crate::raw_arena::RawArena::new(Box::leak(vec![0u8; crate::raw_arena::WINDOW_BYTES as usize].into_boxed_slice()));
         let mut frame = new_boxed_frame();
         let first_index = frame.indices().len();
         let run = {
             let (mut geometry, _) = frame.split();
-            record_raw_gathered(&mut geometry, &mut memory, format, &layout, &transform, (&calls, None), &colors, &mut raw).expect("gathered")
+            record_raw_gathered(&mut geometry, &mut memory, format, &layout, &inputs, (&calls, None), &colors, &mut raw).expect("gathered")
         };
-        assert_eq!(run.bones, 0, "the shared weight is folded, no bones");
+        assert_ne!(run.bones, 0, "one weight: skinned by the program (its bone in the table)");
         let RawPlace::Arena(window) = run.window else { panic!("in the arena") };
         let runs = &frame.indices()[first_index..];
         assert_eq!(runs.len(), 6);
@@ -4671,7 +4623,7 @@ mod tests {
             let format = VertexFormat((3 << 7) | (index_bits << 11));
             let layout = format.layout();
             assert_eq!(layout.size, 12);
-            let transform = Transform::new(&ge, format);
+            let inputs = crate::transform::TransformInputs::of(&ge, format);
             let mut words = Vec::new();
             for i in 0..20u32 {
                 words.extend([(i as f32).to_bits(), 0, 0]);
@@ -4682,7 +4634,7 @@ mod tests {
             let indices = VERTICES + 20 * 12;
             let call = |primitive_type, count, at: u32| PrimCall { primitive_type, count, vertex_address: VERTICES, index_address: indices + at * size };
             let calls = [call(primitive::TRIANGLES, 6, 0), call(primitive::TRIANGLE_STRIP, 5, 6), call(primitive::TRIANGLE_FAN, 4, 11)];
-            let colors = raw_color_fields(&Prepared { gpu_transform: true, ..Prepared::EMPTY }, 0xFFFF_FFFF, &transform, format).expect("raw");
+            let colors = raw_color_fields(&Prepared { gpu_transform: true, ..Prepared::EMPTY }, 0xFFFF_FFFF, inputs.lighting(), format).expect("raw");
             let mut corners_x = Vec::new();
             for convert in [true, false] {
                 let mut memory = Lending { base: VERTICES, words: words.clone() };
@@ -4692,9 +4644,9 @@ mod tests {
                 let run = {
                     let (mut geometry, _) = frame.split();
                     if convert {
-                        record_raw_converted(&mut geometry, &mut memory, format, &layout, &transform, &calls, &colors, &mut raw, (3, 19), false)
+                        record_raw_converted(&mut geometry, &mut memory, format, &layout, &inputs, &calls, &colors, &mut raw, (3, 19), false)
                     } else {
-                        record_raw_gathered(&mut geometry, &mut memory, format, &layout, &transform, (&calls, Some((3, 19))), &colors, &mut raw)
+                        record_raw_gathered(&mut geometry, &mut memory, format, &layout, &inputs, (&calls, Some((3, 19))), &colors, &mut raw)
                     }
                     .expect("recorded")
                 };
@@ -4721,21 +4673,21 @@ mod tests {
         let ge = ge_for_3d();
         let format = VertexFormat((3 << 7) | (1 << 11));
         let layout = format.layout();
-        let transform = Transform::new(&ge, format);
+        let inputs = crate::transform::TransformInputs::of(&ge, format);
         let mut words = Vec::new();
         for i in 0..8u32 {
             words.extend([(i as f32).to_bits(), 0, 0]);
         }
         words.push(u32::from_le_bytes([2, 3, 7, 0])); // 7: past the bounds below
         let calls = [PrimCall { primitive_type: primitive::TRIANGLES, count: 3, vertex_address: VERTICES, index_address: VERTICES + 8 * 12 }];
-        let colors = raw_color_fields(&Prepared { gpu_transform: true, ..Prepared::EMPTY }, 0xFFFF_FFFF, &transform, format).expect("raw");
+        let colors = raw_color_fields(&Prepared { gpu_transform: true, ..Prepared::EMPTY }, 0xFFFF_FFFF, inputs.lighting(), format).expect("raw");
         let mut raw = crate::raw_arena::RawArena::new(Box::leak(vec![0u8; crate::raw_arena::WINDOW_BYTES as usize].into_boxed_slice()));
         let mut frame = new_boxed_frame();
         let (mut geometry, _) = frame.split();
         let mut memory = Lending { base: VERTICES, words: words.clone() };
-        assert!(record_raw_converted(&mut geometry, &mut memory, format, &layout, &transform, &calls, &colors, &mut raw, (2, 5), false).is_none());
+        assert!(record_raw_converted(&mut geometry, &mut memory, format, &layout, &inputs, &calls, &colors, &mut raw, (2, 5), false).is_none());
         let mut memory = Lending { base: VERTICES, words };
-        assert!(record_raw_gathered(&mut geometry, &mut memory, format, &layout, &transform, (&calls, Some((2, 5))), &colors, &mut raw).is_none());
+        assert!(record_raw_gathered(&mut geometry, &mut memory, format, &layout, &inputs, (&calls, Some((2, 5))), &colors, &mut raw).is_none());
     }
 
     /// MTX's puddle squares (user's savestate 8, 2026-11-10): the water is
@@ -4747,13 +4699,13 @@ mod tests {
     fn fix_a_draws_go_raw_like_the_ground_they_cover() {
         let ge = ge_for_3d();
         let format = VertexFormat(3 << 7);
-        let transform = Transform::new(&ge, format);
+        let inputs = crate::transform::TransformInputs::of(&ge, format);
         let water = Prepared { gpu_transform: true, blending: true, source_scale: Some(0x00C8_C8C8), ..Prepared::EMPTY };
         assert!(may_go_raw(&water, None, format), "FIX A no longer keeps a draw off the raw path");
-        let colors = raw_color_fields(&water, 0xFFFF_FFFF, &transform, format).expect("FIX A goes raw");
+        let colors = raw_color_fields(&water, 0xFFFF_FFFF, inputs.lighting(), format).expect("FIX A goes raw");
         assert_eq!(colors.scale, [200.0, 200.0, 200.0, 1.0]);
         assert_eq!(colors.color(Some(0x80FF_FFFF)), crate::blend::scale_color(0x80FF_FFFF, 0x00C8_C8C8));
         let ground = Prepared { source_scale: None, ..water };
-        assert_eq!(raw_color_fields(&ground, 0xFFFF_FFFF, &transform, format).expect("raw").scale, [0.0; 4]);
+        assert_eq!(raw_color_fields(&ground, 0xFFFF_FFFF, inputs.lighting(), format).expect("raw").scale, [0.0; 4]);
     }
 }

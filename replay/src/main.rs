@@ -311,11 +311,17 @@ fn run(dump_path: &str, png_path: &str, trace: bool) -> Result<(), String> {
     // How full the frame's tables for the GPU are: a run that finds one full
     // is transformed / lit on the CPU instead.
     println!(
-        "gpu tables: transforms {} of {}, light sets {} of {}",
+        "gpu tables: transforms {} of {}, light sets {} of {}, raw transforms {} of {}, raw cameras {} of {}, bone floats {} of {}",
         frame.transform_count,
         nativeres_core::frame::MAX_TRANSFORMS,
         frame.light_set_count,
-        nativeres_core::frame::MAX_LIGHT_SETS
+        nativeres_core::frame::MAX_LIGHT_SETS,
+        frame.raw_transform_count,
+        nativeres_core::frame::MAX_RAW_TRANSFORMS,
+        frame.raw_camera_count,
+        nativeres_core::frame::MAX_RAW_CAMERAS,
+        frame.bone_float_count,
+        nativeres_core::frame::MAX_BONE_FLOATS
     );
     let broken = frame.unfogged_draws_with_fog();
     if broken > 0 {
