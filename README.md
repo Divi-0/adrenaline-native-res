@@ -10,6 +10,8 @@ of showing the 480x272 picture of Sony's PSP emulator scaled up.
 > wrong pictures or run slower than without it; heavy 3D scenes can drop below the game's own frame
 > rate. Back up your saves.
 
+[Supported games](https://divi-0.github.io/adrenaline-native-res/)
+
 ## How it works
 
 Adrenaline runs PSP games in Sony's PSP emulator (the one inside the Vita's firmware for PS1/PSP
