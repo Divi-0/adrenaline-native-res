@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+# core: the PSP GE side, no Vita code (tested on the PC); vita: the
+# renderer on the Vita; plugin: adrenaline-native-res.suprx (vita as a plugin);
+# psp: the PSP side the plugin carries; replay: renders frame dumps on the PC
+# (regression test); shadercompiler: the Vita app compiling our shaders.
+members = ["core", "vita", "plugin", "psp", "replay", "shadercompiler"]
+
+# Abort on panic everywhere: there is no unwinder on the Vita, and a panic in
+# the renderer should stop it, not try to recover. Tests still unwind.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+# Link-time optimisation lets rustc drop the parts of `core` we don't use
+# (float formatting, 128-bit math, ...). Without it the whole of `core`
+# ends up in adrenaline_user, since the Vita link doesn't remove unused code.
+lto = true
+codegen-units = 1

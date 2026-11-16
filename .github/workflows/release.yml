@@ -1,0 +1,45 @@
+# Builds adrenaline-native-res.suprx in the SDK image (docker/Dockerfile) and, for a
+# tag v*, publishes it as a GitHub release. Run by hand (Actions -> Release
+# -> Run workflow) it only builds and keeps the plugin as a workflow
+# artifact.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the SDK image
+        run: docker build -t nativepsp-sdk docker
+
+      - name: Test and build the plugin
+        run: docker run --rm -v "$PWD:/src" -w /src nativepsp-sdk bash -lc "sh scripts/build.sh"
+
+      - name: Package
+        run: |
+          mkdir dist
+          cp target/adrenaline-native-res.suprx dist/
+          cd dist && sha256sum adrenaline-native-res.suprx > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: adrenaline-native-res
+          path: dist/
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/adrenaline-native-res.suprx
+            dist/SHA256SUMS
+          generate_release_notes: true

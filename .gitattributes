@@ -1,0 +1,5 @@
+# Source files are stored with LF; the build runs in a Linux container.
+* text=auto eol=lf
+*.bin binary
+*.gxp binary
+*.png binary

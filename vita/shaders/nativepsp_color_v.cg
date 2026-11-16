@@ -1,0 +1,18 @@
+// NativePSP: vertex program for untextured draws and our own clears
+// (basic_programs.rs; vita2d's colour program until stage 2).
+//
+// aPosition: x, y in 960x544 pixels, z; aColor: RGBA bytes read as 0..1.
+// wvp: the projection (basic_programs.rs ORTHO, or draw.rs's native matrix).
+//
+// Compiled on the Vita: python tools/vita.py shaders.
+
+void main(
+	float3 aPosition,
+	float4 aColor,
+	uniform float4x4 wvp,
+	out float4 vPosition : POSITION,
+	out float4 vColor : COLOR)
+{
+	vPosition = mul(float4(aPosition, 1.0f), wvp);
+	vColor = aColor;
+}

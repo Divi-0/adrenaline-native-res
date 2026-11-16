@@ -1,0 +1,13 @@
+[package]
+name = "nativepsp-replay"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Replays a frame dumped on the Vita and renders it to a PNG on the PC"
+
+[[bin]]
+name = "replay"
+path = "src/main.rs"
+
+[dependencies]
+nativepsp-core = { path = "../core" }

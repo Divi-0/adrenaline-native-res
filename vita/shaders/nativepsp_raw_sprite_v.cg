@@ -1,0 +1,125 @@
+// NativePSP: vertex program for raw 3D sprites (PRIM type 6, rectangles;
+// NATIVEPSP_DRAW_RAW_SPRITES, frame.rs draw_flags::RAW_SPRITES). A PSP
+// sprite is two vertices: A (one corner) and B (the opposite one). The raw
+// arena holds each sprite's pair four times (one pair per corner); the
+// display reads the pairs as two streams over the same bytes (A at the
+// pair's start, B one stride later) and a third stream with the corner
+// number (0..3, vertex index % 4). Patched per PSP vertex format like
+// nativepsp_raw_v.cg (nativepsp_render.c SpriteProgramFor); same uniforms
+// and outputs. raw_vertex.rs RawCorners::sprite_corner is the CPU's copy:
+// keep both in step.
+//
+// What the CPU path does with a 3D sprite (recorder.rs record_vertices_now):
+// both corners to the screen; the sprite is left out if either is behind
+// the near plane; corner 0 at A, 1 at (B x, A y), 2 at (A x, B y), 3 at B,
+// texture coordinates the same way; colour and depth from B; fog of the
+// vertex the corner's y comes from; flat (w 1: no perspective across it).
+// Not lit with lights, not skinned (the capture leaves those to the CPU).
+//
+// aPosition, aTexcoord: A's; aPositionB, aTexcoordB, aColorBytesB,
+// aColor32B: B's (formats as nativepsp_raw_v.cg); aCorner: 0..3.
+//
+// Compiled on the Vita: python tools/vita.py shaders (see nativepsp_shader.c).
+
+float High(float value, float inverse)
+{
+	return floor(value * inverse + inverse * 0.5f);
+}
+
+float Expand5(float c) { return c * 8.0f + High(c, 0.25f); }
+float Expand6(float c) { return c * 4.0f + High(c, 0.0625f); }
+
+// The vertex colour as whole numbers 0..255, as nativepsp_raw_v.cg.
+float4 VertexColor(float mode, float2 bytes, float4 color32, float4 material)
+{
+	float lo = bytes.x, hi = bytes.y;
+	if (mode > 6.5f)
+		return floor(color32 * 255.0f + 0.5f);
+	if (mode > 5.5f) {
+		float g = High(lo, 1.0f / 16.0f), a = High(hi, 1.0f / 16.0f);
+		return float4(lo - g * 16.0f, g, hi - a * 16.0f, a) * 17.0f;
+	}
+	if (mode > 4.5f) {
+		float g = High(lo, 1.0f / 32.0f), a = High(hi, 1.0f / 128.0f), b = High(hi, 1.0f / 4.0f) - a * 32.0f;
+		float g2 = hi - High(hi, 1.0f / 4.0f) * 4.0f;
+		return float4(Expand5(lo - g * 32.0f), Expand5(g + g2 * 8.0f), Expand5(b), a * 255.0f);
+	}
+	if (mode > 3.5f) {
+		float g = High(lo, 1.0f / 32.0f), b = High(hi, 1.0f / 8.0f);
+		float g2 = hi - b * 8.0f;
+		return float4(Expand5(lo - g * 32.0f), Expand6(g + g2 * 8.0f), Expand5(b), 255.0f);
+	}
+	return material;
+}
+
+void main(
+	float3 aPosition,
+	float2 aTexcoord,
+	float3 aPositionB,
+	float2 aTexcoordB,
+	float2 aColorBytesB,
+	float4 aColor32B,
+	float aCorner,
+	uniform float4x4 wvp,
+	uniform float4 uRows[4],
+	uniform float4 uFogRow,
+	uniform float4 uViewport,
+	uniform float2 uUvScale,
+	uniform float4 uFormat,
+	uniform float4 uRawUv,
+	uniform float4 uMaterial,
+	uniform float4 uAmbient,
+	uniform float4 uEmissive,
+	uniform float4 uColors,
+	out float4 vPosition : POSITION,
+	out float2 vTexcoord : TEXCOORD0,
+	out float4 vColor : TEXCOORD1,
+	out float vFog : TEXCOORD2,
+	out float3 vSpecular : TEXCOORD3)
+{
+	// The separate specular colour (LIGHTMODE 1), added after texturing by
+	// the fragment program; 0 unless lit with it.
+	vSpecular = float3(0.0f, 0.0f, 0.0f);
+	float4 pa = float4(aPosition, 1.0f);
+	float4 pb = float4(aPositionB, 1.0f);
+	float4 ca = float4(dot(uRows[0], pa), dot(uRows[1], pa), dot(uRows[2], pa), dot(uRows[3], pa));
+	float4 cb = float4(dot(uRows[0], pb), dot(uRows[1], pb), dot(uRows[2], pb), dot(uRows[3], pb));
+	// The corner's x (and u) from B for corners 1 and 3, y (and v, fog)
+	// from B for corners 2 and 3.
+	float xFromB = (aCorner == 1.0f || aCorner == 3.0f) ? 1.0f : 0.0f;
+	float yFromB = aCorner > 1.5f ? 1.0f : 0.0f;
+	float2 screenA = uViewport.xy + uViewport.zw * ca.xy / ca.w;
+	float2 screenB = uViewport.xy + uViewport.zw * cb.xy / cb.w;
+	float2 screen = float2(lerp(screenA.x, screenB.x, xFromB), lerp(screenA.y, screenB.y, yFromB));
+	vPosition = mul(float4(screen, 0.0f, 1.0f), wvp);
+	// Depth from B, as nativepsp_raw_v.cg sends z / w out (w 1 here).
+	vPosition.z = 0.5f * (cb.z / cb.w - 1.0f);
+	vPosition.w = 1.0f;
+	// A corner behind the near plane: the whole sprite out (every corner
+	// reads both, so all four land here); beyond the GPU's far plane.
+	if (!(ca.w > 0.0f && ca.z >= -ca.w && cb.w > 0.0f && cb.z >= -cb.w))
+		vPosition = float4(0.0f, 0.0f, 2.0f, 1.0f);
+	float2 uvA = aTexcoord * uRawUv.xy + uRawUv.zw;
+	float2 uvB = aTexcoordB * uRawUv.xy + uRawUv.zw;
+	vTexcoord = float2(lerp(uvA.x, uvB.x, xFromB), lerp(uvA.y, uvB.y, yFromB)) * uUvScale;
+	vFog = lerp(dot(uFogRow, pa), dot(uFogRow, pb), yFromB);
+
+	// B's colour, with nativepsp_raw_v.cg's rules (lighting 0..2).
+	float mode = uFormat.y;
+	float4 color = VertexColor(mode, aColorBytesB, aColor32B, uMaterial);
+	if (uColors.x > 0.5f) {
+		float4 material = (uColors.x < 1.5f && mode > 3.5f) ? color : uMaterial;
+		float4 product = (2.0f * material + 1.0f) * (2.0f * uAmbient + 1.0f);
+		color = min(float4(High(product.x, 1.0f / 1024.0f), High(product.y, 1.0f / 1024.0f),
+		                   High(product.z, 1.0f / 1024.0f), High(product.w, 1.0f / 1024.0f)) + uEmissive, 255.0f);
+	}
+	if (uColors.y > 0.5f)
+		color.a = 255.0f;
+	if (uColors.w > 0.5f)
+		color.a = min(2.0f * color.a, 255.0f);
+	if (uColors.z > 1.5f)
+		color = float4(255.0f, 255.0f, 255.0f, 255.0f);
+	else if (uColors.z > 0.5f)
+		color.rgb = float3(255.0f, 255.0f, 255.0f);
+	vColor = color * (1.0f / 255.0f);
+}

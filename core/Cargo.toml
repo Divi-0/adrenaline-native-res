@@ -1,0 +1,9 @@
+[package]
+name = "nativepsp-core"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "PSP graphics engine (GE) display list handling, independent of the Vita"
+
+[lib]
+name = "nativepsp_core"

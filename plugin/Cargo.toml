@@ -1,0 +1,13 @@
+[package]
+name = "nativepsp-plugin"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "adrenaline-native-res.suprx: the taiHEN plugin for stock Adrenaline (the renderer is ../vita)"
+
+[lib]
+name = "nativepsp_plugin"
+crate-type = ["staticlib"]
+
+[dependencies]
+nativepsp-vita = { path = "../vita" }

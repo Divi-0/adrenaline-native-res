@@ -1,0 +1,9 @@
+// NativePSP: fragment program for untextured draws: the interpolated vertex
+// colour (basic_programs.rs; vita2d's colour program until stage 2).
+//
+// Compiled on the Vita: python tools/vita.py shaders.
+
+float4 main(float4 vColor : COLOR) : COLOR
+{
+	return vColor;
+}

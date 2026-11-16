@@ -1,0 +1,108 @@
+// NativePSP: vertex program for textured 3D draws whose vertices are still in
+// model space (NativePspDraw.transform, frame.rs GpuTransform): it does what
+// the capture's CPU path does per vertex (RowTransform::apply), then what
+// nativepsp_textured_v.cg does. Same outputs, so the same fragment programs.
+//
+// aPosition: model-space position.
+// aNormal: GPU-lit draws only: the vertex's normal (lighting.rs pack_normal,
+//   four signed bytes in the vertex's w); other draws' w is not a normal.
+// aTexcoord, aColor: as for nativepsp_textured_v.cg (already final), except
+//   for GPU-lit draws: aColor is the raw vertex colour, lit here.
+// uRows: projection x view x world (bone, position scale folded in), row by row.
+// uFogRow: fog factor = uFogRow . position; (0, 0, 0, 1) without fog.
+// uViewport: origin x, y and scale x, y, in PSP pixels.
+// uDepth: x = depth centre, y = depth scale (PSP depth / 65535).
+// wvp: our NativeMatrix (PSP pixels and depth to the Vita's clip space).
+// uUvScale: multiplies the texture coordinates (1, 1 but for textures from
+// our render targets; nativepsp_textured_v.cg's draws get it on the CPU).
+// uNormalRows: rows 0..2: the matrix taking aNormal to world space (world x
+//   bone, negated for REVERSENORMAL); row 3 x: > 0 = the draw is GPU-lit.
+// uLights: GPU-lit draws: frame.rs GpuLights as 22 float4:
+//   0..3 towards each light, 4..7 the specular half vectors,
+//   8..11 diffuse colours (a: powered diffuse), 12..15 specular colours
+//   (a: the light has specular), 16 ambient light (+ the lights' ambient;
+//   a: ambient alpha), 17 emissive (a: specular coefficient), 18 material
+//   ambient, 19 material diffuse (a: result opaque), 20 material specular
+//   (a: separate specular, LIGHTMODE 1: the specular part goes to vSpecular),
+//   21 x, y, z: ambient, diffuse, specular from the vertex colour.
+//   The lighting is PPSSPP's hardware vertex shader's for directional
+//   lights (VertexShaderGenerator.cpp), its CPU twin GpuLights::color.
+//
+// Only vertices in front of the PSP's near plane come here (the capture
+// clips the others), so clip.w > 0.
+//
+// Compiled on the Vita: python tools/vita.py shaders (see nativepsp_shader.c).
+
+// The GE's pow for lighting, as PPSSPP's shader without bit operations:
+// 1 for e <= 0, else 0 for x <= 0, else a true pow ("close enough"; the GE
+// interpolates between powers of two, lighting.rs psp_pow).
+float PspPow(float x, float e)
+{
+	if (e <= 0.0f)
+		return 1.0f;
+	return x > 0.0f ? exp2(e * log2(x)) : 0.0f;
+}
+
+void main(
+	float3 aPosition,
+	float4 aNormal,
+	float2 aTexcoord,
+	float4 aColor,
+	uniform float4x4 wvp,
+	uniform float4 uRows[4],
+	uniform float4 uFogRow,
+	uniform float4 uViewport,
+	uniform float4 uDepth,
+	uniform float2 uUvScale,
+	uniform float4 uNormalRows[4],
+	uniform float4 uLights[22],
+	out float4 vPosition : POSITION,
+	out float2 vTexcoord : TEXCOORD0,
+	out float4 vColor : TEXCOORD1,
+	out float vFog : TEXCOORD2,
+	out float3 vSpecular : TEXCOORD3)
+{
+	// The separate specular colour (LIGHTMODE 1), added after texturing by
+	// the fragment program; 0 unless lit with it.
+	vSpecular = float3(0.0f, 0.0f, 0.0f);
+	float4 p = float4(aPosition, 1.0f);
+	float4 clip = float4(dot(uRows[0], p), dot(uRows[1], p), dot(uRows[2], p), dot(uRows[3], p));
+	float overW = 1.0f / clip.w;
+	float3 screen = float3(uViewport.xy + uViewport.zw * clip.xy * overW, saturate(uDepth.x + uDepth.y * clip.z * overW));
+	// As nativepsp_textured_v.cg: times w, so the GPU interpolates with perspective.
+	vPosition = mul(float4(screen, 1.0f), wvp) * clip.w;
+	vTexcoord = aTexcoord * uUvScale;
+	vFog = dot(uFogRow, p);
+
+	float4 color = aColor;
+	if (uNormalRows[3].x > 0.5f) {
+		float3 n = float3(dot(uNormalRows[0].xyz, aNormal.xyz), dot(uNormalRows[1].xyz, aNormal.xyz),
+		                  dot(uNormalRows[2].xyz, aNormal.xyz));
+		float length2 = dot(n, n);
+		n = length2 > 0.0f ? n * rsqrt(length2) : float3(0.0f, 0.0f, 1.0f);
+		float4 fromVertex = uLights[21];
+		float4 ambientColor = lerp(uLights[18], aColor, fromVertex.x);
+		float3 diffuseColor = lerp(uLights[19].rgb, aColor.rgb, fromVertex.y);
+		float3 specularColor = lerp(uLights[20].rgb, aColor.rgb, fromVertex.z);
+		float coefficient = uLights[17].a;
+		float3 diffuse = float3(0.0f, 0.0f, 0.0f);
+		float3 specular = float3(0.0f, 0.0f, 0.0f);
+		for (int i = 0; i < 4; i++) {
+			float lightDot = dot(uLights[i].xyz, n);
+			if (uLights[8 + i].a > 0.5f)
+				lightDot = PspPow(lightDot, coefficient);
+			diffuse += uLights[8 + i].rgb * max(lightDot, 0.0f);
+			if (uLights[12 + i].a > 0.5f && lightDot >= 0.0f)
+				specular += uLights[12 + i].rgb * PspPow(dot(uLights[4 + i].xyz, n), coefficient);
+		}
+		float3 specularPart = specular * specularColor;
+		if (uLights[20].a > 0.5f) {
+			// Separate specular: after texturing (vSpecular).
+			vSpecular = saturate(specularPart);
+			specularPart = float3(0.0f, 0.0f, 0.0f);
+		}
+		color.rgb = saturate(uLights[17].rgb + uLights[16].rgb * ambientColor.rgb + diffuse * diffuseColor + specularPart);
+		color.a = uLights[19].a > 0.5f ? 1.0f : saturate(uLights[16].a * ambientColor.a);
+	}
+	vColor = color;
+}

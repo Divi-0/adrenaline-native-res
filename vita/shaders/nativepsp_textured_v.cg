@@ -1,0 +1,32 @@
+// NativePSP: vertex program for textured PSP draws.
+//
+// aPosition: x, y in vita2d's 960x544 units, z, and w. The position is
+// multiplied by w after the projection, so the GPU divides by it again:
+// the picture is unchanged, but texture coordinates, colours and fog are
+// then interpolated with perspective (w = 1 for 2D draws).
+// aColor: per-vertex colour (PSP vertex colour or material colour, with the
+// texture function applied), RGBA bytes read as 0..1.
+// aFog: PSP fog factor, 1 = no fog, 0 = fog colour (see nativepsp_textured_f.cg).
+//
+// Compiled on the Vita: python tools/vita.py shaders (see nativepsp_shader.c).
+
+void main(
+	float4 aPosition,
+	float2 aTexcoord,
+	float4 aColor,
+	float aFog,
+	uniform float4x4 wvp,
+	out float4 vPosition : POSITION,
+	out float2 vTexcoord : TEXCOORD0,
+	out float4 vColor : TEXCOORD1,
+	out float vFog : TEXCOORD2,
+	out float3 vSpecular : TEXCOORD3)
+{
+	// The separate specular colour (LIGHTMODE 1), added after texturing by
+	// the fragment program; 0 unless lit with it.
+	vSpecular = float3(0.0f, 0.0f, 0.0f);
+	vPosition = mul(float4(aPosition.xyz, 1.0f), wvp) * aPosition.w;
+	vTexcoord = aTexcoord;
+	vColor = aColor;
+	vFog = aFog;
+}

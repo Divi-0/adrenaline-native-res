@@ -1,0 +1,13 @@
+[package]
+name = "nativepsp-shadercompiler"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "NativePSP Shader Compiler: a Vita app (development only) that compiles our .cg shaders with Sony's runtime compiler"
+
+[lib]
+name = "nativepsp_shadercompiler"
+crate-type = ["staticlib"]
+
+[dependencies]
+nativepsp-core = { path = "../core" }

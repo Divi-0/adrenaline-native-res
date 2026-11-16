@@ -1,0 +1,4 @@
+# `Capture` is ~0.5 MiB and many tests make one on the stack; in debug
+# builds its temporaries overflow the test threads' default 2 MiB stack.
+[env]
+RUST_MIN_STACK = "16777216"

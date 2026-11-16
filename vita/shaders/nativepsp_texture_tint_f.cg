@@ -1,0 +1,12 @@
+// NativePSP: fragment program for nativepsp_texture_v.cg: the texel times
+// one colour for the whole draw (white for copies).
+//
+// Compiled on the Vita: python tools/vita.py shaders.
+
+float4 main(
+	float2 vTexcoord : TEXCOORD0,
+	uniform sampler2D tex,
+	uniform float4 uTintColor) : COLOR
+{
+	return tex2D(tex, vTexcoord) * uTintColor;
+}

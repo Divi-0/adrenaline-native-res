@@ -1,0 +1,480 @@
+//! Replays one PSP frame dumped on the Vita and renders it on the PC.
+//!
+//!     replay <dump.bin> <out.png> [--trace]
+//!     replay <dump.bin> --bench <runs> [walk|stats|produce|full]
+//!
+//! 3D draws are transformed the way the Vita does it, by default on the
+//! GPU (`frame::GpuTransform`, here `GpuTransform::to_screen`); with
+//! `--cpu-transform` (or `NATIVEPSP_CPU_TRANSFORM=1`) the capture
+//! transforms every vertex itself, as before. Both give the same picture.
+//!
+//! Draws for the GPU transform go through a vertex cache as on the Vita
+//! (`--no-cache` or `NATIVEPSP_NO_CACHE=1`: none; `--raw` or
+//! `NATIVEPSP_RAW=1`: 3D runs as raw PSP vertices, `raw_arena`). With `--twice` the frame is replayed a second
+//! time with the cache already filled, and that second frame is drawn.
+//!
+//! With `--trace`, prints the GE state of every draw (texture function,
+//! blending, tests, ...), to explain differences.
+//!
+//! If the dump contains the original picture, also writes
+//! `<out>-original.png` (enlarged 2x) and `<out>-diff.png` (differences
+//! amplified, black = identical), and prints the average difference per
+//! screen region.
+//!
+//! Runs the same `nativepsp-core` code as the Vita: restores the capture
+//! state from the start of the frame, feeds the frame's events through
+//! `Capture`, then draws the resulting frame description with a small
+//! software renderer that imitates what the Vita side does (its GPU
+//! shaders, alpha blending, 2x scale). Differences between this image and a
+//! Vita screenshot point at the Vita-specific code; wrong content in both
+//! points at the core.
+
+mod compare;
+mod dump_file;
+mod png;
+mod raster;
+mod sublists;
+mod trace;
+
+use std::process::ExitCode;
+
+use nativepsp_core::bench::{self, Mode};
+use nativepsp_core::block_cache::BlockCache;
+use nativepsp_core::capture::{Capture, Event};
+use nativepsp_core::dump::DumpView;
+use nativepsp_core::frame::{Frame, FrameVertex};
+
+use nativepsp_core::vertex_cache::{VertexCache, ARENA_VERTICES};
+use nativepsp_core::report;
+use nativepsp_core::snapshot::Reader;
+
+use dump_file::DumpFile;
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().collect();
+    let trace = args.iter().any(|arg| arg == "--trace");
+    // NATIVEPSP_LIGHTS=0: lit draws with their vertex colours as they are
+    // (as debug "lights 0" on the Vita), for comparing costs.
+    if std::env::var("NATIVEPSP_LIGHTS").is_ok_and(|value| value == "0") {
+        nativepsp_core::lighting::LIGHTS_ON.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+    if args.iter().any(|arg| arg == "--sublists") {
+        return match print_sublists(&args[1]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("error: {message}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if let Some(at) = args.iter().position(|arg| arg == "--bench") {
+        let runs = args.get(at + 1).and_then(|runs| runs.parse().ok()).unwrap_or(100);
+        let only = args.get(at + 2).map(String::as_str);
+        return match bench(&args[1], runs, only) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("error: {message}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let paths: Vec<&String> = args.iter().skip(1).filter(|arg| !arg.starts_with("--")).collect();
+    if paths.len() != 2 {
+        eprintln!("usage: replay <dump.bin> <out.png> [--trace]");
+        return ExitCode::FAILURE;
+    }
+    match run(paths[0], paths[1], trace) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("error: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Stage B's thread (`--stage-thread`) polls; nothing to wake.
+static PC_STAGE_HOOKS: nativepsp_core::walk_stream::WalkHooks =
+    nativepsp_core::walk_stream::WalkHooks { wake_reader: || {}, wait: std::thread::yield_now };
+
+fn stage_thread() -> bool {
+    std::env::args().any(|arg| arg == "--stage-thread") || std::env::var("NATIVEPSP_STAGE_THREAD").is_ok()
+}
+
+/// Whether the draw stream's copier copies the vertex memory (as the Vita's
+/// copy thread, here in this thread): `--copier` or NATIVEPSP_COPIER set.
+fn copier() -> bool {
+    std::env::args().any(|arg| arg == "--copier") || std::env::var("NATIVEPSP_COPIER").is_ok()
+}
+
+/// Whether the capture runs in two stages (`walk_stream`), both in this
+/// thread: `--pipeline` or NATIVEPSP_PIPELINE set.
+fn pipelined() -> bool {
+    std::env::args().any(|arg| arg == "--pipeline") || std::env::var("NATIVEPSP_PIPELINE").is_ok()
+}
+
+/// Whether 3D draws are left to the GPU transform (see the module comment).
+fn gpu_transform() -> bool {
+    !std::env::args().any(|arg| arg == "--cpu-transform") && std::env::var("NATIVEPSP_CPU_TRANSFORM").is_err()
+}
+
+/// A vertex cache (`nativepsp_core::vertex_cache`) for the session, unless
+/// `--no-cache`.
+fn new_vertex_cache() -> Option<&'static mut VertexCache> {
+    if std::env::args().any(|arg| arg == "--no-cache") || std::env::var("NATIVEPSP_NO_CACHE").is_ok() {
+        return None;
+    }
+    let arena = Box::leak(vec![FrameVertex::default(); ARENA_VERTICES].into_boxed_slice());
+    let cache = Box::leak(Box::new(VertexCache::new(arena)));
+    // Raw PSP vertices for the GPU (`--raw` or NATIVEPSP_RAW=1, as debug
+    // "rawvertices 1" on the Vita): a raw arena as big as the Vita's.
+    // Without: the old path (the regression hashes are the old path's;
+    // logs/prof/raw-vs-old.sh compares the two), though raw is on by
+    // default on the Vita.
+    let raw = std::env::args().any(|arg| arg == "--raw") || std::env::var("NATIVEPSP_RAW").is_ok_and(|value| value == "1");
+    nativepsp_core::raw_arena::ENABLED.store(raw, std::sync::atomic::Ordering::Relaxed);
+    nativepsp_core::raw_arena::SPRITES.store(raw, std::sync::atomic::Ordering::Relaxed);
+    // Like the Vita once its alpha-test program exists: textured draws are
+    // alpha-tested in the shader (this rasterizer tests every draw).
+    // NATIVEPSP_BLEND_ALPHA_TEST=1: blending stands in as before (A/B).
+    let shader_alpha_test = std::env::var("NATIVEPSP_BLEND_ALPHA_TEST").is_err();
+    nativepsp_core::blend::ALPHA_TEST_IN_SHADER.store(shader_alpha_test, std::sync::atomic::Ordering::Relaxed);
+    if raw {
+        cache.set_raw_arena(Box::leak(vec![0u8; RAW_ARENA_BYTES].into_boxed_slice()));
+    }
+    Some(cache)
+}
+
+/// The raw arena's size, as the Vita's (nativepsp_render.c RAW_ARENA_BYTES).
+const RAW_ARENA_BYTES: usize = 6 * 1024 * 1024;
+
+
+/// An empty frame description on the heap (it is ~2.2 MiB).
+fn new_frame() -> Box<Frame> {
+    let layout = std::alloc::Layout::new::<Frame>();
+    // Safe: Frame consists of integers and floats only, for which all-zero
+    // bytes are valid values, and the layout is non-zero-sized.
+    unsafe { Box::from_raw(std::alloc::alloc_zeroed(layout) as *mut Frame) }
+}
+
+fn run(dump_path: &str, png_path: &str, trace: bool) -> Result<(), String> {
+    let bytes = std::fs::read(dump_path).map_err(|error| format!("{dump_path}: {error}"))?;
+    let mut dump = DumpFile::parse(&bytes)?;
+    println!(
+        "dump: {} events, {} memory blocks of 1 KiB",
+        dump.events.len(),
+        dump.memory.block_count()
+    );
+
+    let mut capture = Capture::new();
+    capture.set_gpu_transform(gpu_transform());
+    capture.set_vertex_cache(new_vertex_cache());
+    capture.set_pipelined(pipelined());
+    // `--copier`: the vertex memory goes through the draw stream's copier
+    // (copied before the jobs are recorded, as the Vita's copy_thread.rs).
+    if copier() {
+        static COPIER: nativepsp_core::draw_stream::CopierHooks = nativepsp_core::draw_stream::CopierHooks { wake: || {} };
+        dump_file::use_for_copier(&dump.memory);
+        capture.set_stream_reader(Some(dump_file::COPIER_READER));
+        capture.set_stream_copier(Some(&COPIER));
+    }
+
+    let mut frame = new_frame();
+    let mut stats = None;
+    let rounds = if std::env::args().any(|arg| arg == "--twice") { 2 } else { 1 };
+    // Traces the round that is drawn (the last).
+    let mut tracer = trace::DrawTracer::new(trace);
+    let mut silent = trace::DrawTracer::new(false);
+    // Stage B on a thread of its own (`--stage-thread` or
+    // NATIVEPSP_STAGE_THREAD), as on the Vita.
+    let threaded = stage_thread();
+    if threaded {
+        capture.set_pipelined(true);
+        capture.set_stage_hooks(Some(&PC_STAGE_HOOKS));
+    }
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let capture_address = &mut capture as *mut Capture as usize;
+    let shared_memory = &dump.memory;
+    std::thread::scope(|scope| -> Result<(), String> {
+        if threaded {
+            scope.spawn(|| {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let mut memory = BlockCache::new(shared_memory);
+                    // Safe: the capture outlives the scope; this is its only
+                    // stage B thread (`Capture::run_stage_b_thread`).
+                    let run = unsafe { Capture::run_stage_b_thread(capture_address as *mut Capture, &mut memory) };
+                    if run == nativepsp_core::capture::StageBRun::Nothing {
+                        std::thread::yield_now();
+                    }
+                }
+            });
+        }
+        let result = (|| -> Result<(), String> {
+            for round in 0..rounds {
+                capture
+                    .load_state(&mut Reader::new(&dump.snapshot))
+                    .ok_or("the dump's capture state can't be restored (other version?)")?;
+                frame.clear();
+                let tracer = if round + 1 == rounds { &mut tracer } else { &mut silent };
+                for &(event_type, args) in &dump.events {
+                    let Some(event) = Event::from_ring(event_type, args) else {
+                        continue;
+                    };
+                    // A fresh block cache per event, as on the Vita.
+                    let mut memory = BlockCache::new(&dump.memory);
+                    if let Some(finished) = capture.handle_traced(event, &mut memory, Some(&mut frame), &mut *tracer) {
+                        stats = Some(finished);
+                    }
+                }
+                if round + 1 == rounds && rounds > 1 {
+                    if let Some(stats) = &stats {
+                        let cache = stats.cache;
+                        println!(
+                            "second round: vertex cache {} hits, {} misses, {} stored, {} for the CPU; raw runs {} ({} lit); transforms {}, light sets {}, raw colours {}, bone floats {}",
+                            cache.hits, cache.misses, cache.stored, cache.cpu_only, cache.raw_runs, cache.raw_lit,
+                            frame.transform_count, frame.light_set_count, frame.raw_colors_count, frame.bone_float_count
+                        );
+                    }
+                }
+            }
+            Ok(())
+        })();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        result
+    })?;
+    let stats = stats.ok_or("the dump contains no complete frame")?;
+    if capture.pipelined() {
+        let (sent, dropped) = capture.write_filter_counts();
+        println!("walk stream: {sent} plain register writes passed on, {dropped} left out (no change)");
+    }
+    if stats.approximated_draws > 0 {
+        let reasons: Vec<String> = nativepsp_core::recorder::approx::NAMES
+            .iter()
+            .zip(stats.approximated_by_reason)
+            .filter(|(_, count)| *count > 0)
+            .map(|(name, count)| format!("{name} {count}"))
+            .collect();
+        println!("approximated: {} ({})", stats.approximated_draws, reasons.join(", "));
+    }
+    if std::env::args().any(|arg| arg == "--vram") {
+        // Textures in VRAM (what the Vita side asks the PSP plugin to copy)
+        // and the framebuffers the frame draws into.
+        let framebuffers: std::collections::BTreeSet<u32> = frame.draws().iter().map(|draw| draw.framebuffer).collect();
+        println!("vram: framebuffers drawn {:08x?}", framebuffers);
+        for texture in frame.textures() {
+            let address = nativepsp_core::memory::fold_vram_mirror(texture.address & 0x0FFF_FFFF);
+            if (0x0400_0000..0x0420_0000).contains(&address) {
+                let size = nativepsp_core::texture::data_size(texture).unwrap_or(0);
+                println!(
+                    "vram: texture {address:08x} {}x{} format {} stride {}: {} KiB",
+                    texture.width, texture.height, texture.format, texture.buffer_width, size / 1024
+                );
+            }
+        }
+    }
+    if std::env::args().any(|arg| arg == "--runs") {
+        print_index_runs(&frame);
+    }
+    if std::env::args().any(|arg| arg == "--palettes") {
+        // The palette tables the Vita fills for this frame (one per distinct
+        // palette, as nativepsp_render.c SamePalette tells them apart).
+        let mut tables = std::collections::BTreeMap::<u8, std::collections::BTreeSet<(u32, u32, u32, u16)>>::new();
+        for texture in frame.textures().iter().filter(|texture| nativepsp_core::texture::is_palette_format(texture.format)) {
+            tables.entry(texture.format).or_default().insert((
+                texture.clut_format,
+                texture.palette_hash,
+                texture.palette_word_count,
+                texture.flags & nativepsp_core::frame::texture_flags::IGNORE_ALPHA,
+            ));
+        }
+        for (format, set) in &tables {
+            println!("palette tables: format {format}: {}", set.len());
+        }
+        println!(
+            "frame palettes: {} (by address and length), {} words",
+            frame.palettes().len(),
+            frame.palette_word_count
+        );
+    }
+    if std::env::args().any(|arg| arg == "--opcodes") {
+        tracer.print_opcode_counts();
+    }
+    {
+        tracer.print_light_survey();
+    }
+
+    let mut line = String::new();
+    report::write_frame(&mut line, &stats).map_err(|_| "report failed")?;
+    println!("frame: {line}");
+    // How full the frame's tables for the GPU are: a run that finds one full
+    // is transformed / lit on the CPU instead.
+    println!(
+        "gpu tables: transforms {} of {}, light sets {} of {}",
+        frame.transform_count,
+        nativepsp_core::frame::MAX_TRANSFORMS,
+        frame.light_set_count,
+        nativepsp_core::frame::MAX_LIGHT_SETS
+    );
+    let broken = frame.unfogged_draws_with_fog();
+    if broken > 0 {
+        println!("BROKEN: {broken} draws without fog have vertices with fog (Frame::unfogged_draws_with_fog)");
+    }
+    println!(
+        "description: {} draws, {} vertices, {} indices, {} textures, overflow {}, hash {:016x}",
+        frame.draws().len(),
+        frame.vertices().len(),
+        frame.corner_count(),
+        frame.textures().len(),
+        frame.is_overflowed() as u32,
+        frame.description_hash()
+    );
+    let gpu_draws: Vec<_> = frame.draws().iter().filter(|draw| draw.transform != 0).collect();
+    println!(
+        "gpu transform: {} transforms, {} draws, {} of {} vertices",
+        frame.transform_count,
+        gpu_draws.len(),
+        gpu_draws.iter().map(|draw| draw.vertex_count).sum::<u32>(),
+        frame.vertices().len()
+    );
+    println!("vertex hash: {:016x}", frame.vertex_hash());
+    if trace {
+        // The frame's textures, as the Vita looks them up.
+        for (index, texture) in frame.textures().iter().enumerate() {
+            println!(
+                "texture {index:3}: {:08x} {}x{} buffer width {} format {} swizzled {} data {} bytes",
+                texture.address,
+                texture.width,
+                texture.height,
+                texture.buffer_width,
+                texture.format,
+                texture.swizzled,
+                nativepsp_core::texture::data_size(texture).unwrap_or(0)
+            );
+        }
+        // The recorded draws, as the Vita gets them.
+        for (index, draw) in frame.draws().iter().enumerate() {
+            let corners: Vec<String> = frame.screen_corners(draw).take(3).map(|v| format!("({:.1},{:.1} uv {:.3},{:.3})", v.x, v.y, v.u, v.v)).collect();
+            println!(
+                "draw {index:3}: fb {:08x} tex {} flags {:x} scissor {},{}-{},{} {} vertices {}",
+                draw.framebuffer, draw.texture, draw.flags, draw.scissor_left, draw.scissor_top, draw.scissor_right,
+                draw.scissor_bottom, frame.draw_index_count(draw), corners.join(" ")
+            );
+        }
+    }
+
+    let image = raster::render_frame(&frame, &mut dump.memory, dump.original.as_ref());
+    write_png(png_path, &image)?;
+
+    if let Some(original) = &dump.original {
+        let enlarged = compare::enlarge(original, raster::WIDTH, raster::HEIGHT);
+        let base = png_path.trim_end_matches(".png");
+        write_png(&format!("{base}-original.png"), &enlarged)?;
+        write_png(&format!("{base}-diff.png"), &compare::difference_image(&image, &enlarged))?;
+        compare::print_region_differences(&image, &enlarged, raster::WIDTH, raster::HEIGHT);
+    } else {
+        println!("(no original picture in this dump)");
+    }
+    Ok(())
+}
+
+/// `--sublists`: the frame's sub-list calls (see `sublists`).
+fn print_sublists(dump_path: &str) -> Result<(), String> {
+    let bytes = std::fs::read(dump_path).map_err(|error| format!("{dump_path}: {error}"))?;
+    let dump = DumpFile::parse(&bytes)?;
+    let mut capture = Capture::new();
+    capture.set_gpu_transform(gpu_transform());
+    let mut frame = new_frame();
+    capture
+        .load_state(&mut Reader::new(&dump.snapshot))
+        .ok_or("the dump's capture state can't be restored (other version?)")?;
+    let mut sublists = sublists::SubLists::new();
+    for &(event_type, args) in &dump.events {
+        let Some(event) = Event::from_ring(event_type, args) else {
+            continue;
+        };
+        let mut memory = BlockCache::new(&dump.memory);
+        capture.handle_traced(event, &mut memory, Some(&mut frame), &mut sublists);
+    }
+    sublists.print();
+    Ok(())
+}
+
+/// Times the capture over the dump's events, `runs` times per mode, with
+/// the same code as the Vita's `capturebench` command (`core::bench`).
+/// `--runs`: the frame's index runs (`draw_flags::INDEX_RUNS`) by primitive
+/// type, with their triangles, and how many GPU draw calls they would take
+/// drawn straight from fixed index tables: list and sprite runs that follow
+/// on from the run before (same type, next vertex) join it; strips and fans
+/// are one call each.
+fn print_index_runs(frame: &nativepsp_core::frame::Frame) {
+    use nativepsp_core::command::primitive;
+    use nativepsp_core::frame::{draw_flags, run_triangles};
+    let mut by_type = std::collections::BTreeMap::<u16, (u32, u32)>::new();
+    let (mut draws, mut calls, mut corners) = (0u32, 0u32, 0u32);
+    let indices = frame.indices();
+    for draw in frame.draws().iter().filter(|draw| draw.flags & draw_flags::INDEX_RUNS != 0) {
+        draws += 1;
+        let runs = &indices[draw.first_index as usize..][..draw.index_count as usize];
+        let mut next: Option<(u16, u32)> = None; // type and vertex a joining run starts at
+        for run in runs.chunks_exact(3) {
+            let (kind, count, base) = (run[0], run[1], run[2] as u32);
+            let triangles = run_triangles(kind, count);
+            let entry = by_type.entry(kind).or_default();
+            entry.0 += 1;
+            entry.1 += triangles;
+            corners += 3 * triangles;
+            let vertices = match kind as u32 {
+                primitive::RECTANGLES => 4 * count as u32,
+                _ => count as u32,
+            };
+            let joinable = matches!(kind as u32, primitive::TRIANGLES | primitive::RECTANGLES);
+            if !(joinable && next == Some((kind, base))) {
+                calls += 1;
+            }
+            next = joinable.then_some((kind, base + vertices));
+        }
+    }
+    let name = |kind: u16| match kind as u32 {
+        primitive::TRIANGLES => "lists",
+        primitive::TRIANGLE_STRIP => "strips",
+        primitive::TRIANGLE_FAN => "fans",
+        primitive::RECTANGLES => "sprites",
+        _ => "other",
+    };
+    for (kind, (runs, triangles)) in &by_type {
+        println!("index runs: {} {runs} runs, {triangles} triangles", name(*kind));
+    }
+    println!("index runs: {draws} draws, {corners} corners written today, {calls} draw calls from tables");
+}
+
+fn bench(dump_path: &str, runs: u32, only: Option<&str>) -> Result<(), String> {
+    let bytes = std::fs::read(dump_path).map_err(|error| format!("{dump_path}: {error}"))?;
+    let dump = DumpView::parse(&bytes).ok_or("not a complete NativePSP dump (or another version)")?;
+    let mut index = vec![0u32; dump.block_count()];
+    let sorted = dump.sort_blocks(&mut index).ok_or("block index too small")?;
+    let mut capture = Box::new(Capture::new());
+    capture.set_gpu_transform(gpu_transform());
+    capture.set_vertex_cache(new_vertex_cache());
+    let mut frame = new_frame();
+    let modes = [("walk", Mode::WalkOnly), ("stats", Mode::Stats), ("produce", Mode::Produce), ("full", Mode::Full)];
+    for (name, mode) in modes.into_iter().filter(|(name, _)| only.is_none_or(|only| only == *name)) {
+        let start = std::time::Instant::now();
+        let totals = bench::run(&dump, sorted, mode, runs, &mut capture, &mut frame)
+            .ok_or("the dump's capture state can't be restored (other version?)")?;
+        let per_run = start.elapsed() / runs;
+        println!(
+            "{name:>12}: {per_run:>10.1?} per frame, {} copies (blocks + lines), {} draws, {} vertices ({runs} runs)",
+            totals.copies, totals.draws, totals.vertices
+        );
+        if mode == Mode::Full {
+            // The same as the Vita's capturebench prints for this dump.
+            println!("{:>12}  hashes {:016x} {:016x}", "", frame.description_hash(), frame.vertex_hash());
+        }
+    }
+    Ok(())
+}
+
+fn write_png(path: &str, pixels: &[u32]) -> Result<(), String> {
+    png::write_rgba(path, raster::WIDTH, raster::HEIGHT, pixels).map_err(|error| format!("{path}: {error}"))?;
+    println!("wrote {path}");
+    Ok(())
+}
