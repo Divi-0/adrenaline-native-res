@@ -99,6 +99,86 @@ fn sample_texture(catalog: &mut Catalog, memory: &mut impl PspMemory, prepared: 
     }
 }
 
+/// Why a draw's vertices were decoded on the CPU instead of going to the
+/// GPU raw (`raw_arena`): counted per reason in `FrameStats::fallback_prims`
+/// / `fallback_vertices` (capture log and replay: `cpu=`), so the CPU path
+/// can be driven to zero game by game. The first reason that applies, in
+/// this order.
+pub mod fallback {
+    /// Through mode (screen-space 2D): no raw program for it yet.
+    pub const THROUGH: usize = 0;
+    /// Raw vertices switched off, or no raw arena.
+    pub const RAW_OFF: usize = 1;
+    /// Morphing (several vertex sets blended by the GE).
+    pub const MORPH: usize = 2;
+    /// No GPU transform for the draw (`Prepared::gpu_transform`: untextured
+    /// 3D draws).
+    pub const UNTEXTURED: usize = 3;
+    /// Lit with lights the GPU path doesn't take (`may_go_raw`: not
+    /// directional, a colour function other than the plain one, no normals).
+    pub const LIGHTS: usize = 4;
+    /// 3D rectangles the raw sprite program can't draw (lights, FIX A,
+    /// weights, indexed, no whole sprite).
+    pub const SPRITES: usize = 5;
+    /// The raw path tried and refused for another reason than those below
+    /// (too many vertices for a window, a PRIM without a whole triangle).
+    pub const REFUSED: usize = 6;
+    /// No room in the raw arena (recent frames still use it; `raw=` counts
+    /// these runs too).
+    pub const ARENA_FULL: usize = 7;
+    /// A frame table full: transforms, light sets, raw colours, bones,
+    /// indices.
+    pub const TABLES_FULL: usize = 8;
+    /// The vertices or indices couldn't be read.
+    pub const UNREADABLE: usize = 9;
+    pub const COUNT: usize = 10;
+    pub const NAMES: [&str; COUNT] =
+        ["through", "raw_off", "morph", "untextured", "lights", "sprites", "refused", "arena_full", "tables_full", "unreadable"];
+}
+
+/// Why a PRIM drawn with this state goes to the CPU (`fallback`), asked
+/// where the raw path has turned it down; `raw` the raw arena (`None`:
+/// none), which knows why it turned the draw down last (`RawArena::refusal`).
+fn fallback_reason(
+    prepared: &Prepared,
+    transform: Option<&Transform>,
+    format: VertexFormat,
+    primitive_type: u32,
+    raw: Option<&crate::raw_arena::RawArena>,
+) -> usize {
+    let Some(transform) = transform.filter(|_| !format.is_through()) else {
+        return fallback::THROUGH;
+    };
+    let Some(raw) = raw.filter(|_| crate::raw_arena::ENABLED.load(core::sync::atomic::Ordering::Relaxed)) else {
+        return fallback::RAW_OFF;
+    };
+    if format.morph_count() != 1 {
+        fallback::MORPH
+    } else if !prepared.gpu_transform {
+        fallback::UNTEXTURED
+    } else if !may_go_raw(prepared, transform.lights.as_ref().map(|lights| lights.gpu_ready()), format) {
+        fallback::LIGHTS
+    } else if primitive_type == primitive::RECTANGLES {
+        fallback::SPRITES
+    } else {
+        raw.refusal
+    }
+}
+
+/// Notes why the raw path turns a draw down if it does so now
+/// (`RawArena::refusal`): call before each step that can fail.
+#[inline(always)]
+fn refusing(raw: &mut crate::raw_arena::RawArena, reason: usize) {
+    raw.refusal = reason;
+}
+
+/// Counts `prims` PRIMs with `vertices` PSP vertices as decoded on the CPU
+/// for `reason` (`fallback`).
+fn count_fallback(stats: &mut FrameStats, reason: usize, prims: u32, vertices: u32) {
+    stats.fallback_prims[reason] += prims;
+    stats.fallback_vertices[reason] += vertices;
+}
+
 /// Counts a draw's approximations (`approx` mask) `times` times.
 fn count_approximations(stats: &mut FrameStats, mask: u32, times: u32) {
     if mask == 0 {
@@ -683,7 +763,9 @@ fn run_job_now(
     mut cache: Option<&mut VertexCache>,
 ) {
     if let Some(fill) = job.palette {
+        let previous = crate::phase::recorder::enter(crate::phase::recorder::PALETTE);
         store_palette(geometry, fill, memory);
+        crate::phase::recorder::leave(previous);
     }
     let format = VertexFormat(job.format);
     let layout = format.layout();
@@ -792,9 +874,17 @@ fn record_batch_vertices(
                 continue;
             }
         }
+        let raw = cache.as_deref().and_then(|cache| cache.raw.as_ref());
+        let reason = fallback_reason(prepared, Some(transform), format, chunk[0].primitive_type, raw);
         let gpu = GpuRun { wanted: prepared.gpu_transform, cache: cache.as_deref_mut(), colors, lighting: prepared.gpu_lighting() };
-        match record_3d_run(geometry, memory, format, layout, transform, chunk, draw.first_vertex, &color_of, gpu) {
+        let previous = crate::phase::recorder::enter(crate::phase::recorder::CPU_DECODE);
+        let run = record_3d_run(geometry, memory, format, layout, transform, chunk, draw.first_vertex, &color_of, gpu);
+        crate::phase::recorder::leave(previous);
+        match run {
             Run::Recorded { transform, cached } => {
+                // (Chunks the run path turns down are counted PRIM by PRIM
+                // in `record_vertices_now`.)
+                count_fallback(stats, reason, chunk.len() as u32, chunk.iter().map(|call| call.count).sum());
                 draw.transform = transform;
                 draw.flags |= draw_flags::INDEX_RUNS;
                 if let Some(window) = cached {
@@ -1120,7 +1210,41 @@ fn record_vertices_now(
                 return;
             }
         }
+    } else if let (Some(transform), IndexFormat::None) = (transform, format.index_format()) {
+        // Raw PSP vertices for the GPU where the draw allows it, as a
+        // batch's runs (MTX: ~440 single PRIMs per race frame).
+        if let Some(fields) = raw_colors_if_enabled(prepared, material_color, transform, format) {
+            if record_raw_draw(geometry, memory, format, layout, transform, &[call], &fields, cache.as_deref_mut(), draw) {
+                return;
+            }
+        }
     }
+    // Everything below decodes the vertices on the CPU.
+    let raw = cache.as_deref().and_then(|cache| cache.raw.as_ref());
+    count_fallback(stats, fallback_reason(prepared, transform, format, primitive_type, raw), 1, count);
+    let decoding = crate::phase::recorder::enter(crate::phase::recorder::CPU_DECODE);
+    record_on_cpu(geometry, stats, memory, format, layout, transform, prepared, material_color, call, cache, draw);
+    crate::phase::recorder::leave(decoding);
+}
+
+/// `record_vertices_now`'s CPU half: the vertices decoded (and for 3D
+/// transformed, or left to the GPU transform through the vertex cache)
+/// into the frame's vertices.
+#[allow(clippy::too_many_arguments)]
+fn record_on_cpu(
+    geometry: &mut Geometry,
+    stats: &mut FrameStats,
+    memory: &mut impl PspMemory,
+    format: VertexFormat,
+    layout: &VertexLayout,
+    transform: Option<&Transform>,
+    prepared: &Prepared,
+    material_color: u32,
+    call: PrimCall,
+    cache: Option<&mut VertexCache>,
+    mut draw: Draw,
+) {
+    let PrimCall { primitive_type, count, .. } = call;
     let texel_scale = prepared.texel_scale;
     let first_vertex = draw.first_vertex;
 
@@ -1142,13 +1266,6 @@ fn record_vertices_now(
     // transform the whole run at once.
     if let Some(transform) = transform {
         if primitive_type != primitive::RECTANGLES && format.index_format() == IndexFormat::None {
-            // Raw PSP vertices for the GPU where the draw allows it, as a
-            // batch's runs (MTX: ~440 single PRIMs per race frame).
-            if let Some(fields) = raw_colors_if_enabled(prepared, material_color, transform, format) {
-                if record_raw_draw(geometry, memory, format, layout, transform, &[call], &fields, cache.as_deref_mut(), draw) {
-                    return;
-                }
-            }
             let run_color = |color: Option<u32>| frame_color(prepared.base_color(color, material_color));
             let gpu = GpuRun { wanted: prepared.gpu_transform, cache, colors: prepared.color_key(material_color), lighting: prepared.gpu_lighting() };
             match record_3d_run(geometry, memory, format, layout, transform, &[call], first_vertex, &run_color, gpu) {
@@ -1836,7 +1953,7 @@ fn record_raw_sprites(
 ) -> bool {
     let sprites = call.count / 2;
     let drawable = crate::raw_arena::SPRITES.load(core::sync::atomic::Ordering::Relaxed);
-    if !drawable || sprites == 0 || sprites > 65_536 / 4 || format.has_weights() {
+    if !drawable || !sprites_suit_raw(format, sprites) {
         return false;
     }
     let Some(colors) = raw_colors_if_enabled(prepared, material_color, transform, format) else {
@@ -1853,9 +1970,11 @@ fn record_raw_sprites(
     let address = call.vertex_address;
     let skew = address & 3;
     let length = stride * (2 * sprites - 1) + format.bytes_used(layout);
+    refusing(raw, fallback::UNREADABLE);
     let Some(words) = memory.borrow_words(address & !3, (skew + length).div_ceil(4) as usize) else {
         return false;
     };
+    refusing(raw, fallback::TABLES_FULL);
     // Safe to view as bytes: `words` covers the PRIM (borrowed for its span).
     let bytes = unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4) };
     let source = &bytes[skew as usize..];
@@ -1868,9 +1987,11 @@ fn record_raw_sprites(
     };
     // A block of four pairs per sprite; whole blocks into the window, so
     // the first corner of each sprite is a multiple of 4.
+    refusing(raw, fallback::ARENA_FULL);
     let Some((placed, out)) = raw.reserve(4 * pair as u32 * sprites, 4 * pair as u32) else {
         return false;
     };
+    let copying = crate::phase::recorder::enter(crate::phase::recorder::ARENA);
     for (sprite, block) in out.chunks_exact_mut(4 * pair).enumerate() {
         // The last vertex may end before a whole stride: what's there.
         let start = sprite * pair;
@@ -1879,7 +2000,9 @@ fn record_raw_sprites(
             corner[..end - start].copy_from_slice(&source[start..end]);
         }
     }
+    crate::phase::recorder::leave(copying);
     let first_corner = 4 * placed.first_vertex(4 * pair as u32);
+    refusing(raw, fallback::TABLES_FULL);
     let Some(record) = geometry.reserve_indices(3) else {
         return false;
     };
@@ -1891,6 +2014,14 @@ fn record_raw_sprites(
     draw.flags |= draw_flags::RAW_SPRITES;
     geometry.finish_raw_draw(draw, placed.window);
     true
+}
+
+/// Whether `sprites` rectangles of this format can be raw sprites: at least
+/// one, few enough for 16-bit corner numbers, no weights (the sprite program
+/// doesn't skin), and not indexed: indexed rectangles name their vertices by
+/// index, and the raw sprites are copied from the vertices in a row.
+fn sprites_suit_raw(format: VertexFormat, sprites: u32) -> bool {
+    sprites > 0 && sprites <= 65_536 / 4 && !format.has_weights() && format.index_format() == IndexFormat::None
 }
 
 /// Records a run of PRIMs as raw PSP vertices (`draw_flags::RAW_VERTICES`):
@@ -1912,6 +2043,7 @@ fn record_raw_run(
     colors: &crate::frame::RawColors,
     raw: &mut crate::raw_arena::RawArena,
 ) -> Option<RawRun> {
+    refusing(raw, fallback::REFUSED);
     if format.index_format() != IndexFormat::None {
         return record_raw_gathered(geometry, memory, format, layout, transform, calls, colors, raw);
     }
@@ -1934,6 +2066,7 @@ fn record_raw_run(
     // look at them (`raw_arena::zero_copy_wanted` leaves out the formats
     // that would need it).
     let in_psp_ram = memory.zero_copy(address, length) && !(format.has_weights() && format.weight_count() == 1);
+    refusing(raw, fallback::UNREADABLE);
     let words = if in_psp_ram { &[][..] } else { memory.borrow_words(address & !3, (skew + length).div_ceil(4) as usize)? };
     // Skinned formats: one bone whose weight every vertex shares (MTX: most
     // of its skinned parts) is folded into the rows, as the GPU path does it
@@ -1944,8 +2077,10 @@ fn record_raw_run(
         .then(|| shared_weight(words, skew, stride, used as usize))
         .flatten()
         .filter(|&weight| !lit || weight > 0.0);
+    refusing(raw, fallback::TABLES_FULL);
     let (number, colors_number, bones) = raw_entry(geometry, format, transform, colors, shared)?;
     let runs = calls.iter().filter(|call| triangle_count(call.primitive_type, call.count) > 0).count();
+    refusing(raw, fallback::ARENA_FULL);
     let (window, mut first) = if in_psp_ram {
         raw.stats.psp_ram += 1;
         raw.stats.psp_ram_bytes += length;
@@ -1953,10 +2088,14 @@ fn record_raw_run(
     } else {
         // Safe to view as bytes: `words` covers the run (borrowed for its span).
         let bytes = unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4) };
-        let placed = raw.put(&bytes[skew as usize..(skew + length) as usize], stride)?;
+        let copying = crate::phase::recorder::enter(crate::phase::recorder::ARENA);
+        let placed = raw.put(&bytes[skew as usize..(skew + length) as usize], stride);
+        crate::phase::recorder::leave(copying);
+        let placed = placed?;
         (RawPlace::Arena(placed.window), placed.first_vertex(stride))
     };
     raw.stats.lit += (colors.rules[0] == crate::raw_vertex::lighting::LIGHTS) as u32;
+    refusing(raw, fallback::TABLES_FULL);
     let out = geometry.reserve_indices(3 * runs)?;
     let mut records = out.chunks_exact_mut(3);
     for call in calls {
@@ -1973,6 +2112,19 @@ fn record_raw_run(
 /// skinning in the shader), raw colours and bones: `(Draw::transform,
 /// Draw::raw_colors, Draw::bones)`.
 fn raw_entry(
+    geometry: &mut Geometry,
+    format: VertexFormat,
+    transform: &Transform,
+    colors: &crate::frame::RawColors,
+    shared: Option<f32>,
+) -> Option<(u32, u32, u32)> {
+    let previous = crate::phase::recorder::enter(crate::phase::recorder::RAW_ENTRY);
+    let entry = raw_entry_now(geometry, format, transform, colors, shared);
+    crate::phase::recorder::leave(previous);
+    entry
+}
+
+fn raw_entry_now(
     geometry: &mut Geometry,
     format: VertexFormat,
     transform: &Transform,
@@ -2042,15 +2194,64 @@ fn record_raw_gathered(
     let count: u32 = calls.iter().map(|call| call.count).sum();
     let index_skew = index_start & 3;
     let index_words = (index_skew + count * index_size).div_ceil(4) as usize;
+    refusing(raw, fallback::UNREADABLE);
     memory.borrow_words(index_start & !3, index_words)?;
-    let (lowest, highest) = index_bounds(memory, index_format, index_start, count)?;
+    let scanning = crate::phase::recorder::enter(crate::phase::recorder::INDICES);
+    let bounds = index_bounds(memory, index_format, index_start, count);
+    crate::phase::recorder::leave(scanning);
+    let (lowest, highest) = bounds?;
     let span_start = calls[0].vertex_address.wrapping_add(lowest * stride);
     let span_skew = span_start & 3;
     let span_length = (highest - lowest) * stride + format.bytes_used(layout);
     let span_words = (span_skew + span_length).div_ceil(4) as usize;
     memory.borrow_words(span_start & !3, span_words)?;
 
+    refusing(raw, fallback::ARENA_FULL);
     let (placed, out) = raw.reserve(used * stride, stride)?;
+    let gathering = crate::phase::recorder::enter(crate::phase::recorder::GATHER);
+    let gathered = gather_vertices(memory, format, calls, used_of, index_start, index_words, span_start, span_words, lowest, stride, out);
+    crate::phase::recorder::leave(gathering);
+    let written = gathered?;
+    let lit = colors.rules[0] == crate::raw_vertex::lighting::LIGHTS;
+    let shared = (format.has_weights() && format.weight_count() == 1)
+        .then(|| shared_weight_of(&out[..written], stride, format.weight_format()))
+        .flatten()
+        .filter(|&weight| !lit || weight > 0.0);
+    refusing(raw, fallback::TABLES_FULL);
+    let (number, colors_number, bones) = raw_entry(geometry, format, transform, colors, shared)?;
+    let runs = calls.iter().filter(|call| used_of(call) >= 3).count();
+    let out_indices = geometry.reserve_indices(3 * runs)?;
+    let mut first = placed.first_vertex(stride);
+    for (record, call) in out_indices.chunks_exact_mut(3).zip(calls.iter().filter(|call| used_of(call) >= 3)) {
+        let take = used_of(call);
+        record.copy_from_slice(&[call.primitive_type as u16, take as u16, first as u16]);
+        first += take;
+    }
+    raw.stats.lit += lit as u32;
+    Some(RawRun { transform: number, colors: colors_number, bones, window: RawPlace::Arena(placed.window) })
+}
+
+/// `record_raw_gathered`'s copy: each index's vertex, in index order, into
+/// `out` (one stride each, a short last vertex filled with zeros). The
+/// number of bytes written; `None` if the indices or the span can't be read.
+#[allow(clippy::too_many_arguments)]
+fn gather_vertices(
+    memory: &mut impl PspMemory,
+    format: VertexFormat,
+    calls: &[PrimCall],
+    used_of: impl Fn(&PrimCall) -> u32,
+    index_start: u32,
+    index_words: usize,
+    span_start: u32,
+    span_words: usize,
+    lowest: u32,
+    stride: u32,
+    out: &mut [u8],
+) -> Option<usize> {
+    let index_format = format.index_format();
+    let index_size = index_format.size();
+    let index_skew = index_start & 3;
+    let span_skew = span_start & 3;
     let mut written = 0usize;
     let mut position = 0u32; // index number from `index_start`
     let mut indices = [0u32; 64];
@@ -2087,22 +2288,7 @@ fn record_raw_gathered(
         }
         position += call.count;
     }
-    let lit = colors.rules[0] == crate::raw_vertex::lighting::LIGHTS;
-    let shared = (format.has_weights() && format.weight_count() == 1)
-        .then(|| shared_weight_of(&out[..written], stride, format.weight_format()))
-        .flatten()
-        .filter(|&weight| !lit || weight > 0.0);
-    let (number, colors_number, bones) = raw_entry(geometry, format, transform, colors, shared)?;
-    let runs = calls.iter().filter(|call| used_of(call) >= 3).count();
-    let out_indices = geometry.reserve_indices(3 * runs)?;
-    let mut first = placed.first_vertex(stride);
-    for (record, call) in out_indices.chunks_exact_mut(3).zip(calls.iter().filter(|call| used_of(call) >= 3)) {
-        let take = used_of(call);
-        record.copy_from_slice(&[call.primitive_type as u16, take as u16, first as u16]);
-        first += take;
-    }
-    raw.stats.lit += lit as u32;
-    Some(RawRun { transform: number, colors: colors_number, bones, window: RawPlace::Arena(placed.window) })
+    Some(written)
 }
 
 /// What `record_raw_run` gives the draw: its `Draw::transform`,
@@ -4214,6 +4400,20 @@ mod tests {
         };
         let xs: Vec<f32> = (0..6).map(|n| x_of(runs[2] + n)).collect();
         assert_eq!(xs, vec![7.0, 8.0, 9.0, 2.0, 3.0, 4.0]);
+    }
+
+    /// Indexed rectangles were taken by the raw sprite path, which copies
+    /// each sprite's vertex pair from the vertices in a row (found reading
+    /// the code, 2026-11-16; no dump has indexed sprites): they must be left
+    /// to the CPU path, which reads them by index.
+    #[test]
+    fn indexed_rectangles_are_not_raw_sprites() {
+        let plain = VertexFormat((3 << 7) | (2 << 2));
+        assert!(sprites_suit_raw(plain, 4));
+        for index_bits in [1 << 11, 2 << 11, 3 << 11] {
+            assert!(!sprites_suit_raw(VertexFormat(plain.0 | index_bits), 4), "index format {}", index_bits >> 11);
+        }
+        assert!(!sprites_suit_raw(plain, 0), "no whole sprite");
     }
 
     /// MTX's puddle squares (user's savestate 8, 2026-11-10): the water is

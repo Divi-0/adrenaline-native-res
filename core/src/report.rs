@@ -102,6 +102,22 @@ pub fn write_frame(out: &mut impl Write, stats: &FrameStats) -> fmt::Result {
         }
     }
 
+    // PRIMs decoded on the CPU by reason (`recorder::fallback`):
+    // cpu=<reason>:<PRIMs>/<PSP vertices>,...
+    if stats.fallback_prims.iter().any(|&prims| prims > 0) {
+        out.write_str(" cpu=")?;
+        let mut first = true;
+        for (reason, name) in crate::recorder::fallback::NAMES.iter().enumerate() {
+            if stats.fallback_prims[reason] > 0 {
+                if !first {
+                    out.write_char(',')?;
+                }
+                first = false;
+                write!(out, "{}:{}/{}", name, stats.fallback_prims[reason], stats.fallback_vertices[reason])?;
+            }
+        }
+    }
+
     if let Some(shown) = stats.displayed {
         write!(out, " shown={:08x}/{}/{}", shown.address, shown.stride, shown.pixel_format)?;
     }

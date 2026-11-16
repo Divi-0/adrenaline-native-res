@@ -12,6 +12,7 @@ use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, Ordering};
 
 use nativeres_core::draw_stream::{DrawStream, StreamHooks};
+use nativeres_core::phase;
 
 use crate::sys;
 
@@ -205,11 +206,15 @@ unsafe extern "C" fn recorder_thread(_args: u32, _argp: *mut c_void) -> i32 {
                 } else {
                     // Published jobs the copier (copy_thread.rs) hasn't
                     // copied yet: it is microseconds behind the producer.
+                    let waiting = phase::recorder::enter(phase::recorder::WAIT);
                     sys::sceKernelDelayThread(COPIER_WAIT_US);
+                    phase::recorder::leave(waiting);
                 }
             }
         }
         IN_USE.store(core::ptr::null_mut(), Ordering::SeqCst);
+        // For the profile: whatever was noted last, the thread is idle now.
+        phase::recorder::enter(phase::recorder::IDLE);
         // Sleep, unless jobs came in meanwhile (`SLEEPING`).
         SLEEPING.store(true, Ordering::SeqCst);
         core::sync::atomic::fence(Ordering::SeqCst);

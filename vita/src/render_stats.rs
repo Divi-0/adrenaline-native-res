@@ -59,6 +59,9 @@ pub struct RenderStats {
     pub plain_draws: u32,
     /// Draws blended with FIX B through the alpha (BLEND_FIX programs).
     pub fix_b_draws: u32,
+    /// Raw draws left out: no vertex program for their format (all
+    /// `programs::RAW_PROGRAMS` places taken, or the shaders not ready).
+    pub raw_no_program: u32,
     /// Of textures_us: the cache's lookups.
     pub lookup_us: u64,
     /// Of textures_us: palette tables for the frame's index textures.
@@ -98,6 +101,7 @@ impl RenderStats {
         alpha_test_skipped: 0,
         ring_draws: 0,
         plain_draws: 0,
+        raw_no_program: 0,
         fix_b_draws: 0,
         lookup_us: 0,
         palette_us: 0,
@@ -211,6 +215,9 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
         t.scans / frames,
         per_frame(s.end_us)
     );
+    if s.raw_no_program > 0 {
+        let _ = write!(text, " raw_no_program={}", s.raw_no_program);
+    }
     let _ = write!(text, " ");
     crate::heap::report(&mut text);
     let length = text.len();

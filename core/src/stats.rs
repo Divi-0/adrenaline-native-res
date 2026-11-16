@@ -198,6 +198,10 @@ pub struct FrameStats {
     pub inline_words: u32,
     /// Draws that write no colour (all RGB bits masked), not rendered.
     pub color_masked_draws: u32,
+    /// PRIMs whose vertices were decoded on the CPU, and their PSP
+    /// vertices, by reason (`recorder::fallback`; capture log `cpu=`).
+    pub fallback_prims: [u32; crate::recorder::fallback::COUNT],
+    pub fallback_vertices: [u32; crate::recorder::fallback::COUNT],
 
     /// Set by the frame-ending flip.
     pub displayed: Option<DisplayedFramebuffer>,
@@ -247,6 +251,8 @@ impl FrameStats {
             inline_draws: 0,
             inline_words: 0,
             color_masked_draws: 0,
+            fallback_prims: [0; crate::recorder::fallback::COUNT],
+            fallback_vertices: [0; crate::recorder::fallback::COUNT],
             displayed: None,
             lists_pending: 0,
         }

@@ -42,11 +42,13 @@ pub const MAX_LIGHT_SETS: usize = 128;
 /// colour rules of raw draws, consecutive equal ones stored once. When the
 /// table is full, runs go the old way. MTX's race start uses 3.
 pub const MAX_RAW_COLORS: usize = 64;
-/// Floats of `Frame::bone_floats` (32 KiB; every frame slot has them): the
+/// Floats of `Frame::bone_floats` (96 KiB; every frame slot has them): the
 /// bones of raw draws skinned in the shader, 12 per bone. MTX's race start
-/// changes bones before nearly every rider part (3,612 floats used). When
-/// full, runs go the old way.
-pub const MAX_BONE_FLOATS: usize = 8192;
+/// changes bones before nearly every rider part (4,584 floats used). When
+/// full, runs go the old way: Monster Hunter Freedom's village intro needs
+/// 17,280 (2026-11-16: with 8,192, 1,077 PRIMs / 5,919 vertices per frame
+/// were decoded on the CPU, `cpu=tables_full`).
+pub const MAX_BONE_FLOATS: usize = 24576;
 
 /// One corner of a triangle.
 #[repr(C)]

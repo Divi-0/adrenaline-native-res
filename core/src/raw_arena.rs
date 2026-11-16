@@ -117,6 +117,10 @@ pub struct RawArena {
     /// Counts recorded frames (`next_frame`).
     frame: u64,
     pub stats: RawStats,
+    /// Why the last raw draw the recorder turned down was turned down
+    /// (`recorder::fallback`: arena or tables full, unreadable, other); set
+    /// by the recorder as a draw passes each step, read when it falls back.
+    pub refusal: usize,
 }
 
 impl RawArena {
@@ -125,7 +129,14 @@ impl RawArena {
     pub fn new(bytes: &'static mut [u8]) -> RawArena {
         let length = bytes.len() / WINDOW_BYTES as usize * WINDOW_BYTES as usize;
         assert!(length > 0, "the raw arena needs at least one window ({WINDOW_BYTES} bytes)");
-        RawArena { bytes: &mut bytes[..length], head: 0, frame_starts: [0; PROTECTED_FRAMES], frame: 0, stats: RawStats::default() }
+        RawArena {
+            bytes: &mut bytes[..length],
+            head: 0,
+            frame_starts: [0; PROTECTED_FRAMES],
+            frame: 0,
+            stats: RawStats::default(),
+            refusal: 0,
+        }
     }
 
     /// The arena's bytes, for the frame (`Frame::raw_vertices`).

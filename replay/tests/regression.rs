@@ -26,6 +26,13 @@
 //! Pictures go to `renderer/target/regression/<game>-<scene>.png` (plus
 //! `-original` and `-diff`) for looking at the differences.
 //!
+//! Every dump is replayed twice: the old way (CPU-decoded vertices, the
+//! baseline `expected.txt`) and the way the Vita draws by default, raw PSP
+//! vertices for the GPU with the vertex cache filled by a first round
+//! (`--raw --twice`, baseline `expected-raw.txt`, pictures
+//! `<game>-<scene>-raw.png`). Both baselines are checked and rewritten
+//! together.
+//!
 //! Adding a scene: copy its dump to <tests>/dumps/<game>/<scene>.bin and
 //! run the update command above.
 //!
@@ -60,12 +67,28 @@ struct Result {
     summary: String,
 }
 
+/// One way of replaying the dumps, with its own baseline.
+struct Mode {
+    /// The replay's extra arguments.
+    flags: &'static [&'static str],
+    /// The baseline's file in the test directory.
+    expected: &'static str,
+    /// Added to the pictures' names.
+    suffix: &'static str,
+}
+
+const MODES: [Mode; 2] = [
+    Mode { flags: &[], expected: "expected.txt", suffix: "" },
+    Mode { flags: &["--raw", "--twice"], expected: "expected-raw.txt", suffix: "-raw" },
+];
+
 /// Replays one dump; `name` is "<game>/<scene>".
-fn replay(name: &str, dump: &Path, out_dir: &Path) -> std::result::Result<Result, String> {
-    let picture = out_dir.join(format!("{}.png", name.replace('/', "-")));
+fn replay(name: &str, dump: &Path, out_dir: &Path, mode: &Mode) -> std::result::Result<Result, String> {
+    let picture = out_dir.join(format!("{}{}.png", name.replace('/', "-"), mode.suffix));
     let output = Command::new(env!("CARGO_BIN_EXE_replay"))
         .arg(dump)
         .arg(&picture)
+        .args(mode.flags)
         .output()
         .map_err(|error| format!("can't run replay: {error}"))?;
     let text = String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr);
@@ -150,12 +173,13 @@ fn read_expected(path: &Path) -> BTreeMap<String, Result> {
     expected
 }
 
-fn write_expected(path: &Path, results: &BTreeMap<String, Result>) {
-    let mut text = String::from(
+fn write_expected(path: &Path, results: &BTreeMap<String, Result>, mode: &Mode) {
+    let mut text = format!(
         "# Regression baseline for replay/tests/regression.rs: per dump in\n\
          # dumps/, the frame description hash and the mean difference (0..255)\n\
-         # to the game's own picture. Rewritten by\n\
+         # to the game's own picture, replayed with [{}]. Rewritten by\n\
          #   NATIVERES_UPDATE_EXPECTED=1 cargo test --release -p nativeres-replay --test regression\n",
+        mode.flags.join(" ")
     );
     for (name, result) in results {
         text += &format!("{name} hash={} diff={:.2}\n", result.hash, result.diff);
@@ -173,13 +197,32 @@ fn every_dumped_scene_replays_as_accepted() {
     }
     let out_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/regression");
     std::fs::create_dir_all(&out_dir).unwrap();
-    let expected_path = tests.join("expected.txt");
-    let expected = read_expected(&expected_path);
+    let mut problems = Vec::new();
+    for mode in &MODES {
+        println!("== replayed with [{}], baseline {}", mode.flags.join(" "), mode.expected);
+        problems.extend(check_mode(&tests, &dumps, &out_dir, mode));
+    }
+    if std::env::var_os("NATIVERES_UPDATE_EXPECTED").is_some() {
+        return;
+    }
+    assert!(
+        problems.is_empty(),
+        "\n{}\n\nPictures: {}\nIf the changes are intended: NATIVERES_UPDATE_EXPECTED=1 cargo test --release -p nativeres-replay --test regression\n",
+        problems.join("\n"),
+        out_dir.display()
+    );
+}
 
+/// Replays every dump in `mode` against its baseline (rewritten instead with
+/// NATIVERES_UPDATE_EXPECTED); the problems found, each prefixed with the
+/// baseline's name.
+fn check_mode(tests: &Path, dumps: &[(String, PathBuf)], out_dir: &Path, mode: &Mode) -> Vec<String> {
+    let expected_path = tests.join(mode.expected);
+    let expected = read_expected(&expected_path);
     let mut results = BTreeMap::new();
     let mut problems = Vec::new();
-    for (name, path) in &dumps {
-        match replay(name, path, &out_dir) {
+    for (name, path) in dumps {
+        match replay(name, path, out_dir, mode) {
             Ok(result) => {
                 let line = match expected.get(name) {
                     None => {
@@ -226,14 +269,8 @@ fn every_dumped_scene_replays_as_accepted() {
     }
 
     if std::env::var_os("NATIVERES_UPDATE_EXPECTED").is_some() {
-        write_expected(&expected_path, &results);
+        write_expected(&expected_path, &results, mode);
         println!("wrote {} ({} scenes)", expected_path.display(), results.len());
-        return;
     }
-    assert!(
-        problems.is_empty(),
-        "\n{}\n\nPictures: {}\nIf the changes are intended: NATIVERES_UPDATE_EXPECTED=1 cargo test --release -p nativeres-replay --test regression\n",
-        problems.join("\n"),
-        out_dir.display()
-    );
+    problems.into_iter().map(|problem| format!("{}: {problem}", mode.expected)).collect()
 }

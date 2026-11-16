@@ -874,7 +874,13 @@ impl Draws {
             let (Some(transform), Some(colors)) = (transform, colors) else {
                 return; // can't happen: raw draws only come with the arena, the program and colour rules
             };
-            if program.is_null() || (!in_psp_ram && (frame.raw_vertices.is_null() || draw.first_vertex >= frame.raw_vertices_len)) {
+            if program.is_null() {
+                // Every program place taken by other formats (or no shaders):
+                // the draw is missing from the picture. Counted (render statistics).
+                stats().raw_no_program += 1;
+                return;
+            }
+            if !in_psp_ram && (frame.raw_vertices.is_null() || draw.first_vertex >= frame.raw_vertices_len) {
                 return; // can't happen (as above)
             }
             if in_psp_ram {

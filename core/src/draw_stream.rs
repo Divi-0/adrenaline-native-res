@@ -736,6 +736,7 @@ impl DrawStream {
             self.recorded.store(published, Ordering::Release);
             return true;
         }
+        let recording = crate::phase::recorder::enter(crate::phase::recorder::OTHER);
         while recorded != published && self.is_copied(recorded) {
             // Safe: a published job, unchanged until it is counted recorded.
             let job = unsafe { &(*rings).jobs[recorded as usize % MAX_JOBS] };
@@ -755,11 +756,14 @@ impl DrawStream {
             let calls = &rings.calls[job.first_call as usize..][..job.call_count as usize];
             // Safe: the builder is the consumer's (as the geometry above).
             let builder = unsafe { &mut *self.transform_builder.get() };
+            let building = crate::phase::recorder::enter(crate::phase::recorder::TRANSFORM);
             let transform = job.transform.map(|position| builder.build(&rings.transforms[position as usize % MAX_TRANSFORMS]));
+            crate::phase::recorder::leave(building);
             recorder::run_job(&mut geometry, stats, job, calls, transform, &mut memory, cache.as_deref_mut());
             recorded = recorded.wrapping_add(1);
             self.recorded.store(recorded, Ordering::Release);
         }
+        crate::phase::recorder::leave(recording);
         true
     }
 
@@ -799,6 +803,10 @@ impl DrawStream {
         stats.frame_overflows += consumer.frame_overflows;
         consumer.unreadable_draws = 0;
         consumer.frame_overflows = 0;
+        for reason in 0..crate::recorder::fallback::COUNT {
+            stats.fallback_prims[reason] += core::mem::take(&mut consumer.fallback_prims[reason]);
+            stats.fallback_vertices[reason] += core::mem::take(&mut consumer.fallback_vertices[reason]);
+        }
     }
 
     fn has_transform(&self, generation: u32) -> bool {
@@ -946,7 +954,9 @@ impl CopiedMemory<'_> {
         if range.deferred {
             range.deferred = false;
             let started = crate::cycles::start(crate::cycles::COPIES);
+            let copying = crate::phase::recorder::enter(crate::phase::recorder::COPY);
             let copied = self.reader.is_some_and(|reader| (reader.read)(range.address, words));
+            crate::phase::recorder::leave(copying);
             crate::cycles::add(crate::cycles::COPIES, started);
             if !copied {
                 range.word_count = 0;
