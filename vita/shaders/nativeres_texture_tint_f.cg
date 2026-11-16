@@ -1,4 +1,4 @@
-// NativeRes: fragment program for nativepsp_texture_v.cg: the texel times
+// NativeRes: fragment program for nativeres_texture_v.cg: the texel times
 // one colour for the whole draw (white for copies).
 //
 // Compiled on the Vita with the shader compiler app (README.md "Shaders").

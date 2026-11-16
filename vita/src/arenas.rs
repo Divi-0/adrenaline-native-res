@@ -2,7 +2,7 @@
 //! its GPU programs exist, and handed over through capture.rs's pointers:
 //!
 //! - the raw arena (`nativepsp_core::raw_arena`): raw PSP vertices the GPU
-//!   reads as they are (draws with `RAW_VERTICES`, nativepsp_raw_v.cg),
+//!   reads as they are (draws with `RAW_VERTICES`, nativeres_raw_v.cg),
 //!   written once per frame by the recorder and kept for 6 recorded frames.
 //!   MTX's race start copies ~450 KiB of raw runs per frame.
 //! - the index ring: the capture writes draws' index runs there as triangle

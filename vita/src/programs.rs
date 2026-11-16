@@ -10,13 +10,13 @@
 //! draws that differ only in their colour (Final Fantasy's menu glyphs) can
 //! be joined.
 //!
-//! - the textured program (nativepsp_textured_v/_f.cg), with the alpha-test
+//! - the textured program (nativeres_textured_v/_f.cg), with the alpha-test
 //!   and FIX B variants of the fragment program;
-//! - the 3D program (nativepsp_3d_v.cg): the same outputs for vertices in
+//! - the 3D program (nativeres_3d_v.cg): the same outputs for vertices in
 //!   model space (the GPU transform and lighting);
-//! - the raw programs (nativepsp_raw_v.cg, _raw_plain_v.cg): raw PSP
+//! - the raw programs (nativeres_raw_v.cg, _raw_plain_v.cg): raw PSP
 //!   vertices, one patched program per PSP vertex format;
-//! - the raw sprite programs (nativepsp_raw_sprite_v.cg);
+//! - the raw sprite programs (nativeres_raw_sprite_v.cg);
 //! - blend programs: GXM bakes blending into the fragment program, so every
 //!   blend mode a game uses needs its own; made on first use and kept.
 //!
@@ -90,12 +90,12 @@ pub struct Textured {
     pub vertex: *mut gxm::VertexProgram,
     pub wvp: *const ProgramParameter,
     pub fog_and_scale: *const ProgramParameter,
-    /// nativepsp_textured_test_f.cg: the fragment program with the alpha test.
+    /// nativeres_textured_test_f.cg: the fragment program with the alpha test.
     pub have_test: bool,
     fragment_test_id: PatcherId,
     pub fog_and_scale_test: *const ProgramParameter,
     pub alpha_test: *const ProgramParameter,
-    /// nativepsp_textured_(test_)fix_f.cg: grey FIX B blending through the alpha.
+    /// nativeres_textured_(test_)fix_f.cg: grey FIX B blending through the alpha.
     pub have_fix: bool,
     fragment_fix_id: PatcherId,
     fragment_test_fix_id: PatcherId,
@@ -104,7 +104,7 @@ pub struct Textured {
     pub fog_and_scale_test_fix: *const ProgramParameter,
     pub alpha_test_fix: *const ProgramParameter,
     pub blend_fix_test: *const ProgramParameter,
-    /// nativepsp_3d_v.cg; null if it couldn't be made (the capture then
+    /// nativeres_3d_v.cg; null if it couldn't be made (the capture then
     /// transforms on the CPU).
     pub vertex_3d: *mut gxm::VertexProgram,
     pub wvp_3d: *const ProgramParameter,
@@ -117,7 +117,7 @@ pub struct Textured {
     pub lights_3d: *const ProgramParameter,
 }
 
-/// A raw program (nativepsp_raw_v.cg or the plain one) and its programs per
+/// A raw program (nativeres_raw_v.cg or the plain one) and its programs per
 /// PSP vertex format.
 pub struct RawSet {
     plain: bool,
@@ -208,7 +208,7 @@ impl RawUniforms {
     }
 }
 
-/// The raw sprite program (nativepsp_raw_sprite_v.cg) and its programs per
+/// The raw sprite program (nativeres_raw_sprite_v.cg) and its programs per
 /// format, plus the corner table.
 pub struct SpriteSet {
     tried: bool,
@@ -294,7 +294,7 @@ impl RawSet {
             return self.ready;
         }
         self.tried = true;
-        let program = if self.plain { gxp(&shaders::nativepsp_raw_plain_v) } else { gxp(&shaders::nativepsp_raw_v) };
+        let program = if self.plain { gxp(&shaders::nativeres_raw_plain_v) } else { gxp(&shaders::nativeres_raw_v) };
         let Some(id) = register(program) else {
             render_log::line(format_args!("raw program{}: invalid or not registered\n", self.label()));
             return false;
@@ -418,7 +418,7 @@ impl SpriteSet {
             return self.ready;
         }
         self.tried = true;
-        let program = gxp(&shaders::nativepsp_raw_sprite_v);
+        let program = gxp(&shaders::nativeres_raw_sprite_v);
         let Some(id) = register(program) else {
             render_log::line(format_args!("sprite program: invalid or not registered\n"));
             return false;
@@ -540,8 +540,8 @@ impl Programs {
             return !textured.vertex.is_null();
         }
         textured.tried = true;
-        let vertex_gxp = gxp(&shaders::nativepsp_textured_v);
-        let fragment_gxp = gxp(&shaders::nativepsp_textured_f);
+        let vertex_gxp = gxp(&shaders::nativeres_textured_v);
+        let fragment_gxp = gxp(&shaders::nativeres_textured_f);
         let (Some(vertex_id), Some(fragment_id)) = (register(vertex_gxp), register(fragment_gxp)) else {
             render_log::line(format_args!("our programs: invalid GXP\n"));
             return false;
@@ -576,12 +576,12 @@ impl Programs {
         true
     }
 
-    /// The alpha-test variant (nativepsp_textured_test_f.cg). Once it is
+    /// The alpha-test variant (nativeres_textured_test_f.cg). Once it is
     /// registered, the capture leaves textured draws' alpha test to it
     /// instead of standing in with blending.
     fn make_alpha_test_program(&mut self) {
         let textured = &mut self.textured;
-        let program = gxp(&shaders::nativepsp_textured_test_f);
+        let program = gxp(&shaders::nativeres_textured_test_f);
         let Some(id) = register(program) else {
             render_log::line(format_args!("alpha test program: invalid GXP\n"));
             return;
@@ -601,8 +601,8 @@ impl Programs {
     /// The BLEND_FIX variants (grey FIX B through the alpha, core blend.rs).
     fn make_blend_fix_programs(&mut self) {
         let textured = &mut self.textured;
-        let program = gxp(&shaders::nativepsp_textured_fix_f);
-        let test_program = gxp(&shaders::nativepsp_textured_test_fix_f);
+        let program = gxp(&shaders::nativeres_textured_fix_f);
+        let test_program = gxp(&shaders::nativeres_textured_test_fix_f);
         let (Some(id), Some(test_id)) = (register(program), register(test_program)) else {
             render_log::line(format_args!("blend fix programs: invalid GXP\n"));
             return;
@@ -632,7 +632,7 @@ impl Programs {
     /// The 3D vertex program. Failing only leaves the GPU transform off.
     fn make_3d_program(&mut self) {
         let textured = &mut self.textured;
-        let program = gxp(&shaders::nativepsp_3d_v);
+        let program = gxp(&shaders::nativeres_3d_v);
         let Some(id) = register(program) else {
             render_log::line(format_args!("3d program: invalid or not registered\n"));
             return;
@@ -699,7 +699,7 @@ impl Programs {
             Kind::Textured => textured.fragment_id,
             _ => return null_mut(),
         };
-        basic_programs::fragment_program(id, blend_info, gxp(&shaders::nativepsp_textured_v))
+        basic_programs::fragment_program(id, blend_info, gxp(&shaders::nativeres_textured_v))
     }
 
     /// The fragment program of `kind` for a draw's blending (`Draw::blend`),

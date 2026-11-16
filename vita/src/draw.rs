@@ -471,7 +471,7 @@ impl Draws {
 
     /// The PSP's alpha test of a textured draw as the alpha values that
     /// pass: range[0] ..= range[1] (0..255), or outside it with range[2] = 1
-    /// (nativepsp_textured_test_f.cg). None if the draw needs no test
+    /// (nativeres_textured_test_f.cg). None if the draw needs no test
     /// program: no test, "always", a mask other than 0xFF (blending stands in
     /// for those, blend.rs), no test program, a test every alpha passes, or
     /// one that only rejects alpha 0 where that changes nothing.
@@ -580,7 +580,7 @@ impl Draws {
         }
     }
 
-    /// The viewport for raw draws with `transform` (nativepsp_raw_v.cg sends
+    /// The viewport for raw draws with `transform` (nativeres_raw_v.cg sends
     /// z / w out as (z / w - 1) / 2, so the GPU clips at the PSP's near
     /// plane): depth = offset + scale * that = 0.5 + 0.5 * the PSP depth,
     /// what every other draw writes (measured on the Vita,
@@ -1273,11 +1273,11 @@ pub static nativepsp_plan_phycont_test_block: u32 = sys::pages(TEST_BLOCK_BYTES)
 /// Which raw program set a raw draw uses.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RawSetChoice {
-    /// nativepsp_raw_v.cg: skinning and lights.
+    /// nativeres_raw_v.cg: skinning and lights.
     Full,
-    /// nativepsp_raw_plain_v.cg.
+    /// nativeres_raw_plain_v.cg.
     Plain,
-    /// nativepsp_raw_sprite_v.cg.
+    /// nativeres_raw_sprite_v.cg.
     Sprites,
 }
 

@@ -1,5 +1,5 @@
 //! What the GPU does with raw PSP vertices (`draw_flags::RAW_VERTICES`,
-//! nativepsp_raw_v.cg), done on the CPU: for the PC replay, the frame
+//! nativeres_raw_v.cg), done on the CPU: for the PC replay, the frame
 //! hashes and the tests. Keep both in step.
 //!
 //! A raw vertex is decoded from its bytes as the fast path decodes it
@@ -34,7 +34,7 @@ pub mod lighting {
     pub const MATERIAL: f32 = 2.0;
     /// Lit with directional lights by the GPU: the transform's light set
     /// (`GpuTransform::light_set`, `normal_rows`) lights the vertex colour
-    /// (white without one) with the vertex's normal, as nativepsp_3d_v.cg
+    /// (white without one) with the vertex's normal, as nativeres_3d_v.cg
     /// lights GPU-lit vertices (`GpuLights::color`).
     pub const LIGHTS: f32 = 3.0;
 }
@@ -266,7 +266,7 @@ impl<'a, I: Iterator<Item = u16>> RawCorners<'a, I> {
     }
 
     /// Corner `index % 4` of a raw sprite on the screen, as
-    /// nativepsp_raw_sprite_v.cg makes it (and the CPU path,
+    /// nativeres_raw_sprite_v.cg makes it (and the CPU path,
     /// `recorder::record_vertices_now`): x and u from B for corners 1 and 3,
     /// y and v from B for corners 2 and 3, the fog of the corner's y vertex,
     /// colour and depth from B, flat (w 1). `None` if a corner is behind

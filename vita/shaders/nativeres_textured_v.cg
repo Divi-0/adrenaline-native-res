@@ -6,7 +6,7 @@
 // then interpolated with perspective (w = 1 for 2D draws).
 // aColor: per-vertex colour (PSP vertex colour or material colour, with the
 // texture function applied), RGBA bytes read as 0..1.
-// aFog: PSP fog factor, 1 = no fog, 0 = fog colour (see nativepsp_textured_f.cg).
+// aFog: PSP fog factor, 1 = no fog, 0 = fog colour (see nativeres_textured_f.cg).
 //
 // Compiled on the Vita with the shader compiler app (README.md "Shaders").
 

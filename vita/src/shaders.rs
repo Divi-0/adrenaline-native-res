@@ -22,23 +22,23 @@ macro_rules! embed_gxp {
 
 // Through-mode (2D) and CPU-transformed draws: position with w, texture
 // coordinates, colour and fog per vertex.
-embed_gxp!(nativepsp_textured_v);
-embed_gxp!(nativepsp_textured_f);
+embed_gxp!(nativeres_textured_v);
+embed_gxp!(nativeres_textured_f);
 // The same with the PSP's alpha test (discard).
-embed_gxp!(nativepsp_textured_test_f);
+embed_gxp!(nativeres_textured_test_f);
 // Grey FIX B blending through the alpha, without and with the alpha test.
-embed_gxp!(nativepsp_textured_fix_f);
-embed_gxp!(nativepsp_textured_test_fix_f);
+embed_gxp!(nativeres_textured_fix_f);
+embed_gxp!(nativeres_textured_test_fix_f);
 // Decoded vertices in model space: the GPU transforms and lights them.
-embed_gxp!(nativepsp_3d_v);
+embed_gxp!(nativeres_3d_v);
 // Raw PSP vertices, read by the GPU as the game wrote them: with skinning
 // and lights, without either, and sprites (two corners per rectangle).
-embed_gxp!(nativepsp_raw_v);
-embed_gxp!(nativepsp_raw_plain_v);
-embed_gxp!(nativepsp_raw_sprite_v);
+embed_gxp!(nativeres_raw_v);
+embed_gxp!(nativeres_raw_plain_v);
+embed_gxp!(nativeres_raw_sprite_v);
 // The basic programs (basic_programs.rs): untextured draws and clears;
 // full-screen quads and textured draws without our textured program.
-embed_gxp!(nativepsp_color_v);
-embed_gxp!(nativepsp_color_f);
-embed_gxp!(nativepsp_texture_v);
-embed_gxp!(nativepsp_texture_tint_f);
+embed_gxp!(nativeres_color_v);
+embed_gxp!(nativeres_color_f);
+embed_gxp!(nativeres_texture_v);
+embed_gxp!(nativeres_texture_tint_f);

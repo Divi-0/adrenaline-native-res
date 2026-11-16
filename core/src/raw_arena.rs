@@ -4,7 +4,7 @@
 //! Instead of decoding a 3D run's vertices into `FrameVertex`es, the
 //! recorder copies its bytes here as they are, and the display draws them
 //! with a vertex program whose attribute formats read the PSP fields
-//! (nativepsp_raw_v.cg). Nothing is hashed, looked up or decoded on the CPU.
+//! (nativeres_raw_v.cg). Nothing is hashed, looked up or decoded on the CPU.
 //!
 //! The arena is a ring of bytes in windows of `WINDOW_BYTES`. A raw draw's
 //! 16-bit indices (index runs) count vertices from the start of the window

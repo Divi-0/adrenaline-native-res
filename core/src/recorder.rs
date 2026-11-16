@@ -925,7 +925,7 @@ impl Prepared {
         ambient_lighting: None,
     };
 
-    /// Whether the GPU may light this draw's lit vertices (nativepsp_3d_v.cg):
+    /// Whether the GPU may light this draw's lit vertices (nativeres_3d_v.cg):
     /// `Some(opaque)` if it gets the GPU transform and `frame_color` does
     /// nothing to their colour but, for unblended draws, make it opaque
     /// (`GpuLights::material_diffuse` a). Others are lit on the CPU.
@@ -1842,7 +1842,7 @@ fn record_raw_sprites(
     let Some(colors) = raw_colors_if_enabled(prepared, material_color, transform, format) else {
         return false;
     };
-    // The sprite program has neither lights nor FIX A (nativepsp_raw_sprite_v.cg).
+    // The sprite program has neither lights nor FIX A (nativeres_raw_sprite_v.cg).
     if colors.rules[0] == crate::raw_vertex::lighting::LIGHTS || colors.scale[3] != 0.0 {
         return false;
     }
@@ -2305,7 +2305,7 @@ fn store_decoded_run<const GPU: bool>(
 
 /// The GPU-lit counterpart of `store_run::<true>`: vertices in model space
 /// with their raw colour (white without one) and their normal packed into
-/// `w` (`lighting::pack_normal`); nativepsp_3d_v.cg lights them. Normals of
+/// `w` (`lighting::pack_normal`); nativeres_3d_v.cg lights them. Normals of
 /// several-bone vertices are skinned here (as their positions), single-bone
 /// and unskinned ones stay raw (`Transform::gpu_normal_rows`). A vertex the
 /// GPU can't take (zero normal, a weight not folded into the rows, no

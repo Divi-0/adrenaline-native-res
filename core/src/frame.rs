@@ -115,7 +115,7 @@ pub mod draw_flags {
     /// The vertices are raw PSP vertices in the raw arena
     /// (`Frame::raw_vertices`, `raw_arena`), in the layout of
     /// `Draw::vertex_format`, read by the GPU as they are
-    /// (nativepsp_raw_v.cg). `first_vertex` is the byte offset of the
+    /// (nativeres_raw_v.cg). `first_vertex` is the byte offset of the
     /// arena window the index runs count vertices from (`vertex_count` 0).
     /// Always with `INDEX_RUNS`, a transform (its `raw_uv`) and an entry of
     /// `Frame::raw_colors` (`Draw::raw_colors`), which finish the decoding. Only vertices in front of the near plane are drawn: the
@@ -132,7 +132,7 @@ pub mod draw_flags {
     /// opposite one) are in the arena four times as A B pairs, one pair per
     /// corner, so vertex k of the window is pair k (A at 2k strides, B one
     /// stride after) and corner k % 4 of its sprite: 0 at A, 1 at (B x, A y),
-    /// 2 at (A x, B y), 3 at B (nativepsp_raw_sprite_v.cg; the CPU path's
+    /// 2 at (A x, B y), 3 at B (nativeres_raw_sprite_v.cg; the CPU path's
     /// rules: colour and depth from B, flat, `raw_vertex::RawCorners`). Its
     /// index runs are `[RECTANGLES, sprites, first corner]`.
     pub const RAW_SPRITES: u32 = 1 << 14;
@@ -316,7 +316,7 @@ pub struct GpuTransform {
 }
 
 /// How a raw draw's vertices get their colour (`raw_vertex`,
-/// nativepsp_raw_v.cg): what the CPU path's `base_color` and `frame_color`
+/// nativeres_raw_v.cg): what the CPU path's `base_color` and `frame_color`
 /// do. Colours as whole numbers 0..255 per channel (RGBA), so the shader's
 /// integer steps are exact.
 #[repr(C)]
@@ -345,7 +345,7 @@ pub struct RawColors {
 }
 
 /// The lighting of GPU-lit draws (`lighting::Lights::gpu`), world space:
-/// what nativepsp_3d_v.cg gets as uniforms (same names, same order) and
+/// what nativeres_3d_v.cg gets as uniforms (same names, same order) and
 /// `GpuLights::color` computes on the CPU (the PC replay). Unused lights are
 /// all zeros.
 #[repr(C)]
@@ -985,7 +985,7 @@ impl Frame {
         let stored = self.draw_corners(draw).map(move |vertex| match &transform {
             Some(transform) => {
                 let mut screen = transform.to_screen(vertex);
-                // GPU-lit: the colour the 3D program lights (nativepsp_3d_v.cg).
+                // GPU-lit: the colour the 3D program lights (nativeres_3d_v.cg).
                 if let Some(lights) = &lights {
                     let normal = crate::lighting::unpack_normal(vertex.w.to_bits());
                     screen.color = lights.color(vertex.color, normal, &transform.normal_rows);

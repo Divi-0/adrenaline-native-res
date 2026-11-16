@@ -22,7 +22,7 @@
 //!   framebuffer's alpha (MTX's blur quad: weight = sampled alpha) gets the
 //!   PSP's values.
 //! - the alpha test: textured draws are alpha-tested in the Vita's fragment
-//!   shader (nativepsp_textured_test_f.cg, once the display has it:
+//!   shader (nativeres_textured_test_f.cg, once the display has it:
 //!   `ALPHA_TEST_IN_SHADER`). Where it can't (untextured, a mask other than
 //!   0xFF), a draw with blending off and the alpha test on is drawn with
 //!   normal blending instead: exact for fully transparent and opaque texels,

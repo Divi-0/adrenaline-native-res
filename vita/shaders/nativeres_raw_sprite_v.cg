@@ -5,7 +5,7 @@
 // display reads the pairs as two streams over the same bytes (A at the
 // pair's start, B one stride later) and a third stream with the corner
 // number (0..3, vertex index % 4). Patched per PSP vertex format like
-// nativepsp_raw_v.cg (nativepsp_render.c SpriteProgramFor); same uniforms
+// nativeres_raw_v.cg (nativepsp_render.c SpriteProgramFor); same uniforms
 // and outputs. raw_vertex.rs RawCorners::sprite_corner is the CPU's copy:
 // keep both in step.
 //
@@ -17,7 +17,7 @@
 // Not lit with lights, not skinned (the capture leaves those to the CPU).
 //
 // aPosition, aTexcoord: A's; aPositionB, aTexcoordB, aColorBytesB,
-// aColor32B: B's (formats as nativepsp_raw_v.cg); aCorner: 0..3.
+// aColor32B: B's (formats as nativeres_raw_v.cg); aCorner: 0..3.
 //
 // Compiled on the Vita with the shader compiler app (README.md "Shaders").
 
@@ -29,7 +29,7 @@ float High(float value, float inverse)
 float Expand5(float c) { return c * 8.0f + High(c, 0.25f); }
 float Expand6(float c) { return c * 4.0f + High(c, 0.0625f); }
 
-// The vertex colour as whole numbers 0..255, as nativepsp_raw_v.cg.
+// The vertex colour as whole numbers 0..255, as nativeres_raw_v.cg.
 float4 VertexColor(float mode, float2 bytes, float4 color32, float4 material)
 {
 	float lo = bytes.x, hi = bytes.y;
@@ -92,7 +92,7 @@ void main(
 	float2 screenB = uViewport.xy + uViewport.zw * cb.xy / cb.w;
 	float2 screen = float2(lerp(screenA.x, screenB.x, xFromB), lerp(screenA.y, screenB.y, yFromB));
 	vPosition = mul(float4(screen, 0.0f, 1.0f), wvp);
-	// Depth from B, as nativepsp_raw_v.cg sends z / w out (w 1 here).
+	// Depth from B, as nativeres_raw_v.cg sends z / w out (w 1 here).
 	vPosition.z = 0.5f * (cb.z / cb.w - 1.0f);
 	vPosition.w = 1.0f;
 	// A corner behind the near plane: the whole sprite out (every corner
@@ -104,7 +104,7 @@ void main(
 	vTexcoord = float2(lerp(uvA.x, uvB.x, xFromB), lerp(uvA.y, uvB.y, yFromB)) * uUvScale;
 	vFog = lerp(dot(uFogRow, pa), dot(uFogRow, pb), yFromB);
 
-	// B's colour, with nativepsp_raw_v.cg's rules (lighting 0..2).
+	// B's colour, with nativeres_raw_v.cg's rules (lighting 0..2).
 	float mode = uFormat.y;
 	float4 color = VertexColor(mode, aColorBytesB, aColor32B, uMaterial);
 	if (uColors.x > 0.5f) {

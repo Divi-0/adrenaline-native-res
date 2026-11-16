@@ -1,12 +1,12 @@
 // NativeRes: vertex program for textured 3D draws whose vertices are still in
 // model space (NativePspDraw.transform, frame.rs GpuTransform): it does what
 // the capture's CPU path does per vertex (RowTransform::apply), then what
-// nativepsp_textured_v.cg does. Same outputs, so the same fragment programs.
+// nativeres_textured_v.cg does. Same outputs, so the same fragment programs.
 //
 // aPosition: model-space position.
 // aNormal: GPU-lit draws only: the vertex's normal (lighting.rs pack_normal,
 //   four signed bytes in the vertex's w); other draws' w is not a normal.
-// aTexcoord, aColor: as for nativepsp_textured_v.cg (already final), except
+// aTexcoord, aColor: as for nativeres_textured_v.cg (already final), except
 //   for GPU-lit draws: aColor is the raw vertex colour, lit here.
 // uRows: projection x view x world (bone, position scale folded in), row by row.
 // uFogRow: fog factor = uFogRow . position; (0, 0, 0, 1) without fog.
@@ -14,7 +14,7 @@
 // uDepth: x = depth centre, y = depth scale (PSP depth / 65535).
 // wvp: our NativeMatrix (PSP pixels and depth to the Vita's clip space).
 // uUvScale: multiplies the texture coordinates (1, 1 but for textures from
-// our render targets; nativepsp_textured_v.cg's draws get it on the CPU).
+// our render targets; nativeres_textured_v.cg's draws get it on the CPU).
 // uNormalRows: rows 0..2: the matrix taking aNormal to world space (world x
 //   bone, negated for REVERSENORMAL); row 3 x: > 0 = the draw is GPU-lit.
 // uLights: GPU-lit draws: frame.rs GpuLights as 22 float4:
@@ -69,7 +69,7 @@ void main(
 	float4 clip = float4(dot(uRows[0], p), dot(uRows[1], p), dot(uRows[2], p), dot(uRows[3], p));
 	float overW = 1.0f / clip.w;
 	float3 screen = float3(uViewport.xy + uViewport.zw * clip.xy * overW, saturate(uDepth.x + uDepth.y * clip.z * overW));
-	// As nativepsp_textured_v.cg: times w, so the GPU interpolates with perspective.
+	// As nativeres_textured_v.cg: times w, so the GPU interpolates with perspective.
 	vPosition = mul(float4(screen, 1.0f), wvp) * clip.w;
 	vTexcoord = aTexcoord * uUvScale;
 	vFog = dot(uFogRow, p);

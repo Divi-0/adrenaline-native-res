@@ -349,7 +349,7 @@ impl Lights {
         Some(model_lights)
     }
 
-    /// These lights for the GPU (`GpuLights`, nativepsp_3d_v.cg): world
+    /// These lights for the GPU (`GpuLights`, nativeres_3d_v.cg): world
     /// space, directional lights only (`gpu_ready`). `has_vertex_color`:
     /// the draw's vertices have a colour (else the material's are used
     /// whatever MATERIAL_UPDATE says); `opaque`: the result's alpha is 1.
@@ -412,7 +412,7 @@ impl Lights {
     /// Whether textured draws lit with these lights on the CPU are drawn
     /// approximately (the separate specular colour added before texturing:
     /// a CPU-lit vertex has one colour). The GPU's lighting adds it after
-    /// texturing (`GpuLights::material_specular`, nativepsp_raw_v.cg).
+    /// texturing (`GpuLights::material_specular`, nativeres_raw_v.cg).
     pub fn approximated(&self) -> bool {
         self.separate_specular && self.lights[..self.count].iter().any(|light| light.computation == DIFFUSE_AND_SPECULAR)
     }
@@ -565,7 +565,7 @@ pub fn unpack_normal(packed: u32) -> [f32; 3] {
 }
 
 impl GpuLights {
-    /// The colour nativepsp_3d_v.cg gives a GPU-lit vertex: `vertex` its
+    /// The colour nativeres_3d_v.cg gives a GPU-lit vertex: `vertex` its
     /// colour as stored, `normal` as the shader reads it, `normal_rows` the
     /// transform's (`GpuTransform::normal_rows`). PPSSPP's hardware vertex
     /// shader (VertexShaderGenerator.cpp) for directional lights; the pow

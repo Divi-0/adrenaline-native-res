@@ -2,9 +2,9 @@
 //! programs and the 960x544 projection. These were vita2d's (Adrenaline's drawing library); a plugin
 //! of our own can't reach vita2d, so they are ours now, the same programs:
 //!
-//! - colour (nativepsp_color_v/_f.cg): untextured draws, and the clear of a
+//! - colour (nativeres_color_v/_f.cg): untextured draws, and the clear of a
 //!   new render target (a black triangle over the whole scene);
-//! - texture-tint (nativepsp_texture_v.cg, nativepsp_texture_tint_f.cg):
+//! - texture-tint (nativeres_texture_v.cg, nativeres_texture_tint_f.cg):
 //!   full-screen quads (render-target copies, presenting our picture, the
 //!   GPU unswizzle) and textured draws when our textured program is
 //!   missing.
@@ -282,10 +282,10 @@ const ALPHA_BLEND: gxm::BlendInfo = gxm::BlendInfo::new(
 );
 
 fn make_basic() -> Option<Basic> {
-    let color_v = gxp(&shaders::nativepsp_color_v);
-    let color_f = gxp(&shaders::nativepsp_color_f);
-    let texture_v = gxp(&shaders::nativepsp_texture_v);
-    let texture_tint_f = gxp(&shaders::nativepsp_texture_tint_f);
+    let color_v = gxp(&shaders::nativeres_color_v);
+    let color_f = gxp(&shaders::nativeres_color_f);
+    let texture_v = gxp(&shaders::nativeres_texture_v);
+    let texture_tint_f = gxp(&shaders::nativeres_texture_tint_f);
     let (Some(color_vertex_id), Some(color_fragment_id), Some(texture_vertex_id), Some(texture_tint_fragment_id)) =
         (register(color_v), register(color_f), register(texture_v), register(texture_tint_f))
     else {
@@ -360,9 +360,9 @@ pub fn blend_fragment_program(textured: bool, blend: *const gxm::BlendInfo) -> *
         return null_mut();
     };
     if textured {
-        fragment_program(basic.texture_tint_fragment_id, blend, gxp(&shaders::nativepsp_texture_v))
+        fragment_program(basic.texture_tint_fragment_id, blend, gxp(&shaders::nativeres_texture_v))
     } else {
-        fragment_program(basic.color_fragment_id, blend, gxp(&shaders::nativepsp_color_v))
+        fragment_program(basic.color_fragment_id, blend, gxp(&shaders::nativeres_color_v))
     }
 }
 
