@@ -1,11 +1,11 @@
 // NativeRes: vertex program for raw 3D sprites (PRIM type 6, rectangles;
-// NATIVEPSP_DRAW_RAW_SPRITES, frame.rs draw_flags::RAW_SPRITES). A PSP
+// NATIVERES_DRAW_RAW_SPRITES, frame.rs draw_flags::RAW_SPRITES). A PSP
 // sprite is two vertices: A (one corner) and B (the opposite one). The raw
 // arena holds each sprite's pair four times (one pair per corner); the
 // display reads the pairs as two streams over the same bytes (A at the
 // pair's start, B one stride later) and a third stream with the corner
 // number (0..3, vertex index % 4). Patched per PSP vertex format like
-// nativeres_raw_v.cg (nativepsp_render.c SpriteProgramFor); same uniforms
+// nativeres_raw_v.cg (nativeres_render.c SpriteProgramFor); same uniforms
 // and outputs. raw_vertex.rs RawCorners::sprite_corner is the CPU's copy:
 // keep both in step.
 //

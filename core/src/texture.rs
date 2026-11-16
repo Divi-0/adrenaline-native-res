@@ -68,7 +68,7 @@ pub fn is_palette_format(format: u8) -> bool {
 /// Describes the texture level 0 the GE would currently sample from.
 /// Palette fields are left empty; the caller fills them in.
 /// Menu option "NativeRes Distant Textures" (Adrenaline's config byte
-/// `nativepsp_mip_mode`, set by the display every frame): 0 "Sharp" (level 0
+/// `nativeres_mip_mode`, set by the display every frame): 0 "Sharp" (level 0
 /// only, the default), 1 "Blurry (like PSP)" (the game's mip levels, one
 /// level blurrier than the GPU would pick at our 2x size: the PSP's choice),
 /// 2 "Mipmapped" (the game's levels as the GPU picks them at our size).

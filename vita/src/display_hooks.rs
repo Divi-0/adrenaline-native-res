@@ -35,7 +35,7 @@ use core::ffi::c_void;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
-use nativepsp_core::game_fps::{self, GameFps, LABEL_HEIGHT, LABEL_WIDTH};
+use nativeres_core::game_fps::{self, GameFps, LABEL_HEIGHT, LABEL_WIDTH};
 
 use crate::basic_programs::TextureVertex;
 use crate::capture::COMPLETED_FRAME_COUNT;
@@ -84,7 +84,7 @@ const SONY_PICTURE_BYTES: u32 = 512 * 272 * 4;
 /// counts it so the budget stays comparable.
 #[no_mangle]
 #[used]
-pub static nativepsp_plan_library_vita2d_pool: u32 = 1024 * 1024;
+pub static nativeres_plan_library_vita2d_pool: u32 = 1024 * 1024;
 
 /// The display thread's GXM context (vita2d's), from its first
 /// sceGxmBeginScene; null before.
@@ -523,7 +523,7 @@ const LABEL_QUAD_BYTES: usize = 4 * core::mem::size_of::<TextureVertex>();
 const LABEL_BLOCK_BYTES: usize = 2 * (LABEL_TEXTURE_BYTES + LABEL_QUAD_BYTES);
 #[no_mangle]
 #[used]
-pub static nativepsp_plan_fixed_game_fps_label: u32 = sys::pages(LABEL_BLOCK_BYTES);
+pub static nativeres_plan_fixed_game_fps_label: u32 = sys::pages(LABEL_BLOCK_BYTES);
 
 /// Right of VitaCam's "60.0 FPS  RENDER 30" box, as menu.c drew it: at
 /// (252, 4), 2x, white on black.
@@ -562,7 +562,7 @@ impl Label {
     fn make(&mut self) -> bool {
         if !self.tried {
             self.tried = true;
-            if let Some(block) = gpu_memory::for_gpu(b"NativePspGameFps\0", sys::pages(LABEL_BLOCK_BYTES)) {
+            if let Some(block) = gpu_memory::for_gpu(b"NativeResGameFps\0", sys::pages(LABEL_BLOCK_BYTES)) {
                 self.base = block.base;
                 for index in 0..2 {
                     // Safe: a linear RGBA texture over our block's picture.

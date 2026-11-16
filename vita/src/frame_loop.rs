@@ -1,23 +1,23 @@
 //! The display thread's part of the renderer: draws a recorded PSP frame at
 //! 960x544.
 //!
-//! Adrenaline's display loop (menu.c) calls `NativePspRenderFrame` once per
+//! Adrenaline's display loop (menu.c) calls `NativeResRenderFrame` once per
 //! loop, before its own scene. It takes the newest recorded frame
 //! (frames.rs), looks up the frame's textures (textures.rs: decoded into a
 //! cache, keyed by description and a hash of the pixel data, so a texture is
 //! only decoded again when the game changes it) and draws the frame into the
 //! render target of its PSP framebuffer (targets.rs), in a GXM scene of its
 //! own: every draw of the frame becomes one sceGxmDraw (draw.rs). The
-//! display's scene then shows that target (`NativePspPresentFrame`). PSP
+//! display's scene then shows that target (`NativeResPresentFrame`). PSP
 //! coordinates are simply doubled: the PSP screen is 480x272.
 
 use core::ffi::c_void;
 use core::ptr::null;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, Ordering};
 
-use nativepsp_core::blend::{self, BLEND_ENABLED};
-use nativepsp_core::frame::{draw_flags, Frame, MAX_TEXTURES};
-use nativepsp_core::texture_cache::MAX_RENDER_TARGETS;
+use nativeres_core::blend::{self, BLEND_ENABLED};
+use nativeres_core::frame::{draw_flags, Frame, MAX_TEXTURES};
+use nativeres_core::texture_cache::MAX_RENDER_TARGETS;
 
 use crate::capture::{COMPLETED_FRAME_COUNT, GPU_TRANSFORM_READY, set_mip_mode};
 use crate::draw::{self, REDRAW_SKIP};
@@ -53,7 +53,7 @@ pub static ALPHA_MASK: AtomicI32 = AtomicI32::new(1);
 /// 2: the GPU drained before the scene too.
 pub static MEASURE_GPU: AtomicI32 = AtomicI32::new(0);
 /// Process time (low 32 bits) when the last drawn frame's rendering
-/// started / ended, and when `NativePspRenderFrame` was entered.
+/// started / ended, and when `NativeResRenderFrame` was entered.
 pub static RENDER_START_US: AtomicU32 = AtomicU32::new(0);
 pub static RENDER_END_US: AtomicU32 = AtomicU32::new(0);
 pub static LOOP_START_US: AtomicU32 = AtomicU32::new(0);
@@ -100,10 +100,10 @@ pub fn redraw_paused() {
     FORCE_REDRAW.store(1, Ordering::Relaxed);
 }
 
-/// See `NativePspRenderFrame`: a PSP frame comes every 16.7 ms.
+/// See `NativeResRenderFrame`: a PSP frame comes every 16.7 ms.
 const FRAME_DUE_US: u64 = 12_000;
 const FRAME_WAIT_US: u32 = 5_000;
-/// See `NativePspRenderFrame`: how many PSP frames old our last picture may
+/// See `NativeResRenderFrame`: how many PSP frames old our last picture may
 /// be to be shown again while a frame waits for textures.
 const MAX_HELD_FRAMES: u32 = 2;
 /// Frames in a row left out because their textures were rewritten.
@@ -187,7 +187,7 @@ fn now() -> u64 {
 /// Display thread, after vita2d_pool_reset and before the display's scene
 /// (vita2d_start_drawing): draws a new frame into the render target of its
 /// PSP framebuffer, in a GXM scene of its own. Returns 1 if
-/// `NativePspPresentFrame` should be used this time, 0 (renderer off, no
+/// `NativeResPresentFrame` should be used this time, 0 (renderer off, no
 /// frame yet, or this frame falls back to the game's own picture) if not.
 pub fn render_frame() -> bool {
     // Safe: the display thread's entry point; both references are passed
@@ -451,7 +451,7 @@ impl FrameLoop {
     /// target yet (renderer just switched on).
     fn prepare_sampled_targets(&mut self, targets: &mut Targets, frame: &Frame) {
         let idle_us = now().wrapping_sub(self.last_drawn_us);
-        if nativepsp_core::frame::targets_outdated(self.last_drawn_frame, frame.frame_number, idle_us) {
+        if nativeres_core::frame::targets_outdated(self.last_drawn_frame, frame.frame_number, idle_us) {
             for target in targets.targets.iter_mut().filter(|t| t.psp_address != 0) {
                 target.needs_clear = true;
             }
@@ -532,7 +532,7 @@ impl FrameLoop {
     /// frame late (see VramState::copy_pending in texture_cache), and new
     /// textures over the work budget wait a frame; drawing without them
     /// leaves holes, which flickered at Final Fantasy's battle start. Such
-    /// frames aren't drawn; `NativePspRenderFrame` shows our last picture
+    /// frames aren't drawn; `NativeResRenderFrame` shows our last picture
     /// again meanwhile. True if the frame waits.
     fn waits_for_textures(&self, frame: &Frame, render_count: u32, textures_us: u64) -> bool {
         let (mut missing, mut waiting_draws) = (0u32, 0u32);
@@ -718,7 +718,7 @@ fn shows_cpu_written_picture(frame: &Frame, targets: &Targets) -> bool {
         }
     }
     let ours_samples = ours.is_some().then_some(&ours_samples[..samples]);
-    nativepsp_core::display_loop::shows_cpu_written_picture(&sony[..samples], ours_samples)
+    nativeres_core::display_loop::shows_cpu_written_picture(&sony[..samples], ours_samples)
 }
 
 /// Every target can be a texture's (`FrameInfo::render_targets`).

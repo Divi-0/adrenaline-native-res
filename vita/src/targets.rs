@@ -9,7 +9,7 @@
 //! So each PSP framebuffer address gets a 960x544 render target that keeps
 //! its contents too. A frame is drawn into the target of the framebuffer it
 //! shows, in a GXM scene of its own (frame_loop.rs), and the display's scene
-//! then copies that target to the screen (`NativePspPresentFrame`). A frame
+//! then copies that target to the screen (`NativeResPresentFrame`). A frame
 //! is drawn into its target only once: drawing it again would apply
 //! additive draws twice.
 //!
@@ -40,19 +40,19 @@ const TARGET_BYTES: u32 = sys::pages((TARGET_WIDTH * TARGET_HEIGHT * 4) as usize
 #[no_mangle]
 #[used]
 #[allow(non_upper_case_globals)]
-pub static nativepsp_plan_fixed_render_targets: u32 = (TARGET_COUNT as u32 + 1) * TARGET_BYTES;
+pub static nativeres_plan_fixed_render_targets: u32 = (TARGET_COUNT as u32 + 1) * TARGET_BYTES;
 
 /// Indices 0, 1, 2, ... for sceGxmDraw, which always wants an index buffer.
-const LINEAR_INDICES: usize = nativepsp_core::frame::MAX_VERTICES;
+const LINEAR_INDICES: usize = nativeres_core::frame::MAX_VERTICES;
 #[no_mangle]
 #[used]
 #[allow(non_upper_case_globals)]
-pub static nativepsp_plan_fixed_linear_indices: u32 = sys::pages(LINEAR_INDICES * 2);
+pub static nativeres_plan_fixed_linear_indices: u32 = sys::pages(LINEAR_INDICES * 2);
 
-/// Set to 1 by `NativePspPresentFrame`; whoever watches the shown frames
+/// Set to 1 by `NativeResPresentFrame`; whoever watches the shown frames
 /// reads and clears it after each swap.
 pub static FRAME_DRAWN: AtomicI32 = AtomicI32::new(0);
-/// The PSP frame number (`Frame::frame_number`) `NativePspPresentFrame`
+/// The PSP frame number (`Frame::frame_number`) `NativeResPresentFrame`
 /// showed last.
 pub static SHOWN_FRAME_NUMBER: AtomicU32 = AtomicU32::new(0);
 
@@ -120,7 +120,7 @@ impl Target {
         if shared_depth().is_null() {
             return false;
         }
-        let Some(GpuBlock { uid, base }) = gpu_memory::for_gpu(b"NativePspTarget\0", TARGET_BYTES) else {
+        let Some(GpuBlock { uid, base }) = gpu_memory::for_gpu(b"NativeResTarget\0", TARGET_BYTES) else {
             return false;
         };
         let params = gxm::RenderTargetParams {
@@ -182,7 +182,7 @@ impl Target {
 
 pub struct Targets {
     pub targets: [Target; TARGET_COUNT],
-    /// What `NativePspPresentFrame` shows.
+    /// What `NativeResPresentFrame` shows.
     pub shown: Option<usize>,
     /// Log lines left: targets reused too early, failed scenes.
     eviction_logs: u32,
@@ -210,7 +210,7 @@ pub fn shared_depth() -> *const gxm::DepthStencilSurface {
     let depth = unsafe { SHARED_DEPTH.get() };
     if depth.is_none() {
         // 4 bytes per texel too.
-        let Some(GpuBlock { uid, base }) = gpu_memory::for_gpu(b"NativePspTargetDepth\0", TARGET_BYTES) else {
+        let Some(GpuBlock { uid, base }) = gpu_memory::for_gpu(b"NativeResTargetDepth\0", TARGET_BYTES) else {
             return null();
         };
         let mut surface = gxm::DepthStencilSurface { words: [0; 5] };
@@ -248,7 +248,7 @@ pub fn linear_indices() -> *const u16 {
     // Safe: display thread only.
     let indices = unsafe { LINEAR.get() };
     if indices.is_null() {
-        let Some(block) = gpu_memory::gpu_input(b"NativePspIndices\0", sys::pages(LINEAR_INDICES * 2)) else {
+        let Some(block) = gpu_memory::gpu_input(b"NativeResIndices\0", sys::pages(LINEAR_INDICES * 2)) else {
             return null();
         };
         let words = block.base as *mut u16;
@@ -269,7 +269,7 @@ fn full_quad() -> *const TextureVertex {
     // Safe: display thread only.
     let quad = unsafe { FULL_QUAD.get() };
     if quad.is_null() {
-        let Some(block) = gpu_memory::gpu_input(b"NativePspFullQuad\0", sys::pages(QUAD_BYTES as usize)) else {
+        let Some(block) = gpu_memory::gpu_input(b"NativeResFullQuad\0", sys::pages(QUAD_BYTES as usize)) else {
             return null();
         };
         let vertices = block.base as *mut TextureVertex;

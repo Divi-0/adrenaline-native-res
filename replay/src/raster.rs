@@ -1,5 +1,5 @@
 //! A small software renderer that draws a frame description the way the
-//! Vita side does (Adrenaline/user/nativepsp_render.c):
+//! Vita side does (Adrenaline/user/nativeres_render.c):
 //! - PSP coordinates doubled onto a 960x544 screen cleared to black,
 //! - textured draws (our GPU program): texture colour x vertex colour (x2
 //!   with colour doubling, then clamped), then fog; texture coordinates,
@@ -15,9 +15,9 @@
 //! Pixels are sampled at their centres with a top-left fill rule, like GPUs
 //! do, so triangles sharing an edge don't draw its pixels twice.
 
-use nativepsp_core::blend::{channel_mask, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_FIX_B_SHIFT, BLEND_PREMULTIPLY_SHIFT};
-use nativepsp_core::frame::{draw_flags, test_flags, texture_flags, Draw, Frame, FrameVertex, TextureDescriptor};
-use nativepsp_core::texture::{data_size, decode_texture};
+use nativeres_core::blend::{channel_mask, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_FIX_B_SHIFT, BLEND_PREMULTIPLY_SHIFT};
+use nativeres_core::frame::{draw_flags, test_flags, texture_flags, Draw, Frame, FrameVertex, TextureDescriptor};
+use nativeres_core::texture::{data_size, decode_texture};
 
 use crate::dump_file::{DumpMemory, OriginalPicture};
 
@@ -143,7 +143,7 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
             }
         }
     }
-    // Shown opaque, as NativePspPresentFrame does: the alpha is the game's
+    // Shown opaque, as NativeResPresentFrame does: the alpha is the game's
     // stencil, not meant for the screen.
     for pixel in &mut screen {
         *pixel |= 0xFF00_0000;
@@ -179,8 +179,8 @@ fn draw_one(screen: &mut [u32], depth: &mut [f32], frame: &Frame, textures: &[Op
 /// instead, Sony's last shown frame, as the Vita seeds a target that holds
 /// nothing (SeedTargetFromSony).
 fn other_framebuffer(texture: &TextureDescriptor, frame: &Frame) -> bool {
-    let address = nativepsp_core::memory::fold_vram_mirror(texture.address & 0x0FFF_FFFF);
-    (nativepsp_core::memory::VRAM_START..nativepsp_core::memory::VRAM_END).contains(&address)
+    let address = nativeres_core::memory::fold_vram_mirror(texture.address & 0x0FFF_FFFF);
+    (nativeres_core::memory::VRAM_START..nativeres_core::memory::VRAM_END).contains(&address)
         && texture.format == 3
         && texture.width >= 480
         && texture.height >= 272
@@ -456,7 +456,7 @@ fn wrap(coordinate: i64, size: usize, clamp: bool) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nativepsp_core::blend::{Blend, BLEND_ALPHA_ONLY, BLEND_WRITES_ALPHA};
+    use nativeres_core::blend::{Blend, BLEND_ALPHA_ONLY, BLEND_WRITES_ALPHA};
 
     const SOURCE: Color = Color { r: 1.0, g: 0.0, b: 0.0, a: 0.5 };
     const TARGET: Color = Color { r: 0.0, g: 0.0, b: 1.0, a: 0.0 };

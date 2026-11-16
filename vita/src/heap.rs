@@ -1,4 +1,4 @@
-//! Our heap (the bookkeeping is `nativepsp_core::heap`, tested there): one
+//! Our heap (the bookkeeping is `nativeres_core::heap`, tested there): one
 //! block of main memory, made on first use, for the texture cache's texture
 //! objects and the shader patcher's host memory (shader_patcher.rs). It
 //! replaces the C library heap (newlib's calloc/free) we used while linked
@@ -8,7 +8,7 @@
 
 use core::ffi::c_void;
 
-use nativepsp_core::heap::Heap;
+use nativeres_core::heap::Heap;
 
 use crate::blocks::SpinLocked;
 use crate::{render_log, sys};
@@ -21,7 +21,7 @@ const HEAP_BYTES: usize = 128 * 1024;
 #[no_mangle]
 #[used]
 #[allow(non_upper_case_globals)]
-pub static nativepsp_plan_fixed_heap: u32 = sys::pages(HEAP_BYTES);
+pub static nativeres_plan_fixed_heap: u32 = sys::pages(HEAP_BYTES);
 
 struct State {
     /// The block's words; null until made.
@@ -52,7 +52,7 @@ impl State {
         }
         // Safe: plain system calls; the block is ours alone.
         unsafe {
-            let block = sys::alloc_block(b"NativePspHeap\0".as_ptr(), sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, HEAP_BYTES as u32, core::ptr::null_mut());
+            let block = sys::alloc_block(b"NativeResHeap\0".as_ptr(), sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, HEAP_BYTES as u32, core::ptr::null_mut());
             let mut base: *mut c_void = core::ptr::null_mut();
             if block < 0 || sys::sceKernelGetMemBlockBase(block, &mut base) < 0 {
                 self.failed = true;

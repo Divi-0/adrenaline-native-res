@@ -8,7 +8,7 @@
 //! seen before is not decoded again, and its vertices aren't even copied
 //! into the frame: the draw points at the cache (`draw_flags::CACHED_VERTICES`)
 //! and the GPU reads them there. On the Vita the arena is 1 MiB of main
-//! memory mapped for the GPU (not CDRAM, see nativepsp_render.c), written
+//! memory mapped for the GPU (not CDRAM, see nativeres_render.c), written
 //! once by the CPU per new run.
 //!
 //! An entry is found by what decoding depends on (`RunKey`: address,
@@ -44,7 +44,7 @@ pub fn window_of(start: u32) -> u32 {
 }
 
 /// Vertices in the PC replay's arena (the Vita's comes from the display
-/// side, `nativepsp_render.c`): two windows, 4 MiB of vertices.
+/// side, `nativeres_render.c`): two windows, 4 MiB of vertices.
 pub const ARENA_VERTICES: usize = 2 * WINDOW_VERTICES as usize;
 /// Entries, in sets of `WAYS` (a key's set is chosen by its hash; within
 /// the set the least recently used entry makes room).

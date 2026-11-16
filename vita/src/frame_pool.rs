@@ -1,6 +1,6 @@
 //! The frame pool: GPU-readable memory for what a frame's draws build
 //! (indices, converted vertices). The ring's bookkeeping and the reason for
-//! it are in `nativepsp_core::frame_pool`; this side owns the memory block,
+//! it are in `nativeres_core::frame_pool`; this side owns the memory block,
 //! reads the GPU's notification word and waits when the ring is full.
 //!
 //! Display thread only.
@@ -10,8 +10,8 @@ use core::fmt;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use nativepsp_core::frame::{MAX_INDICES, MAX_VERTICES};
-use nativepsp_core::frame_pool::{segment_done, Allocation, FramePool};
+use nativeres_core::frame::{MAX_INDICES, MAX_VERTICES};
+use nativeres_core::frame_pool::{segment_done, Allocation, FramePool};
 
 use crate::{gxm, render_log, sys, SingleThreaded};
 
@@ -21,7 +21,7 @@ const FRAME_POOL_BYTES: usize = MAX_VERTICES * 32 + MAX_INDICES * 2 + 128 * 1024
 #[no_mangle]
 #[used]
 #[allow(non_upper_case_globals)]
-pub static nativepsp_plan_fixed_frame_pool: u32 = sys::pages(FRAME_POOL_BYTES);
+pub static nativeres_plan_fixed_frame_pool: u32 = sys::pages(FRAME_POOL_BYTES);
 
 /// GXM's notification region has 512 words for the whole process. vita2d
 /// uses none; the PSP emulator's code shares the process, so a high slot,
@@ -88,7 +88,7 @@ impl State {
         // Safe: plain system calls; the block is ours alone.
         unsafe {
             let block = sys::alloc_block(
-                b"NativePspFramePool\0".as_ptr(),
+                b"NativeResFramePool\0".as_ptr(),
                 sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_RW,
                 FRAME_POOL_BYTES as u32,
                 core::ptr::null_mut(),

@@ -21,7 +21,7 @@ use core::ffi::c_void;
 
 pub type SceUID = i32;
 
-// Module info (PSP_MODULE_INFO("NativePSP", 0x1007, 1, 0): kernel mode),
+// Module info (PSP_MODULE_INFO("NativeRes", 0x1007, 1, 0): kernel mode),
 // the export table's bounds, and the syslib exports (module_start,
 // module_stop, module_info), as pspsdk's crt0 and exports.exp made them.
 global_asm!(
@@ -69,7 +69,7 @@ global_asm!(
     "module_info:",
     ".hword 0x1007",
     ".byte 0, 1",
-    ".ascii \"NativePSP\"",
+    ".ascii \"NativeRes\"",
     ".space 28 - 9",
     ".word _gp",
     ".word __lib_ent_top",

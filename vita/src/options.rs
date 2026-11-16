@@ -1,6 +1,6 @@
 //! Our own settings: distant textures, texture filter, the game's fps
 //! label and the ARM clock. Read once from
-//! ux0:data/nativepsp/config.txt (nativepsp_core::options; we never write
+//! ux0:data/nativeres/config.txt (nativeres_core::options; we never write
 //! it), changed later only at run time (the setters below); nothing is
 //! saved.
 //!
@@ -12,12 +12,12 @@
 
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering::Relaxed};
 
-use nativepsp_core::options::{start_skip, Options};
+use nativeres_core::options::{start_skip, Options};
 
 use crate::{adrenaline, frame_loop, menu, render_log, sys};
 
 /// Where we read our settings from.
-const PATH: &[u8] = b"ux0:data/nativepsp/config.txt\0";
+const PATH: &[u8] = b"ux0:data/nativeres/config.txt\0";
 /// The file is a few lines; anything past this is ignored.
 const MAX_BYTES: usize = 1024;
 
@@ -29,7 +29,7 @@ static PAUSED: AtomicBool = AtomicBool::new(false);
 /// sharp, 1 blurry like the PSP, 2 mipmapped.
 pub static MIP_MODE: AtomicU8 = AtomicU8::new(0);
 
-/// `startskip=` (nativepsp_core::options::start_skip), read by
+/// `startskip=` (nativeres_core::options::start_skip), read by
 /// `read_start_skip` before the hooks are set.
 static START_SKIP: AtomicU32 = AtomicU32::new(0);
 
@@ -103,7 +103,7 @@ fn load() {
     let options = Options::parse(text);
     render_log::line(format_args!(
         "options: {} ({} bytes): mip={} smooth={} gamefps={} armclock={} startskip={}\n",
-        if text.is_empty() { "defaults, no ux0:data/nativepsp/config.txt" } else { "config.txt" },
+        if text.is_empty() { "defaults, no ux0:data/nativeres/config.txt" } else { "config.txt" },
         text.len(),
         options.mip,
         options.smooth as i32,
@@ -150,7 +150,7 @@ pub fn start() {
     // Safe: plain system calls; the entry function matches `ThreadEntry`.
     unsafe {
         let thread = sys::sceKernelCreateThread(
-            b"NativePspOptions\0".as_ptr(),
+            b"NativeResOptions\0".as_ptr(),
             options_thread,
             0x1000_0100,
             0x2000,

@@ -31,7 +31,7 @@
 use core::ffi::c_void;
 use core::fmt;
 
-use nativepsp_core::texture_cache::gpu::{GpuFormat, TextureShape};
+use nativeres_core::texture_cache::gpu::{GpuFormat, TextureShape};
 
 use crate::{gxm, heap, render_log, sys, SingleThreaded};
 
@@ -111,7 +111,7 @@ const TEXTURE_ARENA_BYTES: usize = 6 * 1024 * 1024;
 #[no_mangle]
 #[used]
 #[allow(non_upper_case_globals)]
-pub static nativepsp_plan_phycont_texture_arena: u32 = sys::pages(TEXTURE_ARENA_BYTES);
+pub static nativeres_plan_phycont_texture_arena: u32 = sys::pages(TEXTURE_ARENA_BYTES);
 
 /// Render targets by texture size (a render target only describes the
 /// size; the colour surface says where the texels go).
@@ -141,7 +141,7 @@ pub fn texture_arena_bytes() -> u32 {
     // Safe: plain system calls; the block is ours alone.
     unsafe {
         let block = sys::alloc_block(
-            b"NativePspTextureArena\0".as_ptr(),
+            b"NativeResTextureArena\0".as_ptr(),
             sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW,
             TEXTURE_ARENA_BYTES as u32,
             core::ptr::null_mut(),
@@ -219,7 +219,7 @@ pub fn create(shape: &TextureShape, arena_offset: Option<u32>) -> *mut TextureOb
             }
             None => {
                 let block = sys::alloc_block(
-                    b"NativePspTexture\0".as_ptr(),
+                    b"NativeResTexture\0".as_ptr(),
                     sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_RW,
                     bytes,
                     core::ptr::null_mut(),

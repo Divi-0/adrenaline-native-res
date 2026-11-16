@@ -26,16 +26,16 @@ use core::ffi::c_void;
 use core::mem::offset_of;
 use core::ptr::{null, null_mut};
 
-use nativepsp_core::blend::{BLEND_ALPHA_ONLY, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_WRITES_ALPHA};
-use nativepsp_core::frame::FrameVertex;
-use nativepsp_core::vertex::VertexFormat;
+use nativeres_core::blend::{BLEND_ALPHA_ONLY, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_WRITES_ALPHA};
+use nativeres_core::frame::FrameVertex;
+use nativeres_core::vertex::VertexFormat;
 
 use crate::gxm::{self, PatcherId, ProgramParameter, VertexAttribute, VertexStream};
 use crate::basic_programs::{self, gxp, parameter, register, resource};
 use crate::{render_log, shaders};
 
 /// The PSP's blend words' FIX B value and premultiply bits: uniforms of the
-/// BLEND_FIX programs, not part of a program (NATIVEPSP_BLEND_FIX_B_VALUES).
+/// BLEND_FIX programs, not part of a program (NATIVERES_BLEND_FIX_B_VALUES).
 pub const BLEND_FIX_B_VALUES: u32 = 0x3FF << 12;
 
 /// Which fragment program: the basic colour and texture-tint programs, our
@@ -235,7 +235,7 @@ pub const SPRITE_CORNERS: usize = 32768;
 #[no_mangle]
 #[used]
 #[allow(non_upper_case_globals)]
-pub static nativepsp_plan_fixed_sprite_corners: u32 = crate::sys::pages(SPRITE_CORNERS);
+pub static nativeres_plan_fixed_sprite_corners: u32 = crate::sys::pages(SPRITE_CORNERS);
 
 struct BlendProgram {
     kind: Kind,
@@ -437,7 +437,7 @@ impl SpriteSet {
             render_log::line(format_args!("sprite program: parameters missing\n"));
             return false;
         }
-        let Some(block) = crate::gpu_memory::gpu_input(b"NativePspSpriteCorners\0", SPRITE_CORNERS as u32) else {
+        let Some(block) = crate::gpu_memory::gpu_input(b"NativeResSpriteCorners\0", SPRITE_CORNERS as u32) else {
             render_log::line(format_args!("sprite program: no corner table\n"));
             return false;
         };

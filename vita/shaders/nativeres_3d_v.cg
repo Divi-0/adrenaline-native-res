@@ -1,5 +1,5 @@
 // NativeRes: vertex program for textured 3D draws whose vertices are still in
-// model space (NativePspDraw.transform, frame.rs GpuTransform): it does what
+// model space (NativeResDraw.transform, frame.rs GpuTransform): it does what
 // the capture's CPU path does per vertex (RowTransform::apply), then what
 // nativeres_textured_v.cg does. Same outputs, so the same fragment programs.
 //

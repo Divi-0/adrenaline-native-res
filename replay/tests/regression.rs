@@ -1,7 +1,7 @@
 //! Regression test over every game and scene checked on the Vita so far.
 //!
 //! The test directory is `tests/` at the repository root, or the one named
-//! by `NATIVEPSP_TESTS`. In it, `dumps/<game>/<scene>.bin` are frame dumps
+//! by `NATIVERES_TESTS`. In it, `dumps/<game>/<scene>.bin` are frame dumps
 //! taken on the Vita (a development build of the plugin records them);
 //! `expected.txt` holds, per dump, what the replay made of it when it was
 //! last accepted:
@@ -20,7 +20,7 @@
 //! Accept the current results with
 //!
 //! ```text
-//! NATIVEPSP_UPDATE_EXPECTED=1 cargo test --release -p nativepsp-replay --test regression
+//! NATIVERES_UPDATE_EXPECTED=1 cargo test --release -p nativeres-replay --test regression
 //! ```
 //!
 //! Pictures go to `renderer/target/regression/<game>-<scene>.png` (plus
@@ -32,7 +32,7 @@
 //! A frame dump is a copy of the game's memory for one frame (its display
 //! lists, vertices and textures) plus the game's own picture: dumps of
 //! commercial games can't be published, so they live in a private test
-//! directory (`NATIVEPSP_TESTS`). Without any dumps the test passes and
+//! directory (`NATIVERES_TESTS`). Without any dumps the test passes and
 //! says so.
 
 use std::collections::BTreeMap;
@@ -44,9 +44,9 @@ use std::process::Command;
 /// but small rounding changes shouldn't be called improvements).
 const DIFF_TOLERANCE: f64 = 0.05;
 
-/// `NATIVEPSP_TESTS`, or `tests/` at the repository root.
+/// `NATIVERES_TESTS`, or `tests/` at the repository root.
 fn tests_dir() -> PathBuf {
-    match std::env::var_os("NATIVEPSP_TESTS") {
+    match std::env::var_os("NATIVERES_TESTS") {
         Some(dir) => PathBuf::from(dir),
         None => Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests"),
     }
@@ -155,7 +155,7 @@ fn write_expected(path: &Path, results: &BTreeMap<String, Result>) {
         "# Regression baseline for replay/tests/regression.rs: per dump in\n\
          # dumps/, the frame description hash and the mean difference (0..255)\n\
          # to the game's own picture. Rewritten by\n\
-         #   NATIVEPSP_UPDATE_EXPECTED=1 cargo test --release -p nativepsp-replay --test regression\n",
+         #   NATIVERES_UPDATE_EXPECTED=1 cargo test --release -p nativeres-replay --test regression\n",
     );
     for (name, result) in results {
         text += &format!("{name} hash={} diff={:.2}\n", result.hash, result.diff);
@@ -168,7 +168,7 @@ fn every_dumped_scene_replays_as_accepted() {
     let tests = tests_dir();
     let dumps = find_dumps(&tests.join("dumps"));
     if dumps.is_empty() {
-        println!("no frame dumps in {}: nothing to replay (set NATIVEPSP_TESTS to a test directory)", tests.join("dumps").display());
+        println!("no frame dumps in {}: nothing to replay (set NATIVERES_TESTS to a test directory)", tests.join("dumps").display());
         return;
     }
     let out_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/regression");
@@ -225,14 +225,14 @@ fn every_dumped_scene_replays_as_accepted() {
         problems.push(format!("{name}: in expected.txt but its dump is missing"));
     }
 
-    if std::env::var_os("NATIVEPSP_UPDATE_EXPECTED").is_some() {
+    if std::env::var_os("NATIVERES_UPDATE_EXPECTED").is_some() {
         write_expected(&expected_path, &results);
         println!("wrote {} ({} scenes)", expected_path.display(), results.len());
         return;
     }
     assert!(
         problems.is_empty(),
-        "\n{}\n\nPictures: {}\nIf the changes are intended: NATIVEPSP_UPDATE_EXPECTED=1 cargo test --release -p nativepsp-replay --test regression\n",
+        "\n{}\n\nPictures: {}\nIf the changes are intended: NATIVERES_UPDATE_EXPECTED=1 cargo test --release -p nativeres-replay --test regression\n",
         problems.join("\n"),
         out_dir.display()
     );

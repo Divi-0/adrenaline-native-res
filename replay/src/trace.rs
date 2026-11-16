@@ -1,10 +1,10 @@
 //! `--trace`: prints the GE state at every draw of the replayed frame.
 
-use nativepsp_core::command::{op, Command};
-use nativepsp_core::display_list::CommandVisitor;
-use nativepsp_core::ge_state::{float24, GeState};
-use nativepsp_core::memory::PspMemory;
-use nativepsp_core::transform::Transform;
+use nativeres_core::command::{op, Command};
+use nativeres_core::display_list::CommandVisitor;
+use nativeres_core::ge_state::{float24, GeState};
+use nativeres_core::memory::PspMemory;
+use nativeres_core::transform::Transform;
 
 const TEXTURE_FUNCTIONS: [&str; 8] = ["modulate", "decal", "blend", "replace", "add", "?5", "?6", "?7"];
 const BLEND_FACTORS: [&str; 11] = [

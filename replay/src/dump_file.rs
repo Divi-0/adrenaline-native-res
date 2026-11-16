@@ -1,12 +1,12 @@
-//! Reading a frame dump (format: `nativepsp_core::dump`).
+//! Reading a frame dump (format: `nativeres_core::dump`).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-use nativepsp_core::block_cache::{BlockSource, BLOCK_SIZE, BLOCK_WORDS};
-use nativepsp_core::draw_stream::DeferredReader;
-use nativepsp_core::dump::{Header, EVENT_WORDS, HEADER_BYTES, ORIGINAL_MAGIC};
-use nativepsp_core::memory::physical;
+use nativeres_core::block_cache::{BlockSource, BLOCK_SIZE, BLOCK_WORDS};
+use nativeres_core::draw_stream::DeferredReader;
+use nativeres_core::dump::{Header, EVENT_WORDS, HEADER_BYTES, ORIGINAL_MAGIC};
+use nativeres_core::memory::physical;
 
 /// What Sony's PSP emulator showed for the dumped frame.
 pub struct OriginalPicture {
@@ -66,7 +66,7 @@ impl BlockSource for &DumpMemory {
 
     /// Main RAM the dump holds, with `--copier` (`use_for_copier`).
     fn defer(&mut self, address: u32, bytes: u32) -> bool {
-        DEFER_MAIN_RAM.load(Ordering::Relaxed) && address >= nativepsp_core::memory::RAM_START && self.bytes(address, bytes).is_some()
+        DEFER_MAIN_RAM.load(Ordering::Relaxed) && address >= nativeres_core::memory::RAM_START && self.bytes(address, bytes).is_some()
     }
 
     /// As the Vita's direct reads: only the words asked for.
@@ -104,7 +104,7 @@ impl Cursor<'_> {
     }
 }
 
-/// The optional trailer with the original picture (see `nativepsp_core::dump`).
+/// The optional trailer with the original picture (see `nativeres_core::dump`).
 fn read_original(cursor: &mut Cursor) -> Result<Option<OriginalPicture>, String> {
     if cursor.bytes.len() < cursor.position + 8 || cursor.take(8)? != ORIGINAL_MAGIC {
         return Ok(None);

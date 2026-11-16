@@ -15,15 +15,15 @@
 //!    ARM clock, menu entry), then the extension's part, if there is one
 //!    (`ext`).
 //!
-//! `startskip=` in ux0:data/nativepsp/config.txt (read first) leaves parts
+//! `startskip=` in ux0:data/nativeres/config.txt (read first) leaves parts
 //! out, to bisect a crash at Adrenaline's start (C1-2858-3 hunt).
 
 use core::ffi::c_void;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-use nativepsp_core::options::start_skip;
-use nativepsp_core::report::TextBuffer;
+use nativeres_core::options::start_skip;
+use nativeres_core::report::TextBuffer;
 
 use crate::{capture, display_hooks, ext, io_hooks, log, options, psp_plugin, render_log, sys};
 
@@ -121,7 +121,7 @@ pub fn start(extensions: Option<&'static ext::Extensions>) -> i32 {
     }
     // Safe: plain system calls; `start_thread` matches `ThreadEntry`.
     unsafe {
-        let thread = sys::sceKernelCreateThread(b"NativePspStart\0".as_ptr(), start_thread, 0x1000_0100, 0x2000, 0, 0, core::ptr::null_mut());
+        let thread = sys::sceKernelCreateThread(b"NativeResStart\0".as_ptr(), start_thread, 0x1000_0100, 0x2000, 0, 0, core::ptr::null_mut());
         if thread >= 0 {
             sys::sceKernelStartThread(thread, 0, core::ptr::null_mut());
         }

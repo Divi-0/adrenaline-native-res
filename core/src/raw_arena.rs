@@ -38,7 +38,7 @@ pub static ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicB
 pub static ZERO_COPY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Whether the display can draw raw sprites (`draw_flags::RAW_SPRITES`):
-/// set once its sprite program exists (nativepsp_render.c); without it 3D
+/// set once its sprite program exists (nativeres_render.c); without it 3D
 /// rectangles stay on the CPU path.
 pub static SPRITES: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 

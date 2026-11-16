@@ -1,10 +1,10 @@
-//! NativeRes's PSP side: the kernel module nativepsp.prx that runs with every
+//! NativeRes's PSP side: the kernel module nativeres.prx that runs with every
 //! PSP game (loaded by Adrenaline's plugins.txt; the Vita plugin
-//! nativepsp.suprx carries it and installs it).
+//! nativeres.suprx carries it and installs it).
 //!
 //! Observe only: it hooks the calls a game uses to hand display lists to the
 //! PSP graphics engine (GE) and to show a finished frame, and records each
-//! call as an event in the shared ring (`nativepsp_core::event_ring`). The
+//! call as an event in the shared ring (`nativeres_core::event_ring`). The
 //! Vita side reads the ring and walks the same display lists. Every hook
 //! calls the original function unchanged, so the game renders exactly as
 //! before. One exception (2026-11-08): after the game's GE sync it may wait
@@ -12,7 +12,7 @@
 //! reuse their memory before we have read it.
 //!
 //! It also copies the VRAM the Vita side asks for (`copy`, protocol:
-//! `nativepsp_core::psp_link`).
+//! `nativeres_core::psp_link`).
 //!
 //! Hooking is done as GePatch (TheFloW) does it: the kernel function is
 //! found by NID and its system call pointed at our function, so the game's
@@ -31,13 +31,13 @@ use core::ffi::c_void;
 use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering::Relaxed};
 
-use nativepsp_core::event_ring::{
+use nativeres_core::event_ring::{
     Ring, CAPACITY, EVENT_FRAMEBUFFER_FLIP, EVENT_GE_RESTORE_CONTEXT, EVENT_GE_SAVE_CONTEXT, EVENT_GE_SYNC,
     EVENT_LIST_ENQUEUE, EVENT_LIST_ENQUEUE_HEAD,
     EVENT_STALL_UPDATE, MAGIC, RING_ADDRESS, SYNC_TIMEOUT_US, SYNC_WANTED, VERSION,
 };
-use nativepsp_core::psp_copy::SyncStall;
-use nativepsp_core::psp_link::{copy_method, VramRequestTable, VRAM_REQUESTS_ADDRESS};
+use nativeres_core::psp_copy::SyncStall;
+use nativeres_core::psp_link::{copy_method, VramRequestTable, VRAM_REQUESTS_ADDRESS};
 
 use sys::*;
 
@@ -273,7 +273,7 @@ fn wait_for_vita() -> u32 {
     loop {
         // Safe: a plain kernel call.
         unsafe { sceKernelDelayThread(100) };
-        if nativepsp_core::psp_copy::reached(header_get(header!(vita_handled)), target) {
+        if nativeres_core::psp_copy::reached(header_get(header!(vita_handled)), target) {
             break;
         }
         if header_get(header!(vita_sync_wanted)) != SYNC_WANTED {

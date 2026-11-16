@@ -22,10 +22,10 @@ use core::ffi::c_void;
 use core::ptr::{null, null_mut};
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, Ordering};
 
-use nativepsp_core::blend::{BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_WRITES_ALPHA};
-use nativepsp_core::frame::{draw_flags, test_flags, Draw, Frame, FrameVertex, GpuLights, GpuTransform, RawColors, NO_RING_INDICES};
-use nativepsp_core::texture;
-use nativepsp_core::vertex::VertexFormat;
+use nativeres_core::blend::{BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_WRITES_ALPHA};
+use nativeres_core::frame::{draw_flags, test_flags, Draw, Frame, FrameVertex, GpuLights, GpuTransform, RawColors, NO_RING_INDICES};
+use nativeres_core::texture;
+use nativeres_core::vertex::VertexFormat;
 
 use crate::arenas;
 use crate::capture::{RAW_ARENA, RAW_ARENA_BYTES, VERTEX_ARENA, VERTEX_ARENA_VERTICES};
@@ -1091,7 +1091,7 @@ impl Draws {
             // Safe: plain system calls; the block is ours alone.
             unsafe {
                 let uid = sys::alloc_block(
-                    b"NativePspTestBlock\0".as_ptr(),
+                    b"NativeResTestBlock\0".as_ptr(),
                     sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW,
                     TEST_BLOCK_BYTES as u32,
                     null_mut(),
@@ -1268,7 +1268,7 @@ const TEST_BLOCK_BYTES: usize = 65536 * core::mem::size_of::<basic_programs::Col
 #[no_mangle]
 #[used]
 #[allow(non_upper_case_globals)]
-pub static nativepsp_plan_phycont_test_block: u32 = sys::pages(TEST_BLOCK_BYTES);
+pub static nativeres_plan_phycont_test_block: u32 = sys::pages(TEST_BLOCK_BYTES);
 
 /// Which raw program set a raw draw uses.
 #[derive(Clone, Copy, PartialEq, Eq)]

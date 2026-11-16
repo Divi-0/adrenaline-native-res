@@ -1,8 +1,8 @@
-//! The PSP side (psp/ -> nativepsp.prx, built by
+//! The PSP side (psp/ -> nativeres.prx, built by
 //! scripts/build-psp-plugin.sh) is carried inside this plugin, so the user
 //! installs one file. At Adrenaline's start, before its PSP side boots,
 //! `install` puts it where Adrenaline's PSP side loads plugins from:
-//! `<ms0>/seplugins/nativepsp.prx` (written only when it differs from the
+//! `<ms0>/seplugins/nativeres.prx` (written only when it differs from the
 //! file there) and its line in `<ms0>/seplugins/plugins.txt` (added only
 //! when no line mentions the plugin: a line the user turned off stays off;
 //! core `psp_copy::plugins_txt_with_ours`). <ms0> is Adrenaline's "Memory
@@ -13,11 +13,11 @@
 
 use core::ffi::c_void;
 
-use nativepsp_core::psp_copy::plugins_txt_with_ours;
+use nativeres_core::psp_copy::plugins_txt_with_ours;
 
 use crate::{adrenaline, render_log, sys, SingleThreaded};
 
-static PRX: &[u8] = include_bytes!("../../target/nativepsp.prx");
+static PRX: &[u8] = include_bytes!("../../target/nativeres.prx");
 
 /// plugins.txt is read and written whole; bigger ones are left alone.
 const PLUGINS_TXT_MAX: usize = 8 * 1024;
@@ -137,7 +137,7 @@ pub fn install() {
     let buffers = unsafe { BUFFERS.get() };
     let (mut directory, mut prx, mut list) = ([0u8; 64], [0u8; 64], [0u8; 64]);
     let directory = path(&mut directory, b"/seplugins");
-    let prx = path(&mut prx, b"/seplugins/nativepsp.prx");
+    let prx = path(&mut prx, b"/seplugins/nativeres.prx");
     let list = path(&mut list, b"/seplugins/plugins.txt");
     // Safe: a NUL-terminated path; fails harmlessly when it exists.
     unsafe { sys::sceIoMkdir(directory.as_ptr(), 0o777) };

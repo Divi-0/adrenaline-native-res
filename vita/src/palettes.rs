@@ -1,5 +1,5 @@
 //! The palette tables' GPU memory (which table holds which palette:
-//! `nativepsp_core::palette_tables`, the reason for them there).
+//! `nativeres_core::palette_tables`, the reason for them there).
 //!
 //! Uncached GPU memory: 1 KiB of writes per new palette, nothing to flush.
 //! Display thread only.
@@ -7,16 +7,16 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use nativepsp_core::frame::{Frame, TextureDescriptor};
-use nativepsp_core::palette_tables::{PaletteKey, PaletteLookup, PaletteTables, TABLES, TABLE_BYTES};
-use nativepsp_core::texture;
+use nativeres_core::frame::{Frame, TextureDescriptor};
+use nativeres_core::palette_tables::{PaletteKey, PaletteLookup, PaletteTables, TABLES, TABLE_BYTES};
+use nativeres_core::texture;
 
 use crate::{gpu_memory, render_log, sys, SingleThreaded};
 
 #[no_mangle]
 #[used]
 #[allow(non_upper_case_globals)]
-pub static nativepsp_plan_fixed_palette_tables: u32 = sys::pages(TABLES * TABLE_BYTES);
+pub static nativeres_plan_fixed_palette_tables: u32 = sys::pages(TABLES * TABLE_BYTES);
 
 /// "palette tables full" is logged this often at most.
 const MAX_LOGGED: u32 = 5;
@@ -50,7 +50,7 @@ pub fn palette_for(frame: &Frame, texture: &TextureDescriptor, now: u32) -> *con
         if state.failed {
             return core::ptr::null();
         }
-        match gpu_memory::for_gpu(b"NativePspPalettes\0", (TABLES * TABLE_BYTES) as u32) {
+        match gpu_memory::for_gpu(b"NativeResPalettes\0", (TABLES * TABLE_BYTES) as u32) {
             Some(block) => state.memory = block.base as *mut u32,
             None => {
                 state.failed = true;

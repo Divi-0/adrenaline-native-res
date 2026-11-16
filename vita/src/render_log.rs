@@ -12,7 +12,7 @@ use core::cell::UnsafeCell;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use nativepsp_core::report::TextBuffer;
+use nativeres_core::report::TextBuffer;
 
 const RENDER_LOG_SIZE: usize = 64 * 1024;
 

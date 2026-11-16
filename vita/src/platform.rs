@@ -4,14 +4,14 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use nativepsp_core::memory::{place_read, PspPlace};
+use nativeres_core::memory::{place_read, PspPlace};
 
 use crate::sys;
 
 /// The PSP plugin's copy of VRAM (`psp_link::VRAM_COPY_ADDRESS`). Sony's
 /// emulator keeps the real VRAM where we can't read it; the plugin copies
-/// the ranges we ask for there (see `nativepsp_core::vram_requests`).
-use nativepsp_core::psp_link::VRAM_COPY_ADDRESS;
+/// the ranges we ask for there (see `nativeres_core::vram_requests`).
+use nativeres_core::psp_link::VRAM_COPY_ADDRESS;
 
 /// Reads `psp_memory` refused (outside VRAM, RAM and the
 /// scratchpad), for the capture log (`badread=`). Each one would have been
@@ -24,7 +24,7 @@ pub static LAST_REFUSED_SIZE: AtomicU32 = AtomicU32::new(0);
 /// Where `size` bytes of PSP memory at physical `address` can be read on
 /// the Vita, or null. VRAM addresses (also in VRAM's mirrors) lead to the
 /// plugin's copy. Null for anything that isn't VRAM, RAM or the scratchpad
-/// (`nativepsp_core::memory::place_read`, tested there).
+/// (`nativeres_core::memory::place_read`, tested there).
 ///
 /// We read PSP RAM directly (like the native framebuffer in menu.c) instead
 /// of using ScePspemuConvertAddress(KERMIT_INPUT_MODE): that call does

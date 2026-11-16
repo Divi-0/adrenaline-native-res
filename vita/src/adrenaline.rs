@@ -28,7 +28,7 @@ struct AdrenalineConfig {
     /// Settings > "NativeRes Renderer" (the fork's menu, below Graphics
     /// Filtering): 0 = on (default; older files have 0 in this former
     /// padding), 1 = off. Stock Adrenaline keeps the byte when it saves.
-    nativepsp_renderer_off: u8,
+    nativeres_renderer_off: u8,
 }
 
 const _: () = assert!(core::mem::size_of::<AdrenalineConfig>() == CONFIG_BYTES);
@@ -238,7 +238,7 @@ pub fn graphics_filtering() -> Option<u8> {
 /// are found.
 pub fn renderer_switch() -> Option<bool> {
     // Safe: a byte the menu may change; any value read is fine.
-    config().map(|config| unsafe { read_volatile(addr_of!((*config).nativepsp_renderer_off)) } == 0)
+    config().map(|config| unsafe { read_volatile(addr_of!((*config).nativeres_renderer_off)) } == 0)
 }
 
 /// Sets "NativeRes Renderer" without saving it (Adrenaline saves it with
@@ -246,7 +246,7 @@ pub fn renderer_switch() -> Option<bool> {
 pub fn set_renderer_switch(on: bool) {
     if let Some(config) = config() {
         // Safe: a byte; the menu writes it the same way.
-        unsafe { write_volatile(addr_of_mut!((*config).nativepsp_renderer_off), (!on) as u8) }
+        unsafe { write_volatile(addr_of_mut!((*config).nativeres_renderer_off), (!on) as u8) }
     }
 }
 

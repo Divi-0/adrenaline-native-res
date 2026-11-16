@@ -1,4 +1,4 @@
-//! The VRAM copy (protocol: `nativepsp_core::psp_link`; decisions: core
+//! The VRAM copy (protocol: `nativeres_core::psp_link`; decisions: core
 //! `psp_copy`, tested there). Sony's emulator keeps PSP VRAM where the Vita
 //! side can't read it; we copy the ranges it lists to the copy area and keep
 //! them up to date:
@@ -39,12 +39,12 @@ use core::ffi::c_void;
 use core::ptr::{addr_of, read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};
 
-use nativepsp_core::psp_copy::{
+use nativeres_core::psp_copy::{
     best_method, copy_span, ge_probe_list, KnownRanges, Refresh, CHECK_BLOCK_BYTES, GE_PROBE_LIST_WORDS,
     REFRESH_BYTES_PER_FRAME,
 };
-use nativepsp_core::psp_link::{copy_method, VRAM_CACHED, VRAM_COPY_ADDRESS, VRAM_COPY_CACHED_ADDRESS, VRAM_UNCACHED};
-use nativepsp_core::vram_requests::{VramRange, MAX_RANGES, VRAM_SIZE};
+use nativeres_core::psp_link::{copy_method, VRAM_CACHED, VRAM_COPY_ADDRESS, VRAM_COPY_CACHED_ADDRESS, VRAM_UNCACHED};
+use nativeres_core::vram_requests::{VramRange, MAX_RANGES, VRAM_SIZE};
 
 use crate::sys::*;
 use crate::{add, get, now_us, set, table, without_interrupts, Global, CHECK_AT_FLIP, COPY_WAKEUP, SYNCED_SINCE_FLIP};
@@ -452,7 +452,7 @@ fn ge_user_memory() -> Option<u32> {
     let base = unsafe {
         let block = sceKernelAllocPartitionMemory(
             USER_PARTITION,
-            b"NativePspGeProbe\0".as_ptr(),
+            b"NativeResGeProbe\0".as_ptr(),
             SMEM_HIGH,
             256 + GE_SCRATCH_BYTES,
             core::ptr::null_mut(),
@@ -610,14 +610,14 @@ unsafe extern "C" fn copy_thread(_args: u32, _argp: *mut c_void) -> i32 {
 pub fn start_thread() {
     // Safe: plain kernel calls, NUL-terminated names.
     unsafe {
-        let wakeup = sceKernelCreateSema(b"NativePspCopyWakeup\0".as_ptr(), 0, 0, 1, core::ptr::null_mut());
+        let wakeup = sceKernelCreateSema(b"NativeResCopyWakeup\0".as_ptr(), 0, 0, 1, core::ptr::null_mut());
         if wakeup < 0 {
             set!(copy_thread_error, wakeup as u32);
             return;
         }
         COPY_WAKEUP.store(wakeup, Relaxed);
         let thread = sceKernelCreateThread(
-            b"NativePspVramCopy\0".as_ptr(),
+            b"NativeResVramCopy\0".as_ptr(),
             copy_thread,
             COPY_THREAD_PRIORITY,
             COPY_THREAD_STACK_SIZE,

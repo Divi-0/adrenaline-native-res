@@ -1,4 +1,4 @@
-//! Recording one frame into a dump (format: `nativepsp_core::dump`).
+//! Recording one frame into a dump (format: `nativeres_core::dump`).
 //!
 //! Used from the capture thread only. While a dump is active:
 //! - every 1 KiB block of PSP memory that `VitaPspMemory` maps is copied
@@ -13,8 +13,8 @@
 
 use core::ptr;
 
-use nativepsp_core::dump::{Header, BLOCK_SIZE, EVENT_WORDS, HEADER_BYTES};
-use nativepsp_core::snapshot::Writer;
+use nativeres_core::dump::{Header, BLOCK_SIZE, EVENT_WORDS, HEADER_BYTES};
+use nativeres_core::snapshot::Writer;
 
 /// Room for header, snapshot and events at the start of the buffer.
 const BLOCKS_START: usize = 256 * 1024;

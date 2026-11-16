@@ -1,12 +1,12 @@
 //! The three recorded frames shared by the capture thread (fills them) and
 //! the display thread (frame_loop.rs draws them), handed over with
-//! `nativepsp_core::triple_buffer`: no locks, the newest frame wins.
+//! `nativeres_core::triple_buffer`: no locks, the newest frame wins.
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, Ordering};
 
-use nativepsp_core::frame::Frame;
-use nativepsp_core::triple_buffer::{Consumer, Producer, TripleBuffer, SLOTS};
+use nativeres_core::frame::Frame;
+use nativeres_core::triple_buffer::{Consumer, Producer, TripleBuffer, SLOTS};
 
 use crate::sys;
 use crate::SingleThreaded;
@@ -19,7 +19,7 @@ static FRAMES: AtomicPtr<Frame> = AtomicPtr::new(core::ptr::null_mut());
 #[no_mangle]
 #[used]
 #[allow(non_upper_case_globals)]
-pub static nativepsp_plan_fixed_frames: u32 = sys::pages(core::mem::size_of::<Frame>() * SLOTS);
+pub static nativeres_plan_fixed_frames: u32 = sys::pages(core::mem::size_of::<Frame>() * SLOTS);
 /// Semaphore (max 1), signalled for every published frame.
 static PUBLISHED: AtomicI32 = AtomicI32::new(-1);
 static ALLOCATED: AtomicBool = AtomicBool::new(false);
@@ -43,7 +43,7 @@ pub fn allocate() -> bool {
     // Safe: plain system calls; the block is ours alone until FRAMES is set.
     unsafe {
         let block = sys::alloc_block(
-            b"NativePspFrames\0".as_ptr(),
+            b"NativeResFrames\0".as_ptr(),
             sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_RW,
             size as u32,
             core::ptr::null_mut(),
@@ -58,7 +58,7 @@ pub fn allocate() -> bool {
             (*frames.add(slot)).clear();
         }
         PUBLISHED.store(
-            sys::sceKernelCreateSema(b"NativePspFramePublished\0".as_ptr(), 0, 0, 1, core::ptr::null_mut()),
+            sys::sceKernelCreateSema(b"NativeResFramePublished\0".as_ptr(), 0, 0, 1, core::ptr::null_mut()),
             Ordering::Release,
         );
         FRAMES.store(frames, Ordering::Release);

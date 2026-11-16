@@ -10,7 +10,7 @@
 //! after the sync therefore holds the new picture above the row being
 //! written at `t` and the old one below it: a seam at that row.
 //!
-//! Copied after `NativePspRenderFrame` (which may wait up to 5 ms for a
+//! Copied after `NativeResRenderFrame` (which may wait up to 5 ms for a
 //! frame of ours, `FRAME_WAIT_US`, and is preempted by the capture threads),
 //! the copy came 1-7 ms after the sync in more than half the loops
 //! (during the movie: 179 of 359 loops 5-7 ms after it): a seam ~90 rows down, "split horizontally in the top section"
@@ -35,16 +35,16 @@ pub const HIDDEN_SEAM_ROWS: u32 = 17;
 /// Where the loop copies Sony's picture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CopyPoint {
-    /// Right after the LCD sync, before `NativePspRenderFrame`.
+    /// Right after the LCD sync, before `NativeResRenderFrame`.
     AfterSync,
-    /// Only once `NativePspRenderFrame` said the loop shows Sony's picture
+    /// Only once `NativeResRenderFrame` said the loop shows Sony's picture
     /// (needed then; when our frame is shown, no copy at all).
     AfterRender,
 }
 
 /// Where to copy: right after the sync while the screen shows Sony's
 /// picture (it was shown in the loop before: CPU-drawn pictures come in
-/// runs), otherwise only if `NativePspRenderFrame` falls back to it.
+/// runs), otherwise only if `NativeResRenderFrame` falls back to it.
 pub fn sony_copy_point(showed_sony_picture_last: bool) -> CopyPoint {
     if showed_sony_picture_last {
         CopyPoint::AfterSync
@@ -68,7 +68,7 @@ pub fn copy_is_clean(copy_at_us: u32) -> bool {
     row < HIDDEN_SEAM_ROWS || row >= PSP_ROWS
 }
 
-/// When a copy at `point` starts, given when `NativePspRenderFrame` returned
+/// When a copy at `point` starts, given when `NativeResRenderFrame` returned
 /// (`render_end_us` after the sync).
 pub fn copy_time_us(point: CopyPoint, render_end_us: u32) -> u32 {
     match point {
@@ -85,7 +85,7 @@ pub const CPU_PICTURE_DIFFERENCE: u32 = 96;
 /// screens, movies): the screen cells no draw touches, Sony's picture
 /// (`sony`) against ours (`ours`; `None` when our target holds nothing yet,
 /// new or cleared: black). Then the display shows Sony's picture for it
-/// (nativepsp_render.c ShowsCpuWrittenPicture).
+/// (nativeres_render.c ShowsCpuWrittenPicture).
 ///
 /// MTX's boot loading screen (2026-11-11): the game writes the picture once
 /// into both framebuffers and draws only the progress bar, alternating
@@ -123,11 +123,11 @@ mod tests {
     use super::*;
 
     /// Measured during MTX's intro movie, renderer on (2026-11-10): how
-    /// long after the LCD sync `NativePspRenderFrame` returned in loops that
+    /// long after the LCD sync `NativeResRenderFrame` returned in loops that
     /// showed Sony's picture, by 1 ms bucket. Where the copy used to be.
     const RENDER_END_HISTOGRAM: [(u32, u32); 6] = [(0, 147), (1, 28), (2, 2), (4, 3), (5, 10), (6, 169)];
 
-    /// The torn intro movie: copied after `NativePspRenderFrame`, most loops
+    /// The torn intro movie: copied after `NativeResRenderFrame`, most loops
     /// split the picture far below the top edge.
     #[test]
     fn copying_after_our_render_step_tore_the_movie() {

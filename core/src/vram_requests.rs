@@ -29,7 +29,7 @@
 /// PSP VRAM, physical addresses.
 pub const VRAM_START: u32 = 0x0400_0000;
 pub const VRAM_SIZE: u32 = 0x20_0000;
-/// Entries in the shared table (NATIVEPSP_VRAM_MAX_RANGES).
+/// Entries in the shared table (NATIVERES_VRAM_MAX_RANGES).
 pub const MAX_RANGES: usize = 32;
 pub const BLOCK_SIZE: u32 = 1024;
 pub const BLOCKS: usize = (VRAM_SIZE / BLOCK_SIZE) as usize;
@@ -47,7 +47,7 @@ pub const LOOKAHEAD_BLOCKS: usize = 64;
 /// gets few ranges (doubled until the ranges fit into the table).
 pub const GAP_BLOCKS: usize = 8;
 
-/// One table entry: bytes from the start of VRAM (NativePspVramRange).
+/// One table entry: bytes from the start of VRAM (NativeResVramRange).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct VramRange {
@@ -367,14 +367,14 @@ impl VramRequests {
 
 /// Whether `texture` needs the plugin's VRAM copy, given the framebuffers
 /// the display has render targets for (`display_targets`, PSP addresses, 0 =
-/// none; nativepsp_render.c publishes them) and the frame's shown framebuffer.
+/// none; nativeres_render.c publishes them) and the frame's shown framebuffer.
 ///
 /// MTX samples framebuffers as textures while driving (2026-11-09): the VRAM
 /// requests grew to 2.1-2.3 MB (nearly all of VRAM), and since the GE redraws
 /// them every frame the plugin found ~800 changed blocks per frame and copied
 /// them in the game's thread. The display doesn't use that copy where it has
 /// a target at the texture's address: it samples the target (format < 4, not
-/// the framebuffer the frame shows, as in nativepsp_render.c). Those textures
+/// the framebuffer the frame shows, as in nativeres_render.c). Those textures
 /// aren't requested. Others are: a first try that skipped every recently
 /// drawn framebuffer lost MTX's HUD (drawn into a third buffer the display
 /// keeps no target for).

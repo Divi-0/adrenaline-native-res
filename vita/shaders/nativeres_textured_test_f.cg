@@ -6,7 +6,7 @@
 //
 // uAlphaTest: the alpha values (0..255) that pass are lo (x) .. hi (y); with
 // z = 1 the ones outside pass instead (NOTEQUAL). The display works the range
-// out from the compare function and reference (nativepsp_render.c
+// out from the compare function and reference (nativeres_render.c
 // AlphaTestRange). A range instead of == / != compares: PPSSPP notes a
 // PowerVR driver problem with an equality check plus discard.
 //

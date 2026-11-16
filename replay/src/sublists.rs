@@ -9,10 +9,10 @@
 
 use std::collections::BTreeSet;
 
-use nativepsp_core::command::{op, Command};
-use nativepsp_core::display_list::CommandVisitor;
-use nativepsp_core::ge_state::GeState;
-use nativepsp_core::memory::PspMemory;
+use nativeres_core::command::{op, Command};
+use nativeres_core::display_list::CommandVisitor;
+use nativeres_core::ge_state::GeState;
+use nativeres_core::memory::PspMemory;
 
 /// One sub-list call being walked.
 struct Open {

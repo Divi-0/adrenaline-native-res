@@ -1,4 +1,4 @@
-//! The display thread's texture cache (`nativepsp_core::texture_cache`) on
+//! The display thread's texture cache (`nativeres_core::texture_cache`) on
 //! the Vita: its host (GPU textures from gpu_textures.rs,
 //! PSP memory, the clock, the render log), the staging buffer, and the
 //! worker thread that re-checks big textures.
@@ -18,12 +18,12 @@ use core::fmt;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, Ordering};
 
-use nativepsp_core::frame::{Frame, TextureDescriptor, MAX_TEXTURES};
-use nativepsp_core::texture::{self, DecodeError};
-use nativepsp_core::texture_cache::gpu::{GpuFormat, GpuTexture, TextureShape};
-use nativepsp_core::texture_cache::refresh::{run_refresh, RefreshJob, RefreshResult};
-use nativepsp_core::texture_cache::staging::STAGING_SIZE;
-use nativepsp_core::texture_cache::{FrameStart, FrameTimes, Host, Lookup, TextureCache, TextureStats, VramState, MAX_RENDER_TARGETS};
+use nativeres_core::frame::{Frame, TextureDescriptor, MAX_TEXTURES};
+use nativeres_core::texture::{self, DecodeError};
+use nativeres_core::texture_cache::gpu::{GpuFormat, GpuTexture, TextureShape};
+use nativeres_core::texture_cache::refresh::{run_refresh, RefreshJob, RefreshResult};
+use nativeres_core::texture_cache::staging::STAGING_SIZE;
+use nativeres_core::texture_cache::{FrameStart, FrameTimes, Host, Lookup, TextureCache, TextureStats, VramState, MAX_RENDER_TARGETS};
 
 use crate::capture::{self, CAPTURED_FRAME_NUMBER};
 use crate::platform::{psp_copy, psp_memory};
@@ -67,7 +67,7 @@ static DISPLAY: SingleThreaded<DisplayState> = SingleThreaded::new(DisplayState 
 #[no_mangle]
 #[used]
 #[allow(non_upper_case_globals)]
-pub static nativepsp_plan_fixed_staging: u32 = 2 * sys::pages(STAGING_SIZE);
+pub static nativeres_plan_fixed_staging: u32 = 2 * sys::pages(STAGING_SIZE);
 
 /// Allocates `STAGING_SIZE` bytes of cached main memory, or null.
 fn allocate_staging(name: &[u8]) -> *mut u8 {
@@ -95,7 +95,7 @@ pub fn ready() -> bool {
     // Safe: only the display thread calls this.
     let display = unsafe { DISPLAY.get() };
     if display.staging.is_null() {
-        display.staging = allocate_staging(b"NativePspStaging\0");
+        display.staging = allocate_staging(b"NativeResStaging\0");
         if display.staging.is_null() {
             return false;
         }
@@ -264,7 +264,7 @@ pub fn take_counters() -> Counters {
 }
 
 // ------------------------------------------------------------------------
-// The worker thread (see `nativepsp_core::texture_cache::refresh`)
+// The worker thread (see `nativeres_core::texture_cache::refresh`)
 // ------------------------------------------------------------------------
 
 const IDLE: u32 = 0;
@@ -300,21 +300,21 @@ static WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
 /// Starts the worker and its own staging buffer. On failure big textures
 /// are re-checked on the display thread.
 fn start_worker() {
-    let staging = allocate_staging(b"NativePspRefreshStaging\0");
+    let staging = allocate_staging(b"NativeResRefreshStaging\0");
     if staging.is_null() {
         return;
     }
     WORKER.staging.store(staging, Ordering::Release);
     // Safe: plain system calls.
     unsafe {
-        let wakeup = sys::sceKernelCreateSema(b"NativePspRefreshWakeup\0".as_ptr(), 0, 0, 1, null_mut());
+        let wakeup = sys::sceKernelCreateSema(b"NativeResRefreshWakeup\0".as_ptr(), 0, 0, 1, null_mut());
         if wakeup < 0 {
             log_line(format_args!("background refresh unavailable: sema {:08x}\n", wakeup));
             return;
         }
         WORKER.wakeup.store(wakeup, Ordering::Release);
         let thread = sys::sceKernelCreateThread(
-            b"NativePspRefresh\0".as_ptr(),
+            b"NativeResRefresh\0".as_ptr(),
             worker_thread,
             WORKER_PRIORITY,
             WORKER_STACK_SIZE,
@@ -516,9 +516,9 @@ impl Host for VitaHost {
 }
 
 /// Display loop (menu.c): 1 if Sony's picture is to be copied right after
-/// the LCD sync (`nativepsp_core::display_loop::sony_copy_point`), 0 if only
-/// once `NativePspRenderFrame` falls back to it.
+/// the LCD sync (`nativeres_core::display_loop::sony_copy_point`), 0 if only
+/// once `NativeResRenderFrame` falls back to it.
 pub fn copy_sony_picture_early(showed_sony_picture_last: bool) -> bool {
-    use nativepsp_core::display_loop::{sony_copy_point, CopyPoint};
+    use nativeres_core::display_loop::{sony_copy_point, CopyPoint};
     sony_copy_point(showed_sony_picture_last) == CopyPoint::AfterSync
 }

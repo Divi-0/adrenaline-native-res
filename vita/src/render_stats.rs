@@ -2,14 +2,14 @@
 
 use core::fmt::Write;
 
-use nativepsp_core::report::TextBuffer;
+use nativeres_core::report::TextBuffer;
 
 use crate::{frame_pool, palettes, sys, textures, SingleThreaded};
 
 #[derive(Clone, Copy)]
 pub struct RenderStats {
     pub frames: u32,
-    /// The whole NativePspRenderFrame.
+    /// The whole NativeResRenderFrame.
     pub total_us: u64,
     /// The texture cache (hashing + decoding) and palettes.
     pub textures_us: u64,

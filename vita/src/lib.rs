@@ -8,7 +8,7 @@
 //!   the loop's timings, the GAME fps label), the PSP's buttons, threads.
 //! - `io_hooks`: AdrenalineUser's file calls on PSP memory through a buffer
 //!   of ours.
-//! - `psp_plugin`: the PSP side (nativepsp.prx, renderer/psp) carried in
+//! - `psp_plugin`: the PSP side (nativeres.prx, renderer/psp) carried in
 //!   this plugin, installed into Adrenaline's seplugins at the start.
 //! - `capture`: the capture thread (event ring -> core `Capture` -> log
 //!   line, recorded frames, VRAM copy requests).
@@ -97,9 +97,9 @@ use core::cell::UnsafeCell;
 use core::fmt::Write;
 use core::panic::PanicInfo;
 
-use nativepsp_core::frame::TextureDescriptor;
-use nativepsp_core::report::TextBuffer;
-use nativepsp_core::texture;
+use nativeres_core::frame::TextureDescriptor;
+use nativeres_core::report::TextBuffer;
+use nativeres_core::texture;
 
 /// State only one thread uses (the capture thread's, or the display
 /// thread's side of the frame handover). Transparent: the value's own

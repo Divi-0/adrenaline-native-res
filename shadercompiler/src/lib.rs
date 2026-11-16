@@ -1,7 +1,7 @@
 //! NativeRes Shader Compiler: a small Vita app, only needed to change the
 //! plugin's shaders.
 //!
-//! Compiles every .cg file in ux0:data/nativepsp/shaders/ with Sony's
+//! Compiles every .cg file in ux0:data/nativeres/shaders/ with Sony's
 //! runtime Cg compiler (ur0:data/libshacccg.suprx, extracted by tools like
 //! ShaRKBR33D) and writes <name>.gxp plus <name>.gxp.txt (the compiler's
 //! messages) next to it. Files ending in _v.cg are vertex programs, all
@@ -19,7 +19,7 @@
 //!
 //! Built by scripts/build-shadercompiler.sh (cargo, the SDK's linker and
 //! tools, no C library): the compiler's malloc/free are ours
-//! (`nativepsp_core::class_heap` over one 32 MiB block, as big as the C
+//! (`nativeres_core::class_heap` over one 32 MiB block, as big as the C
 //! app's newlib heap).
 
 #![no_std]
@@ -31,11 +31,11 @@ use core::fmt::Write;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
-use nativepsp_core::class_heap::ClassHeap;
+use nativeres_core::class_heap::ClassHeap;
 
 type SceUID = i32;
 
-const SHADER_DIR: &str = "ux0:data/nativepsp/shaders";
+const SHADER_DIR: &str = "ux0:data/nativeres/shaders";
 const SHACCCG_PATH: &[u8] = b"ur0:data/libshacccg.suprx\0";
 const MAX_SOURCE: usize = 60 * 1024;
 /// The compiler's memory (the C app: `_newlib_heap_size_user`).
@@ -304,7 +304,7 @@ unsafe fn words<'a>(memory: *mut u32) -> &'a mut [u32] {
 fn heap_init() -> bool {
     // Safe: plain system calls; the block is ours alone.
     let base = unsafe {
-        let block = sceKernelAllocMemBlock(b"NativePspShaccHeap\0".as_ptr(), SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, HEAP_BYTES, core::ptr::null_mut());
+        let block = sceKernelAllocMemBlock(b"NativeResShaccHeap\0".as_ptr(), SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, HEAP_BYTES, core::ptr::null_mut());
         let mut base: *mut c_void = core::ptr::null_mut();
         if block < 0 || sceKernelGetMemBlockBase(block, &mut base) < 0 {
             say(format_args!("ERR no memory for the compiler's heap: {:08x}\n", block as u32));

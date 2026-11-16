@@ -249,7 +249,7 @@ pub fn psp_to_vita(address: u32) -> usize {
 }
 
 /// `bytes` rounded up to whole 4 KiB pages, as the kernel allocates them:
-/// for the `nativepsp_plan_*` statics that tell the memory plan how much
+/// for the `nativeres_plan_*` statics that tell the memory plan how much
 /// memory an allocation site takes (see blocks.rs).
 pub const fn pages(bytes: usize) -> u32 {
     ((bytes + 0xFFF) & !0xFFF) as u32

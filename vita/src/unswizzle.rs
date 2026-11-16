@@ -22,7 +22,7 @@
 use core::ptr::{null, null_mut};
 use core::sync::atomic::{AtomicI32, Ordering};
 
-use nativepsp_core::frame::TextureDescriptor;
+use nativeres_core::frame::TextureDescriptor;
 
 use crate::gpu_textures::TextureObject;
 use crate::platform::{psp_copy, psp_memory};
@@ -44,7 +44,7 @@ const _: () = assert!(SLICE_BLOCKS as usize * 6 * 2 <= QUAD_INDEX_BYTES as usize
 #[no_mangle]
 #[used]
 #[allow(non_upper_case_globals)]
-pub static nativepsp_plan_fixed_unswizzle: u32 = sys::pages(
+pub static nativeres_plan_fixed_unswizzle: u32 = sys::pages(
     MAX_LAYOUTS * sys::pages((512 / 8) * (512 / 8) * 4 * core::mem::size_of::<TextureVertex>()) as usize + QUAD_INDEX_BYTES as usize,
 );
 
@@ -79,7 +79,7 @@ fn layout_for(width: u32, height: u32) -> Option<Layout> {
         return Some(*layout);
     }
     if state.quad_indices.is_null() {
-        let block = gpu_memory::gpu_input(b"NativePspQuadIndices\0", QUAD_INDEX_BYTES)?;
+        let block = gpu_memory::gpu_input(b"NativeResQuadIndices\0", QUAD_INDEX_BYTES)?;
         let indices = block.base as *mut u16;
         const CORNERS: [u16; 6] = [0, 1, 2, 2, 1, 3];
         for quad in 0..SLICE_BLOCKS as usize {
@@ -93,7 +93,7 @@ fn layout_for(width: u32, height: u32) -> Option<Layout> {
     let slot = state.layouts.iter_mut().find(|l| l.vertices.is_null())?;
     let blocks = width / 8 * (height / 8);
     let bytes = sys::pages(blocks as usize * 4 * core::mem::size_of::<TextureVertex>());
-    let block = gpu_memory::gpu_input(b"NativePspUnswizzle\0", bytes)?;
+    let block = gpu_memory::gpu_input(b"NativeResUnswizzle\0", bytes)?;
     let vertices = block.base as *mut TextureVertex;
     let (scale_x, scale_y) = (TARGET_WIDTH as f32 / width as f32, TARGET_HEIGHT as f32 / height as f32);
     const CORNERS: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];

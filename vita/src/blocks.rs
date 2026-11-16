@@ -10,7 +10,7 @@
 //!   `free_block`, which keep a table of the live ones (`report`, with the
 //!   free memory), so a live run shows exactly where the memory goes.
 //! - Each allocation site states its size in the build as a constant named
-//!   `nativepsp_plan_<kind>_<name>` (a `#[no_mangle]` static, so it keeps
+//!   `nativeres_plan_<kind>_<name>` (a `#[no_mangle]` static, so it keeps
 //!   that name in the ELF), so a tool can read them from the ELF and check
 //!   that the build fits the memory measured on the Vita.
 
@@ -19,7 +19,7 @@ use core::ffi::c_void;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use nativepsp_core::report::TextBuffer;
+use nativeres_core::report::TextBuffer;
 
 use crate::sys::{self, SceUID};
 

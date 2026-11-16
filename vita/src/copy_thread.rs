@@ -1,5 +1,5 @@
 //! The thread that copies the capture's draws' vertex memory out of PSP RAM
-//! (the copier of `nativepsp_core::draw_stream`), on by default, on cores 0-2.
+//! (the copier of `nativeres_core::draw_stream`), on by default, on cores 0-2.
 //!
 //! Why: reading PSP RAM is slow for the Vita's CPU (uncached, ~1 us per
 //! 128-byte burst while the game runs), and MTX's race copies ~1 MiB per
@@ -25,7 +25,7 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, Ordering};
 
-use nativepsp_core::draw_stream::{CopierHooks, DrawStream};
+use nativeres_core::draw_stream::{CopierHooks, DrawStream};
 
 use crate::sys;
 
@@ -117,13 +117,13 @@ pub fn start() -> bool {
     }
     // Safe: plain system calls with valid arguments.
     unsafe {
-        let sema = sys::sceKernelCreateSema(b"NativePspCopierWake\0".as_ptr(), 0, 0, 1, core::ptr::null_mut());
+        let sema = sys::sceKernelCreateSema(b"NativeResCopierWake\0".as_ptr(), 0, 0, 1, core::ptr::null_mut());
         if sema < 0 {
             return false;
         }
         SEMA.store(sema, Ordering::Relaxed);
         let thread = sys::sceKernelCreateThread(
-            b"NativePspCopier\0".as_ptr(),
+            b"NativeResCopier\0".as_ptr(),
             copy_thread,
             PRIORITY,
             STACK_SIZE,

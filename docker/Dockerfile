@@ -1,4 +1,4 @@
-# nativepsp-sdk: vitasdk + pspdev + Rust, everything the build needs (scripts/build.sh).
+# nativeres-sdk: vitasdk + pspdev + Rust, everything the build needs (scripts/build.sh).
 #
 # Rust nightly is pinned because the Vita is a tier-3 target: its core library
 # must be compiled from source with `-Z build-std`, which only nightly allows.

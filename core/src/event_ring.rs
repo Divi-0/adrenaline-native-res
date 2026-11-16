@@ -42,7 +42,7 @@ pub const EVENT_GE_SAVE_CONTEXT: u32 = 6;
 /// sceGeRestoreContext: context address, result.
 pub const EVENT_GE_RESTORE_CONTEXT: u32 = 7;
 
-/// NativePspEvent.
+/// NativeResEvent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct RawEvent {
@@ -56,7 +56,7 @@ pub struct RawEvent {
     pub reserved: u32,
 }
 
-/// NativePspRingHeader.
+/// NativeResRingHeader.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct RingHeader {
@@ -81,12 +81,12 @@ pub struct RingHeader {
     pub reserved: [u32; 5],
 }
 
-/// NATIVEPSP_SYNC_WANTED.
+/// NATIVERES_SYNC_WANTED.
 pub const SYNC_WANTED: u32 = 0x434E_5953;
-/// NATIVEPSP_SYNC_TIMEOUT_US.
+/// NATIVERES_SYNC_TIMEOUT_US.
 pub const SYNC_TIMEOUT_US: u32 = 50_000;
 
-/// NativePspRing.
+/// NativeResRing.
 #[repr(C)]
 pub struct Ring {
     pub header: RingHeader,

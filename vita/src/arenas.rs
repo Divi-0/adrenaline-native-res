@@ -1,7 +1,7 @@
 //! The GPU memory the capture records into, made by the display thread once
 //! its GPU programs exist, and handed over through capture.rs's pointers:
 //!
-//! - the raw arena (`nativepsp_core::raw_arena`): raw PSP vertices the GPU
+//! - the raw arena (`nativeres_core::raw_arena`): raw PSP vertices the GPU
 //!   reads as they are (draws with `RAW_VERTICES`, nativeres_raw_v.cg),
 //!   written once per frame by the recorder and kept for 6 recorded frames.
 //!   MTX's race start copies ~450 KiB of raw runs per frame.
@@ -10,7 +10,7 @@
 //!   instead of building them (~1 ms of display CPU per race frame,
 //!   measured 2026-11-10). MTX's race start: ~97,000 corners (~195 KiB)
 //!   per frame, kept for 6 frames.
-//! - the vertex cache's arena (`nativepsp_core::vertex_cache`): decoded
+//! - the vertex cache's arena (`nativeres_core::vertex_cache`): decoded
 //!   vertices kept across frames, drawn by the GPU straight from there.
 //! - PSP RAM itself, mapped for the GPU to read (zero copy, `RAW_PSP_RAM`).
 //!
@@ -20,7 +20,7 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
-use nativepsp_core::frame::FrameVertex;
+use nativeres_core::frame::FrameVertex;
 
 use crate::capture::{
     INDEX_RING, INDEX_RING_BYTES, RAW_ARENA, RAW_ARENA_BYTES, VERTEX_ARENA,
@@ -33,7 +33,7 @@ const RAW_ARENA_SIZE: usize = 6 * 1024 * 1024;
 #[no_mangle]
 #[used]
 #[allow(non_upper_case_globals)]
-pub static nativepsp_plan_phycont_raw_arena: u32 = sys::pages(RAW_ARENA_SIZE);
+pub static nativeres_plan_phycont_raw_arena: u32 = sys::pages(RAW_ARENA_SIZE);
 
 /// 8 windows of 192 KiB. In phycont memory (blocks of whole MiB: 2 MiB)
 /// since the plugin runs on stock Adrenaline, whose vita2d pool takes
@@ -46,7 +46,7 @@ const _: () = assert!(INDEX_RING_SIZE <= INDEX_RING_PHYCONT_BYTES);
 #[no_mangle]
 #[used]
 #[allow(non_upper_case_globals)]
-pub static nativepsp_plan_phycont_index_ring: u32 = sys::pages(INDEX_RING_PHYCONT_BYTES);
+pub static nativeres_plan_phycont_index_ring: u32 = sys::pages(INDEX_RING_PHYCONT_BYTES);
 
 /// 32768 vertices of main memory (short). Not CDRAM:
 /// with 2 MiB of CDRAM, Adrenaline crashed (C2-12828-1) twice, and both
@@ -56,7 +56,7 @@ const VERTEX_ARENA_BYTES: usize = 1024 * 1024;
 #[no_mangle]
 #[used]
 #[allow(non_upper_case_globals)]
-pub static nativepsp_plan_optin_vertex_arena: u32 = sys::pages(VERTEX_ARENA_BYTES);
+pub static nativeres_plan_optin_vertex_arena: u32 = sys::pages(VERTEX_ARENA_BYTES);
 /// The default ("vertexcache 2"): phycont, ~23 MiB free in MTX; blocks come
 /// in whole MiB. 4 MiB = two windows of 65536 vertices (2026-11-08; one
 /// window was full at MTX's race start): a cached draw's 16-bit indices
@@ -66,7 +66,7 @@ const VERTEX_ARENA_PHYCONT_BYTES: usize = 4 * 1024 * 1024;
 #[no_mangle]
 #[used]
 #[allow(non_upper_case_globals)]
-pub static nativepsp_plan_phycont_vertex_arena: u32 = sys::pages(VERTEX_ARENA_PHYCONT_BYTES);
+pub static nativeres_plan_phycont_vertex_arena: u32 = sys::pages(VERTEX_ARENA_PHYCONT_BYTES);
 
 /// PSP RAM as the GPU sees it (the emulator's 32 MiB block, PSP 0x08000000
 /// up), null until mapped; read by the draw loop for zero-copy draws.
@@ -96,7 +96,7 @@ fn mapped_block(name: &'static [u8], block_type: u32, bytes: usize) -> Result<*m
 /// so the capture finds them when it makes the vertex cache). 1 if the raw
 /// arena exists now. The caller checked that the raw vertex program exists.
 pub fn make_raw_arena() -> i32 {
-    match mapped_block(b"NativePspRawArena\0", sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW, RAW_ARENA_SIZE) {
+    match mapped_block(b"NativeResRawArena\0", sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW, RAW_ARENA_SIZE) {
         Ok(base) => {
             // The size first: the capture thread reads the pointer first.
             RAW_ARENA_BYTES.store(RAW_ARENA_SIZE as u32, Ordering::Release);
@@ -109,9 +109,9 @@ pub fn make_raw_arena() -> i32 {
         }
     }
     // Phycont first, main memory if there is none (see INDEX_RING_SIZE).
-    let ring = match mapped_block(b"NativePspIndexRing\0", sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW, INDEX_RING_PHYCONT_BYTES) {
+    let ring = match mapped_block(b"NativeResIndexRing\0", sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW, INDEX_RING_PHYCONT_BYTES) {
         Ok(ring) => Ok((ring, "phycont")),
-        Err(_) => mapped_block(b"NativePspIndexRing\0", sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, INDEX_RING_SIZE).map(|ring| (ring, "main")),
+        Err(_) => mapped_block(b"NativeResIndexRing\0", sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, INDEX_RING_SIZE).map(|ring| (ring, "main")),
     };
     match ring {
         Ok((ring, kind)) => {
@@ -132,7 +132,7 @@ pub fn make_vertex_arena(phycont: i32) {
     } else {
         (sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, VERTEX_ARENA_BYTES, "main")
     };
-    match mapped_block(b"NativePspVertexArena\0", block_type, bytes) {
+    match mapped_block(b"NativeResVertexArena\0", block_type, bytes) {
         Ok(base) => {
             VERTEX_ARENA_VERTICES
                 .store((bytes / core::mem::size_of::<FrameVertex>()) as u32, Ordering::Release);

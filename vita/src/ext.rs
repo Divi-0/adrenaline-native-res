@@ -13,7 +13,7 @@
 
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-use nativepsp_core::frame::Frame;
+use nativeres_core::frame::Frame;
 
 use crate::capture::CaptureState;
 use crate::frame_loop::FrameLoop;
@@ -24,7 +24,7 @@ use crate::targets::Targets;
 /// to do returns at once.
 pub struct Extensions {
     /// The plugin's start thread, before any hook is set: `skip` is
-    /// `startskip=` (`nativepsp_core::options::start_skip`).
+    /// `startskip=` (`nativeres_core::options::start_skip`).
     pub before_hooks: fn(skip: u32),
     /// The plugin's start thread, after the capture started.
     pub started: fn(skip: u32),

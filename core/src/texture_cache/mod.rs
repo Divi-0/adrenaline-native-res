@@ -270,7 +270,7 @@ pub struct TextureStats {
 }
 
 /// Where this frame's texture time went, for the slow-frame log line
-/// (mirrored in C as NativePspTextureTimes).
+/// (mirrored in C as NativeResTextureTimes).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FrameTimes {
@@ -481,7 +481,7 @@ impl TextureCache {
 
     /// Textures of the last `textures_for_frame` whose pixels the game had
     /// rewritten before we read them (`shows_other_pixels`): the frame can't
-    /// be drawn as the GE drew it, and isn't shown (nativepsp_render.c).
+    /// be drawn as the GE drew it, and isn't shown (nativeres_render.c).
     pub fn moved_on(&self) -> u32 {
         self.moved_on
     }

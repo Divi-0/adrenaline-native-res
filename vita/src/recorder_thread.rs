@@ -1,5 +1,5 @@
 //! The thread that records the vertices of the capture's draws (the
-//! consumer half of `nativepsp_core::draw_stream`), on another core than
+//! consumer half of `nativeres_core::draw_stream`), on another core than
 //! the capture thread: the capture follows the display lists and works out
 //! the draws' states, this thread decodes, transforms and stores their
 //! vertices, both for the same frame at the same time.
@@ -11,7 +11,7 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, Ordering};
 
-use nativepsp_core::draw_stream::{DrawStream, StreamHooks};
+use nativeres_core::draw_stream::{DrawStream, StreamHooks};
 
 use crate::sys;
 
@@ -134,13 +134,13 @@ pub fn start() -> bool {
     }
     // Safe: plain system calls with valid arguments.
     unsafe {
-        let sema = sys::sceKernelCreateSema(b"NativePspRecorderWake\0".as_ptr(), 0, 0, 1, core::ptr::null_mut());
+        let sema = sys::sceKernelCreateSema(b"NativeResRecorderWake\0".as_ptr(), 0, 0, 1, core::ptr::null_mut());
         if sema < 0 {
             return false;
         }
         SEMA.store(sema, Ordering::Relaxed);
         let thread = sys::sceKernelCreateThread(
-            b"NativePspRecorder\0".as_ptr(),
+            b"NativeResRecorder\0".as_ptr(),
             recorder_thread,
             PRIORITY,
             STACK_SIZE,

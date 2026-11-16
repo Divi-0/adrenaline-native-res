@@ -53,7 +53,7 @@ You need a PS Vita with HENkaku/taiHEN (tested: firmware 3.65 with Enso) and Adr
    ```
    It only loads inside Adrenaline, never at boot. Keep any other `*PSPEMUCFW` lines you already have.
 4. Reboot the Vita, then start Adrenaline. At its first start the plugin writes its PSP side to
-   `<Memory Stick>/seplugins/nativepsp.prx` and adds its line to `seplugins/plugins.txt`.
+   `<Memory Stick>/seplugins/nativeres.prx` and adds its line to `seplugins/plugins.txt`.
 5. Start a PSP game. The renderer is on by default. Switch it in Adrenaline's menu: **Settings →
    NativeRes Renderer**, right below Graphics Filtering. With it on, the picture is drawn with the GPU
    whatever filter is selected; your filter setting is kept.
@@ -63,7 +63,7 @@ make new savestates; loading an old one runs the old PSP side.
 
 ### Settings (optional)
 
-`ux0:data/nativepsp/config.txt`, one `name=value` per line, read when Adrenaline starts:
+`ux0:data/nativeres/config.txt`, one `name=value` per line, read when Adrenaline starts:
 
 ```
 mip=0        # distant textures: 0 sharp (default), 1 blurry like the PSP, 2 mipmapped
@@ -74,8 +74,8 @@ gamefps=1    # 1 (default): the game's own frame rate in the top left corner, 0:
 ### Uninstalling
 
 Remove the line from `ur0:tai/config.txt` (or `ux0:tai/config.txt`) and reboot. Then delete
-`ur0:tai/adrenaline-native-res.suprx`, `ux0:data/nativepsp/` (if you made a settings file),
-`<Memory Stick>/seplugins/nativepsp.prx` and its line in `seplugins/plugins.txt`.
+`ur0:tai/adrenaline-native-res.suprx`, `ux0:data/nativeres/` (if you made a settings file),
+`<Memory Stick>/seplugins/nativeres.prx` and its line in `seplugins/plugins.txt`.
 
 ## Building
 
@@ -83,8 +83,8 @@ Everything builds in a Docker image with vitasdk, pspdev and Rust (a pinned nigh
 the PSP are tier-3 targets whose `core` is built from source):
 
 ```
-docker build -t nativepsp-sdk docker
-docker run --rm -v "$PWD:/src" -w /src nativepsp-sdk bash -lc "sh scripts/build.sh"
+docker build -t nativeres-sdk docker
+docker run --rm -v "$PWD:/src" -w /src nativeres-sdk bash -lc "sh scripts/build.sh"
 ```
 
 This runs the PC tests and writes `target/adrenaline-native-res.suprx`. Pushing a tag `v*` makes the GitHub

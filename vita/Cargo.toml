@@ -1,5 +1,5 @@
 [package]
-name = "nativepsp-vita"
+name = "nativeres-vita"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
@@ -10,7 +10,7 @@ description = "NativeRes's Vita side: the renderer the taiHEN plugin adrenaline-
 # +60% code.) A crate building its own plugin on top of this one links it
 # the same way and registers extensions (src/ext.rs).
 [lib]
-name = "nativepsp_vita"
+name = "nativeres_vita"
 
 [dependencies]
-nativepsp-core = { path = "../core" }
+nativeres-core = { path = "../core" }

@@ -5,7 +5,7 @@
 //! lines are dropped and counted (the next session's first line says how
 //! many).
 //!
-//! The capture thread only appends to the ring (`nativepsp_core::log_ring`);
+//! The capture thread only appends to the ring (`nativeres_core::log_ring`);
 //! a low-priority writer thread does the sending, which can block for
 //! milliseconds (that made the capture miss the display loop once a second
 //! when it was file I/O).
@@ -19,8 +19,8 @@ use core::ffi::c_void;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
-use nativepsp_core::log_ring::LogRing;
-use nativepsp_core::report::TextBuffer;
+use nativeres_core::log_ring::LogRing;
+use nativeres_core::report::TextBuffer;
 
 use crate::sys;
 
@@ -67,12 +67,12 @@ pub fn start_writer() {
     append(b"# NativeRes started, no game yet\n");
     // Safe: plain system calls with valid arguments.
     unsafe {
-        let sema = sys::sceKernelCreateSema(b"NativePspLogWakeup\0".as_ptr(), 0, 0, 1, core::ptr::null_mut());
+        let sema = sys::sceKernelCreateSema(b"NativeResLogWakeup\0".as_ptr(), 0, 0, 1, core::ptr::null_mut());
         if sema < 0 {
             return;
         }
         let thread = sys::sceKernelCreateThread(
-            b"NativePspLogWriter\0".as_ptr(),
+            b"NativeResLogWriter\0".as_ptr(),
             writer_thread,
             WRITER_PRIORITY,
             0x2000,

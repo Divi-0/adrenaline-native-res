@@ -1,4 +1,4 @@
-//! Our settings file (ux0:data/nativepsp/config.txt on the Vita): one
+//! Our settings file (ux0:data/nativeres/config.txt on the Vita): one
 //! `name=value` per line, read once when the plugin starts. We never write
 //! it; a missing file or line means the default, an unknown name or a bad
 //! value is skipped.

@@ -1,5 +1,5 @@
 [package]
-name = "nativepsp-replay"
+name = "nativeres-replay"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
@@ -10,4 +10,4 @@ name = "replay"
 path = "src/main.rs"
 
 [dependencies]
-nativepsp-core = { path = "../core" }
+nativeres-core = { path = "../core" }

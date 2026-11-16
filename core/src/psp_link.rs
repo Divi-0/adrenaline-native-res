@@ -2,7 +2,7 @@
 //! the Vita side share in PSP memory: the event ring ([`crate::event_ring`])
 //! and the VRAM copy request table ([`VramRequestTable`]). Both sides use
 //! these definitions (until stage 4 they were the C header
-//! shared/nativepsp_ring.h, which both sides had to match).
+//! shared/nativeres_ring.h, which both sides had to match).
 //!
 //! Both live in the unused tail of Adrenaline's shared area (the
 //! SceAdrenaline struct uses its first ~0x600 bytes, DRAW_NATIVE sits at
@@ -94,7 +94,7 @@ pub mod copy_method {
     }
 }
 
-/// The shared VRAM request table (was NativePspVramRequests), at
+/// The shared VRAM request table (was NativeResVramRequests), at
 /// [`VRAM_REQUESTS_ADDRESS`]. "Vita" fields are written by the Vita side,
 /// "plugin" fields by the PSP plugin.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -165,7 +165,7 @@ mod tests {
     use super::*;
     use core::mem::offset_of;
 
-    /// The offsets the C plugin (psp-plugin/main.c, nativepsp_ring.h) used:
+    /// The offsets the C plugin (psp-plugin/main.c, nativeres_ring.h) used:
     /// a Rust plugin and an old Vita side (or the other way round) must
     /// still understand each other.
     #[test]

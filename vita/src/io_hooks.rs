@@ -22,7 +22,7 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use nativepsp_core::span;
+use nativeres_core::span;
 
 use crate::sys::{self, SceUID};
 use crate::taihen::Hook;

@@ -9,7 +9,7 @@
 //!   line before "Memory Stick Location" goes. Adrenaline's own code only
 //!   uses entries 0 and 2 (Graphics Filtering) by index, which stay. The
 //!   switch is a byte of Adrenaline's saved settings
-//!   (`nativepsp_renderer_off`, padding; 0 = on), so Adrenaline saves it
+//!   (`nativeres_renderer_off`, padding; 0 = on), so Adrenaline saves it
 //!   with the rest.
 //! - Graphics Filtering stays the user's choice: its entry edits
 //!   `USER_FILTER` instead. With the renderer on in a PSP game, the filter
@@ -22,7 +22,7 @@ use core::ffi::c_void;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering::Relaxed};
 
-use nativepsp_core::span;
+use nativeres_core::span;
 
 use crate::adrenaline::{self, CONFIG_BYTES, FILTER_BILINEAR, GRAPHICS_FILTERING_OFFSET, NO_SMOOTH_GRAPHICS_OFFSET, RENDERER_OFF_OFFSET};
 use crate::{render_log, sys};
@@ -52,7 +52,7 @@ struct Text(*const u8);
 unsafe impl Sync for Text {}
 
 static RENDERER_NAME: Text = Text(b"NativeRes Renderer\0".as_ptr());
-/// 0 = On (`nativepsp_renderer_off` 0), 1 = Off.
+/// 0 = On (`nativeres_renderer_off` 0), 1 = Off.
 static RENDERER_OPTIONS: [Text; 2] = [Text(b"On\0".as_ptr()), Text(b"Off\0".as_ptr())];
 
 /// More Settings entries than this: not Adrenaline's table.

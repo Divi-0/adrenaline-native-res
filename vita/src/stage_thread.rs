@@ -1,4 +1,4 @@
-//! The capture's stage B on a thread of its own (`nativepsp_core::
+//! The capture's stage B on a thread of its own (`nativeres_core::
 //! walk_stream`): the capture thread (stage A) follows the display lists,
 //! this thread works out the draws from what it walked (draw state,
 //! textures, palettes, queuing the vertices for the recorder thread). Off
@@ -13,11 +13,11 @@ use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, Ordering};
 
-use nativepsp_core::block_cache::{BlockCache, BlockSource, BLOCK_SIZE, BLOCK_WORDS};
-use nativepsp_core::capture::{Capture, StageBRun};
-use nativepsp_core::memory::{RAM_END, RAM_START};
-use nativepsp_core::vram_requests::{StageVramReads, VramRequests, VRAM_SIZE, VRAM_START};
-use nativepsp_core::walk_stream::WalkHooks;
+use nativeres_core::block_cache::{BlockCache, BlockSource, BLOCK_SIZE, BLOCK_WORDS};
+use nativeres_core::capture::{Capture, StageBRun};
+use nativeres_core::memory::{RAM_END, RAM_START};
+use nativeres_core::vram_requests::{StageVramReads, VramRequests, VRAM_SIZE, VRAM_START};
+use nativeres_core::walk_stream::WalkHooks;
 
 use crate::{platform, sys};
 
@@ -132,13 +132,13 @@ pub fn start() -> bool {
     }
     // Safe: plain system calls with valid arguments.
     unsafe {
-        let sema = sys::sceKernelCreateSema(b"NativePspStageWake\0".as_ptr(), 0, 0, 1, core::ptr::null_mut());
+        let sema = sys::sceKernelCreateSema(b"NativeResStageWake\0".as_ptr(), 0, 0, 1, core::ptr::null_mut());
         if sema < 0 {
             return false;
         }
         SEMA.store(sema, Ordering::Relaxed);
         let thread = sys::sceKernelCreateThread(
-            b"NativePspStageB\0".as_ptr(),
+            b"NativeResStageB\0".as_ptr(),
             stage_thread,
             PRIORITY,
             STACK_SIZE,

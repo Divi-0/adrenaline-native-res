@@ -1,10 +1,10 @@
-//! The capture thread: reads the event ring the nativepsp.prx PSP plugin
-//! writes (`nativepsp_core::event_ring`), passes each event to the core's
+//! The capture thread: reads the event ring the nativeres.prx PSP plugin
+//! writes (`nativeres_core::event_ring`), passes each event to the core's
 //! `Capture`, logs one line of statistics per frame (`log`), and records
 //! frames for the display thread (`frames`) while the renderer is on.
 //!
 //! It also keeps the PSP plugin's VRAM copy requests up to date
-//! (`nativepsp_core::vram_requests`) and records frame dumps for the PC
+//! (`nativeres_core::vram_requests`) and records frame dumps for the PC
 //! replay on request (`dump_file`).
 //!
 //! If the plugin isn't loaded the ring never gets its magic value and the
@@ -15,19 +15,19 @@ use core::fmt::Write;
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, Ordering};
 
-use nativepsp_core::block_cache::{BlockCache, BlockSource, BLOCK_SIZE, BLOCK_WORDS};
-use nativepsp_core::capture::{Capture, Event};
-use nativepsp_core::draw_stream;
-use nativepsp_core::event_ring::{self, Next, RawEvent, Ring, RingHeader, RingReader, RingSource};
-use nativepsp_core::frame::{Frame, FrameVertex};
-use nativepsp_core::memory::{RAM_END, RAM_START};
-use nativepsp_core::psp_link::{copy_method, VramRequestTable, VRAM_REQUESTS_ADDRESS};
-use nativepsp_core::vertex_cache::VertexCache;
-use nativepsp_core::report::{self, TextBuffer};
-use nativepsp_core::stats::FrameStats;
-use nativepsp_core::texture_cache::VramState;
-use nativepsp_core::texture;
-use nativepsp_core::vram_requests::{Plan, VramRange, VramRequests, MAX_RANGES, VRAM_SIZE, VRAM_START};
+use nativeres_core::block_cache::{BlockCache, BlockSource, BLOCK_SIZE, BLOCK_WORDS};
+use nativeres_core::capture::{Capture, Event};
+use nativeres_core::draw_stream;
+use nativeres_core::event_ring::{self, Next, RawEvent, Ring, RingHeader, RingReader, RingSource};
+use nativeres_core::frame::{Frame, FrameVertex};
+use nativeres_core::memory::{RAM_END, RAM_START};
+use nativeres_core::psp_link::{copy_method, VramRequestTable, VRAM_REQUESTS_ADDRESS};
+use nativeres_core::vertex_cache::VertexCache;
+use nativeres_core::report::{self, TextBuffer};
+use nativeres_core::stats::FrameStats;
+use nativeres_core::texture_cache::VramState;
+use nativeres_core::texture;
+use nativeres_core::vram_requests::{Plan, VramRange, VramRequests, MAX_RANGES, VRAM_SIZE, VRAM_START};
 
 use crate::dump::DumpRecorder;
 use crate::{copy_thread, ext, frames, log, platform, recorder_thread, stage_thread, sys, SingleThreaded};
@@ -124,36 +124,36 @@ pub static COPY_LINES: AtomicU32 = AtomicU32::new(1);
 pub static DEFERRED_COPY_WANTED: AtomicU32 = AtomicU32::new(0);
 
 /// Whether the vertex cache finds runs by their mini
-/// hash (`nativepsp_core::vertex_cache::QUICK_HITS`).
+/// hash (`nativeres_core::vertex_cache::QUICK_HITS`).
 pub fn set_quick_hits(on: u32) {
-    nativepsp_core::vertex_cache::QUICK_HITS.store(on != 0, Ordering::Relaxed);
+    nativeres_core::vertex_cache::QUICK_HITS.store(on != 0, Ordering::Relaxed);
 }
 
 /// Whether cached textures get a few-word check at
-/// their first use in a frame (`nativepsp_core::texture_cache::QUICK_CHECKS`).
+/// their first use in a frame (`nativeres_core::texture_cache::QUICK_CHECKS`).
 pub fn set_quick_checks(on: u32) {
-    nativepsp_core::texture_cache::QUICK_CHECKS.store(on != 0, Ordering::Relaxed);
+    nativeres_core::texture_cache::QUICK_CHECKS.store(on != 0, Ordering::Relaxed);
 }
 
 /// How far the copier thread may fall behind
 /// before the capture thread copies the oldest jobs itself
-/// (`nativepsp_core::draw_stream::COPIER_LAG_JOBS`; at least 2).
+/// (`nativeres_core::draw_stream::COPIER_LAG_JOBS`; at least 2).
 pub fn set_copier_lag(jobs: u32) {
-    let jobs = jobs.clamp(2, nativepsp_core::draw_stream::MAX_JOBS as u32);
-    nativepsp_core::draw_stream::COPIER_LAG_JOBS.store(jobs, Ordering::Relaxed);
+    let jobs = jobs.clamp(2, nativeres_core::draw_stream::MAX_JOBS as u32);
+    nativeres_core::draw_stream::COPIER_LAG_JOBS.store(jobs, Ordering::Relaxed);
 }
 
 /// Note every copied range and check at each frame's
-/// end whether the game rewrote it (`nativepsp_core::copy_watch`; log
+/// end whether the game rewrote it (`nativeres_core::copy_watch`; log
 /// `rewritten=`). Off by default.
 pub fn set_copy_watch(on: u32) {
-    nativepsp_core::copy_watch::ON.store(on != 0, Ordering::Relaxed);
+    nativeres_core::copy_watch::ON.store(on != 0, Ordering::Relaxed);
 }
 
 /// Copiers read small ranges until two reads agree
-/// (`nativepsp_core::draw_stream::STABLE_COPIES`; on by default).
+/// (`nativeres_core::draw_stream::STABLE_COPIES`; on by default).
 pub fn set_stable_copies(on: u32) {
-    nativepsp_core::draw_stream::STABLE_COPIES.store(on != 0, Ordering::Relaxed);
+    nativeres_core::draw_stream::STABLE_COPIES.store(on != 0, Ordering::Relaxed);
 }
 
 /// The clock `copy_watch` notes copies with (microseconds, low 32 bits).
@@ -162,16 +162,16 @@ fn clock_us() -> u32 {
 }
 
 /// Lit draws with lights drawn lit (1, default) or with
-/// their vertex colours as they are (0) (`nativepsp_core::lighting::LIGHTS_ON`).
+/// their vertex colours as they are (0) (`nativeres_core::lighting::LIGHTS_ON`).
 pub fn set_lights(on: u32) {
-    nativepsp_core::lighting::LIGHTS_ON.store(on != 0, Ordering::Relaxed);
+    nativeres_core::lighting::LIGHTS_ON.store(on != 0, Ordering::Relaxed);
 }
 
 /// Words a vertex-cache mini hash samples
-/// (`nativepsp_core::vertex_cache::SAMPLE_COUNT`).
+/// (`nativeres_core::vertex_cache::SAMPLE_COUNT`).
 pub fn set_mini_samples(count: u32) {
-    let count = (count as usize).clamp(1, nativepsp_core::vertex_cache::SAMPLE_WORDS);
-    nativepsp_core::vertex_cache::SAMPLE_COUNT.store(count, Ordering::Relaxed);
+    let count = (count as usize).clamp(1, nativeres_core::vertex_cache::SAMPLE_WORDS);
+    nativeres_core::vertex_cache::SAMPLE_COUNT.store(count, Ordering::Relaxed);
 }
 
 
@@ -228,8 +228,8 @@ fn sample_psp_ram(address: u32, positions: &[usize], out: &mut [u32]) -> bool {
 }
 
 /// The recorder thread's way to PSP memory.
-const PSP_RAM_READER: nativepsp_core::draw_stream::DeferredReader =
-    nativepsp_core::draw_stream::DeferredReader { read: read_psp_ram, sample: sample_psp_ram };
+const PSP_RAM_READER: nativeres_core::draw_stream::DeferredReader =
+    nativeres_core::draw_stream::DeferredReader { read: read_psp_ram, sample: sample_psp_ram };
 
 /// Set by the display side (programs.rs) once its 3D vertex program
 /// is made: without it, draws in model space couldn't be drawn.
@@ -248,7 +248,7 @@ const VERTEX_CACHE_TABLE_BYTES: usize = (core::mem::size_of::<VertexCache>() + 0
 #[no_mangle]
 #[used]
 #[allow(non_upper_case_globals)]
-pub static nativepsp_plan_phycont_vertex_cache_tables: u32 = VERTEX_CACHE_TABLE_BYTES as u32;
+pub static nativeres_plan_phycont_vertex_cache_tables: u32 = VERTEX_CACHE_TABLE_BYTES as u32;
 
 
 /// Capture thread: the vertex cache over the display's arena, made once the
@@ -265,7 +265,7 @@ fn make_vertex_cache() -> Option<&'static mut VertexCache> {
     // arena is ours alone (the display only reads what frames point at).
     unsafe {
         let block = sys::alloc_block(
-            b"NativePspVertexCache\0".as_ptr(),
+            b"NativeResVertexCache\0".as_ptr(),
             sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW,
             size as u32,
             core::ptr::null_mut(),
@@ -282,13 +282,13 @@ fn make_vertex_cache() -> Option<&'static mut VertexCache> {
         // so it is there now if at all).
         let raw = RAW_ARENA.load(Ordering::Acquire);
         let raw_bytes = RAW_ARENA_BYTES.load(Ordering::Acquire) as usize;
-        if !raw.is_null() && raw_bytes >= nativepsp_core::raw_arena::WINDOW_BYTES as usize {
+        if !raw.is_null() && raw_bytes >= nativeres_core::raw_arena::WINDOW_BYTES as usize {
             (*place).set_raw_arena(core::slice::from_raw_parts_mut(raw, raw_bytes));
         }
         // The index ring likewise (made with the raw arena).
         let ring = INDEX_RING.load(Ordering::Acquire);
         let ring_bytes = INDEX_RING_BYTES.load(Ordering::Acquire) as usize;
-        if !ring.is_null() && ring_bytes >= nativepsp_core::raw_arena::WINDOW_BYTES as usize {
+        if !ring.is_null() && ring_bytes >= nativeres_core::raw_arena::WINDOW_BYTES as usize {
             (*place).set_index_ring(core::slice::from_raw_parts_mut(ring, ring_bytes));
         }
         Some(&mut *place)
@@ -296,7 +296,7 @@ fn make_vertex_cache() -> Option<&'static mut VertexCache> {
 }
 
 /// The display's raw arena (arenas.rs `make_raw_arena`): GPU memory for
-/// raw PSP vertices (`nativepsp_core::raw_arena`), made with the vertex
+/// raw PSP vertices (`nativeres_core::raw_arena`), made with the vertex
 /// arena when the raw vertex program exists. Null: none.
 pub static RAW_ARENA: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 pub static RAW_ARENA_BYTES: AtomicU32 = AtomicU32::new(0);
@@ -308,15 +308,15 @@ pub static INDEX_RING: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 pub static INDEX_RING_BYTES: AtomicU32 = AtomicU32::new(0);
 
 /// 3D runs as raw PSP vertices for the GPU
-/// (`nativepsp_core::raw_arena::ENABLED`), where the draw allows it.
+/// (`nativeres_core::raw_arena::ENABLED`), where the draw allows it.
 pub fn set_raw_vertices(on: u32) {
-    nativepsp_core::raw_arena::ENABLED.store(on != 0, Ordering::Relaxed);
+    nativeres_core::raw_arena::ENABLED.store(on != 0, Ordering::Relaxed);
 }
 
 /// The display's sprite program exists: 3D rectangles may go raw
-/// (`nativepsp_core::raw_arena::SPRITES`).
+/// (`nativeres_core::raw_arena::SPRITES`).
 pub fn set_raw_sprites(on: u32) {
-    nativepsp_core::raw_arena::SPRITES.store(on != 0, Ordering::Relaxed);
+    nativeres_core::raw_arena::SPRITES.store(on != 0, Ordering::Relaxed);
 }
 
 /// The framebuffers the display has render targets for (PSP addresses, 0 =
@@ -338,23 +338,23 @@ pub fn set_vram_requests(on: u32) {
 
 /// Menu "NativeRes Distant Textures" (Adrenaline config byte
 /// MIP_MODE, pushed by the display every frame): see
-/// `nativepsp_core::texture::MIP_MODE`.
+/// `nativeres_core::texture::MIP_MODE`.
 pub fn set_mip_mode(mode: u32) {
-    nativepsp_core::texture::MIP_MODE.store(mode.min(2) as u8, Ordering::Relaxed);
+    nativeres_core::texture::MIP_MODE.store(mode.min(2) as u8, Ordering::Relaxed);
 }
 
 /// The display's alpha-test program exists: textured draws' alpha test is
-/// left to its fragment shader (`nativepsp_core::blend::ALPHA_TEST_IN_SHADER`).
+/// left to its fragment shader (`nativeres_core::blend::ALPHA_TEST_IN_SHADER`).
 pub fn set_alpha_test_ready(ready: u32) {
-    nativepsp_core::blend::ALPHA_TEST_IN_SHADER.store(ready != 0, Ordering::Relaxed);
+    nativeres_core::blend::ALPHA_TEST_IN_SHADER.store(ready != 0, Ordering::Relaxed);
 }
 
 /// Big raw runs drawn by the GPU straight from PSP RAM
-/// (`nativepsp_core::raw_arena::ZERO_COPY`). Switched on by the display once
+/// (`nativeres_core::raw_arena::ZERO_COPY`). Switched on by the display once
 /// it has mapped PSP RAM for the GPU (arenas.rs `map_psp_ram_for_gpu`), the
 /// default since 2026-11-09.
 pub fn set_zero_copy(on: u32) {
-    nativepsp_core::raw_arena::ZERO_COPY.store(on != 0, Ordering::Relaxed);
+    nativeres_core::raw_arena::ZERO_COPY.store(on != 0, Ordering::Relaxed);
 }
 
 /// Whether the capture should leave 3D draws to the GPU transform now.
@@ -386,7 +386,7 @@ const CAPTURE_BLOCK_BYTES: usize = (core::mem::size_of::<Capture>() + 0xF_FFFF) 
 #[no_mangle]
 #[used]
 #[allow(non_upper_case_globals)]
-pub static nativepsp_plan_phycont_capture: u32 = CAPTURE_BLOCK_BYTES as u32;
+pub static nativeres_plan_phycont_capture: u32 = CAPTURE_BLOCK_BYTES as u32;
 
 impl CaptureBox {
     const NONE: CaptureBox = CaptureBox(core::ptr::null_mut());
@@ -398,7 +398,7 @@ impl CaptureBox {
         // `init_zeroed` is made for zeroed memory.
         unsafe {
             let uid = sys::alloc_block(
-                b"NativePspCaptureState\0".as_ptr(),
+                b"NativeResCaptureState\0".as_ptr(),
                 sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW,
                 CAPTURE_BLOCK_BYTES as u32,
                 core::ptr::null_mut(),
@@ -460,7 +460,7 @@ static STATE: SingleThreaded<CaptureState> = SingleThreaded::new(CaptureState {
     copies: CopyStats { us: 0, count: 0, direct: 0, direct_bytes: 0 },
 });
 
-/// PSP memory as the capture reads it (see `nativepsp_core::block_cache`).
+/// PSP memory as the capture reads it (see `nativeres_core::block_cache`).
 /// While a dump runs, every block copied also goes into the dump.
 pub struct VitaBlocks<'a> {
     dump: &'a mut DumpRecorder,
@@ -618,10 +618,10 @@ impl CaptureState {
                 let mut textures = frame
                     .textures()
                     .iter()
-                    .filter(|texture| nativepsp_core::vram_requests::texture_needs_copy(texture, &targets, shown))
+                    .filter(|texture| nativeres_core::vram_requests::texture_needs_copy(texture, &targets, shown))
                     .filter_map(|texture| {
                     // Textures in a VRAM mirror need the VRAM itself copied.
-                    let address = nativepsp_core::memory::fold_vram_mirror(texture.address & 0x0FFF_FFFF);
+                    let address = nativeres_core::memory::fold_vram_mirror(texture.address & 0x0FFF_FFFF);
                     let offset = address.checked_sub(VRAM_START).filter(|&offset| offset < VRAM_SIZE)?;
                     let size = texture::data_size(texture).unwrap_or(0);
                     Some(VramRange { offset, size })
@@ -883,8 +883,8 @@ fn log_frame(state: &mut CaptureState, timing: &mut FrameTiming, flip: &RawEvent
         crate::recorder_thread::WAKES.load(Ordering::Relaxed),
         crate::copy_thread::take_busy_us(),
         crate::copy_thread::WAKES.load(Ordering::Relaxed),
-        nativepsp_core::draw_stream::PRODUCER_COPIES.load(Ordering::Relaxed),
-        nativepsp_core::draw_stream::UNSTABLE_READS.load(Ordering::Relaxed),
+        nativeres_core::draw_stream::PRODUCER_COPIES.load(Ordering::Relaxed),
+        nativeres_core::draw_stream::UNSTABLE_READS.load(Ordering::Relaxed),
         sync.sync_waits,
         sync.sync_wait_us / 1000,
         sync.sync_timeouts,
@@ -908,10 +908,10 @@ fn log_frame(state: &mut CaptureState, timing: &mut FrameTiming, flip: &RawEvent
     );
     let _ = report::write_frame(&mut text, &state.last_frame);
     // Copied ranges the game rewrote before the frame's
-    // end (`nativepsp_core::copy_watch`): changed/checked, the first one
+    // end (`nativeres_core::copy_watch`): changed/checked, the first one
     // (address+words, ms from its copy), the youngest changed one's age.
-    if nativepsp_core::copy_watch::ON.load(Ordering::Relaxed) {
-        let r = nativepsp_core::copy_watch::check(sample_psp_ram);
+    if nativeres_core::copy_watch::ON.load(Ordering::Relaxed) {
+        let r = nativeres_core::copy_watch::check(sample_psp_ram);
         let _ = write!(
             text,
             " rewritten={}/{}@{:08x}+{}w/{}.{}ms/{}.{}ms",
@@ -957,7 +957,7 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
     log::append(if have_frames { b"capture: frames ready\n" } else { b"capture: no memory for frames, not recording\n" });
     log::append(b"capture: waiting for the PSP plugin's event ring\n");
     log::flush();
-    nativepsp_core::copy_watch::set_clock(Some(clock_us));
+    nativeres_core::copy_watch::set_clock(Some(clock_us));
     // Whether the draws' vertices are recorded on another core
     // (recorder_thread.rs; can be switched at run time).
     let mut threaded = false;
@@ -1101,11 +1101,11 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
             if sync_wanted {
                 let started = sys::now_us();
                 state.capture.stream().copy_untaken();
-                let previous = nativepsp_core::phase::enter(nativepsp_core::phase::WAIT);
+                let previous = nativeres_core::phase::enter(nativeres_core::phase::WAIT);
                 while !state.capture.stream().copies_complete() && sys::now_us() - started < COPIES_WAIT_LIMIT_US {
                     sys::sceKernelDelayThread(20);
                 }
-                nativepsp_core::phase::leave(previous);
+                nativeres_core::phase::leave(previous);
                 timing.syncs.copies_wait_us += (sys::now_us() - started) as u32;
             }
             ring.set_handled(state.reader.consumed());
@@ -1197,7 +1197,7 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
         if log::waiting() >= log::FLUSH_THRESHOLD {
             log::flush();
         }
-        nativepsp_core::phase::enter(nativepsp_core::phase::IDLE);
+        nativeres_core::phase::enter(nativeres_core::phase::IDLE);
         sys::sceKernelDelayThread(POLL_INTERVAL_US);
     }
 }
@@ -1210,7 +1210,7 @@ pub fn start() {
     // Safe: plain system calls with valid arguments.
     unsafe {
         let thread = sys::sceKernelCreateThread(
-            b"NativePspCapture\0".as_ptr(),
+            b"NativeResCapture\0".as_ptr(),
             capture_thread,
             PRIORITY,
             STACK_SIZE,

@@ -29,7 +29,7 @@ pub struct GpuTexture {
 /// The smooth filter needs RGBA: it changes individual texels (see
 /// `texture::bleed_transparent_texels`).
 ///
-/// The numbers are what the C side's `NativePspCreateTexture` expects.
+/// The numbers are what the C side's `NativeResCreateTexture` expects.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GpuFormat {
@@ -114,7 +114,7 @@ pub const TARGET_WIDTH: u32 = 960;
 pub const TARGET_HEIGHT: u32 = 544;
 
 /// The GPU unswizzle reads the swizzled data in slices of 8 x 4096 texels
-/// (SLICE_BYTES in nativepsp_render.c, which must match).
+/// (SLICE_BYTES in nativeres_render.c, which must match).
 pub const GPU_UNSWIZZLE_SLICE_BYTES: u32 = 8 * 4096 * 2;
 
 /// True if the GPU can unswizzle this texture into a texture of `format`

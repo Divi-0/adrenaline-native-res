@@ -6,8 +6,8 @@ set -e
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 # Cargo's download cache inside the checkout, so it survives container runs
-# (NATIVEPSP_CARGO_HOME to put it elsewhere).
-export CARGO_HOME="${NATIVEPSP_CARGO_HOME:-$ROOT/.cargo-home}"
+# (NATIVERES_CARGO_HOME to put it elsewhere).
+export CARGO_HOME="${NATIVERES_CARGO_HOME:-$ROOT/.cargo-home}"
 mkdir -p "$CARGO_HOME"
 # The Vita and the PSP are tier-3 targets: core is built from source
 # (-Z build-std), which needs nightly. Pinned in docker/Dockerfile too.

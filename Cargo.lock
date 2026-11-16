@@ -3,40 +3,40 @@
 version = 4
 
 [[package]]
-name = "nativepsp-core"
+name = "nativeres-core"
 version = "0.1.0"
 
 [[package]]
-name = "nativepsp-plugin"
+name = "nativeres-plugin"
 version = "0.1.0"
 dependencies = [
- "nativepsp-vita",
+ "nativeres-vita",
 ]
 
 [[package]]
-name = "nativepsp-psp"
+name = "nativeres-psp"
 version = "0.1.0"
 dependencies = [
- "nativepsp-core",
+ "nativeres-core",
 ]
 
 [[package]]
-name = "nativepsp-replay"
+name = "nativeres-replay"
 version = "0.1.0"
 dependencies = [
- "nativepsp-core",
+ "nativeres-core",
 ]
 
 [[package]]
-name = "nativepsp-shadercompiler"
+name = "nativeres-shadercompiler"
 version = "0.1.0"
 dependencies = [
- "nativepsp-core",
+ "nativeres-core",
 ]
 
 [[package]]
-name = "nativepsp-vita"
+name = "nativeres-vita"
 version = "0.1.0"
 dependencies = [
- "nativepsp-core",
+ "nativeres-core",
 ]

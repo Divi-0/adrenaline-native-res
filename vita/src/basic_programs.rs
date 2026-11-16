@@ -64,7 +64,7 @@ const FRAGMENT_USSE_BYTES: usize = 64 * 1024;
 #[no_mangle]
 #[used]
 #[allow(non_upper_case_globals)]
-pub static nativepsp_plan_fixed_shader_patcher: u32 =
+pub static nativeres_plan_fixed_shader_patcher: u32 =
     sys::pages(PATCHER_BUFFER_BYTES) + sys::pages(VERTEX_USSE_BYTES) + sys::pages(FRAGMENT_USSE_BYTES);
 
 /// The patcher's bookkeeping lives on our heap.
@@ -91,12 +91,12 @@ fn usse_block(name: &'static [u8], bytes: usize) -> *mut c_void {
 
 /// Makes the shader patcher; null if it can't be made (logged).
 fn make_patcher() -> *mut gxm::ShaderPatcher {
-    let buffer = match crate::gpu_memory::for_gpu(b"NativePspPatcherBuffer\0", PATCHER_BUFFER_BYTES as u32) {
+    let buffer = match crate::gpu_memory::for_gpu(b"NativeResPatcherBuffer\0", PATCHER_BUFFER_BYTES as u32) {
         Some(block) => block.base as *mut c_void,
         None => null_mut(),
     };
-    let vertex_usse = usse_block(b"NativePspVertexUsse\0", VERTEX_USSE_BYTES);
-    let fragment_usse = usse_block(b"NativePspFragmentUsse\0", FRAGMENT_USSE_BYTES);
+    let vertex_usse = usse_block(b"NativeResVertexUsse\0", VERTEX_USSE_BYTES);
+    let fragment_usse = usse_block(b"NativeResFragmentUsse\0", FRAGMENT_USSE_BYTES);
     if buffer.is_null() || vertex_usse.is_null() || fragment_usse.is_null() {
         render_log::line(format_args!("shader patcher: no memory\n"));
         return null_mut();
@@ -416,7 +416,7 @@ pub unsafe fn clear_screen() {
 /// The clear's triangle in GPU memory: (-1, -1), (3, -1), (-1, 3) after
 /// the projection, twice the screen in both directions; opaque black.
 fn make_clear_triangle() -> *mut ColorVertex {
-    let Some(block) = crate::gpu_memory::gpu_input(b"NativePspClearTriangle\0", sys::pages(3 * core::mem::size_of::<ColorVertex>())) else {
+    let Some(block) = crate::gpu_memory::gpu_input(b"NativeResClearTriangle\0", sys::pages(3 * core::mem::size_of::<ColorVertex>())) else {
         return null_mut();
     };
     let vertices = block.base as *mut ColorVertex;
