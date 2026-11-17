@@ -45,6 +45,17 @@ pub fn lighting_key(lit: Option<(bool, bool)>) -> u32 {
 /// (`lit`: has a vertex colour, opaque), its light set. `None` if a table is
 /// full (the run then goes the old way).
 pub fn raw_transform(tables: &mut RawTables, inputs: &TransformInputs, lit: Option<(bool, bool)>) -> Option<u32> {
+    raw_transform_with(tables, inputs, lit, None)
+}
+
+/// `raw_transform`, its light sets worked out through `lights`
+/// (`lighting::GpuLightsCache`; the same sets) if given.
+pub fn raw_transform_with(
+    tables: &mut RawTables,
+    inputs: &TransformInputs,
+    lit: Option<(bool, bool)>,
+    lights: Option<&mut crate::lighting::GpuLightsCache>,
+) -> Option<u32> {
     let (inputs_change, lighting_change) = inputs.changes();
     let key = lighting_key(lit);
     // The newest entry's camera and world, if it was written from the same
@@ -65,7 +76,13 @@ pub fn raw_transform(tables: &mut RawTables, inputs: &TransformInputs, lit: Opti
         None => (tables.add_raw_camera(&inputs.raw_camera())?, inputs.raw_world()),
     };
     let light_set = match lit {
-        Some((has_color, opaque)) => tables.add_light_set(&inputs.gpu_lights(has_color, opaque)?)? as u16,
+        Some((has_color, opaque)) => {
+            let set = match lights {
+                Some(cache) => inputs.gpu_lights_cached(has_color, opaque, cache)?,
+                None => inputs.gpu_lights(has_color, opaque)?,
+            };
+            tables.add_light_set(&set)? as u16
+        }
         None => 0,
     };
     if let Some((number, last)) = tables.last_raw_transform() {

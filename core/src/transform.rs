@@ -559,6 +559,13 @@ impl TransformInputs {
         Some(Lights::from_registers(registers, &self.world, &self.view).gpu(has_vertex_color, opaque))
     }
 
+    /// `gpu_lights` through `cache` (the same light set; the lights' part
+    /// is reused while only the material changes).
+    pub fn gpu_lights_cached(&self, has_vertex_color: bool, opaque: bool, cache: &mut crate::lighting::GpuLightsCache) -> Option<GpuLights> {
+        let registers = self.lighting.as_ref()?;
+        Some(cache.gpu_lights(registers, &self.world, &self.view, has_vertex_color, opaque))
+    }
+
     /// Copies these inputs into `target` with only the bones they use (the
     /// draw stream's copy of each new transform, `draw_stream`). The unused
     /// bones of `target` keep what they held; nothing reads them.

@@ -65,7 +65,17 @@ pub const RUN_LOOKUP: usize = 19;
 pub const RUN_ENTRY: usize = 20;
 /// A raw draw written on the capture thread (`frame_builder::FrameBuilder::try_record`).
 pub const DIRECT: usize = 21;
-pub const COUNT: usize = 22;
+/// Inside DIRECT: a draw's transform entry looked up or added
+/// (`raw_blocks::raw_transform_with`; repeated entries don't get here).
+pub const DIRECT_TRANSFORM: usize = 22;
+/// Inside DIRECT: the draw's raw colours (`recorder::raw_colors_if_enabled`),
+/// its copy handed over (`Writer::copy`), arena room reserved
+/// (`RawArena::reserve`), the draw finished or merged (`Geometry::finish_raw_*`).
+pub const DIRECT_COLORS: usize = 23;
+pub const DIRECT_COPY: usize = 24;
+pub const DIRECT_RESERVE: usize = 25;
+pub const DIRECT_FINISH: usize = 26;
+pub const COUNT: usize = 27;
 pub const NAMES: [&str; COUNT] = [
     "jobs",
     "copies",
@@ -89,6 +99,11 @@ pub const NAMES: [&str; COUNT] = [
     "run_lookup",
     "run_entry",
     "direct",
+    "d_transform",
+    "d_colors",
+    "d_copy",
+    "d_reserve",
+    "d_finish",
 ];
 
 /// Readings left out because they came out implausibly large (from 2^30

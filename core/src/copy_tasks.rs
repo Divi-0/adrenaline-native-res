@@ -21,7 +21,7 @@
 //! (`draw_stream::read_stable`: HUD text the game rewrites while we copy).
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::memory::PspMemory;
 
@@ -227,16 +227,35 @@ fn copy_pieces(task: &CopyTask, unit: u32, source: &mut impl ByteSource, out: &m
     true
 }
 
+/// A counter alone on its cache line (the Vita's are 64 bytes): the
+/// producer writes `published` while the copier swaps `claimed` and counts
+/// `finished` up; on one line, every task moved the line between the cores.
+#[repr(align(64))]
+struct OwnLine(AtomicU32);
+
 /// The ring of published tasks (see the module documentation).
+///
+/// Cheap for the producer (the capture thread, which the game waits for):
+/// pushing a task normally touches nothing the copier writes. A slot is
+/// known free when its old task is older than the last time every task
+/// was complete (`known_done`, noted by `complete`, at least once per frame
+/// end and GE sync); only otherwise does the producer read `claimed` and the
+/// slot's `done` number. Measured on the Vita before (MTX race): ~650 cycles
+/// per task, most of it barriers and cache lines coming from the copier's core.
 pub struct CopyTasks {
     tasks: UnsafeCell<[CopyTask; MAX_TASKS]>,
-    done: [AtomicBool; MAX_TASKS],
+    /// Per slot: the number + 1 of the last task copied from it (written by
+    /// whoever copied it, release; the producer never writes it).
+    done: [AtomicU32; MAX_TASKS],
     // Producer only.
     position: u32,
+    /// Every task numbered below this is copied (`complete` saw it; a plain
+    /// load and store on ARM, only the producer touches it).
+    known_done: AtomicU32,
     // Shared.
-    published: AtomicU32,
-    claimed: AtomicU32,
-    finished: AtomicU32,
+    published: OwnLine,
+    claimed: OwnLine,
+    finished: OwnLine,
 }
 
 // Safe: the producer and the copiers touch a slot one after the other,
@@ -247,48 +266,50 @@ impl CopyTasks {
     pub const fn new() -> CopyTasks {
         CopyTasks {
             tasks: UnsafeCell::new([CopyTask::EMPTY; MAX_TASKS]),
-            done: [const { AtomicBool::new(true) }; MAX_TASKS],
+            done: [const { AtomicU32::new(0) }; MAX_TASKS],
             position: 0,
-            published: AtomicU32::new(0),
-            claimed: AtomicU32::new(0),
-            finished: AtomicU32::new(0),
+            known_done: AtomicU32::new(0),
+            published: OwnLine(AtomicU32::new(0)),
+            claimed: OwnLine(AtomicU32::new(0)),
+            finished: OwnLine(AtomicU32::new(0)),
         }
     }
 
     /// Producer: publishes `task`. Its slot's task before it must be done:
-    /// if nobody has taken it, the producer copies the oldest tasks itself
-    /// (`copy`) until it is taken, then waits the moment its copier needs.
+    /// known done (`known_done`), or else if nobody has taken it, the
+    /// producer copies the oldest tasks itself (`copy`) until it is taken,
+    /// then waits the moment its copier needs.
     pub fn push(&mut self, task: CopyTask, mut copy: impl FnMut(&CopyTasks) -> bool) {
         let slot = self.position as usize % MAX_TASKS;
-        if self.position as usize >= MAX_TASKS {
-            let before = self.position.wrapping_sub(MAX_TASKS as u32);
-            while self.claimed.load(Ordering::Acquire).wrapping_sub(before) as i32 <= 0 {
+        let before = self.position.wrapping_sub(MAX_TASKS as u32);
+        let reused = self.position as usize >= MAX_TASKS;
+        if reused && before.wrapping_sub(self.known_done.load(Ordering::Relaxed)) as i32 >= 0 {
+            while self.claimed.0.load(Ordering::Acquire).wrapping_sub(before) as i32 <= 0 {
                 if copy(self) {
                     PRODUCER_TASKS.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            while !self.done[slot].load(Ordering::Acquire) {
+            while self.done[slot].load(Ordering::Acquire) != before.wrapping_add(1) {
                 core::hint::spin_loop();
             }
         }
-        self.done[slot].store(false, Ordering::Relaxed);
         // Safe: the slot's task before is done and nobody takes this one
         // before it is published below.
         unsafe { (*self.tasks.get())[slot] = task };
         self.position = self.position.wrapping_add(1);
-        self.published.store(self.position, Ordering::Release);
+        self.published.0.store(self.position, Ordering::Release);
     }
 
     /// Takes the oldest published task nobody has taken yet; `None` if
     /// there is none.
     fn take(&self) -> Option<u32> {
-        let mut task = self.claimed.load(Ordering::Relaxed);
+        let mut task = self.claimed.0.load(Ordering::Relaxed);
         loop {
-            let published = self.published.load(Ordering::Acquire);
+            let published = self.published.0.load(Ordering::Acquire);
             if task == published {
                 return None;
             }
-            match self.claimed.compare_exchange_weak(task, task.wrapping_add(1), Ordering::Acquire, Ordering::Relaxed) {
+            match self.claimed.0.compare_exchange_weak(task, task.wrapping_add(1), Ordering::Acquire, Ordering::Relaxed) {
                 Ok(_) => return Some(task),
                 Err(now) => task = now,
             }
@@ -305,24 +326,34 @@ impl CopyTasks {
         // Safe: a published task this caller took (module documentation).
         let task = unsafe { (*self.tasks.get())[slot] };
         run(&task, source, stable);
-        self.done[slot].store(true, Ordering::Release);
-        self.finished.fetch_add(1, Ordering::Release);
+        self.done[slot].store(number.wrapping_add(1), Ordering::Release);
+        self.finished.0.fetch_add(1, Ordering::Release);
         true
     }
 
     /// True if every published task is taken (it may still be copied).
     pub fn all_taken(&self) -> bool {
-        self.claimed.load(Ordering::Relaxed) == self.published.load(Ordering::Acquire)
+        self.claimed.0.load(Ordering::Relaxed) == self.published.0.load(Ordering::Acquire)
     }
 
-    /// Producer: true if every task it published is copied.
+    /// Producer: true if every task it published is copied (noted for
+    /// `push`: their slots are free).
     pub fn complete(&self) -> bool {
-        self.finished.load(Ordering::Acquire) == self.position
+        let complete = self.finished.0.load(Ordering::Acquire) == self.position;
+        if complete {
+            self.known_done.store(self.position, Ordering::Relaxed);
+        }
+        complete
     }
 
     /// Producer: published tasks nobody has taken yet.
     pub fn untaken(&self) -> u32 {
-        self.position.wrapping_sub(self.claimed.load(Ordering::Relaxed))
+        self.position.wrapping_sub(self.claimed.0.load(Ordering::Relaxed))
+    }
+
+    /// Producer: tasks published so far (counts up for ever, wrapping).
+    pub fn pushed(&self) -> u32 {
+        self.position
     }
 }
 

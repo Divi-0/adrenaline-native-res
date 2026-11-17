@@ -226,6 +226,103 @@ impl LightingRegisters {
     }
 }
 
+/// The lighting registers `Lights::set_material` reads: the material's part
+/// of a light set. Everything else in `LightingRegisters` describes the
+/// lights themselves.
+const MATERIAL_REGISTERS: [u8; 11] = [
+    op::MATERIAL_UPDATE,
+    op::MATERIAL_EMISSIVE,
+    op::MATERIAL_AMBIENT,
+    op::MATERIAL_DIFFUSE,
+    op::MATERIAL_SPECULAR,
+    op::MATERIAL_ALPHA,
+    op::MATERIAL_SPECULAR_COEFFICIENT,
+    op::AMBIENT_COLOR,
+    op::AMBIENT_ALPHA,
+    op::LIGHT_MODE,
+    op::REVERSE_NORMAL,
+];
+
+/// Per `LightingRegisters` word: all ones for the lights' registers, zero
+/// for the material's (`MATERIAL_REGISTERS`).
+const LIGHT_PART_MASK: [u32; LIGHTING_REGISTER_COUNT] = {
+    let mut mask = [u32::MAX; LIGHTING_REGISTER_COUNT];
+    let mut index = 0;
+    while index < MATERIAL_REGISTERS.len() {
+        mask[lighting_slot(MATERIAL_REGISTERS[index])] = 0;
+        index += 1;
+    }
+    mask
+};
+
+/// The last light set worked out (`gpu_lights_cached`): its lights and
+/// their part of the GPU light set, and what they came from.
+#[derive(Clone, Copy)]
+struct CachedLights {
+    /// The lighting registers without the material's (`LIGHT_PART_MASK`).
+    light_registers: [u32; LIGHTING_REGISTER_COUNT],
+    /// The view matrix's z axis (its bits): the specular half vectors.
+    view_axis: [u32; 3],
+    lights: Lights,
+    light_part: GpuLights,
+}
+
+/// Remembers the lights of the last GPU light set, so a draw whose lights
+/// stay and only the material changes (MTX's riders: another material
+/// colour before nearly every part) doesn't work them out again: the
+/// normalized directions and half vectors are taken over, only the
+/// material's part is filled in anew. The result is the same, bit for bit,
+/// as `Lights::from_registers(..).gpu(..)`.
+pub struct GpuLightsCache {
+    last: Option<CachedLights>,
+}
+
+impl GpuLightsCache {
+    pub const fn new() -> GpuLightsCache {
+        GpuLightsCache { last: None }
+    }
+
+    /// `Lights::from_registers(registers, world, view).gpu(has_vertex_color,
+    /// opaque)`, the lights' part taken from the last call if the lights and
+    /// the view direction are the same.
+    pub fn gpu_lights(
+        &mut self,
+        registers: &LightingRegisters,
+        world: &[f32; 12],
+        view: &[f32; 12],
+        has_vertex_color: bool,
+        opaque: bool,
+    ) -> GpuLights {
+        let view_axis = [view[2].to_bits(), view[5].to_bits(), view[8].to_bits()];
+        // Compared word by word under the mask (no masked copy on the stack,
+        // no memcmp call; integers only, the A9's float compares stall).
+        let same_lights = |last: &CachedLights| {
+            last.view_axis == view_axis
+                && registers.words.iter().zip(&last.light_registers).zip(&LIGHT_PART_MASK).all(|((&now, &then), &mask)| now & mask == then)
+        };
+        match self.last.as_mut() {
+            Some(last) if same_lights(last) => {
+                last.lights.set_material(registers);
+                last.lights.with_material(last.light_part, has_vertex_color, opaque)
+            }
+            _ => {
+                let light_registers: [u32; LIGHTING_REGISTER_COUNT] =
+                    core::array::from_fn(|index| registers.words[index] & LIGHT_PART_MASK[index]);
+                let lights = Lights::from_registers(registers, world, view);
+                let light_part = lights.gpu_light_part();
+                self.last = Some(CachedLights { light_registers, view_axis, lights, light_part });
+                lights.with_material(light_part, has_vertex_color, opaque)
+            }
+        }
+    }
+}
+
+impl Default for GpuLightsCache {
+    fn default() -> Self {
+        GpuLightsCache::new()
+    }
+}
+
 impl Lights {
     /// For a 3D draw with the current GE state: `Some` if lighting is on
     /// and at least one light is.
@@ -237,20 +334,8 @@ impl Lights {
     /// column by column).
     pub fn from_registers(registers: &LightingRegisters, world: &[f32; 12], view: &[f32; 12]) -> Lights {
         let register = |opcode: u8| registers.register(opcode);
-        let material_color = (register(op::MATERIAL_ALPHA) & 0xFF) << 24 | (register(op::MATERIAL_AMBIENT) & 0x00FF_FFFF);
-        let mut lights = Lights {
-            ambient: channels((register(op::AMBIENT_COLOR) & 0x00FF_FFFF) | (register(op::AMBIENT_ALPHA) & 0xFF) << 24),
-            emissive: rgb(register(op::MATERIAL_EMISSIVE)),
-            material_ambient: channels(material_color),
-            material_diffuse: rgb(register(op::MATERIAL_DIFFUSE)),
-            material_specular: rgb(register(op::MATERIAL_SPECULAR)),
-            specular_coefficient: float24(register(op::MATERIAL_SPECULAR_COEFFICIENT)),
-            material_update: register(op::MATERIAL_UPDATE) & 7,
-            separate_specular: register(op::LIGHT_MODE) & 1 != 0,
-            reverse_normal: register(op::REVERSE_NORMAL) & 1 != 0,
-            world: *world,
-            ..Lights::default()
-        };
+        let mut lights = Lights { world: *world, ..Lights::default() };
+        lights.set_material(registers);
         // The view matrix's third row (its z axis in world space).
         lights.view_direction = normalize_or_001([view[2], view[5], view[8]]);
         for number in 0..4u8 {
@@ -282,6 +367,23 @@ impl Lights {
             lights.count += 1;
         }
         lights
+    }
+
+    /// The material's part of `registers` (`MATERIAL_REGISTERS`): material
+    /// colours, the global ambient light, LIGHTMODE, REVERSENORMAL. The rest
+    /// (the lights, the view direction) stays as it is.
+    fn set_material(&mut self, registers: &LightingRegisters) {
+        let register = |opcode: u8| registers.register(opcode);
+        let material_color = (register(op::MATERIAL_ALPHA) & 0xFF) << 24 | (register(op::MATERIAL_AMBIENT) & 0x00FF_FFFF);
+        self.ambient = channels((register(op::AMBIENT_COLOR) & 0x00FF_FFFF) | (register(op::AMBIENT_ALPHA) & 0xFF) << 24);
+        self.emissive = rgb(register(op::MATERIAL_EMISSIVE));
+        self.material_ambient = channels(material_color);
+        self.material_diffuse = rgb(register(op::MATERIAL_DIFFUSE));
+        self.material_specular = rgb(register(op::MATERIAL_SPECULAR));
+        self.specular_coefficient = float24(register(op::MATERIAL_SPECULAR_COEFFICIENT));
+        self.material_update = register(op::MATERIAL_UPDATE) & 7;
+        self.separate_specular = register(op::LIGHT_MODE) & 1 != 0;
+        self.reverse_normal = register(op::REVERSE_NORMAL) & 1 != 0;
     }
 
     /// These lights for vertices whose normals reach world space through
@@ -354,19 +456,15 @@ impl Lights {
     /// the draw's vertices have a colour (else the material's are used
     /// whatever MATERIAL_UPDATE says); `opaque`: the result's alpha is 1.
     pub fn gpu(&self, has_vertex_color: bool, opaque: bool) -> GpuLights {
+        self.with_material(self.gpu_light_part(), has_vertex_color, opaque)
+    }
+
+    /// The lights' part of `gpu`: per light towards it, the half vector,
+    /// its diffuse and specular colours (from the light registers and the
+    /// view direction only; the rest zeros, `with_material` fills it in).
+    fn gpu_light_part(&self) -> GpuLights {
         let flag = |on: bool| if on { 1.0 } else { 0.0 };
-        let mut gpu = GpuLights {
-            ambient: self.ambient,
-            emissive: [self.emissive[0], self.emissive[1], self.emissive[2], self.specular_coefficient],
-            material_ambient: self.material_ambient,
-            material_diffuse: [self.material_diffuse[0], self.material_diffuse[1], self.material_diffuse[2], flag(opaque)],
-            material_specular: [self.material_specular[0], self.material_specular[1], self.material_specular[2], flag(self.separate_specular)],
-            ..GpuLights::default()
-        };
-        let update = if has_vertex_color { self.material_update } else { 0 };
-        // w: REVERSE_NORMAL, for raw draws (the 3D program gets negated
-        // normal rows instead, `normal_rows`).
-        gpu.from_vertex = [flag(update & 1 != 0), flag(update & 2 != 0), flag(update & 4 != 0), flag(self.reverse_normal)];
+        let mut gpu = GpuLights::default();
         for (index, light) in self.lights[..self.count].iter().enumerate() {
             let [x, y, z] = light.position;
             gpu.to_light[index] = [x, y, z, 0.0];
@@ -379,10 +477,30 @@ impl Lights {
             gpu.diffuse[index] = [light.diffuse[0], light.diffuse[1], light.diffuse[2], flag(light.computation == POWERED_DIFFUSE)];
             let specular = light.computation == DIFFUSE_AND_SPECULAR;
             gpu.specular[index] = [light.specular[0], light.specular[1], light.specular[2], flag(specular)];
+        }
+        gpu
+    }
+
+    /// `lights` (`gpu_light_part` of these lights) with the material's part
+    /// of `gpu` filled in: the global ambient light plus each light's
+    /// ambient colour (added in light order), the material colours, flags.
+    fn with_material(&self, mut gpu: GpuLights, has_vertex_color: bool, opaque: bool) -> GpuLights {
+        let flag = |on: bool| if on { 1.0 } else { 0.0 };
+        gpu.ambient = self.ambient;
+        for light in &self.lights[..self.count] {
             for channel in 0..3 {
                 gpu.ambient[channel] += light.ambient[channel];
             }
         }
+        gpu.emissive = [self.emissive[0], self.emissive[1], self.emissive[2], self.specular_coefficient];
+        gpu.material_ambient = self.material_ambient;
+        gpu.material_diffuse = [self.material_diffuse[0], self.material_diffuse[1], self.material_diffuse[2], flag(opaque)];
+        gpu.material_specular =
+            [self.material_specular[0], self.material_specular[1], self.material_specular[2], flag(self.separate_specular)];
+        let update = if has_vertex_color { self.material_update } else { 0 };
+        // w: REVERSE_NORMAL, for raw draws (the 3D program gets negated
+        // normal rows instead, `normal_rows`).
+        gpu.from_vertex = [flag(update & 1 != 0), flag(update & 2 != 0), flag(update & 4 != 0), flag(self.reverse_normal)];
         gpu
     }
 
@@ -942,6 +1060,50 @@ mod tests {
         let mut ge = ge_with_one_light(0);
         set(&mut ge, op::LIGHT_TYPE_0, 1 << 8); // a point light
         assert!(Lights::of(&ge).unwrap().in_model_space(&rotated).is_none());
+    }
+
+    /// The cached light set is the uncached one, bit for bit: after a
+    /// material-only change (taken over), after a light change and after a
+    /// view change (worked out again), for both vertex-colour and opacity
+    /// variants.
+    #[test]
+    fn cached_light_sets_equal_the_ones_worked_out_whole() {
+        let words = |set: &GpuLights| -> [u32; 88] {
+            // Safe: GpuLights is 88 f32s (repr(C)).
+            unsafe { core::mem::transmute_copy(set) }
+        };
+        let mut ge = ge_with_one_light(DIFFUSE_AND_SPECULAR);
+        set(&mut ge, op::LIGHT_ENABLE_0 + 1, 1);
+        set(&mut ge, op::LIGHT_X_0 + 3, float(0.6));
+        set(&mut ge, op::LIGHT_X_0 + 4, float(0.8));
+        set(&mut ge, op::LIGHT_AMBIENT_0 + 3, 0x10_2030);
+        set(&mut ge, op::LIGHT_AMBIENT_0, 0x05_0607);
+        let mut cache = GpuLightsCache::new();
+        let check = |ge: &GeState, cache: &mut GpuLightsCache| {
+            let registers = LightingRegisters::of(ge).expect("lights on");
+            for (has_color, opaque) in [(true, true), (false, false), (true, false)] {
+                let whole = Lights::from_registers(&registers, &ge.matrices.world, &ge.matrices.view).gpu(has_color, opaque);
+                let cached = cache.gpu_lights(&registers, &ge.matrices.world, &ge.matrices.view, has_color, opaque);
+                assert_eq!(words(&cached), words(&whole));
+            }
+        };
+        check(&ge, &mut cache);
+        // Material only (MTX's riders between parts): the lights' part is kept.
+        set(&mut ge, op::MATERIAL_AMBIENT, 0x33_4455);
+        set(&mut ge, op::MATERIAL_DIFFUSE, 0x80_8080);
+        set(&mut ge, op::AMBIENT_COLOR, 0x01_0203);
+        set(&mut ge, op::LIGHT_MODE, 1);
+        check(&ge, &mut cache);
+        assert!(cache.last.is_some_and(|last| last.lights.material_ambient[0] > 0.3), "material taken over");
+        // A light changes: worked out again.
+        set(&mut ge, op::LIGHT_X_0 + 5, float(0.5));
+        check(&ge, &mut cache);
+        // The view turns: the half vectors change.
+        set(&mut ge, op::VIEW_MATRIX_NUMBER, 0);
+        for value in [0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0] {
+            set(&mut ge, op::VIEW_MATRIX_DATA, float(value));
+        }
+        check(&ge, &mut cache);
     }
 
     #[test]

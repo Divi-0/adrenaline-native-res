@@ -77,6 +77,15 @@ fn in_phase<T>(phase: u8, work: impl FnOnce() -> T) -> T {
     result
 }
 
+/// Runs `work` counted as cycle part `part` (`cycles`, when measured).
+#[inline(always)]
+fn timed<T>(part: usize, work: impl FnOnce() -> T) -> T {
+    let started = crate::cycles::start(part);
+    let result = work();
+    crate::cycles::add(part, started);
+    result
+}
+
 /// One stretch of the frame's draws in list order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stretch {
@@ -179,6 +188,9 @@ pub struct FrameBuilder {
     ring: Option<RawArena>,
     /// The previous raw draw's entries this frame (`LastEntries`).
     last_entries: Option<LastEntries>,
+    /// The last light set's lights (kept across frames: it depends on
+    /// registers only).
+    lights: crate::lighting::GpuLightsCache,
     pub stats: DirectStats,
 }
 
@@ -194,6 +206,7 @@ impl FrameBuilder {
             raw: None,
             ring: None,
             last_entries: None,
+            lights: crate::lighting::GpuLightsCache::new(),
             stats: DirectStats::EMPTY,
         }
     }
@@ -307,7 +320,7 @@ impl FrameBuilder {
         // Morphing, untextured, lights the GPU path doesn't take: the
         // recorder names those reasons itself.
         let colors = in_phase(crate::phase::DIRECT_COLORS, || {
-            crate::recorder::raw_colors_if_enabled(prepared, material_color, inputs.lighting(), format)
+            timed(crate::cycles::DIRECT_COLORS, || crate::recorder::raw_colors_if_enabled(prepared, material_color, inputs.lighting(), format))
         })
         .ok_or(None)?;
         let (Some(lists), Some(raw)) = (self.lists.as_deref_mut(), self.raw.as_mut()) else {
@@ -334,6 +347,7 @@ impl FrameBuilder {
             gather,
             gather_count: &mut self.gather_count,
             last_entries: &mut self.last_entries,
+            lights: &mut self.lights,
         };
         let draw = Draw { first_vertex: 0, first_index: out.geometry.index_count(), ..prepared.draw };
         let all_triangles = calls.iter().all(|call| (primitive::TRIANGLES..=primitive::TRIANGLE_FAN).contains(&call.primitive_type));
@@ -450,6 +464,7 @@ struct Writer<'g, 'a, M: PspMemory> {
     gather: &'g mut [u16; GATHER_ENTRIES],
     gather_count: &'g mut usize,
     last_entries: &'g mut Option<LastEntries>,
+    lights: &'g mut crate::lighting::GpuLightsCache,
 }
 
 impl<M: PspMemory> Writer<'_, '_, M> {
@@ -485,7 +500,11 @@ impl<M: PspMemory> Writer<'_, '_, M> {
             0
         };
         let lighting = lit.then(|| (format.has_color(), colors.rules[1] != 0.0));
-        let number = in_phase(DIRECT_TRANSFORM, || crate::raw_blocks::raw_transform(tables, inputs, lighting)).ok_or(fallback::TABLES_FULL)?;
+        let lights = (!crate::bench::experiment(crate::bench::NO_LIGHTS_CACHE)).then_some(&mut *self.lights);
+        let started = crate::cycles::start(crate::cycles::DIRECT_TRANSFORM);
+        let number = in_phase(DIRECT_TRANSFORM, || crate::raw_blocks::raw_transform_with(tables, inputs, lighting, lights));
+        crate::cycles::add(crate::cycles::DIRECT_TRANSFORM, started);
+        let number = number.ok_or(fallback::TABLES_FULL)?;
         let colors_number = in_phase(DIRECT_COLORS, || tables.add_raw_colors(colors)).ok_or(fallback::TABLES_FULL)?;
         Ok((number, colors_number, bones))
     }
@@ -496,7 +515,7 @@ impl<M: PspMemory> Writer<'_, '_, M> {
     /// back then.
     fn copy(&mut self, source: u32, length: u32, destination: *mut u8, layout: Layout) -> Result<(), usize> {
         let task = CopyTask { source, length, destination, layout };
-        if in_phase(crate::phase::DIRECT_COPY, || self.stream.copy_task(self.memory, task)) {
+        if in_phase(crate::phase::DIRECT_COPY, || timed(crate::cycles::DIRECT_COPY, || self.stream.copy_task(self.memory, task))) {
             self.stats.tasks += 1;
             self.stats.task_bytes += task.written() as u32;
             Ok(())
@@ -546,7 +565,8 @@ impl<M: PspMemory> Writer<'_, '_, M> {
             self.raw.stats.psp_ram_bytes += length;
             (address, 0, None)
         } else {
-            let (placed, out) = in_phase(crate::phase::DIRECT_ARENA, || self.raw.reserve(length, stride)).ok_or(fallback::ARENA_FULL)?;
+            let (placed, out) = in_phase(crate::phase::DIRECT_ARENA, || timed(crate::cycles::DIRECT_RESERVE, || self.raw.reserve(length, stride)))
+                .ok_or(fallback::ARENA_FULL)?;
             (placed.window, placed.first_vertex(stride), Some(out.as_mut_ptr()))
         };
         let previous = crate::phase::enter(crate::phase::DIRECT_ARENA);
@@ -576,11 +596,13 @@ impl<M: PspMemory> Writer<'_, '_, M> {
         draw.raw_colors = colors_number;
         draw.bones = bones;
         in_phase(crate::phase::DIRECT_ARENA, || {
-            if in_psp_ram {
-                self.geometry.finish_raw_psp_draw(draw, window, stride);
-            } else {
-                self.geometry.finish_raw_draw(draw, window);
-            }
+            timed(crate::cycles::DIRECT_FINISH, || {
+                if in_psp_ram {
+                    self.geometry.finish_raw_psp_draw(draw, window, stride);
+                } else {
+                    self.geometry.finish_raw_draw(draw, window);
+                }
+            })
         });
         Ok(())
     }

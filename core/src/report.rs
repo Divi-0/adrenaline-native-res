@@ -126,8 +126,7 @@ pub fn write_frame(out: &mut impl Write, stats: &FrameStats) -> fmt::Result {
             direct.sparse,
             direct.segments,
             direct.repeated
-        )?;
-    }
+        )?;    }
 
     // PRIMs decoded on the CPU by reason (`recorder::fallback`):
     // cpu=<reason>:<PRIMs>/<PSP vertices>,...

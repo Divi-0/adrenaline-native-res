@@ -39,6 +39,9 @@ pub const NO_WRITE_FILTER: u32 = 64;
 /// The capture thread's raw draws work their table entries out every time,
 /// also when they repeat the previous draw's (`frame_builder::LastEntries`).
 pub const NO_REPEATED_ENTRIES: u32 = 128;
+/// The capture thread's raw draws work their light sets out whole every
+/// time, also when only the material changed (`lighting::GpuLightsCache`).
+pub const NO_LIGHTS_CACHE: u32 = 256;
 
 /// True if experiment `bit` is on.
 #[inline]

@@ -618,9 +618,11 @@ impl DrawStream {
         self.tasks.push(task, |tasks| tasks.copy_one(&mut ReaderSource(reader.copy_bytes), stable));
         (copier.wake)();
         // A lagging copier (preempted): the oldest tasks copied here, as
-        // `help_a_lagging_copier` does for jobs.
+        // `help_a_lagging_copier` does for jobs. Checked every 16th task:
+        // `untaken` reads the counter the copier swaps all the time, a cache
+        // line from its core each read.
         let limit = COPIER_LAG_JOBS.load(Ordering::Relaxed);
-        if self.tasks.untaken() > limit {
+        if self.tasks.pushed() % 16 == 0 && self.tasks.untaken() > limit {
             let previous = crate::phase::enter(crate::phase::HELP);
             while self.tasks.untaken() > limit / 2 && self.copy_one_task() {
                 crate::copy_tasks::PRODUCER_TASKS.fetch_add(1, Ordering::Relaxed);

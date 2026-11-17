@@ -142,6 +142,18 @@ pub struct RawArena {
     /// once gave the compiler another way to tell `None` apart.
     last_head: u64,
     last_added: u32,
+    /// The window the head is in (its start position; the head may stand at
+    /// its very end) and that start's byte offset in the arena: kept up to
+    /// date as runs are reserved, so `reserve` needs no 64-bit division (the
+    /// A9 has no divide instruction; `% len` and `/ WINDOW_BYTES` on u64 were
+    /// two `__aeabi_uldivmod` calls per run, ~600 cycles with the rest).
+    window_start: u64,
+    window_offset: u32,
+    /// The window state before the newest reservation (`undo_last`).
+    last_window_start: u64,
+    last_window_offset: u32,
+    /// `protected_from`, worked out once per frame (`next_frame`).
+    protected: u64,
 }
 
 impl RawArena {
@@ -159,6 +171,11 @@ impl RawArena {
             refusal: 0,
             last_head: 0,
             last_added: 0,
+            window_start: 0,
+            window_offset: 0,
+            last_window_start: 0,
+            last_window_offset: 0,
+            protected: 0,
         }
     }
 
@@ -167,6 +184,8 @@ impl RawArena {
     pub fn undo_last(&mut self) {
         if self.last_added > 0 {
             self.head = self.last_head;
+            self.window_start = self.last_window_start;
+            self.window_offset = self.last_window_offset;
             self.stats.bytes -= self.last_added;
             self.stats.runs -= 1;
             self.last_added = 0;
@@ -184,6 +203,7 @@ impl RawArena {
         self.last_added = 0;
         self.frame += 1;
         self.frame_starts[(self.frame % PROTECTED_FRAMES as u64) as usize] = self.head;
+        self.protected = self.protected_from();
         core::mem::take(&mut self.stats)
     }
 
@@ -210,38 +230,45 @@ impl RawArena {
     /// Room for a run of `length` bytes, `stride` bytes per vertex, placed as
     /// `put` places it; the caller fills all of it. `None` as for `put`.
     pub fn reserve(&mut self, length: u32, stride: u32) -> Option<(Placed, &mut [u8])> {
-        let length = length as u64;
-        let window_bytes = WINDOW_BYTES as u64;
-        if length == 0 || stride == 0 || length > window_bytes {
+        if length == 0 || stride == 0 || length > WINDOW_BYTES {
             return None;
         }
-        let mut position = self.head;
-        let mut window = position / window_bytes * window_bytes;
-        // A whole number of strides from the window's start.
-        let into = (position - window) % stride as u64;
-        if into != 0 {
-            position += stride as u64 - into;
+        let len = self.bytes.len() as u32;
+        let (mut window, mut window_offset) = (self.window_start, self.window_offset);
+        // The head lies in this window (or at its very end): a 32-bit
+        // distance. The run starts a whole number of strides from the
+        // window's start (one 32-bit division, the only one left).
+        let into = (self.head - window) as u32;
+        let remainder = into % stride;
+        let mut start = if remainder != 0 { into + (stride - remainder) } else { into };
+        if start as u64 + length as u64 > WINDOW_BYTES as u64 {
+            // The next window (the arena is a whole number of them).
+            window += WINDOW_BYTES as u64;
+            window_offset += WINDOW_BYTES;
+            if window_offset == len {
+                window_offset = 0;
+            }
+            start = 0;
         }
-        if position + length > window + window_bytes {
-            window += window_bytes;
-            position = window;
-        }
-        if position + length - self.protected_from() > self.bytes.len() as u64 {
+        let position = window + start as u64;
+        if position + length as u64 - self.protected > len as u64 {
             self.stats.full += 1;
-            self.stats.full_at =
-                [(self.bytes.len() / 1024) as u32, (self.head / 1024) as u32, (self.protected_from() / 1024) as u32, self.frame as u32];
+            self.stats.full_at = [len / 1024, (self.head / 1024) as u32, (self.protected / 1024) as u32, self.frame as u32];
             return None;
         }
-        let len = self.bytes.len() as u64;
-        let offset = (position % len) as usize;
-        let added = (position + length - self.head) as u32;
+        let offset = window_offset + start;
+        let added = (position + length as u64 - self.head) as u32;
         self.stats.bytes += added;
         self.stats.runs += 1;
         self.last_head = self.head;
         self.last_added = added;
-        self.head = position + length;
-        let placed = Placed { offset: offset as u32, window: (window % len) as u32 };
-        Some((placed, &mut self.bytes[offset..offset + length as usize]))
+        self.last_window_start = self.window_start;
+        self.last_window_offset = self.window_offset;
+        self.head = position + length as u64;
+        self.window_start = window;
+        self.window_offset = window_offset;
+        let placed = Placed { offset, window: window_offset };
+        Some((placed, &mut self.bytes[offset as usize..(offset + length) as usize]))
     }
 }
 
@@ -260,6 +287,81 @@ mod tests {
     fn arena(windows: usize) -> RawArena {
         let bytes: &'static mut [u8] = Box::leak(vec![0u8; windows * WINDOW_BYTES as usize + 100].into_boxed_slice());
         RawArena::new(bytes)
+    }
+
+    /// `reserve` without 64-bit divisions places every run exactly where
+    /// the plain formula (head, window = head / WINDOW_BYTES, offset = position
+    /// % length) placed it: over laps of the arena, with undos and frame ends
+    /// mixed in, and strides 3..=60.
+    #[test]
+    fn reservations_match_the_plain_formula() {
+        struct Model {
+            head: u64,
+            last: Option<u64>,
+            frame_starts: [u64; PROTECTED_FRAMES],
+            frame: u64,
+        }
+        impl Model {
+            fn protected(&self) -> u64 {
+                if self.frame < PROTECTED_FRAMES as u64 - 1 {
+                    return 0;
+                }
+                self.frame_starts[((self.frame - (PROTECTED_FRAMES as u64 - 1)) % PROTECTED_FRAMES as u64) as usize]
+            }
+            fn reserve(&mut self, length: u32, stride: u32, len: u64) -> Option<Placed> {
+                let (length, w) = (length as u64, WINDOW_BYTES as u64);
+                let mut position = self.head;
+                let mut window = position / w * w;
+                let into = (position - window) % stride as u64;
+                if into != 0 {
+                    position += stride as u64 - into;
+                }
+                if position + length > window + w {
+                    window += w;
+                    position = window;
+                }
+                if position + length - self.protected() > len {
+                    return None;
+                }
+                self.last = Some(self.head);
+                self.head = position + length;
+                Some(Placed { offset: (position % len) as u32, window: (window % len) as u32 })
+            }
+        }
+        let mut arena = arena(3);
+        let len = arena.bytes().len() as u64;
+        let mut model = Model { head: 0, last: None, frame_starts: [0; PROTECTED_FRAMES], frame: 0 };
+        let mut seed = 0x1234_5678u32;
+        let mut next = |limit: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed % limit
+        };
+        for step in 0..20_000 {
+            match next(40) {
+                0 => {
+                    arena.next_frame();
+                    model.frame += 1;
+                    model.frame_starts[(model.frame % PROTECTED_FRAMES as u64) as usize] = model.head;
+                    model.last = None;
+                }
+                1 => {
+                    arena.undo_last();
+                    if let Some(head) = model.last.take() {
+                        model.head = head;
+                    }
+                }
+                _ => {
+                    let stride = 3 + next(58);
+                    let limit = if next(10) == 0 { WINDOW_BYTES } else { 4000 };
+                    let length = 1 + next(limit);
+                    let got = arena.reserve(length, stride).map(|(placed, _)| placed);
+                    assert_eq!(got, model.reserve(length, stride, len), "step {step}: {length} bytes, stride {stride}");
+                }
+            }
+        }
+        assert!(model.head > 4 * len, "went round the arena a few times");
     }
 
     #[test]
