@@ -124,19 +124,57 @@ pub fn quick_hash<H: Host>(host: &H, texture: &TextureDescriptor) -> u32 {
     texture::quick_sample(&positions.map(|position| data[position]))
 }
 
+/// `quick_hash` of the data staged for `texture` (by [`stage`] with
+/// `layout`, in `staged`): the sample of the very bytes hashed and decoded,
+/// not of PSP memory a moment later. The game runs on while the display
+/// copies its textures out; MTX loads the next screen's tiles into the same
+/// RAM meanwhile, and a sample read after the copy described other pixels
+/// than the cached ones (rider <-> bike select, 2026-11-17: half-loaded
+/// tiles kept for VERIFY_INTERVAL frames). Words outside the staged pieces
+/// (the gaps of a compact layout, not the texture's texels) are read from
+/// PSP memory. 0 if one can't be read.
+pub fn staged_quick_hash<H: Host>(host: &H, texture: &TextureDescriptor, layout: &StagedLayout, staged: &[u8]) -> u32 {
+    let Some(positions) = texture::quick_sample_positions(texture) else {
+        return 0;
+    };
+    let mut words = [0u32; texture::QUICK_SAMPLES];
+    for (word, &position) in words.iter_mut().zip(positions.iter()) {
+        let offset = 4 * position as u32;
+        let (piece, within) =
+            if layout.source_step == 0 { (0, offset) } else { (offset / layout.source_step, offset % layout.source_step) };
+        let at = (piece * layout.piece_bytes + within) as usize;
+        if piece < layout.pieces && within + 4 <= layout.piece_bytes && at + 4 <= staged.len() {
+            *word = u32::from_le_bytes([staged[at], staged[at + 1], staged[at + 2], staged[at + 3]]);
+        } else {
+            match host.psp_words((texture.address & 0x0FFF_FFFF) + offset, 4) {
+                Some(read) => *word = read[0],
+                None => return 0,
+            }
+        }
+    }
+    texture::quick_sample(&words)
+}
+
 /// A hash of texture data already computed this frame: the same pixels are
 /// often used several times (with different palettes, say).
 #[derive(Clone, Copy)]
 pub(super) struct FrameHash {
     pub address: u32,
     pub size: u32,
+    /// `texture::data_size` of the texture hashed (the quick sample's
+    /// positions depend on it).
+    pub data_size: u32,
     pub hash: u32,
+    /// `staged_quick_hash` of the same staged bytes.
+    pub quick: u32,
 }
 
 impl TextureCache {
     /// Hash of `texture`'s data (staged as `layout` says), staging it if it
     /// isn't known yet this frame. Sets `*staged` to the data size when
-    /// `staging` now holds this texture (0 if it doesn't).
+    /// `staging` now holds this texture (0 if it doesn't), and `*quick` to
+    /// the quick sample of the data hashed (`staged_quick_hash`; 0 with
+    /// hash 0).
     pub(super) fn data_hash<H: Host>(
         &mut self,
         host: &H,
@@ -144,10 +182,17 @@ impl TextureCache {
         texture: &TextureDescriptor,
         layout: &StagedLayout,
         staged: &mut u32,
+        quick: &mut u32,
     ) -> u32 {
         *staged = 0;
+        *quick = 0;
+        let data_size = texture::data_size(texture).unwrap_or(0);
         let known = &self.frame_hashes[..self.frame_hash_count];
-        if let Some(known) = known.iter().find(|known| known.address == texture.address && known.size == layout.size) {
+        if let Some(known) = known
+            .iter()
+            .find(|known| known.address == texture.address && known.size == layout.size && known.data_size == data_size)
+        {
+            *quick = known.quick;
             return known.hash;
         }
         let size = stage(host, texture, layout, staging);
@@ -155,10 +200,13 @@ impl TextureCache {
             return 0;
         }
         *staged = size;
-        let hash = texture::hash_texture(&staging[..size as usize]);
+        let data = &staging[..size as usize];
+        let hash = texture::hash_texture(data);
+        *quick = staged_quick_hash(host, texture, layout, data);
         self.stats.hashed_bytes += size as u64;
         if self.frame_hash_count < FRAME_HASHES {
-            self.frame_hashes[self.frame_hash_count] = FrameHash { address: texture.address, size, hash };
+            self.frame_hashes[self.frame_hash_count] =
+                FrameHash { address: texture.address, size, data_size, hash, quick: *quick };
             self.frame_hash_count += 1;
         }
         hash

@@ -46,6 +46,11 @@ struct FakeHost {
     job: Option<RefreshJob>,
     result: Option<RefreshResult>,
     log: String,
+    /// PSP RAM as the staging copies (`Host::copy`) see it, while the game
+    /// writes the real `ram` meanwhile (`None`: they see `ram`). On the
+    /// Vita the game runs on while the display copies its textures out:
+    /// a copy and a later direct read can see different data.
+    copies_see: Option<Vec<u32>>,
 }
 
 impl FakeHost {
@@ -70,6 +75,7 @@ impl FakeHost {
             job: None,
             result: None,
             log: String::new(),
+            copies_see: None,
         }
     }
 
@@ -205,7 +211,16 @@ impl Host for FakeHost {
     }
 
     fn copy(&self, target: &mut [u8], source: &[u8]) {
-        target.copy_from_slice(source);
+        let ram_start = self.ram.as_ptr() as usize;
+        let offset = (source.as_ptr() as usize).wrapping_sub(ram_start);
+        match &self.copies_see {
+            Some(seen) if offset < self.ram.len() * 4 => {
+                // Safe: plain words viewed as bytes, within the snapshot.
+                let bytes = unsafe { core::slice::from_raw_parts(seen.as_ptr() as *const u8, seen.len() * 4) };
+                target.copy_from_slice(&bytes[offset..offset + source.len()]);
+            }
+            _ => target.copy_from_slice(source),
+        }
     }
 
     fn vram(&self) -> VramState {
@@ -463,6 +478,64 @@ fn big_textures_rewritten_after_the_frame_was_drawn_are_noticed_too() {
     test.cache.lookup_sample = staging::quick_hash(&test.host, &wanted);
     test.use_texture(&wanted);
     assert!(!test.cache.shows_other_pixels(&wanted));
+}
+
+/// MTX rider <-> bike select (2026-11-17, "graphics glitch again"): for
+/// ~8 frames of the wipe, background tiles showed pieces of other pictures
+/// (dirt photos, black triangles); Sony's picture clean, the captured
+/// frames identical to the clean ones after them. The game loads the next
+/// screen's tiles into the same RAM while the display re-checks them: the
+/// staged copy we decoded caught the memory mid-load (picture 2), the
+/// cached texture's quick sample was read from PSP memory a moment later
+/// (picture 3, loaded meanwhile). The next frames, drawn with picture 3,
+/// had capture samples equal to that quick sample, so the half-loaded
+/// pixels stayed until the regular re-check VERIFY_INTERVAL frames later.
+/// A cached texture's quick sample must describe the very bytes decoded.
+#[test]
+fn a_decode_racing_with_the_game_loading_new_pixels_is_redone_by_the_next_frame() {
+    let mut test = Test::new();
+    let wanted = texture(RAM_START, 64, 64, format::CLUT8);
+    let old = test.use_texture_captured(&wanted);
+    // The frame drew picture 2; the display's copy catches picture 2, the
+    // game has loaded picture 3 by the time the copy is done.
+    load_new_picture(&mut test, 2);
+    let drawn_with = staging::quick_hash(&test.host, &wanted);
+    let picture_2 = test.host.data_hash(&wanted);
+    test.host.copies_see = Some(test.host.ram.clone());
+    load_new_picture(&mut test, 3);
+    test.cache.lookup_sample = drawn_with;
+    let racing = test.use_texture(&wanted);
+    assert_ne!(racing, old);
+    assert_eq!(test.host.shows(racing), picture_2, "decoded what the copy saw");
+    assert!(!test.cache.shows_other_pixels(&wanted), "which is what the frame drew");
+    test.cache.lookup_sample = 0;
+    test.host.copies_see = None;
+    // The next frame drew picture 3: decoded at once, not VERIFY_INTERVAL
+    // frames later.
+    let next = test.use_texture_captured(&wanted);
+    assert_eq!(test.host.shows(next), test.host.data_hash(&wanted), "picture 3, as the frame drew it");
+    assert_eq!(test.host.decodes, 3);
+}
+
+/// The same race on the path where the re-check finds the old pixels: the
+/// copy still sees picture 1 (its hash is the cached one: kept), the game
+/// has written picture 2 when the quick sample is read. The cached texture
+/// must not take picture 2's quick sample, or the frames drawn with
+/// picture 2 keep showing picture 1 (rider <-> bike select, 2026-11-17).
+#[test]
+fn a_recheck_racing_with_the_game_loading_new_pixels_keeps_the_old_sample() {
+    let mut test = Test::new();
+    let wanted = texture(RAM_START, 64, 64, format::CLUT8);
+    let old = test.use_texture_captured(&wanted);
+    test.host.copies_see = Some(test.host.ram.clone());
+    load_new_picture(&mut test, 2);
+    // The frame drew picture 2; our copy still sees picture 1.
+    assert_eq!(test.use_texture_captured(&wanted), old, "the copy found the cached pixels");
+    test.host.copies_see = None;
+    let next = test.use_texture_captured(&wanted);
+    assert_ne!(next, old);
+    assert_eq!(test.host.shows(next), test.host.data_hash(&wanted), "picture 2, as the frame drew it");
+    assert_eq!(test.host.decodes, 2);
 }
 
 /// Every word of the 64x64 CLUT8 texture at RAM_START rewritten.

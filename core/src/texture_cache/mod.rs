@@ -54,7 +54,7 @@ use gpu::{can_unswizzle_on_gpu, GpuFormat, GpuTexture, TextureShape};
 use arena::PageArena;
 use memory::Retired;
 use refresh::{PendingRefresh, RefreshJob, RefreshResult};
-use staging::{quick_hash, sample_hash, stage, FrameHash, StagedLayout};
+use staging::{quick_hash, sample_hash, stage, staged_quick_hash, FrameHash, StagedLayout};
 
 pub use memory::{ARENA_IDLE_FRAMES, ARENA_SLACK, BUDGET_BYTES, MEMORY_MINIMUM, MEMORY_RESERVE, RETIRE_FRAMES, SPARE_FRAMES};
 
@@ -415,7 +415,7 @@ impl TextureCache {
             trace_address: 0,
             loop_start_us: 0,
             verify_budget: VERIFY_BYTES_PER_FRAME,
-            frame_hashes: [FrameHash { address: 0, size: 0, hash: 0 }; FRAME_HASHES],
+            frame_hashes: [FrameHash { address: 0, size: 0, data_size: 0, hash: 0, quick: 0 }; FRAME_HASHES],
             frame_hash_count: 0,
             times: FrameTimes { trim_us: 0, hash_us: 0, allocate_us: 0, decode_us: 0 },
             deferred_frames: 0,
@@ -873,6 +873,8 @@ impl TextureCache {
         let layout = StagedLayout::of(wanted);
         let mut staged_size = 0;
         let mut data_hash = 0;
+        // The quick sample of the data hashed (`staged_quick_hash`).
+        let mut hashed_quick = 0;
         let mut changes = found.map_or(0, |slot| self.entries[slot].changes);
         let mut unhashed = 0u8;
         let volatile_unhashed = |entry: &Entry| {
@@ -890,7 +892,7 @@ impl TextureCache {
             None if big => unhashed = 1,
             _ => {
                 let hash_start = host.now_us();
-                data_hash = self.data_hash(host, staging, wanted, &layout, &mut staged_size);
+                data_hash = self.data_hash(host, staging, wanted, &layout, &mut staged_size, &mut hashed_quick);
                 self.times.hash_us += host.now_us() - hash_start;
                 if let Some(slot) = found {
                     let entry = &mut self.entries[slot];
@@ -902,7 +904,10 @@ impl TextureCache {
                         let decoded_unhashed = entry.unhashed > 0;
                         entry.changes = 0;
                         entry.unhashed = 0;
-                        entry.quick = quick_hash(host, wanted); // as the data is now
+                        // The sample of the data just hashed, not of the
+                        // memory now: the game may have written new pixels
+                        // since (staged_quick_hash).
+                        entry.quick = hashed_quick;
                         if !decoded_unhashed {
                             return Lookup::Ready(entry.texture.unwrap());
                         }
@@ -942,31 +947,23 @@ impl TextureCache {
         };
         let shape = TextureShape::new(wanted, format, on_gpu);
 
-        if !sampled {
+        if !sampled && big {
             // What the next use compares with.
-            new_sample_hash = if big { sample_hash(host, wanted) } else { quick_hash(host, wanted) };
+            new_sample_hash = sample_hash(host, wanted);
         }
-        let quick = if big { quick_hash(host, wanted) } else { new_sample_hash };
-        if self.lookup_sample != 0 && quick != self.lookup_sample {
-            // The game wrote other pixels there after the GE drew the frame:
-            // what we decode now isn't what the frame showed.
-            host.log(format_args!(
-                "moved on: {:08x} {}x{} fmt {} sampled {:08x} at capture, {:08x} now ({})\n",
-                wanted.address,
-                wanted.width,
-                wanted.height,
-                wanted.format,
-                self.lookup_sample,
-                quick,
-                if found.is_some() { "changed" } else { "new" }
-            ));
-        }
+        // The quick sample of the pixels decoded: of the staged bytes on the
+        // CPU path (set below), of the memory before the GPU reads it on the
+        // GPU path (16-bit textures only).
+        let mut quick = if on_gpu { quick_hash(host, wanted) } else { 0 };
         let decode_start = host.now_us();
         let mut result = Ok(());
         if !on_gpu || !self.unswizzle_on_gpu(host, wanted, texture, shape) {
             if staged_size == 0 {
                 // The hash came from an earlier copy this frame (or there was none).
                 staged_size = stage(host, wanted, &layout, staging);
+                quick = staged_quick_hash(host, wanted, &layout, &staging[..staged_size as usize]);
+            } else {
+                quick = hashed_quick; // the bytes hashed are the ones decoded
             }
             let palette = texture_palette(wanted, palette_words);
             let data = &staging[..staged_size as usize];
@@ -991,6 +988,23 @@ impl TextureCache {
             }
         }
         let decode_us = host.now_us() - decode_start;
+        if !big {
+            new_sample_hash = quick;
+        }
+        if self.lookup_sample != 0 && quick != self.lookup_sample {
+            // The game wrote other pixels there after the GE drew the frame:
+            // what we decoded isn't what the frame showed.
+            host.log(format_args!(
+                "moved on: {:08x} {}x{} fmt {} sampled {:08x} at capture, {:08x} decoded ({})\n",
+                wanted.address,
+                wanted.width,
+                wanted.height,
+                wanted.format,
+                self.lookup_sample,
+                quick,
+                if found.is_some() { "changed" } else { "new" }
+            ));
+        }
         self.stats.decode_us += decode_us;
         self.times.decode_us += decode_us;
         self.stats.decodes += 1;
