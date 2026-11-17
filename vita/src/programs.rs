@@ -14,8 +14,9 @@
 //!   and FIX B variants of the fragment program;
 //! - the 3D program (nativeres_3d_v.cg): the same outputs for vertices in
 //!   model space (the GPU transform and lighting);
-//! - the raw programs (nativeres_raw_v.cg, _raw_plain_v.cg): raw PSP
-//!   vertices, one patched program per PSP vertex format;
+//! - the raw programs (nativeres_raw_v.cg and its variants _raw_plain_v,
+//!   _raw_lit1_v, _raw_lit4_v): raw PSP vertices, one patched program per
+//!   PSP vertex format;
 //! - the raw sprite programs (nativeres_raw_sprite_v.cg);
 //! - blend programs: GXM bakes blending into the fragment program, so every
 //!   blend mode a game uses needs its own; made on first use and kept.
@@ -117,10 +118,50 @@ pub struct Textured {
     pub lights_3d: *const ProgramParameter,
 }
 
-/// A raw program (nativeres_raw_v.cg or the plain one) and its programs per
-/// PSP vertex format.
+/// Which raw program: nativeres_raw_v.cg or one of its variants (see the
+/// shader's comment). Each takes the draws that need no more than it has;
+/// the smaller the program, the less the GPU spends per draw and vertex.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RawVariant {
+    /// Up to eight bones, lights (nativeres_raw_v.cg).
+    Full,
+    /// One bone, no directional lights (nativeres_raw_plain_v.cg).
+    Plain,
+    /// One bone, lights (nativeres_raw_lit1_v.cg).
+    Lit1,
+    /// Up to four bones, lights (nativeres_raw_lit4_v.cg).
+    Lit4,
+}
+
+impl RawVariant {
+    /// The most bones (skinning weights) the program takes.
+    pub fn bones(self) -> u32 {
+        match self {
+            RawVariant::Full => 8,
+            RawVariant::Lit4 => 4,
+            RawVariant::Plain | RawVariant::Lit1 => 1,
+        }
+    }
+
+    /// Whether the program lights with directional lights (uLights, aNormal).
+    pub fn lights(self) -> bool {
+        self != RawVariant::Plain
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            RawVariant::Full => "",
+            RawVariant::Plain => " (plain)",
+            RawVariant::Lit1 => " (lit, one bone)",
+            RawVariant::Lit4 => " (lit, four bones)",
+        }
+    }
+}
+
+/// A raw program (nativeres_raw_v.cg or a variant) and its programs per PSP
+/// vertex format.
 pub struct RawSet {
-    plain: bool,
+    pub variant: RawVariant,
     tried: bool,
     ready: bool,
     id: PatcherId,
@@ -131,7 +172,7 @@ pub struct RawSet {
     normal: *const ProgramParameter,
     weights0: *const ProgramParameter,
     weights1: *const ProgramParameter,
-    /// The plain program's first weight (aWeight).
+    /// The one-bone programs' first weight (aWeight).
     weight: *const ProgramParameter,
     pub uniforms: RawUniforms,
     pub lights: *const ProgramParameter,
@@ -256,6 +297,8 @@ pub struct Programs {
     pub textured: Textured,
     pub raw: RawSet,
     pub raw_plain: RawSet,
+    pub raw_lit1: RawSet,
+    pub raw_lit4: RawSet,
     pub sprites: SpriteSet,
     blend: [BlendProgram; MAX_BLEND_PROGRAMS],
     blend_count: usize,
@@ -264,9 +307,9 @@ pub struct Programs {
 const NO_BLEND_PROGRAM: BlendProgram = BlendProgram { kind: Kind::Color, blend: 0, program: null_mut() };
 
 impl RawSet {
-    const fn new(plain: bool) -> RawSet {
+    const fn new(variant: RawVariant) -> RawSet {
         RawSet {
-            plain,
+            variant,
             tried: false,
             ready: false,
             id: null_mut(),
@@ -290,11 +333,7 @@ impl RawSet {
     }
 
     fn label(&self) -> &'static str {
-        if self.plain {
-            " (plain)"
-        } else {
-            ""
-        }
+        self.variant.label()
     }
 
     /// Registers the program and finds its parameters (once).
@@ -303,7 +342,12 @@ impl RawSet {
             return self.ready;
         }
         self.tried = true;
-        let program = if self.plain { gxp(&shaders::nativeres_raw_plain_v) } else { gxp(&shaders::nativeres_raw_v) };
+        let program = match self.variant {
+            RawVariant::Full => gxp(&shaders::nativeres_raw_v),
+            RawVariant::Plain => gxp(&shaders::nativeres_raw_plain_v),
+            RawVariant::Lit1 => gxp(&shaders::nativeres_raw_lit1_v),
+            RawVariant::Lit4 => gxp(&shaders::nativeres_raw_lit4_v),
+        };
         let Some(id) = register(program) else {
             render_log::line(format_args!("raw program{}: invalid or not registered\n", self.label()));
             return false;
@@ -322,7 +366,7 @@ impl RawSet {
         self.bones = parameter(program, b"uBones\0");
         self.scale = parameter(program, b"uScale\0");
         self.uniforms = RawUniforms::find(program);
-        let lit = [self.normal, self.lights, self.weights0, self.weights1];
+        let bones = self.variant.bones();
         if self.position.is_null()
             || self.texcoord.is_null()
             || self.color_bytes.is_null()
@@ -331,8 +375,10 @@ impl RawSet {
             || self.skin.is_null()
             || self.bones.is_null()
             || !self.uniforms.all_found()
-            || (self.plain && self.weight.is_null())
-            || (!self.plain && lit.iter().any(|parameter| parameter.is_null()))
+            || (bones == 1 && self.weight.is_null())
+            || (bones > 1 && self.weights0.is_null())
+            || (bones > 4 && self.weights1.is_null())
+            || (self.variant.lights() && (self.normal.is_null() || self.lights.is_null()))
         {
             render_log::line(format_args!("raw program{}: parameters missing\n", self.label()));
             return false;
@@ -373,17 +419,25 @@ impl RawSet {
         attributes[1] = attribute(0, texcoord_offset, TEXCOORD_FORMATS[(format & 3) as usize], 2, self.texcoord);
         attributes[2] = attribute(0, color_offset, gxm::ATTRIBUTE_FORMAT_U8, 2, self.color_bytes);
         attributes[3] = attribute(0, color_offset, gxm::ATTRIBUTE_FORMAT_U8N, 4, self.color32);
-        let used = if self.plain {
+        let mut used = 4;
+        let bones = self.variant.bones();
+        if bones == 1 {
             // The first weight (one byte from byte 0 without weights: the
             // program multiplies it by 0 then).
-            attributes[4] = attribute(0, 0, WEIGHT_FORMATS[weight_type], 1, self.weight);
-            5
+            attributes[used] = attribute(0, 0, WEIGHT_FORMATS[weight_type], 1, self.weight);
+            used += 1;
         } else {
-            attributes[4] = attribute(0, normal_offset, POSITION_FORMATS[((format >> 5) & 3) as usize], 3, self.normal);
-            attributes[5] = attribute(0, 0, WEIGHT_FORMATS[weight_type], weights0, self.weights0);
-            attributes[6] = attribute(0, weights1_offset, weights1_format, weights1, self.weights1);
-            7
-        };
+            attributes[used] = attribute(0, 0, WEIGHT_FORMATS[weight_type], weights0, self.weights0);
+            used += 1;
+            if bones > 4 {
+                attributes[used] = attribute(0, weights1_offset, weights1_format, weights1, self.weights1);
+                used += 1;
+            }
+        }
+        if self.variant.lights() {
+            attributes[used] = attribute(0, normal_offset, POSITION_FORMATS[((format >> 5) & 3) as usize], 3, self.normal);
+            used += 1;
+        }
         let stream = [VertexStream { stride: layout.size as u16, index_source: gxm::INDEX_SOURCE_INDEX_16BIT }];
         let program = vertex_program(
             self.id,
@@ -540,11 +594,23 @@ impl Programs {
                 normal_rows_3d: null(),
                 lights_3d: null(),
             },
-            raw: RawSet::new(false),
-            raw_plain: RawSet::new(true),
+            raw: RawSet::new(RawVariant::Full),
+            raw_plain: RawSet::new(RawVariant::Plain),
+            raw_lit1: RawSet::new(RawVariant::Lit1),
+            raw_lit4: RawSet::new(RawVariant::Lit4),
             sprites: SpriteSet::new(),
             blend: [NO_BLEND_PROGRAM; MAX_BLEND_PROGRAMS],
             blend_count: 0,
+        }
+    }
+
+    /// The raw program set of `variant`.
+    pub fn raw_set(&mut self, variant: RawVariant) -> &mut RawSet {
+        match variant {
+            RawVariant::Full => &mut self.raw,
+            RawVariant::Plain => &mut self.raw_plain,
+            RawVariant::Lit1 => &mut self.raw_lit1,
+            RawVariant::Lit4 => &mut self.raw_lit4,
         }
     }
 

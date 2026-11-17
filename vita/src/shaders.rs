@@ -31,10 +31,13 @@ embed_gxp!(nativeres_textured_fix_f);
 embed_gxp!(nativeres_textured_test_fix_f);
 // Decoded vertices in model space: the GPU transforms and lights them.
 embed_gxp!(nativeres_3d_v);
-// Raw PSP vertices, read by the GPU as the game wrote them: with skinning
-// and lights, without either, and sprites (two corners per rectangle).
+// Raw PSP vertices, read by the GPU as the game wrote them: with up to
+// eight bones and lights, one bone without lights, one bone with lights, up
+// to four bones with lights, and sprites (two corners per rectangle).
 embed_gxp!(nativeres_raw_v);
 embed_gxp!(nativeres_raw_plain_v);
+embed_gxp!(nativeres_raw_lit1_v);
+embed_gxp!(nativeres_raw_lit4_v);
 embed_gxp!(nativeres_raw_sprite_v);
 // The basic programs (basic_programs.rs): untextured draws and clears;
 // full-screen quads and textured draws without our textured program.

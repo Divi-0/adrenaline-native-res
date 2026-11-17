@@ -34,7 +34,7 @@ use crate::capture::{RAW_ARENA, RAW_ARENA_BYTES, VERTEX_ARENA, VERTEX_ARENA_VERT
 use crate::frame_pool::alloc as frame_pool_alloc;
 use crate::gpu_textures::TextureObject;
 use crate::gxm::{self, ProgramParameter};
-use crate::programs::{Kind, Programs, RawUniforms, SPRITE_CORNERS};
+use crate::programs::{Kind, Programs, RawUniforms, RawVariant, SPRITE_CORNERS};
 use crate::render_stats::stats;
 use crate::{basic_programs, render_log, sys, SingleThreaded};
 
@@ -93,6 +93,13 @@ pub static ALPHA_LOG: AtomicI32 = AtomicI32::new(0);
 /// the full program costs every vertex its skinning and lighting code,
 /// switched off by uniforms or not (GPU time). 1 = on (default).
 pub static RAW_PLAIN: AtomicI32 = AtomicI32::new(1);
+
+/// Raw draws lit with lights or skinned get the smallest program that takes
+/// them: one bone with lights, up to four bones with lights, else the full
+/// program (nativeres_raw_v.cg's variants; 2026-11-17, MTX's race start with
+/// ~290 small rider draws: GPU 24.8 -> 22.6 ms, picture identical). 0 = only
+/// the plain and the full program, as before. 1 = on (default).
+pub static RAW_VARIANTS: AtomicI32 = AtomicI32::new(1);
 
 /// Measuring only (0 = off): our scene draws only
 /// its top <rows> pixel rows, to see how the GPU time scales with the area
@@ -630,8 +637,10 @@ impl Draws {
         fragment: *const c_void,
     ) {
         let (uniforms, skinning) = match set {
-            RawSetChoice::Full => (self.programs.raw.uniforms, Some(raw_skinning(&self.programs.raw))),
-            RawSetChoice::Plain => (self.programs.raw_plain.uniforms, Some(raw_skinning(&self.programs.raw_plain))),
+            RawSetChoice::Raw(variant) => {
+                let raw = self.programs.raw_set(variant);
+                (raw.uniforms, Some(raw_skinning(raw)))
+            }
             RawSetChoice::Sprites => (self.programs.sprites.uniforms, None),
         };
         let switched = program as *const c_void != self.state.vertex_program;
@@ -651,13 +660,12 @@ impl Draws {
             set_raw_uniforms(buffer, &uniforms, matrix, (transform, camera), uv_scale, &format_uniform, &raw_uv, colors);
             if let Some(skinning) = skinning {
                 set_uniform(buffer, skinning.scale, 4, floats(&colors.scale));
-                let full = set == RawSetChoice::Full;
-                if full {
+                if skinning.variant.lights() {
                     if let Some(lights) = raw_light_set(frame, transform) {
                         set_uniform(buffer, skinning.lights, LIGHT_FLOATS, floats(lights));
                     }
                 }
-                self.set_raw_bones(frame, draw, full, buffer, &skinning);
+                self.set_raw_bones(frame, draw, buffer, &skinning);
             }
             self.state.raw_transform = transform;
             self.state.raw_colors = colors;
@@ -668,25 +676,28 @@ impl Draws {
         self.use_raw_viewport(camera);
     }
 
-    /// The raw programs' bones and uSkin (nativeres_raw_v.cg): the full
-    /// program gets all 8 (the format's, zeros for the rest) and skins where
-    /// uSkin.x is 1; the plain one gets bone 0 and adds uSkin.z to the
-    /// weight, so formats without weights get weight 1 and the identity.
-    fn set_raw_bones(&mut self, frame: &Frame, draw: &Draw, full: bool, buffer: *mut c_void, skinning: &RawSkinning) {
+    /// The raw programs' bones and uSkin (nativeres_raw_v.cg): the programs
+    /// with four or eight bones get as many (the format's, zeros for the
+    /// rest) and skin where uSkin.x is 1; the one-bone programs get bone 0
+    /// and add uSkin.z to the weight, so formats without weights get weight 1
+    /// and the identity.
+    fn set_raw_bones(&mut self, frame: &Frame, draw: &Draw, buffer: *mut c_void, skinning: &RawSkinning) {
         const WEIGHT_SCALES: [f32; 4] = [1.0, 1.0 / 128.0, 1.0 / 32768.0, 1.0];
         const IDENTITY_ROWS: [f32; 12] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
         let weight_type = (draw.vertex_format >> 9) & 3;
-        let bone_count = if full { ((draw.vertex_format >> 14) & 7) + 1 } else { 1 };
+        let program_bones = skinning.variant.bones();
+        let several = program_bones > 1;
+        let bone_count = (((draw.vertex_format >> 14) & 7) + 1).min(program_bones);
         let first = draw.bones as usize;
         let wanted = 12 * bone_count as usize;
         let mut skin = [0.0f32; 4];
-        let floats_used = if full { 24 * 4 } else { 12 };
+        let floats_used = 12 * program_bones as usize;
         if draw.bones != 0 && weight_type != 0 && first - 1 + wanted <= (frame.bone_float_count as usize).min(frame.bone_floats.len()) {
             self.bones[..floats_used].fill(0.0);
             self.bones[..wanted].copy_from_slice(&frame.bone_floats[first - 1..first - 1 + wanted]);
             skin[0] = 1.0;
             skin[1] = WEIGHT_SCALES[weight_type as usize];
-        } else if full {
+        } else if several {
             self.bones[..floats_used].fill(0.0); // not skinned: uSkin.x 0
         } else {
             self.bones[..12].copy_from_slice(&IDENTITY_ROWS);
@@ -863,24 +874,28 @@ impl Draws {
                 n if n <= frame.raw_colors_count => frame.raw_colors.get(n as usize - 1),
                 _ => None,
             };
-            // At most one weight and not lit with lights: the plain program.
-            let several_weights = (draw.vertex_format >> 9) & 3 != 0 && (draw.vertex_format >> 14) & 7 != 0;
+            // The smallest raw program that takes the draw's weights and lights.
             let set = if sprites {
                 RawSetChoice::Sprites
-            } else if RAW_PLAIN.load(Ordering::Relaxed) != 0
-                && !several_weights
-                && colors.is_some_and(|colors| colors.rules[0] < 2.5)
-                && self.programs.raw_plain.ready()
-            {
-                stats().plain_draws += 1;
-                RawSetChoice::Plain
             } else {
-                RawSetChoice::Full
+                let weights = if (draw.vertex_format >> 9) & 3 != 0 { ((draw.vertex_format >> 14) & 7) + 1 } else { 0 };
+                let lit_with_lights = !colors.is_some_and(|colors| colors.rules[0] < 2.5);
+                let plain = RAW_PLAIN.load(Ordering::Relaxed) != 0;
+                let variants = RAW_VARIANTS.load(Ordering::Relaxed) != 0;
+                let mut variant = raw_variant(weights, lit_with_lights, plain, variants);
+                if !self.programs.raw_set(variant).ready() {
+                    variant = RawVariant::Full;
+                }
+                match variant {
+                    RawVariant::Plain => stats().plain_draws += 1,
+                    RawVariant::Lit1 | RawVariant::Lit4 => stats().lit_variant_draws += 1,
+                    RawVariant::Full => {}
+                }
+                RawSetChoice::Raw(variant)
             };
             let program = match set {
                 RawSetChoice::Sprites => self.programs.sprites.program_for(draw.vertex_format),
-                RawSetChoice::Plain => self.programs.raw_plain.program_for(draw.vertex_format),
-                RawSetChoice::Full => self.programs.raw.program_for(draw.vertex_format),
+                RawSetChoice::Raw(variant) => self.programs.raw_set(variant).program_for(draw.vertex_format),
             };
             let in_psp_ram = draw.flags & draw_flags::RAW_PSP_RAM != 0;
             let (Some(blocks), Some(colors)) = (frame.raw_transform_of(draw), colors) else {
@@ -1291,18 +1306,33 @@ pub static nativeres_plan_phycont_test_block: u32 = sys::pages(TEST_BLOCK_BYTES)
 /// Which raw program set a raw draw uses.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RawSetChoice {
-    /// nativeres_raw_v.cg: skinning and lights.
-    Full,
-    /// nativeres_raw_plain_v.cg.
-    Plain,
+    /// nativeres_raw_v.cg or one of its variants.
+    Raw(RawVariant),
     /// nativeres_raw_sprite_v.cg.
     Sprites,
+}
+
+/// The raw program for a draw with `weights` skinning weights (0 without),
+/// lit with directional lights or not: the smallest that takes it
+/// (nativeres_raw_v.cg's variants). `variants` off (debug `rawvariants 0`):
+/// only the plain and the full program, as before 2026-11-17.
+fn raw_variant(weights: u32, lit_with_lights: bool, plain: bool, variants: bool) -> RawVariant {
+    if plain && weights <= 1 && !lit_with_lights {
+        RawVariant::Plain
+    } else if variants && weights <= 1 {
+        RawVariant::Lit1
+    } else if variants && weights <= 4 {
+        RawVariant::Lit4
+    } else {
+        RawVariant::Full
+    }
 }
 
 /// The raw programs' uniforms beyond the ones the sprite program shares
 /// (the plain program has no lights).
 #[derive(Clone, Copy)]
 struct RawSkinning {
+    variant: RawVariant,
     scale: *const ProgramParameter,
     lights: *const ProgramParameter,
     skin: *const ProgramParameter,
@@ -1310,7 +1340,7 @@ struct RawSkinning {
 }
 
 fn raw_skinning(set: &crate::programs::RawSet) -> RawSkinning {
-    RawSkinning { scale: set.scale, lights: set.lights, skin: set.skin, bones: set.bones }
+    RawSkinning { variant: set.variant, scale: set.scale, lights: set.lights, skin: set.skin, bones: set.bones }
 }
 
 /// The uniforms all raw programs (and the sprite program) share.

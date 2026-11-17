@@ -26,10 +26,16 @@ cargo $NIGHTLY build --release -p nativeres-plugin --target $VITA_TARGET \
 #
 # The capture thread's per-batch code is linked first, together, so it
 # misses the instruction cache less (scripts/hot-order.py explains).
+#
+# vita-elf-create appends ~4 KiB of module tables after the code; code
+# ending within that of the next 64 KiB boundary fails ("segment 1
+# overlaps"). __sce_headroom (vitasdk's linker script) moves the data
+# segment on to the next boundary then.
 python3 scripts/hot-order.py target/$VITA_TARGET/release/libnativeres_plugin.a "$OUT/hot-order.ld"
 arm-vita-eabi-gcc -Wl,-q -nostartfiles -nostdlib \
   -Wl,-u,module_start -Wl,-u,module_stop \
   -Wl,--section-ordering-file="$OUT/hot-order.ld" \
+  -Wl,--defsym,__sce_headroom=0x2000 \
   -o "$OUT/nativeres.elf" \
   target/$VITA_TARGET/release/libnativeres_plugin.a \
   -Wl,--start-group \

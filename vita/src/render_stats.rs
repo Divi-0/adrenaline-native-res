@@ -57,6 +57,8 @@ pub struct RenderStats {
     pub ring_draws: u32,
     /// Raw draws with the plain program (no skinning, no lights).
     pub plain_draws: u32,
+    /// Raw draws with the lit one- or four-bone programs (RAW_LIT1, RAW_LIT4).
+    pub lit_variant_draws: u32,
     /// Draws blended with FIX B through the alpha (BLEND_FIX programs).
     pub fix_b_draws: u32,
     /// Raw draws left out: no vertex program for their format (all
@@ -101,6 +103,7 @@ impl RenderStats {
         alpha_test_skipped: 0,
         ring_draws: 0,
         plain_draws: 0,
+        lit_variant_draws: 0,
         raw_no_program: 0,
         fix_b_draws: 0,
         lookup_us: 0,
@@ -188,7 +191,7 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
     );
     let _ = write!(
         text,
-        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} fix_b_draws={} ",
+        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} fix_b_draws={} ",
         per_frame(s.begin_us),
         per_frame(s.loop_us),
         per_frame(s.convert_us),
@@ -199,6 +202,7 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
         s.alpha_test_skipped / frames,
         s.ring_draws / frames,
         s.plain_draws / frames,
+        s.lit_variant_draws / frames,
         s.fix_b_draws / frames
     );
     let _ = write!(
