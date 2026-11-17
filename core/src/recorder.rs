@@ -542,7 +542,7 @@ impl Queues<'_> {
         let format = ge.vertex_format();
         let previous = crate::phase::enter(crate::phase::DIRECT);
         let started = crate::cycles::start(crate::cycles::DIRECT);
-        let written = builder.try_record(frame, self.stream, memory, format, prepared, ge.material_color(), inputs, calls);
+        let written = builder.try_record(frame, self.stream, memory, format, ge.vertex_layout(), prepared, ge.material_color(), inputs, calls);
         crate::cycles::add(crate::cycles::DIRECT, started);
         crate::phase::leave(previous);
         written?;

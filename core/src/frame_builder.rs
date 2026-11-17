@@ -349,6 +349,8 @@ impl FrameBuilder {
         stream: &mut DrawStream,
         memory: &mut impl PspMemory,
         format: VertexFormat,
+        // `format`'s, as `GeState` keeps it (`GeState::vertex_layout`).
+        layout: &VertexLayout,
         prepared: &Prepared,
         material_color: u32,
         inputs: &TransformInputs,
@@ -384,7 +386,6 @@ impl FrameBuilder {
         // (`DrawStream::set_raw_tables_with_consumer`).
         let tables = unsafe { Frame::raw_tables_raw(frame) };
         let mut geometry = Geometry::of_lists(&mut self.counts, draws, indices, Some(tables));
-        let layout = format.layout();
         let mut out = Writer {
             geometry: &mut geometry,
             raw,
@@ -400,12 +401,12 @@ impl FrameBuilder {
         let draw = Draw { first_vertex: 0, first_index: out.geometry.index_count(), ..prepared.draw };
         let all_triangles = calls.iter().all(|call| (primitive::TRIANGLES..=primitive::TRIANGLE_FAN).contains(&call.primitive_type));
         let written = if all_triangles && format.index_format() == IndexFormat::None {
-            out.run(format, &layout, inputs, calls, &colors, draw)
+            out.run(format, layout, inputs, calls, &colors, draw)
         } else if all_triangles {
-            out.indexed(format, &layout, inputs, calls, &colors, draw, index_words)
+            out.indexed(format, layout, inputs, calls, &colors, draw, index_words)
         } else if let [call] = calls {
             if call.primitive_type == primitive::RECTANGLES {
-                out.sprites(format, &layout, inputs, *call, &colors, draw)
+                out.sprites(format, layout, inputs, *call, &colors, draw)
             } else {
                 Err(fallback::REFUSED)
             }

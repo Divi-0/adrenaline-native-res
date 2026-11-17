@@ -170,27 +170,45 @@ fn measured(part: usize) -> bool {
 
 /// The counter now if `part` is measured, else 0. (Parts measured by
 /// outcome, `recorder::record_3d_run`, start with one of theirs.)
+///
+/// Only the check is inlined; the reading itself is a call of its own,
+/// kept out of the way (`#[cold]`). Inlined whole, each of the ~35
+/// measuring points on a PRIM batch's path put ~70 bytes into the hot code,
+/// and the capture thread's per-batch code runs from a cold instruction
+/// cache (2026-11-17: a transform lookup took ~330 cycles cold, ~40 warm).
 #[inline(always)]
 pub fn start(part: usize) -> u32 {
     if measured(part) {
-        now()
+        start_measured()
     } else {
         0
     }
+}
+
+#[cold]
+#[inline(never)]
+fn start_measured() -> u32 {
+    now()
 }
 
 /// Adds the cycles since `started` to `part`.
 #[inline(always)]
 pub fn add(part: usize, started: u32) {
     if measured(part) {
-        let cycles = now().wrapping_sub(started);
-        if cycles >= IMPLAUSIBLE {
-            DROPPED.store(DROPPED.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
-            return;
-        }
-        TOTALS[part].store(TOTALS[part].load(Ordering::Relaxed).wrapping_add(cycles), Ordering::Relaxed);
-        ENTRIES[part].store(ENTRIES[part].load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+        add_measured(part, started);
     }
+}
+
+#[cold]
+#[inline(never)]
+fn add_measured(part: usize, started: u32) {
+    let cycles = now().wrapping_sub(started);
+    if cycles >= IMPLAUSIBLE {
+        DROPPED.store(DROPPED.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+        return;
+    }
+    TOTALS[part].store(TOTALS[part].load(Ordering::Relaxed).wrapping_add(cycles), Ordering::Relaxed);
+    ENTRIES[part].store(ENTRIES[part].load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
 }
 
 /// Zeroes the totals.
