@@ -287,6 +287,23 @@ pub struct CacheStats {
     /// Indexed raw runs converted / gathered (`raw_arena::RawStats`).
     pub raw_converted: u32,
     pub raw_gathered: u32,
+    /// `RawStats::full_at`.
+    pub raw_full_at: [u32; 4],
+}
+
+impl CacheStats {
+    /// Takes the raw arena's statistics of a finished frame.
+    pub fn note_raw(&mut self, stats: crate::raw_arena::RawStats) {
+        self.raw_runs = stats.runs;
+        self.raw_bytes = stats.bytes;
+        self.raw_full = stats.full;
+        self.raw_lit = stats.lit;
+        self.raw_psp_ram = stats.psp_ram;
+        self.raw_psp_ram_bytes = stats.psp_ram_bytes;
+        self.raw_converted = stats.converted;
+        self.raw_gathered = stats.gathered;
+        self.raw_full_at = stats.full_at;
+    }
 }
 
 pub struct VertexCache {
@@ -405,15 +422,7 @@ impl VertexCache {
             ring.next_frame();
         }
         if let Some(raw) = self.raw.as_mut() {
-            let stats = raw.next_frame();
-            self.stats.raw_runs = stats.runs;
-            self.stats.raw_bytes = stats.bytes;
-            self.stats.raw_full = stats.full;
-            self.stats.raw_lit = stats.lit;
-            self.stats.raw_psp_ram = stats.psp_ram;
-            self.stats.raw_psp_ram_bytes = stats.psp_ram_bytes;
-            self.stats.raw_converted = stats.converted;
-            self.stats.raw_gathered = stats.gathered;
+            self.stats.note_raw(raw.next_frame());
         }
         core::mem::take(&mut self.stats)
     }

@@ -97,6 +97,9 @@ pub struct RawStats {
     /// (`record_raw_gathered`: the switch off, or a sparse span).
     pub converted: u32,
     pub gathered: u32,
+    /// Where the arena stood when a run didn't fit: its length, head and
+    /// oldest protected position (KiB, positions modulo 4 GiB) and frame.
+    pub full_at: [u32; 4],
 }
 
 /// Where a run was put: its byte offset in the arena and the window it
@@ -132,6 +135,13 @@ pub struct RawArena {
     /// (`recorder::fallback`: arena or tables full, unreadable, other); set
     /// by the recorder as a draw passes each step, read when it falls back.
     pub refusal: usize,
+    /// The head before the newest reservation and the bytes it added
+    /// (`undo_last`; 0 bytes: nothing to undo). Plain numbers, not an
+    /// `Option`: zeroed memory must read as "no arena" for an
+    /// `Option<RawArena>` (`Capture::init_zeroed`), and a nested `Option`
+    /// once gave the compiler another way to tell `None` apart.
+    last_head: u64,
+    last_added: u32,
 }
 
 impl RawArena {
@@ -147,6 +157,19 @@ impl RawArena {
             frame: 0,
             stats: RawStats::default(),
             refusal: 0,
+            last_head: 0,
+            last_added: 0,
+        }
+    }
+
+    /// Gives the newest reservation's room back (its run couldn't be read:
+    /// `frame_builder`). Nothing if there was none since the last undo.
+    pub fn undo_last(&mut self) {
+        if self.last_added > 0 {
+            self.head = self.last_head;
+            self.stats.bytes -= self.last_added;
+            self.stats.runs -= 1;
+            self.last_added = 0;
         }
     }
 
@@ -158,6 +181,7 @@ impl RawArena {
     /// A recorded frame is finished: its runs stay put for the next
     /// `PROTECTED_FRAMES - 1` frames. Returns its statistics.
     pub fn next_frame(&mut self) -> RawStats {
+        self.last_added = 0;
         self.frame += 1;
         self.frame_starts[(self.frame % PROTECTED_FRAMES as u64) as usize] = self.head;
         core::mem::take(&mut self.stats)
@@ -204,12 +228,17 @@ impl RawArena {
         }
         if position + length - self.protected_from() > self.bytes.len() as u64 {
             self.stats.full += 1;
+            self.stats.full_at =
+                [(self.bytes.len() / 1024) as u32, (self.head / 1024) as u32, (self.protected_from() / 1024) as u32, self.frame as u32];
             return None;
         }
         let len = self.bytes.len() as u64;
         let offset = (position % len) as usize;
-        self.stats.bytes += (position + length - self.head) as u32;
+        let added = (position + length - self.head) as u32;
+        self.stats.bytes += added;
         self.stats.runs += 1;
+        self.last_head = self.head;
+        self.last_added = added;
         self.head = position + length;
         let placed = Placed { offset: offset as u32, window: (window % len) as u32 };
         Some((placed, &mut self.bytes[offset..offset + length as usize]))

@@ -9,6 +9,7 @@ use crate::command::{op, Command};
 use crate::display_list::{walk, CommandVisitor, DisplayList, PlainActions, WalkResult};
 use crate::draw_stream::DrawStream;
 use crate::frame::Frame;
+use crate::frame_builder::FrameBuilder;
 use crate::ge_context::ContextTable;
 use crate::ge_state::GeState;
 use crate::ge_writes::{GeWrites, Overlaid};
@@ -111,6 +112,8 @@ pub struct Capture {
     write_filter: WriteFilter,
     /// GE states saved by lists with a context and sceGeSaveContext.
     contexts: ContextTable,
+    /// Writes the draws the GPU takes raw on this thread (`frame_builder`).
+    builder: FrameBuilder,
 }
 
 impl Capture {
@@ -136,6 +139,7 @@ impl Capture {
             stage_actions: None,
             write_filter: WriteFilter::new(),
             contexts: ContextTable::new(),
+            builder: FrameBuilder::new(),
         }
     }
 
@@ -152,6 +156,7 @@ impl Capture {
         self.palette.clear(); // in place: LoadedPalette holds 2 KiB of words
         self.draw_states.forget();
         self.stream.clear();
+        self.restart_builder(!self.pipelined);
         self.ge_writes.clear();
         self.current_frame = FrameStats::new();
         self.frames_completed = 0;
@@ -188,6 +193,11 @@ impl Capture {
     /// `place` must point to `size_of::<Capture>()` zeroed, writable bytes,
     /// suitably aligned, used by nobody else.
     pub unsafe fn init_zeroed(place: *mut Capture) {
+        // Not all-zero valid: zero bytes needn't mean `None` for its raw
+        // arena (the layout of `Option<RawArena>` is the compiler's choice;
+        // 2026-11-16 a zeroed one read as an empty arena: every raw run
+        // "didn't fit"). Small, so written whole.
+        core::ptr::addr_of_mut!((*place).builder).write(FrameBuilder::new());
         (*place).reset();
     }
 
@@ -231,6 +241,7 @@ impl Capture {
     pub fn set_pipelined(&mut self, on: bool) {
         self.walk_stream.wait_until_read();
         self.pipelined = on;
+        self.restart_builder(!on);
         self.stage_ge.clone_from(&self.ge);
         self.write_filter.start(&self.stage_ge, crate::recorder::recorder_wants);
     }
@@ -275,6 +286,7 @@ impl Capture {
             palette: &mut *core::ptr::addr_of_mut!((*capture).palette),
             draw_states: &mut *core::ptr::addr_of_mut!((*capture).draw_states),
             stream: &mut *core::ptr::addr_of_mut!((*capture).stream),
+            builder: None,
         };
         let mut visitors = Both(recorder, NoTrace);
         let actions = &*(*core::ptr::addr_of_mut!((*capture).stage_actions)).get_or_insert_with(|| PlainActions::for_visitor(&visitors));
@@ -304,7 +316,26 @@ impl Capture {
     /// transform use it.
     pub fn set_vertex_cache(&mut self, cache: Option<&'static mut crate::vertex_cache::VertexCache>) {
         self.walk_stream.wait_until_read();
+        // The builder gives the old cache's raw arena back first.
+        self.restart_builder(false);
         self.stream.set_vertex_cache(cache);
+        self.restart_builder(!self.pipelined);
+    }
+
+    /// Starts the capture thread's builder (`frame_builder`) anew, writing
+    /// raw draws if `wanted` (and it can): between frames only.
+    fn restart_builder(&mut self, wanted: bool) {
+        let active = self.builder.begin_frame(wanted, self.stream.vertex_cache_mut());
+        self.stream.set_raw_tables_with_consumer(!active);
+    }
+
+    /// Gives the capture thread's builder its lists (`frame_builder`;
+    /// `None`: none, every draw goes through the job queue).
+    pub fn set_direct_lists(&mut self, lists: Option<&'static mut crate::frame_builder::DirectLists>) {
+        self.walk_stream.wait_until_read();
+        self.restart_builder(false);
+        self.builder.set_lists(lists);
+        self.restart_builder(!self.pipelined);
     }
 
 
@@ -469,6 +500,7 @@ impl Capture {
                     palette: &mut self.palette,
                     draw_states: &mut self.draw_states,
                     stream: &mut self.stream,
+                    builder: Some(&mut self.builder),
                 };
                 let mut visitors = Both(recorder, &mut *tracer);
                 walk(&mut self.queue[0], &mut self.ge, overlaid, &mut visitors, MAX_COMMANDS_PER_WALK, &mut commands)
@@ -519,6 +551,7 @@ impl Capture {
             palette: &mut self.palette,
             draw_states: &mut self.draw_states,
             stream: &mut self.stream,
+            builder: None,
         };
         let mut visitors = Both(recorder, tracer);
         let actions = PlainActions::for_visitor(&visitors);
@@ -599,6 +632,10 @@ impl Capture {
         match frame.as_deref_mut() {
             Some(frame) => {
                 self.stream.finish(stats);
+                // The capture thread's raw draws and the recorder's, in
+                // list order (`frame_builder`).
+                self.builder.finish_frame(frame, &self.stream);
+                stats.direct = self.builder.stats;
                 frame.merge_overflow();
                 // Every palette's words are stored now.
                 frame.resolve_palette_hashes();
@@ -613,20 +650,31 @@ impl Capture {
             if let Some(cache) = self.stream.vertex_cache_mut() {
                 frame.vertex_cache = cache.arena().as_ptr();
                 frame.vertex_cache_len = cache.arena().len() as u32;
-                // Its raw draws read the raw arena (`raw_arena`) likewise.
-                if let Some(raw) = cache.raw.as_ref() {
+                // Its raw draws read the raw arena (`raw_arena`) likewise:
+                // the vertex cache's, or the builder's while it holds it.
+                if let Some(raw) = cache.raw.as_ref().or(self.builder.raw_arena()) {
                     frame.raw_vertices = raw.bytes().as_ptr();
                     frame.raw_vertices_len = raw.bytes().len() as u32;
                 }
                 // Its index runs as triangle lists, so the display doesn't
                 // build them (~1 ms of its CPU per race frame, measured).
-                if let Some(ring) = cache.index_ring.as_mut() {
+                let ring = match cache.index_ring.as_mut() {
+                    Some(ring) => Some(ring),
+                    None => self.builder.ring_mut(),
+                };
+                if let Some(ring) = ring {
                     frame.write_ring_indices(ring);
                 }
                 stats.cache = cache.next_frame();
+                if let Some(raw) = self.builder.next_frame() {
+                    stats.cache.note_raw(raw);
+                }
             }
         }
-        // The next frame starts empty; nothing in it to reuse.
+        // The next frame starts empty; nothing in it to reuse. The builder
+        // writes the raw draws of the next frame unless the capture runs in
+        // two stages (`walk_stream`).
+        self.restart_builder(!self.pipelined);
         self.draw_states.forget();
         self.palette.next_frame();
     }
@@ -1051,6 +1099,32 @@ mod tests {
         }
         assert_eq!(results[0].0, 1);
         assert_eq!(results[0], results[1]);
+    }
+
+    /// 2026-11-16 (performance refactor step 2, first Vita run): the Vita
+    /// makes the capture in zeroed memory, where the builder's
+    /// `Option<RawArena>` read as an empty arena instead of none. The builder
+    /// kept it (it held "an arena" already) and every raw run of the MTX
+    /// title went to the CPU as "arena full". A zeroed capture must hold no
+    /// arena and take the vertex cache's real one.
+    #[test]
+    fn a_zeroed_capture_takes_the_vertex_caches_raw_arena() {
+        let layout = std::alloc::Layout::new::<Capture>();
+        // Safe: a zeroed block of a Capture's layout, ours alone.
+        let mut capture: Box<Capture> = unsafe {
+            let place = std::alloc::alloc_zeroed(layout) as *mut Capture;
+            Capture::init_zeroed(place);
+            Box::from_raw(place)
+        };
+        assert!(capture.builder.raw_arena().is_none(), "no arena before the vertex cache brings one");
+        crate::raw_arena::ENABLED.store(true, Ordering::Relaxed);
+        let arena = Box::leak(vec![crate::frame::FrameVertex::default(); 16].into_boxed_slice());
+        let cache = Box::leak(Box::new(crate::vertex_cache::VertexCache::new(arena)));
+        cache.set_raw_arena(Box::leak(vec![0u8; crate::raw_arena::WINDOW_BYTES as usize].into_boxed_slice()));
+        capture.set_vertex_cache(Some(cache));
+        capture.set_direct_lists(Some(crate::frame_builder::DirectLists::boxed()));
+        let raw = capture.builder.raw_arena().expect("the builder holds the cache's arena");
+        assert_eq!(raw.bytes().len(), crate::raw_arena::WINDOW_BYTES as usize);
     }
 
     #[test]

@@ -147,6 +147,19 @@ fn new_vertex_cache() -> Option<&'static mut VertexCache> {
     Some(cache)
 }
 
+/// The capture thread's own lists for the raw draws it writes itself
+/// (`frame_builder`, as on the Vita), unless `--jobs` (or NATIVERES_JOBS):
+/// every draw then goes through the draw stream's job queue, as before.
+fn new_direct_lists() -> Option<&'static mut nativeres_core::frame_builder::DirectLists> {
+    if std::env::args().any(|arg| arg == "--jobs") || std::env::var("NATIVERES_JOBS").is_ok() {
+        return None;
+    }
+    let layout = std::alloc::Layout::new::<nativeres_core::frame_builder::DirectLists>();
+    // Safe: the lists are valid as zero bytes (`DirectLists::init_zeroed`)
+    // and the layout is non-zero-sized; kept for the whole run.
+    unsafe { Some(&mut *(std::alloc::alloc_zeroed(layout) as *mut nativeres_core::frame_builder::DirectLists)) }
+}
+
 /// The raw arena's size, as the Vita's (nativeres_render.c RAW_ARENA_BYTES).
 const RAW_ARENA_BYTES: usize = 6 * 1024 * 1024;
 
@@ -171,6 +184,7 @@ fn run(dump_path: &str, png_path: &str, trace: bool) -> Result<(), String> {
     let mut capture = Capture::new();
     capture.set_gpu_transform(gpu_transform());
     capture.set_vertex_cache(new_vertex_cache());
+    capture.set_direct_lists(new_direct_lists());
     capture.set_pipelined(pipelined());
     // `--copier`: the vertex memory goes through the draw stream's copier
     // (copied before the jobs are recorded, as the Vita's copy_thread.rs).

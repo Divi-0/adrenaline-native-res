@@ -169,7 +169,7 @@ pub fn use_for_copier(memory: &DumpMemory) {
 
 /// The draw stream's reader of the dump (`DeferredReader`), as the Vita's
 /// copier thread reads PSP RAM.
-pub const COPIER_READER: DeferredReader = DeferredReader { read: copier_read, sample: copier_sample };
+pub const COPIER_READER: DeferredReader = DeferredReader { read: copier_read, sample: copier_sample, copy_bytes: copier_bytes };
 
 fn copier_read(address: u32, out: &mut [u32]) -> bool {
     // Safe: set by `use_for_copier`, whose caller keeps the dump alive.
@@ -182,6 +182,18 @@ fn copier_read(address: u32, out: &mut [u32]) -> bool {
     for (word, bytes) in out.iter_mut().zip(bytes.chunks_exact(4)) {
         *word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     }
+    true
+}
+
+fn copier_bytes(address: u32, out: &mut [u8]) -> bool {
+    // Safe: as in `copier_read`.
+    let Some(memory) = (unsafe { COPIER_DUMP.load(Ordering::Acquire).as_ref() }) else {
+        return false;
+    };
+    let Some(bytes) = memory.bytes(address, out.len() as u32) else {
+        return false;
+    };
+    out.copy_from_slice(&bytes[..out.len()]);
     true
 }
 

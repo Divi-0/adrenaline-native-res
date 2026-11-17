@@ -97,6 +97,10 @@ pub fn write_frame(out: &mut impl Write, stats: &FrameStats) -> fmt::Result {
     // Raw runs (`raw_arena`): runs/KiB copied/runs that didn't fit/lit ones.
     if cache.raw_runs + cache.raw_full + cache.raw_psp_ram > 0 {
         write!(out, " raw={}/{}k/{}/{}", cache.raw_runs, cache.raw_bytes / 1024, cache.raw_full, cache.raw_lit)?;
+        if cache.raw_full > 0 {
+            let [length, head, protected, frame] = cache.raw_full_at;
+            write!(out, " full_at={length}k/{head}k/{protected}k/{frame}")?;
+        }
         if cache.raw_psp_ram > 0 {
             write!(out, " zerocopy={}/{}k", cache.raw_psp_ram, cache.raw_psp_ram_bytes / 1024)?;
         }
@@ -104,6 +108,23 @@ pub fn write_frame(out: &mut impl Write, stats: &FrameStats) -> fmt::Result {
         if cache.raw_converted + cache.raw_gathered > 0 {
             write!(out, " indexed={}/{}", cache.raw_converted, cache.raw_gathered)?;
         }
+    }
+    // Raw draws the capture thread wrote itself (`frame_builder`):
+    // direct=<PRIMs>/<draws>/<copy tasks>/<KiB>/<gathered spans>/<sparse spans
+    // copied whole>/<fallback segments>
+    let direct = &stats.direct;
+    if direct.prims + direct.segments > 0 {
+        write!(
+            out,
+            " direct={}/{}/{}/{}k/{}/{}/{}",
+            direct.prims,
+            direct.draws,
+            direct.tasks,
+            direct.task_bytes / 1024,
+            direct.gathered,
+            direct.sparse,
+            direct.segments
+        )?;
     }
 
     // PRIMs decoded on the CPU by reason (`recorder::fallback`):

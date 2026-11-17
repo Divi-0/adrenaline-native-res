@@ -695,6 +695,11 @@ pub struct Frame {
     pub raw_transforms: [RawTransform; MAX_RAW_TRANSFORMS],
     pub raw_camera_count: u32,
     pub raw_cameras: [RawCamera; MAX_RAW_CAMERAS],
+    /// Only used while recording: draws before this one are never merged
+    /// with a new one (`Geometry::seal`): the capture thread's draws
+    /// (`frame_builder`) go between them when the frame is finished. Part of
+    /// the geometry.
+    pub draw_merge_floor: u32,
 }
 
 /// `Frame::draw_ring_index` of a draw whose list isn't in the ring.
@@ -742,6 +747,7 @@ impl Frame {
         self.bone_float_count = 0;
         self.raw_transform_count = 0;
         self.raw_camera_count = 0;
+        self.draw_merge_floor = 0;
         self.palette_count = 0;
         self.palette_slots = [0; PALETTE_SLOTS];
     }
@@ -804,6 +810,7 @@ impl Frame {
             raw_transforms,
             raw_camera_count,
             raw_cameras,
+            draw_merge_floor,
             ..
         } = self;
         (
@@ -812,23 +819,26 @@ impl Frame {
                 index_count,
                 draw_count,
                 overflowed: geometry_overflowed,
+                merge_floor: draw_merge_floor,
                 vertices,
                 indices,
                 draws,
                 transform_count,
                 transforms,
-                light_set_count,
-                light_sets,
-                raw_colors_count,
-                raw_colors,
-                bone_float_count,
-                bone_floats,
-                raw_transform_count,
-                raw_transforms,
-                raw_camera_count,
-                raw_cameras,
                 palette_words,
                 palette_hashes,
+                raw: Some(RawTables {
+                    light_set_count,
+                    light_sets,
+                    raw_colors_count,
+                    raw_colors,
+                    bone_float_count,
+                    bone_floats,
+                    raw_transform_count,
+                    raw_transforms,
+                    raw_camera_count,
+                    raw_cameras,
+                }),
             },
             Catalog {
                 texture_count,
@@ -847,23 +857,43 @@ impl Frame {
     }
 
     /// The geometry part of `split`, from a pointer: for the recorder's
-    /// consumer thread, while the producer works on the catalog.
+    /// consumer thread, while the producer works on the catalog. Without
+    /// `with_raw_tables` the geometry has no raw tables (`Geometry::raw`):
+    /// the producer owns them then (`raw_tables_raw`, `frame_builder`).
     ///
     /// # Safety
-    /// `frame` must point to a frame whose geometry nobody else uses for
-    /// `'a` (its catalog may be in use).
-    pub unsafe fn geometry_raw<'a>(frame: *mut Frame) -> Geometry<'a> {
+    /// `frame` must point to a frame whose geometry (and with
+    /// `with_raw_tables` its raw tables) nobody else uses for `'a` (its
+    /// catalog may be in use).
+    pub unsafe fn geometry_raw<'a>(frame: *mut Frame, with_raw_tables: bool) -> Geometry<'a> {
         use core::ptr::addr_of_mut;
         Geometry {
             vertex_count: &mut *addr_of_mut!((*frame).vertex_count),
             index_count: &mut *addr_of_mut!((*frame).index_count),
             draw_count: &mut *addr_of_mut!((*frame).draw_count),
             overflowed: &mut *addr_of_mut!((*frame).geometry_overflowed),
+            merge_floor: &mut *addr_of_mut!((*frame).draw_merge_floor),
             vertices: &mut *addr_of_mut!((*frame).vertices),
             indices: &mut *addr_of_mut!((*frame).indices),
             draws: &mut *addr_of_mut!((*frame).draws),
             transform_count: &mut *addr_of_mut!((*frame).transform_count),
             transforms: &mut *addr_of_mut!((*frame).transforms),
+            palette_words: &mut *addr_of_mut!((*frame).palette_words),
+            palette_hashes: &mut *addr_of_mut!((*frame).palette_hashes),
+            raw: if with_raw_tables { Some(Frame::raw_tables_raw(frame)) } else { None },
+        }
+    }
+
+    /// The tables of raw draws (`RawTables`), from a pointer: for whoever
+    /// records the raw draws (the recorder, or the capture thread's
+    /// `frame_builder`).
+    ///
+    /// # Safety
+    /// `frame` must point to a frame whose raw tables nobody else uses for
+    /// `'a`.
+    pub unsafe fn raw_tables_raw<'a>(frame: *mut Frame) -> RawTables<'a> {
+        use core::ptr::addr_of_mut;
+        RawTables {
             light_set_count: &mut *addr_of_mut!((*frame).light_set_count),
             light_sets: &mut *addr_of_mut!((*frame).light_sets),
             raw_colors_count: &mut *addr_of_mut!((*frame).raw_colors_count),
@@ -874,8 +904,6 @@ impl Frame {
             raw_transforms: &mut *addr_of_mut!((*frame).raw_transforms),
             raw_camera_count: &mut *addr_of_mut!((*frame).raw_camera_count),
             raw_cameras: &mut *addr_of_mut!((*frame).raw_cameras),
-            palette_words: &mut *addr_of_mut!((*frame).palette_words),
-            palette_hashes: &mut *addr_of_mut!((*frame).palette_hashes),
         }
     }
 
@@ -1256,17 +1284,35 @@ impl Frame {
 }
 
 /// A frame's vertices, indices and draws while recording (`Frame::split`).
+/// The lists are slices so that the capture thread's draws can be built in
+/// lists of their own with the same rules (`frame_builder`): such a geometry
+/// has no vertices, transforms or palettes (empty slices).
 pub struct Geometry<'a> {
     vertex_count: &'a mut u32,
     index_count: &'a mut u32,
     draw_count: &'a mut u32,
     /// `Frame::geometry_overflowed`.
     overflowed: &'a mut u32,
-    vertices: &'a mut [FrameVertex; MAX_VERTICES],
-    indices: &'a mut [u16; MAX_INDICES],
-    draws: &'a mut [Draw; MAX_DRAWS],
+    /// `Frame::draw_merge_floor`: draws below it are never merged with.
+    merge_floor: &'a mut u32,
+    vertices: &'a mut [FrameVertex],
+    indices: &'a mut [u16],
+    draws: &'a mut [Draw],
     transform_count: &'a mut u32,
-    transforms: &'a mut [GpuTransform; MAX_TRANSFORMS],
+    transforms: &'a mut [GpuTransform],
+    palette_words: &'a mut [u32],
+    palette_hashes: &'a mut [u32],
+    /// The tables of raw draws, if whoever records into this geometry owns
+    /// them: `None` while the capture thread records the raw draws itself
+    /// (`frame_builder`); the recorder then draws everything on the CPU path.
+    pub raw: Option<RawTables<'a>>,
+}
+
+/// The tables raw draws name (`Draw::transform`, `raw_colors`, `bones`, the
+/// light sets of `RawTransform` and of GPU-lit CPU-path draws): written by
+/// one thread at a time, the recorder or the capture thread's
+/// `frame_builder` (`Frame::geometry_raw`, `Frame::raw_tables_raw`).
+pub struct RawTables<'a> {
     light_set_count: &'a mut u32,
     light_sets: &'a mut [GpuLights; MAX_LIGHT_SETS],
     raw_colors_count: &'a mut u32,
@@ -1277,17 +1323,61 @@ pub struct Geometry<'a> {
     raw_transforms: &'a mut [RawTransform; MAX_RAW_TRANSFORMS],
     raw_camera_count: &'a mut u32,
     raw_cameras: &'a mut [RawCamera; MAX_RAW_CAMERAS],
-    palette_words: &'a mut [u32; MAX_PALETTE_WORDS],
-    palette_hashes: &'a mut [u32; MAX_FRAME_PALETTES],
 }
 
-/// How many of the newest table entries `Geometry::add_raw_colors` checks
+/// How many of the newest table entries `RawTables::add_raw_colors` checks
 /// for the same one (draws alternate between a few materials).
 const RAW_COLORS_RECENT: usize = 8;
-/// The same for `Geometry::add_raw_camera`.
+/// The same for `RawTables::add_raw_camera`.
 const RAW_CAMERAS_RECENT: usize = 8;
 
-impl Geometry<'_> {
+impl<'a> Geometry<'a> {
+    /// A geometry over lists of its own (`frame_builder`): draws and indices
+    /// only (no vertices, transforms or palettes), with `raw` as its raw
+    /// tables.
+    pub fn of_lists(
+        counts: &'a mut ListCounts,
+        draws: &'a mut [Draw],
+        indices: &'a mut [u16],
+        raw: Option<RawTables<'a>>,
+    ) -> Geometry<'a> {
+        let ListCounts { vertex_count, index_count, draw_count, overflowed, merge_floor, transform_count } = counts;
+        Geometry {
+            vertex_count,
+            index_count,
+            draw_count,
+            overflowed,
+            merge_floor,
+            vertices: &mut [],
+            indices,
+            draws,
+            transform_count,
+            transforms: &mut [],
+            palette_words: &mut [],
+            palette_hashes: &mut [],
+            raw,
+        }
+    }
+
+    /// The raw tables, if this geometry has them.
+    pub fn raw_tables(&mut self) -> Option<&mut RawTables<'a>> {
+        self.raw.as_mut()
+    }
+
+    /// Draws added from now on are never merged with those before (another
+    /// writer's draws will go between them, `frame_builder`).
+    pub fn seal(&mut self) {
+        *self.merge_floor = *self.draw_count;
+    }
+
+    pub fn draw_count(&self) -> u32 {
+        *self.draw_count
+    }
+
+    pub fn is_overflowed(&self) -> bool {
+        *self.overflowed != 0
+    }
+
     /// Stores the words of the palette at `place` (`Catalog::add_palette`)
     /// and their hash: `words` as copied from PSP memory, fewer than
     /// `place.word_count` if the rest couldn't be read (zeros then).
@@ -1299,6 +1389,36 @@ impl Geometry<'_> {
         self.palette_hashes[place.index as usize] = crate::texture::hash_words(stored);
     }
 
+    /// `RawTables::add_light_set`; `None` without raw tables too (the
+    /// caller lights on the CPU then).
+    pub fn add_light_set(&mut self, lights: &GpuLights) -> Option<u32> {
+        self.raw.as_mut()?.add_light_set(lights)
+    }
+}
+
+/// The newest of the first `count` draws, the one a new draw may be merged
+/// with, unless it lies below `floor` (`Geometry::seal`).
+fn mergeable(draws: &mut [Draw], floor: u32, count: u32) -> Option<&mut Draw> {
+    draws[floor.min(count) as usize..count as usize].last_mut()
+}
+
+/// The counts of a `Geometry::of_lists` geometry.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ListCounts {
+    pub vertex_count: u32,
+    pub index_count: u32,
+    pub draw_count: u32,
+    pub overflowed: u32,
+    pub merge_floor: u32,
+    pub transform_count: u32,
+}
+
+impl ListCounts {
+    pub const EMPTY: ListCounts =
+        ListCounts { vertex_count: 0, index_count: 0, draw_count: 0, overflowed: 0, merge_floor: 0, transform_count: 0 };
+}
+
+impl RawTables<'_> {
     /// Stores `bones` (4x3, column by column, as uploaded) for the vertex
     /// programs, each as 3 rows of 4 floats (`Draw::bones`), and returns
     /// where they start in `Frame::bone_floats`; the last bones stored again
@@ -1354,10 +1474,6 @@ impl Geometry<'_> {
         Some(count as u32 + 1)
     }
 
-    /// The `Draw::transform` value for `transform`: the last one added if
-    /// it is the same (consecutive draws mostly share it), else a new
-    /// entry. `None` if the table is full (the caller transforms on the
-    /// CPU instead; not an overflow).
     /// The `GpuTransform::light_set` number for `lights`: the last one
     /// added if it is the same, else a new entry. `None` if the table is
     /// full (the caller lights on the CPU instead).
@@ -1424,13 +1540,19 @@ impl Geometry<'_> {
     pub fn light_set(&self, number: u32) -> Option<&GpuLights> {
         self.light_sets[..*self.light_set_count as usize].get((number as usize).checked_sub(1)?)
     }
+}
 
+impl Geometry<'_> {
+    /// The `Draw::transform` value for `transform`: the last one added if
+    /// it is the same (consecutive draws mostly share it), else a new
+    /// entry. `None` if the table is full (the caller transforms on the
+    /// CPU instead; not an overflow).
     pub fn add_transform(&mut self, transform: &GpuTransform) -> Option<u32> {
         let count = *self.transform_count as usize;
         if count > 0 && self.transforms[count - 1].words() == transform.words() {
             return Some(count as u32);
         }
-        if count == MAX_TRANSFORMS {
+        if count == self.transforms.len() {
             return None;
         }
         self.transforms[count] = *transform;
@@ -1471,7 +1593,7 @@ impl Geometry<'_> {
         if draw.index_count == 0 {
             return;
         }
-        if let Some(previous) = self.draws[..*self.draw_count as usize].last_mut() {
+        if let Some(previous) = mergeable(self.draws, *self.merge_floor, *self.draw_count) {
             if previous.same_state(&draw)
                 && previous.first_vertex == draw.first_vertex
                 && previous.first_index + previous.index_count == draw.first_index
@@ -1480,7 +1602,7 @@ impl Geometry<'_> {
                 return;
             }
         }
-        if *self.draw_count as usize == MAX_DRAWS {
+        if *self.draw_count as usize == self.draws.len() {
             *self.overflowed = 1;
             *self.index_count = draw.first_index;
             return;
@@ -1504,7 +1626,7 @@ impl Geometry<'_> {
         if draw.index_count == 0 {
             return;
         }
-        if let Some(previous) = self.draws[..*self.draw_count as usize].last_mut() {
+        if let Some(previous) = mergeable(self.draws, *self.merge_floor, *self.draw_count) {
             let skip = address.wrapping_sub(previous.first_vertex);
             let joinable = previous.flags & draw_flags::RAW_PSP_RAM != 0
                 && previous.same_state(&draw)
@@ -1547,7 +1669,7 @@ impl Geometry<'_> {
         if draw.index_count == 0 {
             return;
         }
-        if let Some(previous) = self.draws[..*self.draw_count as usize].last_mut() {
+        if let Some(previous) = mergeable(self.draws, *self.merge_floor, *self.draw_count) {
             if previous.same_state(&draw)
                 && previous.first_vertex == draw.first_vertex
                 && previous.first_index + previous.index_count == draw.first_index
@@ -1562,7 +1684,7 @@ impl Geometry<'_> {
     /// Adds a finished raw draw as a new draw (its vertices aren't in
     /// `Frame::vertices`); drops its indices if the draw list is full.
     fn add_raw_draw(&mut self, draw: Draw) {
-        if *self.draw_count as usize == MAX_DRAWS {
+        if *self.draw_count as usize == self.draws.len() {
             *self.overflowed = 1;
             *self.index_count = draw.first_index;
             return;
@@ -1584,7 +1706,7 @@ impl Geometry<'_> {
         if draw.index_count == 0 {
             return;
         }
-        if let Some(previous) = self.draws[..*self.draw_count as usize].last_mut() {
+        if let Some(previous) = mergeable(self.draws, *self.merge_floor, *self.draw_count) {
             if previous.same_state(&draw)
                 && previous.first_vertex == draw.first_vertex
                 && previous.first_index + previous.index_count == draw.first_index
@@ -1608,7 +1730,7 @@ impl Geometry<'_> {
     #[inline]
     pub fn add_vertex(&mut self, first_vertex: u32, vertex: FrameVertex) -> Option<u16> {
         let number = *self.vertex_count - first_vertex;
-        if *self.vertex_count as usize == MAX_VERTICES || number >= MAX_DRAW_VERTICES {
+        if *self.vertex_count as usize == self.vertices.len() || number >= MAX_DRAW_VERTICES {
             *self.overflowed = 1;
             return None;
         }
@@ -1620,7 +1742,7 @@ impl Geometry<'_> {
     /// (and `overflowed` set) if the index list is full.
     #[inline]
     pub fn add_index(&mut self, number: u16) -> Option<()> {
-        if *self.index_count as usize == MAX_INDICES {
+        if *self.index_count as usize == self.indices.len() {
             *self.overflowed = 1;
             return None;
         }
@@ -1634,7 +1756,7 @@ impl Geometry<'_> {
     #[inline]
     pub fn reserve_indices(&mut self, count: usize) -> Option<&mut [u16]> {
         let start = *self.index_count as usize;
-        if start + count > MAX_INDICES {
+        if start + count > self.indices.len() {
             *self.overflowed = 1;
             return None;
         }
@@ -1667,7 +1789,7 @@ impl Geometry<'_> {
             return;
         }
 
-        if let Some(previous) = self.draws[..*self.draw_count as usize].last_mut() {
+        if let Some(previous) = mergeable(self.draws, *self.merge_floor, *self.draw_count) {
             if previous.same_state(&draw)
                 && previous.first_vertex + previous.vertex_count == draw.first_vertex
                 && previous.first_index + previous.index_count == draw.first_index
@@ -1692,7 +1814,7 @@ impl Geometry<'_> {
             }
         }
 
-        if *self.draw_count as usize == MAX_DRAWS {
+        if *self.draw_count as usize == self.draws.len() {
             *self.overflowed = 1;
             self.undo_draw(&draw);
             return;

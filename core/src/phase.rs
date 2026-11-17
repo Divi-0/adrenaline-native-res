@@ -82,10 +82,30 @@ pub const WAIT: u8 = 12;
 /// The producer copying jobs' memory a lagging copier hasn't taken
 /// (`DrawStream::help_a_lagging_copier`, `copy_untaken`).
 pub const HELP: u8 = 13;
+/// Writing a raw draw on the capture thread (`frame_builder`): table
+/// entries, arena room, index runs or converted indices, its copy task.
+pub const DIRECT: u8 = 14;
+/// Within `DIRECT`: the draw's transform entry (`raw_blocks::raw_transform`:
+/// camera, world, light set).
+pub const DIRECT_TRANSFORM: u8 = 15;
+/// Within `DIRECT`: handing the copy to the copier (`DrawStream::copy_task`)
+/// or checking a range for zero copy (`PspMemory::defer`).
+pub const DIRECT_COPY: u8 = 16;
+/// Within `DIRECT`: reading an indexed draw's indices, their bounds, and
+/// converting them.
+pub const DIRECT_INDICES: u8 = 17;
+/// Within `DIRECT`: reserving arena room and index records, finishing the
+/// draw (merging).
+pub const DIRECT_ARENA: u8 = 18;
+/// Within `DIRECT`: the draw's raw colours worked out
+/// (`recorder::raw_colors_if_enabled`) and their table entry.
+pub const DIRECT_COLORS: u8 = 19;
+/// Within `DIRECT`: the draw's bone table entry.
+pub const DIRECT_BONES: u8 = 20;
 
-pub const NAMES: [&str; 14] = [
+pub const NAMES: [&str; 21] = [
     "other", "walk", "plain", "matrix", "record", "prepare", "palette", "queue", "transform", "copy", "indices", "idle",
-    "wait", "help",
+    "wait", "help", "direct", "d_transform", "d_copy", "d_indices", "d_arena", "d_colors", "d_bones",
 ];
 
 /// Enters `phase`; returns the phase to go back to (`leave`).

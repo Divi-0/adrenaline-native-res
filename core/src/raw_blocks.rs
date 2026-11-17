@@ -25,7 +25,7 @@
 //! the PC replay, the frame hashes and the tests draw raw vertices with them
 //! (`raw_vertex::RawCorners`). Keep both in step.
 
-use crate::frame::{FrameVertex, Geometry, GpuLights, RawCamera, RawColors, RawTransform};
+use crate::frame::{FrameVertex, GpuLights, RawCamera, RawColors, RawTables, RawTransform};
 use crate::transform::{ClipVertex, TransformInputs};
 use crate::vertex::VertexFormat;
 
@@ -44,7 +44,7 @@ pub fn lighting_key(lit: Option<(bool, bool)>) -> u32 {
 /// numbers), else a new one with its camera and, for draws the GPU lights
 /// (`lit`: has a vertex colour, opaque), its light set. `None` if a table is
 /// full (the run then goes the old way).
-pub fn raw_transform(geometry: &mut Geometry, inputs: &TransformInputs, lit: Option<(bool, bool)>) -> Option<u32> {
+pub fn raw_transform(tables: &mut RawTables, inputs: &TransformInputs, lit: Option<(bool, bool)>) -> Option<u32> {
     let (inputs_change, lighting_change) = inputs.changes();
     let key = lighting_key(lit);
     // The newest entry's camera and world, if it was written from the same
@@ -52,7 +52,7 @@ pub fn raw_transform(geometry: &mut Geometry, inputs: &TransformInputs, lit: Opt
     // `TransformInputs::of`): then only the lighting can differ (MTX's
     // riders change their material colours before nearly every part).
     let mut same_base = None;
-    if let Some((number, last)) = geometry.last_raw_transform() {
+    if let Some((number, last)) = tables.last_raw_transform() {
         if inputs_change != 0 && last.inputs_change == inputs_change {
             if last.lighting_key == key && (key == 0 || last.lighting_change == lighting_change) {
                 return Some(number);
@@ -62,23 +62,23 @@ pub fn raw_transform(geometry: &mut Geometry, inputs: &TransformInputs, lit: Opt
     }
     let (camera, world) = match same_base {
         Some(known) => known,
-        None => (geometry.add_raw_camera(&inputs.raw_camera())?, inputs.raw_world()),
+        None => (tables.add_raw_camera(&inputs.raw_camera())?, inputs.raw_world()),
     };
     let light_set = match lit {
-        Some((has_color, opaque)) => geometry.add_light_set(&inputs.gpu_lights(has_color, opaque)?)? as u16,
+        Some((has_color, opaque)) => tables.add_light_set(&inputs.gpu_lights(has_color, opaque)?)? as u16,
         None => 0,
     };
-    if let Some((number, last)) = geometry.last_raw_transform() {
+    if let Some((number, last)) = tables.last_raw_transform() {
         // Other inputs, the same numbers (bones or the format changed, or a
         // matrix was uploaded again unchanged in another context): that one,
         // so the draws can still be joined.
         let same_world = (0..3).all(|r| (0..4).all(|c| last.world[r][c].to_bits() == world[r][c].to_bits()));
         if same_world && last.camera == camera && last.light_set == light_set && last.lighting_key == key {
-            geometry.restamp_last_raw_transform(inputs_change, lighting_change);
+            tables.restamp_last_raw_transform(inputs_change, lighting_change);
             return Some(number);
         }
     }
-    geometry.push_raw_transform(RawTransform { world, camera, light_set, inputs_change, lighting_change, lighting_key: key })
+    tables.push_raw_transform(RawTransform { world, camera, light_set, inputs_change, lighting_change, lighting_key: key })
 }
 
 /// `((r0 x + r1 y) + r2 z) + r3`: one row of a matrix applied to (x, y, z, 1).
@@ -290,15 +290,16 @@ mod tests {
         let format = VertexFormat(2 | 2 << 7);
         let mut cache = TransformCache::new();
         let mut geometry = frame.split().0;
-        let first = raw_transform(&mut geometry, cache.get(&ge, format), None).unwrap();
-        assert_eq!(raw_transform(&mut geometry, cache.get(&ge, format), None), Some(first), "same inputs");
+        let tables = geometry.raw_tables().unwrap();
+        let first = raw_transform(tables, cache.get(&ge, format), None).unwrap();
+        assert_eq!(raw_transform(tables, cache.get(&ge, format), None), Some(first), "same inputs");
         // Another object: a new entry with the same camera.
         let mut command = |opcode: u8, data: u32| ge.set_register(crate::command::Command((opcode as u32) << 24 | data));
         command(op::WORLD_MATRIX_NUMBER, 9);
         command(op::WORLD_MATRIX_DATA, 7.0f32.to_bits() >> 8);
-        let second = raw_transform(&mut geometry, cache.get(&ge, format), None).unwrap();
+        let second = raw_transform(tables, cache.get(&ge, format), None).unwrap();
         assert_eq!(second, first + 1);
-        assert_eq!(geometry.last_raw_transform().unwrap().1.world[0][3], 7.0);
+        assert_eq!(tables.last_raw_transform().unwrap().1.world[0][3], 7.0);
         drop(geometry);
         assert_eq!(frame.raw_camera_count, 1, "one camera");
         assert_eq!(frame.raw_transforms[0].camera, frame.raw_transforms[1].camera);

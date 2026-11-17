@@ -43,6 +43,7 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
+use crate::copy_tasks::{CopyTask, CopyTasks, MemorySource, ReaderSource};
 use crate::frame::{Draw, Frame};
 use crate::memory::{physical, PspMemory};
 use crate::recorder::{self, PaletteFill, PrimCall, Prepared};
@@ -151,12 +152,19 @@ pub const WAIT_WORDS: usize = 2;
 pub const WAIT_TRANSFORMS: usize = 3;
 pub const WAIT_IDLE: usize = 4;
 
-/// Whether a job is one PRIM or a batch (`recorder::record_batch_vertices`).
+/// Whether a job is one PRIM or a batch (`recorder::record_batch_vertices`),
+/// or only stores a palette (for a draw the capture thread wrote itself,
+/// `frame_builder`: the recorder stores and hashes the frame's palettes).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum JobKind {
     Single,
     Batch,
+    Palette,
 }
+
+/// Fallback segments a frame can have (`frame_builder`): stretches of
+/// draws the recorder writes between draws the capture thread writes.
+pub const MAX_SEGMENTS: usize = 1024;
 
 /// A stretch of PSP memory copied into the queue's words.
 #[derive(Clone, Copy, Debug, Default)]
@@ -202,6 +210,9 @@ pub struct DeferredReader {
     /// (the vertex cache's samples of a run: reading them one call each made
     /// ~10,000 calls per race frame, slower than copying everything).
     pub sample: fn(address: u32, positions: &[usize], out: &mut [u32]) -> bool,
+    /// `out.len()` bytes at `address` (any alignment, main RAM or VRAM as
+    /// `read`), for copy tasks (`copy_tasks`).
+    pub copy_bytes: fn(address: u32, out: &mut [u8]) -> bool,
 }
 
 /// One queued draw (or batch of PRIMs with the same state).
@@ -220,6 +231,10 @@ pub(crate) struct Job {
     hash_vertices: bool,
     /// See `QueuedDraw::index_bounds`.
     pub index_bounds: Option<(u32, u32)>,
+    /// See `QueuedDraw::segment`.
+    segment: u16,
+    /// See `QueuedDraw::refused`.
+    refused: Option<usize>,
     /// Its PRIM calls: ring index and count.
     first_call: u32,
     call_count: u32,
@@ -247,6 +262,8 @@ impl Job {
         transform: None,
         hash_vertices: false,
         index_bounds: None,
+        segment: 0,
+        refused: None,
         first_call: 0,
         call_count: 0,
         ranges: [CopiedRange::NONE; 3],
@@ -287,6 +304,14 @@ pub(crate) struct QueuedDraw<'a> {
     /// The words of a palette restored from a saved state (`PaletteFill`
     /// address 0).
     pub given_palette: &'a [u32],
+    /// 0, or `s + 1`: the job starts fallback segment `s` of the frame
+    /// (`frame_builder`): the recorder merges none of its draws with the
+    /// draws before and notes where they start (`segment_start`).
+    pub segment: u16,
+    /// Why the capture thread didn't write the draw itself
+    /// (`frame_builder`, a `recorder::fallback` reason; `None`: it didn't
+    /// try), for the recorder's fallback counts.
+    pub refused: Option<usize>,
 }
 
 /// How the producer reaches a consumer running in another thread. Without
@@ -368,6 +393,16 @@ pub struct DrawStream {
     /// Works the jobs' transforms out of their inputs; used by whoever
     /// records the jobs (as `vertex_cache`).
     transform_builder: UnsafeCell<TransformBuilder>,
+    /// Whether whoever records the jobs owns the frame's raw tables
+    /// (`Frame::geometry_raw`); false while the capture thread records the
+    /// raw draws itself (`frame_builder`). Changed only while idle.
+    raw_tables_with_consumer: bool,
+    /// Where each fallback segment's draws start in the frame's draw list,
+    /// noted by the consumer as it starts the segment's first job
+    /// (`QueuedDraw::segment`); read by the producer once idle.
+    segment_starts: UnsafeCell<[u32; MAX_SEGMENTS]>,
+    /// The copies of draws the capture thread writes itself (`copy_tasks`).
+    tasks: CopyTasks,
 }
 
 // Safe: the producer and the consumer touch disjoint parts (see the module
@@ -402,6 +437,9 @@ impl DrawStream {
             discard_jobs: AtomicBool::new(false),
             vertex_cache: UnsafeCell::new(None),
             transform_builder: UnsafeCell::new(TransformBuilder::new()),
+            raw_tables_with_consumer: true,
+            segment_starts: UnsafeCell::new([0; MAX_SEGMENTS]),
+            tasks: CopyTasks::new(),
         }
     }
 
@@ -442,19 +480,29 @@ impl DrawStream {
         self.copier.is_none() || self.copy_done[job as usize % MAX_JOBS].load(Ordering::Acquire)
     }
 
-    /// True if no published job waits for a copier to take it.
+    /// True if no published job or copy task waits for a copier to take it.
     pub fn all_copied(&self) -> bool {
-        self.claimed.load(Ordering::Relaxed) == self.published.load(Ordering::Acquire)
+        self.claimed.load(Ordering::Relaxed) == self.published.load(Ordering::Acquire) && self.tasks.all_taken()
     }
 
     /// Copier: copies the deferred ranges of the published jobs nobody has
-    /// taken yet, oldest first (`copy_one`). False if there was none.
+    /// taken yet, oldest first (`copy_one`), and the copy tasks
+    /// (`copy_tasks`). False if there was none.
     pub fn copy_published(&self) -> bool {
         let mut any = false;
-        while self.copy_one() {
+        while self.copy_one() || self.copy_one_task() {
             any = true;
         }
         any
+    }
+
+    /// Takes the oldest copy task nobody has taken yet and copies it. False
+    /// if there was none (or no reader to copy with).
+    fn copy_one_task(&self) -> bool {
+        match self.reader {
+            Some(reader) => self.tasks.copy_one(&mut ReaderSource(reader.copy_bytes), STABLE_COPIES.load(Ordering::Relaxed)),
+            None => false,
+        }
     }
 
     /// Takes the oldest published job nobody has taken yet (`claimed`,
@@ -531,7 +579,7 @@ impl DrawStream {
     /// without a copier: the producer copied it when it queued the job).
     /// The GE sync waits for this (capture.rs).
     pub fn copies_complete(&self) -> bool {
-        self.copier.is_none() || self.copies_finished.load(Ordering::Acquire) == self.job_position
+        (self.copier.is_none() || self.copies_finished.load(Ordering::Acquire) == self.job_position) && self.tasks.complete()
     }
 
     /// Producer, where it must not go on before every job is copied (the GE
@@ -544,8 +592,58 @@ impl DrawStream {
             while self.copy_one() {
                 PRODUCER_COPIES.fetch_add(1, Ordering::Relaxed);
             }
+            while self.copy_one_task() {
+                crate::copy_tasks::PRODUCER_TASKS.fetch_add(1, Ordering::Relaxed);
+            }
             crate::phase::leave(previous);
         }
+    }
+
+    /// Copies `task` (`copy_tasks`): published for the copier when there is
+    /// one and it can read the source now (`PspMemory::defer`: main RAM, or
+    /// VRAM blocks the plugin's copy holds; not while a dump records), else
+    /// at once from `memory`. False if it was copied at once and its source
+    /// couldn't be read (zeros written then; the caller should drop the
+    /// draw).
+    pub(crate) fn copy_task(&mut self, memory: &mut impl PspMemory, task: CopyTask) -> bool {
+        let start = task.source & !3;
+        let span = (task.source - start) + task.length;
+        let stable = STABLE_COPIES.load(Ordering::Relaxed);
+        let (Some(copier), Some(reader)) = (self.copier, self.reader) else {
+            return crate::copy_tasks::run(&task, &mut MemorySource(memory), stable);
+        };
+        if !memory.defer(start, span.next_multiple_of(4)) {
+            return crate::copy_tasks::run(&task, &mut MemorySource(memory), stable);
+        }
+        self.tasks.push(task, |tasks| tasks.copy_one(&mut ReaderSource(reader.copy_bytes), stable));
+        (copier.wake)();
+        // A lagging copier (preempted): the oldest tasks copied here, as
+        // `help_a_lagging_copier` does for jobs.
+        let limit = COPIER_LAG_JOBS.load(Ordering::Relaxed);
+        if self.tasks.untaken() > limit {
+            let previous = crate::phase::enter(crate::phase::HELP);
+            while self.tasks.untaken() > limit / 2 && self.copy_one_task() {
+                crate::copy_tasks::PRODUCER_TASKS.fetch_add(1, Ordering::Relaxed);
+            }
+            crate::phase::leave(previous);
+        }
+        true
+    }
+
+    /// From now on (frame start, the consumer idle) whoever records the jobs
+    /// owns the frame's raw tables (true, as before), or the capture thread
+    /// does (`frame_builder`).
+    pub fn set_raw_tables_with_consumer(&mut self, with_consumer: bool) {
+        self.wait_until_idle();
+        self.raw_tables_with_consumer = with_consumer;
+    }
+
+    /// Producer, the consumer idle: where fallback segment `segment` of the
+    /// frame starts in its draw list (`QueuedDraw::segment`).
+    pub fn segment_start(&self, segment: usize) -> u32 {
+        // Safe: written by the consumer before it counted the job recorded;
+        // the producer reads it only once the consumer is idle.
+        unsafe { (*self.segment_starts.get())[segment] }
     }
 
     /// The producer, after publishing a job: if the copier has fallen
@@ -582,6 +680,8 @@ impl DrawStream {
     /// that is recording some).
     pub fn clear(&mut self) {
         self.wait_until_idle();
+        // Copy tasks write into the raw arena: done before anyone moves on.
+        self.wait_for_tasks();
         let published = self.published.load(Ordering::Relaxed);
         // Without a consumer thread (nothing waited above) the forgotten
         // jobs count as taken too, so no copier writes their words later.
@@ -607,7 +707,7 @@ impl DrawStream {
             // now, while the consumer is idle.
             self.wait_until_idle_or_drain(stats);
             // Safe: the consumer is idle, so the geometry is the producer's.
-            unsafe { Frame::geometry_raw(frame) }.fill_palette(fill.place, draw.given_palette);
+            unsafe { Frame::geometry_raw(frame, self.raw_tables_with_consumer) }.fill_palette(fill.place, draw.given_palette);
             draw.palette = None;
         }
         let palette_memory = draw.palette.map_or((0, 0), |fill| (fill.address, 4 * fill.place.word_count));
@@ -625,15 +725,19 @@ impl DrawStream {
                 format: draw.format,
                 palette: draw.palette,
                 index_bounds: draw.index_bounds,
+                refused: draw.refused,
                 ..Job::EMPTY
             };
             // Safe: the consumer is idle, so the geometry and the vertex
             // cache are the producer's.
-            let mut geometry = unsafe { Frame::geometry_raw(frame) };
+            let mut geometry = unsafe { Frame::geometry_raw(frame, self.raw_tables_with_consumer) };
+            if draw.segment != 0 {
+                self.start_segment(&mut geometry, draw.segment);
+            }
             let cache = unsafe { (*self.vertex_cache.get()).as_deref_mut() };
             // Worked out on its own (rare): the consumer's builder stays as it is.
             let mut builder = TransformBuilder::new();
-            let transform = draw.transform.map(|(inputs, _)| recorder::JobTransform::new(inputs, &mut builder));
+            let transform = draw.transform.map(|(inputs, _)| recorder::JobTransform::new(inputs, &mut builder, draw.refused));
             recorder::run_job(&mut geometry, stats, &job, draw.calls, transform, memory, cache);
             return;
         }
@@ -699,6 +803,8 @@ impl DrawStream {
             call_position,
             word_position,
             transform_floor: transform.unwrap_or(transform_floor),
+            segment: draw.segment,
+            refused: draw.refused,
         };
         self.job_position = self.job_position.wrapping_add(1);
         self.published.store(self.job_position, Ordering::Release);
@@ -717,7 +823,33 @@ impl DrawStream {
     /// counts added to `stats`. Then the frame is the producer's alone again.
     pub fn finish(&mut self, stats: &mut FrameStats) {
         self.wait_until_idle_or_drain(stats);
+        self.wait_for_tasks();
         self.frame.store(core::ptr::null_mut(), Ordering::Relaxed);
+    }
+
+    /// Producer: until every copy task is done (the frame's draws read
+    /// them): copies those nobody took, then waits for the copier's.
+    pub fn wait_for_tasks(&self) {
+        while self.copy_one_task() {
+            crate::copy_tasks::PRODUCER_TASKS.fetch_add(1, Ordering::Relaxed);
+        }
+        while !self.tasks.complete() {
+            match self.hooks {
+                Some(hooks) => (hooks.wait)(),
+                None => core::hint::spin_loop(),
+            }
+        }
+    }
+
+    /// The consumer (or the producer while it is idle) begins fallback
+    /// segment `segment - 1` (`QueuedDraw::segment`).
+    fn start_segment(&self, geometry: &mut crate::frame::Geometry, segment: u16) {
+        geometry.seal();
+        let index = segment as usize - 1;
+        if index < MAX_SEGMENTS {
+            // Safe: the consumer's (see `segment_starts`).
+            unsafe { (*self.segment_starts.get())[index] = geometry.draw_count() };
+        }
     }
 
     /// The producer without a consumer thread: copies what a copier would
@@ -744,8 +876,13 @@ impl DrawStream {
         // records (and touches the geometry and `consumer_stats`) while jobs
         // are published and not recorded.
         let rings = self.rings.get();
-        let (mut geometry, stats, mut cache) =
-            unsafe { (Frame::geometry_raw(frame), &mut *self.consumer_stats.get(), (*self.vertex_cache.get()).as_deref_mut()) };
+        let (mut geometry, stats, mut cache) = unsafe {
+            (
+                Frame::geometry_raw(frame, self.raw_tables_with_consumer),
+                &mut *self.consumer_stats.get(),
+                (*self.vertex_cache.get()).as_deref_mut(),
+            )
+        };
         if self.discard_jobs.load(Ordering::Relaxed) {
             self.recorded.store(published, Ordering::Release);
             return true;
@@ -754,6 +891,9 @@ impl DrawStream {
         while recorded != published && self.is_copied(recorded) {
             // Safe: a published job, unchanged until it is counted recorded.
             let job = unsafe { &(*rings).jobs[recorded as usize % MAX_JOBS] };
+            if job.segment != 0 {
+                self.start_segment(&mut geometry, job.segment);
+            }
             // Measuring (`cycles`): an empty part.
             crate::cycles::add(crate::cycles::CALIBRATION, crate::cycles::start(crate::cycles::CALIBRATION));
             // Deferred ranges are copied when a run needs them whole: a run the
@@ -772,8 +912,9 @@ impl DrawStream {
             // It works the CPU's transform out only for draws that need it
             // (`recorder::JobTransform`).
             let builder = unsafe { &mut *self.transform_builder.get() };
-            let transform =
-                job.transform.map(|position| recorder::JobTransform::new(&rings.transforms[position as usize % MAX_TRANSFORMS], builder));
+            let transform = job
+                .transform
+                .map(|position| recorder::JobTransform::new(&rings.transforms[position as usize % MAX_TRANSFORMS], builder, job.refused));
             recorder::run_job(&mut geometry, stats, job, calls, transform, &mut memory, cache.as_deref_mut());
             recorded = recorded.wrapping_add(1);
             self.recorded.store(recorded, Ordering::Release);
@@ -1137,7 +1278,7 @@ mod tests {
     }
 
     /// Reads "memory" whose every word holds its own address.
-    const FAKE_READER: DeferredReader = DeferredReader { read: fake_read, sample: fake_sample };
+    const FAKE_READER: DeferredReader = DeferredReader { read: fake_read, sample: fake_sample, copy_bytes: |_, _| false };
 
     #[test]
     fn a_deferred_range_is_copied_only_when_read_whole() {
@@ -1260,7 +1401,7 @@ mod tests {
 
     #[test]
     fn small_ranges_are_read_until_two_reads_agree() {
-        let reader = DeferredReader { read: changing_read, sample: changing_sample };
+        let reader = DeferredReader { read: changing_read, sample: changing_sample, copy_bytes: |_, _| false };
         let mut small = [9u32; 24];
         CHANGING_READS.store(0, Ordering::Relaxed);
         assert!(read_stable(reader, 0x0890_0000, &mut small));

@@ -20,6 +20,7 @@ use crate::color::opaque;
 use crate::command::{op, primitive, Command};
 use crate::display_list::{CommandVisitor, MAX_PRIM_BATCH};
 use crate::draw_stream::{DrawStream, Job, JobKind, QueuedDraw};
+use crate::frame_builder::FrameBuilder;
 use crate::frame::{draw_flags, test_flags, Catalog, Draw, Frame, FrameVertex, Geometry, PalettePlace, TextureDescriptor};
 use crate::ge_state::GeState;
 use crate::lighting::{pack_normal, pack_s8_normal, pack_scaled_normal};
@@ -138,18 +139,22 @@ pub mod fallback {
 
 /// Why a PRIM drawn with this state goes to the CPU (`fallback`), asked
 /// where the raw path has turned it down; `raw` the raw arena (`None`:
-/// none), which knows why it turned the draw down last (`RawArena::refusal`).
+/// none), which knows why it turned the draw down last (`RawArena::refusal`),
+/// or `refused`: why the capture thread's builder turned it down
+/// (`frame_builder`, which holds the arena then).
 fn fallback_reason(
     prepared: &Prepared,
     inputs: Option<&TransformInputs>,
     format: VertexFormat,
     primitive_type: u32,
     raw: Option<&crate::raw_arena::RawArena>,
+    refused: Option<usize>,
 ) -> usize {
     let Some(inputs) = inputs.filter(|_| !format.is_through()) else {
         return fallback::THROUGH;
     };
-    let Some(raw) = raw.filter(|_| crate::raw_arena::ENABLED.load(core::sync::atomic::Ordering::Relaxed)) else {
+    let enabled = crate::raw_arena::ENABLED.load(core::sync::atomic::Ordering::Relaxed);
+    let Some(refusal) = refused.or(raw.map(|raw| raw.refusal)).filter(|_| enabled) else {
         return fallback::RAW_OFF;
     };
     if format.morph_count() != 1 {
@@ -161,7 +166,7 @@ fn fallback_reason(
     } else if primitive_type == primitive::RECTANGLES {
         fallback::SPRITES
     } else {
-        raw.refusal
+        refusal
     }
 }
 
@@ -346,6 +351,10 @@ pub struct Recorder<'a> {
     pub draw_states: &'a mut DrawStateCache,
     /// Where the draws wait for their vertices to be recorded.
     pub stream: &'a mut DrawStream,
+    /// Writes the draws the GPU takes raw itself, on this thread
+    /// (`frame_builder`), while recording into a frame; `None`: all go to
+    /// the stream.
+    pub builder: Option<&'a mut FrameBuilder>,
 }
 
 impl CommandVisitor for Recorder<'_> {
@@ -401,7 +410,9 @@ impl Recorder<'_> {
             let frame: *mut Frame = frame;
             // Safe: only the producer (this thread) uses the catalog.
             let mut catalog = unsafe { Frame::catalog_raw(frame) };
-            record_prims(frame, &mut catalog, self.stats, self.palette, self.draw_states, ge, memory, prims, self.stream);
+            let builder = self.builder.as_deref_mut().filter(|builder| builder.is_active());
+            let mut queues = Queues { stream: self.stream, builder };
+            record_prims(frame, &mut catalog, self.stats, self.palette, self.draw_states, ge, memory, prims, &mut queues);
         }
     }
 }
@@ -413,10 +424,10 @@ const INDEX_FORMAT_BITS: u32 = 3 << 11;
 /// where the one before ended (`GeState::advance_after_draw`).
 #[derive(Clone, Copy)]
 pub(crate) struct PrimCall {
-    primitive_type: u32,
-    count: u32,
-    vertex_address: u32,
-    index_address: u32,
+    pub primitive_type: u32,
+    pub count: u32,
+    pub vertex_address: u32,
+    pub index_address: u32,
 }
 
 impl PrimCall {
@@ -443,7 +454,7 @@ fn record_prims(
     ge: &GeState,
     memory: &mut impl PspMemory,
     prims: &[Command],
-    stream: &mut DrawStream,
+    stream: &mut Queues,
 ) {
     let format = ge.vertex_format();
     let vertex_size = ge.vertex_layout().size;
@@ -467,6 +478,63 @@ fn record_prims(
         for call in calls {
             queue_draw(frame, catalog, stats, palette, draw_states, ge, memory, core::slice::from_ref(call), stream);
         }
+    }
+}
+
+/// Where the producer's draws go: the stream's job queue, and, while it
+/// writes the frame's raw draws itself, the capture thread's builder.
+pub(crate) struct Queues<'a> {
+    pub stream: &'a mut DrawStream,
+    pub builder: Option<&'a mut FrameBuilder>,
+}
+
+impl Queues<'_> {
+    /// Writes a draw's PRIMs as raw draws on this thread
+    /// (`FrameBuilder::try_record`) and queues the palette it placed, if any,
+    /// for the recorder to store. `Err(reason)`: queue it as a job
+    /// (`fallback` reason, `None` if the builder didn't try).
+    fn write_direct(
+        &mut self,
+        frame: *mut Frame,
+        stats: &mut FrameStats,
+        memory: &mut impl PspMemory,
+        palette: &mut LoadedPalette,
+        (prepared, ge, inputs): (&Prepared, &GeState, &TransformInputs),
+        calls: &[PrimCall],
+    ) -> Result<(), Option<usize>> {
+        let Some(builder) = self.builder.as_deref_mut() else {
+            return Err(None);
+        };
+        if crate::bench::experiment(crate::bench::SKIP_QUEUE) {
+            return Ok(());
+        }
+        let format = ge.vertex_format();
+        let previous = crate::phase::enter(crate::phase::DIRECT);
+        let started = crate::cycles::start(crate::cycles::DIRECT);
+        let written = builder.try_record(frame, self.stream, memory, format, prepared, ge.material_color(), inputs, calls);
+        crate::cycles::add(crate::cycles::DIRECT, started);
+        crate::phase::leave(previous);
+        written?;
+        if let Some(fill) = palette.take_unstored() {
+            let draw = QueuedDraw {
+                kind: JobKind::Palette,
+                prepared: *prepared,
+                material_color: 0,
+                format: 0,
+                calls: &[],
+                transform: None,
+                memory: [(0, 0), (0, 0)],
+                hash_vertices: false,
+                zero_copy_vertices: false,
+                index_bounds: None,
+                palette: Some(fill),
+                given_palette: palette.given_words(),
+                segment: 0,
+                refused: None,
+            };
+            self.stream.queue(frame, stats, memory, draw);
+        }
+        Ok(())
     }
 }
 
@@ -511,12 +579,12 @@ fn queue_batch(
     ge: &GeState,
     memory: &mut impl PspMemory,
     calls: &[PrimCall],
-    stream: &mut DrawStream,
+    queues: &mut Queues,
 ) {
     let Some(prepared) = prepare(catalog, stats, palette, draw_states, ge) else {
         // The frame is full (counted once); the other PRIMs find the same.
         for &call in &calls[1..] {
-            queue_draw(frame, catalog, stats, palette, draw_states, ge, memory, core::slice::from_ref(&call), stream);
+            queue_draw(frame, catalog, stats, palette, draw_states, ge, memory, core::slice::from_ref(&call), queues);
         }
         return;
     };
@@ -527,6 +595,11 @@ fn queue_batch(
     let previous = crate::phase::enter(crate::phase::TRANSFORM);
     let transform = draw_states.transforms.get_with_generation(ge, format);
     crate::phase::leave(previous);
+    let refused = match queues.write_direct(frame, stats, memory, palette, (&prepared, ge, transform.0), calls) {
+        Ok(()) => return,
+        Err(refused) => refused,
+    };
+    let stream = &mut *queues.stream;
     let raw = goes_raw(&prepared, transform.0.lighting(), format);
     let draw = QueuedDraw {
         kind: JobKind::Batch,
@@ -541,6 +614,8 @@ fn queue_batch(
         index_bounds: None,
         palette: palette.take_unstored(),
         given_palette: palette.given_words(),
+        segment: queues.builder.as_deref_mut().map_or(0, |builder| builder.fallback_segment()),
+        refused,
     };
     if crate::bench::experiment(crate::bench::SKIP_QUEUE) {
         return;
@@ -565,7 +640,7 @@ fn queue_draw(
     ge: &GeState,
     memory: &mut impl PspMemory,
     calls: &[PrimCall],
-    stream: &mut DrawStream,
+    queues: &mut Queues,
 ) {
     let call = calls[0];
     if call.primitive_type < primitive::TRIANGLES {
@@ -589,6 +664,17 @@ fn queue_draw(
     };
     count_approximations(stats, prepared.approximations, calls.len() as u32);
     sample_texture(catalog, memory, &prepared);
+    let mut refused = None;
+    if !ge.vertex_format().is_through() && queues.builder.is_some() {
+        let previous = crate::phase::enter(crate::phase::TRANSFORM);
+        let (inputs, _) = draw_states.transforms.get_with_generation(ge, ge.vertex_format());
+        crate::phase::leave(previous);
+        match queues.write_direct(frame, stats, memory, palette, (&prepared, ge, inputs), calls) {
+            Ok(()) => return,
+            Err(reason) => refused = reason,
+        }
+    }
+    let stream = &mut *queues.stream;
 
     // The memory the vertices are in: with an index buffer, the indices (of
     // all the calls: they follow each other) and the vertices from the
@@ -648,6 +734,8 @@ fn queue_draw(
         index_bounds: producer_bounds,
         palette: palette.take_unstored(),
         given_palette: palette.given_words(),
+        segment: queues.builder.as_deref_mut().map_or(0, |builder| builder.fallback_segment()),
+        refused,
     };
     let previous = crate::phase::enter(crate::phase::QUEUE);
     let queue_started = crate::cycles::start(crate::cycles::QUEUE);
@@ -705,7 +793,7 @@ fn index_bounds(memory: &mut impl PspMemory, format: IndexFormat, address: u32, 
     bounds
 }
 
-fn widen((low, high): (u32, u32), value: u32) -> (u32, u32) {
+pub(crate) fn widen((low, high): (u32, u32), value: u32) -> (u32, u32) {
     (low.min(value), high.max(value))
 }
 
@@ -757,11 +845,14 @@ fn store_palette(geometry: &mut Geometry, fill: PaletteFill, memory: &mut impl P
 pub(crate) struct JobTransform<'a> {
     pub inputs: &'a TransformInputs,
     builder: &'a mut TransformBuilder,
+    /// Why the capture thread's builder turned the job's draw down
+    /// (`QueuedDraw::refused`), for `fallback_reason`.
+    pub refused: Option<usize>,
 }
 
 impl<'a> JobTransform<'a> {
-    pub(crate) fn new(inputs: &'a TransformInputs, builder: &'a mut TransformBuilder) -> Self {
-        JobTransform { inputs, builder }
+    pub(crate) fn new(inputs: &'a TransformInputs, builder: &'a mut TransformBuilder, refused: Option<usize>) -> Self {
+        JobTransform { inputs, builder, refused }
     }
 
     /// The CPU's transform (`TransformBuilder::build`: redone only where the
@@ -801,6 +892,9 @@ fn run_job_now(
         let previous = crate::phase::recorder::enter(crate::phase::recorder::PALETTE);
         store_palette(geometry, fill, memory);
         crate::phase::recorder::leave(previous);
+    }
+    if job.kind == JobKind::Palette {
+        return;
     }
     let format = VertexFormat(job.format);
     let layout = format.layout();
@@ -911,7 +1005,7 @@ fn record_batch_vertices(
             }
         }
         let raw = cache.as_deref().and_then(|cache| cache.raw.as_ref());
-        let reason = fallback_reason(prepared, Some(inputs), format, chunk[0].primitive_type, raw);
+        let reason = fallback_reason(prepared, Some(inputs), format, chunk[0].primitive_type, raw, job_transform.refused);
         let gpu = GpuRun { wanted: prepared.gpu_transform, cache: cache.as_deref_mut(), colors, lighting: prepared.gpu_lighting() };
         let transform = job_transform.built();
         let previous = crate::phase::recorder::enter(crate::phase::recorder::CPU_DECODE);
@@ -956,7 +1050,7 @@ fn record_batch_vertices(
 #[derive(Clone, Copy)]
 pub(crate) struct Prepared {
     /// The draw without its vertex and index ranges and the RECTANGLES flag.
-    draw: Draw,
+    pub draw: Draw,
     /// Approximations to count for every PRIM drawn with it (`approx` mask).
     approximations: u32,
     /// Through mode: 1 / texture size (texel coordinates to 0..1); 3D: 1.
@@ -1259,7 +1353,8 @@ fn record_vertices_now(
     }
     // Everything below decodes the vertices on the CPU.
     let raw = cache.as_deref().and_then(|cache| cache.raw.as_ref());
-    count_fallback(stats, fallback_reason(prepared, inputs, format, primitive_type, raw), 1, count);
+    let refused = transform.as_ref().and_then(|transform| transform.refused);
+    count_fallback(stats, fallback_reason(prepared, inputs, format, primitive_type, raw, refused), 1, count);
     let transform = transform.map(|transform| transform.built());
     let decoding = crate::phase::recorder::enter(crate::phase::recorder::CPU_DECODE);
     record_on_cpu(geometry, stats, memory, format, layout, transform, prepared, material_color, call, cache, draw);
@@ -1489,7 +1584,7 @@ enum Run {
 }
 
 /// Whole triangles of a list, strip or fan of `count` vertices.
-fn triangle_count(primitive_type: u32, count: u32) -> u32 {
+pub(crate) fn triangle_count(primitive_type: u32, count: u32) -> u32 {
     match primitive_type {
         primitive::TRIANGLES => count / 3,
         _ => count.saturating_sub(2),
@@ -1922,7 +2017,7 @@ fn goes_raw(prepared: &Prepared, lighting: Option<&crate::lighting::LightingRegi
 }
 
 /// `raw_color_fields` while raw vertices are on (`raw_arena::ENABLED`).
-fn raw_colors_if_enabled(
+pub(crate) fn raw_colors_if_enabled(
     prepared: &Prepared,
     material_color: u32,
     lights: Option<&crate::lighting::LightingRegisters>,
@@ -2026,10 +2121,13 @@ fn record_raw_sprites(
     let bytes = unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4) };
     let source = &bytes[skew as usize..];
     let pair = 2 * stride as usize;
-    let Some(number) = crate::raw_blocks::raw_transform(geometry, inputs, None) else {
+    let Some(tables) = geometry.raw_tables() else {
         return false;
     };
-    let Some(colors_number) = geometry.add_raw_colors(&colors) else {
+    let Some(number) = crate::raw_blocks::raw_transform(tables, inputs, None) else {
+        return false;
+    };
+    let Some(colors_number) = tables.add_raw_colors(&colors) else {
         return false;
     };
     // A block of four pairs per sprite; whole blocks into the window, so
@@ -2067,7 +2165,7 @@ fn record_raw_sprites(
 /// one, few enough for 16-bit corner numbers, no weights (the sprite program
 /// doesn't skin), and not indexed: indexed rectangles name their vertices by
 /// index, and the raw sprites are copied from the vertices in a row.
-fn sprites_suit_raw(format: VertexFormat, sprites: u32) -> bool {
+pub(crate) fn sprites_suit_raw(format: VertexFormat, sprites: u32) -> bool {
     sprites > 0 && sprites <= 65_536 / 4 && !format.has_weights() && format.index_format() == IndexFormat::None
 }
 
@@ -2167,11 +2265,22 @@ fn raw_entry_now(
     inputs: &TransformInputs,
     colors: &crate::frame::RawColors,
 ) -> Option<(u32, u32, u32)> {
+    raw_table_entries(geometry.raw_tables()?, format, inputs, colors)
+}
+
+/// `raw_entry`'s work on the raw tables (also the capture thread's,
+/// `frame_builder`).
+pub(crate) fn raw_table_entries(
+    tables: &mut crate::frame::RawTables,
+    format: VertexFormat,
+    inputs: &TransformInputs,
+    colors: &crate::frame::RawColors,
+) -> Option<(u32, u32, u32)> {
     let lit = colors.rules[0] == crate::raw_vertex::lighting::LIGHTS;
-    let bones = if format.has_weights() { geometry.add_bones(inputs.bones())? + 1 } else { 0 };
+    let bones = if format.has_weights() { tables.add_bones(inputs.bones())? + 1 } else { 0 };
     let lighting = lit.then(|| (format.has_color(), colors.rules[1] != 0.0));
-    let number = crate::raw_blocks::raw_transform(geometry, inputs, lighting)?;
-    let colors_number = geometry.add_raw_colors(colors)?;
+    let number = crate::raw_blocks::raw_transform(tables, inputs, lighting)?;
+    let colors_number = tables.add_raw_colors(colors)?;
     Some((number, colors_number, bones))
 }
 
@@ -2268,7 +2377,7 @@ fn bounds_of_job(
 /// A span this many times larger than the corners it serves is gathered
 /// instead of copied whole (`record_raw_indexed_run`): copying it would move
 /// more bytes than gathering the corners' vertices.
-const SPARSE_SPAN: u32 = 4;
+pub(crate) const SPARSE_SPAN: u32 = 4;
 
 /// Indexed PRIMs as a raw draw: their indices converted
 /// (`record_raw_converted`) where `raw_arena::INDEXED_DRAWS` is on and the
@@ -2393,7 +2502,7 @@ fn record_raw_converted(
 /// little-endian) as `first + index - lowest` into `out`, in
 /// `frame::run_indices`' corner order. False if an index lies outside
 /// `lowest..=highest` (`out` is then partly written).
-fn convert_indices<const SIZE: usize>(
+pub(crate) fn convert_indices<const SIZE: usize>(
     indices: &[u8],
     calls: &[PrimCall],
     (lowest, highest): (u32, u32),
@@ -3353,7 +3462,7 @@ mod tests {
         let frame: *mut Frame = frame;
         // Safe: one thread; the catalog is only used here.
         let mut catalog = unsafe { Frame::catalog_raw(frame) };
-        record_prims(frame, &mut catalog, stats, palette, draw_states, ge, memory, prims, &mut stream);
+        record_prims(frame, &mut catalog, stats, palette, draw_states, ge, memory, prims, &mut Queues { stream: &mut stream, builder: None });
         stream.finish(stats);
     }
 
@@ -3633,8 +3742,14 @@ mod tests {
         let mut frame = new_boxed_frame();
         let mut stream = Box::new(DrawStream::new());
         let mut draw_states = DrawStateCache::new();
-        let mut recorder =
-            Recorder { stats: &mut stats, frame: Some(&mut frame), palette, draw_states: &mut draw_states, stream: &mut stream };
+        let mut recorder = Recorder {
+            stats: &mut stats,
+            frame: Some(&mut frame),
+            palette,
+            draw_states: &mut draw_states,
+            stream: &mut stream,
+            builder: None,
+        };
         recorder.visit(cmd(op::CLUT_LOAD, blocks), ge, &mut TestMemory::default());
     }
 
@@ -4172,7 +4287,8 @@ mod tests {
                 // Safe: one thread; the catalog is only used here.
                 let mut catalog = unsafe { Frame::catalog_raw(frame_pointer) };
                 let mut stats = FrameStats::new();
-                record_prims(frame_pointer, &mut catalog, &mut stats, &mut LoadedPalette::new(), &mut states, &ge, &mut memory, &[prim], stream);
+                let queues = &mut Queues { stream: &mut *stream, builder: None };
+                record_prims(frame_pointer, &mut catalog, &mut stats, &mut LoadedPalette::new(), &mut states, &ge, &mut memory, &[prim], queues);
                 stream.finish(&mut stats);
                 ge.advance_after_draw(prim.data() & 0xFFFF);
             }
@@ -4360,7 +4476,8 @@ mod tests {
             for &prim in &prims {
                 // Safe: the catalog is only used by this (the producer's) thread.
                 let mut catalog = unsafe { Frame::catalog_raw(frame) };
-                record_prims(frame, &mut catalog, &mut stats, &mut palette, &mut states, &ge, &mut memory, &[prim], stream);
+                let queues = &mut Queues { stream: &mut *stream, builder: None };
+                record_prims(frame, &mut catalog, &mut stats, &mut palette, &mut states, &ge, &mut memory, &[prim], queues);
                 ge.advance_after_draw(prim.data() & 0xFFFF);
             }
             stream.finish(&mut stats);
@@ -4455,7 +4572,8 @@ mod tests {
             for &prim in &prims {
                 // Safe: the catalog is only used by this (the producer's) thread.
                 let mut catalog = unsafe { Frame::catalog_raw(frame) };
-                record_prims(frame, &mut catalog, &mut stats, &mut palette, &mut states, &ge, &mut memory, &[prim], stream);
+                let queues = &mut Queues { stream: &mut *stream, builder: None };
+                record_prims(frame, &mut catalog, &mut stats, &mut palette, &mut states, &ge, &mut memory, &[prim], queues);
                 ge.advance_after_draw(prim.data() & 0xFFFF);
             }
             stream.finish(&mut stats);
@@ -4464,7 +4582,7 @@ mod tests {
         let mut alone = new_boxed_frame();
         record(&mut alone, &mut DrawStream::new());
 
-        const READER: DeferredReader = DeferredReader { read: copier_test_read, sample: copier_test_sample };
+        const READER: DeferredReader = DeferredReader { read: copier_test_read, sample: copier_test_sample, copy_bytes: |_, _| false };
         static HOOKS: StreamHooks = StreamHooks { wake_consumer: || {}, wait: std::thread::yield_now };
         static COPIER: CopierHooks = CopierHooks { wake: || {} };
 

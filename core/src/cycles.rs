@@ -63,7 +63,9 @@ pub const RUNS_QUICK: usize = 18;
 /// set (`gpu_transform`, `Lights::gpu`, `add_light_set`, `add_transform`).
 pub const RUN_LOOKUP: usize = 19;
 pub const RUN_ENTRY: usize = 20;
-pub const COUNT: usize = 21;
+/// A raw draw written on the capture thread (`frame_builder::FrameBuilder::try_record`).
+pub const DIRECT: usize = 21;
+pub const COUNT: usize = 22;
 pub const NAMES: [&str; COUNT] = [
     "jobs",
     "copies",
@@ -86,6 +88,7 @@ pub const NAMES: [&str; COUNT] = [
     "runs_quick",
     "run_lookup",
     "run_entry",
+    "direct",
 ];
 
 /// Readings left out because they came out implausibly large (from 2^30

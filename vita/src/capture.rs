@@ -22,6 +22,7 @@ use nativeres_core::event_ring::{self, Next, RawEvent, Ring, RingHeader, RingRea
 use nativeres_core::frame::{Frame, FrameVertex};
 use nativeres_core::memory::{RAM_END, RAM_START};
 use nativeres_core::psp_link::{copy_method, VramRequestTable, VRAM_REQUESTS_ADDRESS};
+use nativeres_core::frame_builder::DirectLists;
 use nativeres_core::vertex_cache::VertexCache;
 use nativeres_core::report::{self, TextBuffer};
 use nativeres_core::stats::FrameStats;
@@ -227,9 +228,47 @@ fn sample_psp_ram(address: u32, positions: &[usize], out: &mut [u32]) -> bool {
     true
 }
 
-/// The recorder thread's way to PSP memory.
+/// The copier's copy tasks (`DeferredReader::copy_bytes`, core copy_tasks):
+/// `out.len()` bytes at any address into any place of the raw arena. Both
+/// word-aligned: straight there (`psp_copy`'s bursts); otherwise the words
+/// holding them are read in bursts into a buffer on the stack and the bytes
+/// copied out of it (cached memory), as the recorder copied the word ring's
+/// words into the arena before.
+fn copy_psp_bytes(address: u32, out: &mut [u8]) -> bool {
+    const STAGING_BYTES: usize = 2048;
+    let skew = (address & 3) as usize;
+    let words_bytes = (skew + out.len()).next_multiple_of(4);
+    let source = platform::psp_memory(address & !3, words_bytes as u32);
+    if source.is_null() {
+        return false;
+    }
+    if skew == 0 && out.as_ptr() as usize & 3 == 0 {
+        // Safe: `out` holds its length; `source` is mapped PSP memory of
+        // at least that length (the game may write it meanwhile).
+        unsafe { platform::psp_copy(out.as_mut_ptr(), source, out.len() as u32) };
+        return true;
+    }
+    let mut staging = [0u32; STAGING_BYTES / 4];
+    let mut done = 0;
+    while done < out.len() {
+        let from = skew + done; // bytes from the first word
+        let lead = from & 3;
+        let take = (out.len() - done).min(STAGING_BYTES - lead);
+        let read = (lead + take).next_multiple_of(4);
+        // Safe: `staging` holds `read` bytes; the words read lie inside the
+        // `words_bytes` mapped above.
+        unsafe { platform::psp_copy(staging.as_mut_ptr() as *mut u8, source.add(from - lead), read as u32) };
+        // Safe to view as bytes: `read` bytes of `staging` were written.
+        let bytes = unsafe { core::slice::from_raw_parts(staging.as_ptr() as *const u8, read) };
+        out[done..done + take].copy_from_slice(&bytes[lead..lead + take]);
+        done += take;
+    }
+    true
+}
+
+/// The recorder thread's (and the copier's) way to PSP memory.
 const PSP_RAM_READER: nativeres_core::draw_stream::DeferredReader =
-    nativeres_core::draw_stream::DeferredReader { read: read_psp_ram, sample: sample_psp_ram };
+    nativeres_core::draw_stream::DeferredReader { read: read_psp_ram, sample: sample_psp_ram, copy_bytes: copy_psp_bytes };
 
 /// Set by the display side (programs.rs) once its 3D vertex program
 /// is made: without it, draws in model space couldn't be drawn.
@@ -291,6 +330,38 @@ fn make_vertex_cache() -> Option<&'static mut VertexCache> {
         if !ring.is_null() && ring_bytes >= nativeres_core::raw_arena::WINDOW_BYTES as usize {
             (*place).set_index_ring(core::slice::from_raw_parts_mut(ring, ring_bytes));
         }
+        Some(&mut *place)
+    }
+}
+
+/// The capture thread's lists for the raw draws it writes itself
+/// (`nativeres_core::frame_builder::DirectLists`, ~1.1 MiB), in phycont
+/// memory (blocks of whole MiB), made with the vertex cache.
+const DIRECT_LISTS_BYTES: usize = (core::mem::size_of::<DirectLists>() + 0xF_FFFF) & !0xF_FFFF;
+#[no_mangle]
+#[used]
+#[allow(non_upper_case_globals)]
+pub static nativeres_plan_phycont_direct_lists: u32 = DIRECT_LISTS_BYTES as u32;
+
+/// Capture thread: the builder's lists, or `None` if the memory is missing
+/// (every draw then goes through the job queue, as before step 2).
+fn make_direct_lists() -> Option<&'static mut DirectLists> {
+    // Safe: plain system calls; the block is zeroed before use and ours alone.
+    unsafe {
+        let block = sys::alloc_block(
+            b"NativeResDirectDraws\0".as_ptr(),
+            sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW,
+            DIRECT_LISTS_BYTES as u32,
+            core::ptr::null_mut(),
+        );
+        if block < 0 {
+            return None;
+        }
+        let mut base: *mut c_void = core::ptr::null_mut();
+        sys::sceKernelGetMemBlockBase(block, &mut base);
+        core::ptr::write_bytes(base as *mut u8, 0, DIRECT_LISTS_BYTES);
+        let place = base as *mut DirectLists;
+        DirectLists::init_zeroed(place);
         Some(&mut *place)
     }
 }
@@ -1032,6 +1103,10 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
             let message: &[u8] = if cache.is_some() { b"vertex cache ready\n" } else { b"vertex cache: no memory for its tables\n" };
             log::append(message);
             state.capture.set_vertex_cache(cache);
+            let lists = make_direct_lists();
+            let message: &[u8] = if lists.is_some() { b"direct draws ready\n" } else { b"direct draws: no memory for their lists\n" };
+            log::append(message);
+            state.capture.set_direct_lists(lists);
         }
         let header = ring.header();
         if header.magic != event_ring::MAGIC || header.version != event_ring::VERSION {
