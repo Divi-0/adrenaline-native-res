@@ -23,8 +23,13 @@ cargo $NIGHTLY build --release -p nativeres-plugin --target $VITA_TARGET \
 # some libraries are loaded. A plain import of a library not loaded yet makes
 # the loader refuse the whole module, so everything but the process's basics
 # is imported weak, and nothing calls a library before it is there.
+#
+# The capture thread's per-batch code is linked first, together, so it
+# misses the instruction cache less (scripts/hot-order.py explains).
+python3 scripts/hot-order.py target/$VITA_TARGET/release/libnativeres_plugin.a "$OUT/hot-order.ld"
 arm-vita-eabi-gcc -Wl,-q -nostartfiles -nostdlib \
   -Wl,-u,module_start -Wl,-u,module_stop \
+  -Wl,--section-ordering-file="$OUT/hot-order.ld" \
   -o "$OUT/nativeres.elf" \
   target/$VITA_TARGET/release/libnativeres_plugin.a \
   -Wl,--start-group \
