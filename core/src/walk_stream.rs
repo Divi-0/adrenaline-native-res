@@ -463,7 +463,7 @@ fn apply_run<M: PspMemory, V: CommandVisitor>(
                 done += 1;
             }
             // CALL / RET aren't in stage A's runs either (specials).
-            PlainAction::Stop | PlainAction::Call | PlainAction::Ret => {
+            PlainAction::Stop | PlainAction::Call | PlainAction::Ret | PlainAction::Visit | PlainAction::Prims => {
                 ge.set_register(command);
                 visitor.visit(command, ge, memory);
                 done += 1;

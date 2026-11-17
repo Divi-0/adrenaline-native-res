@@ -615,6 +615,33 @@ fn run_plain_commands(
                     ge.set_register(command);
                     break;
                 }
+                PlainAction::Visit => {
+                    ge.set_register(command);
+                    visitor.visit(command, ge, memory);
+                    crate::phase::enter(crate::phase::PLAIN);
+                    done += 1;
+                }
+                PlainAction::Prims => {
+                    // The PRIMs from here, as the main loop batches them;
+                    // a batch that may go on past this piece goes there.
+                    let rest = &words[done..];
+                    let count = rest.iter().take(MAX_PRIM_BATCH).take_while(|&&word| Command(word).opcode() == op::PRIM).count();
+                    if count == rest.len() && count < MAX_PRIM_BATCH {
+                        stopped_at = Some(command.0);
+                        break;
+                    }
+                    let mut batch = [command; MAX_PRIM_BATCH];
+                    for (slot, &word) in batch.iter_mut().zip(&rest[..count]) {
+                        *slot = Command(word);
+                    }
+                    ge.set_register(batch[count - 1]);
+                    visitor.visit_prims(&batch[..count], ge, memory);
+                    crate::phase::enter(crate::phase::PLAIN);
+                    for prim in &batch[..count] {
+                        ge.advance_after_draw(prim.data() & 0xFFFF);
+                    }
+                    done += count;
+                }
                 PlainAction::Stop => {
                     stopped_at = Some(command.0);
                     break;
@@ -700,6 +727,12 @@ pub enum PlainAction {
     /// nearly every draw: ~3,580 of the run-ending commands per race frame.
     Call,
     Ret,
+    /// A plain command the visitor wants (CLUT_LOAD for the recorder, ~720
+    /// per MTX race frame): visited from the run, as the main loop would.
+    Visit,
+    /// PRIMs for a visitor that takes them in batches: the batch visited
+    /// from the run (~1,430 per MTX race frame), as the main loop would.
+    Prims,
     /// Not plain, or the visitor wants it: `walk` handles it.
     Stop,
 }
@@ -714,9 +747,15 @@ pub struct PlainActions(pub(crate) [PlainAction; 256]);
 
 impl PlainActions {
     pub(crate) fn for_visitor(visitor: &impl CommandVisitor) -> Self {
+        // Not for stage A, whose runs must hold plain commands only.
+        let visits = !visitor.plain_runs_by_line() && !crate::bench::experiment(crate::bench::NO_VISIT_RUNS);
         PlainActions(core::array::from_fn(|opcode| {
             let opcode = opcode as u8;
-            if visitor.wants(opcode) {
+            if opcode == op::PRIM && visits && visitor.batches_prims() && visitor.wants(op::PRIM) {
+                PlainAction::Prims
+            } else if visits && visitor.wants(opcode) && PLAIN_COMMANDS[opcode as usize] {
+                PlainAction::Visit
+            } else if visitor.wants(opcode) {
                 PlainAction::Stop
             } else if is_address(opcode) && !crate::bench::experiment(crate::bench::NO_ADDRESS_RUNS) {
                 PlainAction::Address
