@@ -360,6 +360,12 @@ impl CommandVisitor for StreamWriter<'_> {
     fn should_pause(&self) -> bool {
         self.stream.needs_draining()
     }
+
+    /// A run record holds at most a line (`MAX_RECORD_WORDS`).
+    #[inline]
+    fn plain_runs_by_line(&self) -> bool {
+        true
+    }
 }
 
 // ---- Stage B ----
@@ -456,7 +462,8 @@ fn apply_run<M: PspMemory, V: CommandVisitor>(
                 ge.set_register(command);
                 done += 1;
             }
-            PlainAction::Stop => {
+            // CALL / RET aren't in stage A's runs either (specials).
+            PlainAction::Stop | PlainAction::Call | PlainAction::Ret => {
                 ge.set_register(command);
                 visitor.visit(command, ge, memory);
                 done += 1;

@@ -750,6 +750,11 @@ impl<A: CommandVisitor, B: CommandVisitor> CommandVisitor for Both<A, B> {
     fn should_pause(&self) -> bool {
         self.0.should_pause() || self.1.should_pause()
     }
+
+    #[inline]
+    fn plain_runs_by_line(&self) -> bool {
+        self.0.plain_runs_by_line() || self.1.plain_runs_by_line()
+    }
 }
 
 impl<T: CommandVisitor> CommandVisitor for &mut T {
@@ -778,6 +783,11 @@ impl<T: CommandVisitor> CommandVisitor for &mut T {
     #[inline]
     fn should_pause(&self) -> bool {
         (**self).should_pause()
+    }
+
+    #[inline]
+    fn plain_runs_by_line(&self) -> bool {
+        (**self).plain_runs_by_line()
     }
 }
 

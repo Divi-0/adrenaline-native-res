@@ -69,6 +69,9 @@ pub const NO_READ_AHEAD: u32 = 65536;
 /// VERTEX_ADDRESS, INDEX_ADDRESS and OFFSET_ADDRESS end the walk's plain
 /// runs, as before (`display_list::PlainAction::Address`).
 pub const NO_ADDRESS_RUNS: u32 = 131072;
+/// CALL and RET end the walk's plain runs, as before, and runs stop at a
+/// line's end (`display_list::PlainAction::Call`).
+pub const NO_CALL_RUNS: u32 = 262144;
 
 /// True if experiment `bit` is on.
 #[inline]

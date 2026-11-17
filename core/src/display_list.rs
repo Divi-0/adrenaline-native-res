@@ -73,11 +73,6 @@ struct ListWindow {
     len: usize,
 }
 
-const LINE_WORDS: usize = LINE_SIZE as usize / 4;
-
-/// PROBE (temporary): walk-loop stops per opcode.
-pub static PROBE: [core::sync::atomic::AtomicU32; 256] = [const { core::sync::atomic::AtomicU32::new(0) }; 256];
-
 /// The most a window holds: up to the end of a block (`BLOCK_SIZE`), which
 /// the block cache lends in one piece.
 const READ_AHEAD_WORDS: usize = BLOCK_WORDS;
@@ -229,6 +224,15 @@ pub trait CommandVisitor {
     #[inline]
     fn plain_run(&mut self, _words: &[u32]) {}
 
+    /// True: `walk` hands plain runs over a cache line (`LINE_SIZE`) at a
+    /// time and returns to its main loop after each, as before 2026-11-17:
+    /// the capture's stage A (`walk_stream`) makes room in its stream for
+    /// one such step at a time.
+    #[inline]
+    fn plain_runs_by_line(&self) -> bool {
+        false
+    }
+
     /// Checked before every command: true makes `walk` return
     /// `WalkResult::Paused` (stage A when its stream is full and the same
     /// thread has to empty it first, see `walk_stream`).
@@ -377,13 +381,13 @@ fn walk_list(
         if visitor.should_pause() {
             return WalkResult::Paused;
         }
-        // CALL and RET below change the depth for the next round.
-        let window = &mut windows[list.stack_len.min(KEPT_WINDOWS - 1)];
         let mut transferred = false;
         let plain_started = crate::cycles::start(crate::cycles::PLAIN);
         let (ran, stopped_at) =
-            run_plain_commands(list, ge, window, memory, &actions, visitor, max_commands - executed, commands);
+            run_plain_commands(list, ge, &mut windows, memory, &actions, visitor, max_commands - executed, commands);
         crate::cycles::add(crate::cycles::PLAIN, plain_started);
+        // The plain run and CALL / RET below change the depth.
+        let window = &mut windows[list.stack_len.min(KEPT_WINDOWS - 1)];
         crate::phase::enter(crate::phase::WALK);
         executed += ran;
         if executed >= max_commands {
@@ -401,7 +405,6 @@ fn walk_list(
         };
         *commands += 1;
         let command = Command(word);
-        PROBE[command.opcode() as usize].fetch_add(1, core::sync::atomic::Ordering::Relaxed); // PROBE
 
         // A PRIM and the PRIMs right after it go to the visitor together.
         if command.opcode() == op::PRIM && visitor.batches_prims() && visitor.wants(op::PRIM) {
@@ -453,31 +456,8 @@ fn walk_list(
             // "visible" and fall through, which visits a superset of draws.
             op::BOUNDING_BOX_JUMP => {}
 
-            op::CALL => {
-                let target = ge.relative_address(command.data() & !3);
-                // A CALL to an address that isn't memory is skipped and the
-                // list goes on, as PPSSPP does (GPUCommon::Execute_Call with
-                // its default bIgnoreBadMemAccess) and as Sony's emulator
-                // evidently does: MTX's attract demo calls 0x050040C4 (BASE 5
-                // with offset 0) before drawing its logo and menu overlay.
-                if is_valid_address(target) && list.hardware_call_depth() < HARDWARE_CALL_DEPTH {
-                    let saved = ReturnPoint { address: next_pc, offset: ge.offset, base: None };
-                    if list.push(saved) {
-                        next_pc = target;
-                    }
-                }
-            }
-
-            op::RET => {
-                // RET with an empty stack is ignored, like on hardware.
-                if let Some(point) = list.pop() {
-                    ge.offset = point.offset;
-                    if let Some(base) = point.base {
-                        ge.set_register(Command(((op::BASE as u32) << 24) | base));
-                    }
-                    next_pc = physical(point.address);
-                }
-            }
+            op::CALL => next_pc = call(list, ge, command, next_pc),
+            op::RET => next_pc = ret(list, ge, next_pc),
 
             op::END => {
                 let previous = window.word(memory, pc.wrapping_sub(4)).map(Command);
@@ -558,10 +538,12 @@ pub(crate) const PLAIN_COMMANDS: [bool; 256] = {
 /// Runs the plain commands at the list's position that the visitor doesn't
 /// want, straight from the memory block they are in (one lookup for the
 /// run, like PPSSPP's FastRunLoop reading the list through a pointer):
-/// most commands of a list only set a register. Stops at the first other
-/// command, at the stall address, at the cache line's end or after `limit`
-/// commands; returns how many it ran, and the command it stopped at if that
-/// was a command it doesn't run (so `walk` needn't read it again).
+/// most commands of a list only set a register. It also takes the address
+/// commands and follows CALL / RET (`PlainAction`) and goes on from window
+/// to window. Stops at the first other command, at the stall address or
+/// after `limit` commands; returns how many it ran, and the command it
+/// stopped at if that was a command it doesn't run (so `walk` needn't read
+/// it again).
 ///
 /// A run of matrix DATA commands (12 or 16 in a row for every matrix the
 /// game uploads) is handed to `GeState::upload_matrix_run` at once, like
@@ -570,63 +552,125 @@ pub(crate) const PLAIN_COMMANDS: [bool; 256] = {
 fn run_plain_commands(
     list: &mut DisplayList,
     ge: &mut GeState,
-    window: &mut ListWindow,
+    windows: &mut [ListWindow; KEPT_WINDOWS],
     memory: &mut impl PspMemory,
     actions: &PlainActions,
     visitor: &mut impl CommandVisitor,
     limit: u32,
     commands: &mut u32,
 ) -> (u32, Option<u32>) {
-    let pc = list.pc;
-    if pc % 4 != 0 {
-        return (0, None);
-    }
-    // Up to the end of the cache line: a block is filled a line at a time
-    // (`block_cache::LINE_SIZE`), so borrowing further would copy lines the
-    // list may never reach (a CALLed sub-list is often a few dozen words).
-    let count = ((LINE_SIZE - pc % LINE_SIZE) / 4).min(limit);
-    let count = commands_before_stall(list.stall, pc, count as usize) as u32;
-    if count == 0 {
-        return (0, None);
-    }
+    // As before 2026-11-17 (A/B): one piece, up to the line's end.
+    let one_line = crate::bench::experiment(crate::bench::NO_CALL_RUNS) || visitor.plain_runs_by_line();
+    let mut ran = 0;
     crate::phase::enter(crate::phase::PLAIN);
-    let Some(words) = window.words_from(memory, pc, count as usize) else {
-        return (0, None);
-    };
-    let mut done = 0;
-    let mut stopped_at = None;
-    while done < words.len() {
-        let command = Command(words[done]);
-        match actions.0[command.opcode() as usize] {
-            PlainAction::SetRegister => {
-                ge.set_plain_register(command);
-                done += 1;
-            }
-            PlainAction::MatrixRun => {
-                crate::phase::enter(crate::phase::MATRIX);
-                let started = crate::cycles::start(crate::cycles::MATRIX);
-                done += ge.upload_matrix_run(&words[done..]);
-                crate::cycles::add(crate::cycles::MATRIX, started);
-                crate::phase::enter(crate::phase::PLAIN);
-            }
-            PlainAction::Address => {
-                ge.apply_address(command);
-                ge.set_register(command);
-                done += 1;
-            }
-            PlainAction::Stop => {
-                stopped_at = Some(command.0);
-                break;
+    // A piece of the list from one window at a time: up to the window's
+    // end, a CALL or a RET (then on in the window of the new depth), or a
+    // command the run doesn't take.
+    loop {
+        let pc = list.pc;
+        if pc % 4 != 0 {
+            return (ran, None);
+        }
+        let mut count = (limit - ran) as usize;
+        if one_line {
+            count = count.min(((LINE_SIZE - pc % LINE_SIZE) / 4) as usize);
+        }
+        let count = commands_before_stall(list.stall, pc, count);
+        if count == 0 {
+            return (ran, None);
+        }
+        let window = &mut windows[list.stack_len.min(KEPT_WINDOWS - 1)];
+        let Some(words) = window.words_from(memory, pc, count) else {
+            return (ran, None);
+        };
+        let mut done = 0;
+        let mut stopped_at = None;
+        let mut next_pc = None;
+        while done < words.len() {
+            let command = Command(words[done]);
+            match actions.0[command.opcode() as usize] {
+                PlainAction::SetRegister => {
+                    ge.set_plain_register(command);
+                    done += 1;
+                }
+                PlainAction::MatrixRun => {
+                    crate::phase::enter(crate::phase::MATRIX);
+                    let started = crate::cycles::start(crate::cycles::MATRIX);
+                    done += ge.upload_matrix_run(&words[done..]);
+                    crate::cycles::add(crate::cycles::MATRIX, started);
+                    crate::phase::enter(crate::phase::PLAIN);
+                }
+                PlainAction::Address => {
+                    ge.apply_address(command);
+                    ge.set_register(command);
+                    done += 1;
+                }
+                PlainAction::Call | PlainAction::Ret => {
+                    done += 1;
+                    let after = pc.wrapping_add(4 * done as u32);
+                    next_pc = Some(match command.opcode() {
+                        op::CALL => call(list, ge, command, after),
+                        _ => ret(list, ge, after),
+                    });
+                    ge.set_register(command);
+                    break;
+                }
+                PlainAction::Stop => {
+                    stopped_at = Some(command.0);
+                    break;
+                }
             }
         }
+        let read_all = done == words.len();
+        if done > 0 {
+            visitor.plain_run(&words[..done]);
+        }
+        *commands += done as u32;
+        ran += done as u32;
+        list.pc = next_pc.unwrap_or(pc.wrapping_add(4 * done as u32));
+        // On after a CALL / RET or at the window's end, unless the main loop
+        // must look first: a command the run doesn't take, the limit, a
+        // pausing visitor (stage A, whose stream may be full).
+        let go_on = next_pc.is_some() || (read_all && !one_line);
+        if stopped_at.is_some() || !go_on || ran >= limit || visitor.should_pause() {
+            return (ran, stopped_at);
+        }
     }
-    if done > 0 {
-        visitor.plain_run(&words[..done]);
+}
+
+/// CALL at `next_pc - 4`: pushes the return point and gives the target, or
+/// `next_pc` if the call is skipped.
+#[inline(always)]
+fn call(list: &mut DisplayList, ge: &GeState, command: Command, next_pc: u32) -> u32 {
+    let target = ge.relative_address(command.data() & !3);
+    // A CALL to an address that isn't memory is skipped and the list goes
+    // on, as PPSSPP does (GPUCommon::Execute_Call with its default
+    // bIgnoreBadMemAccess) and as Sony's emulator evidently does: MTX's
+    // attract demo calls 0x050040C4 (BASE 5 with offset 0) before drawing its
+    // logo and menu overlay.
+    if is_valid_address(target) && list.hardware_call_depth() < HARDWARE_CALL_DEPTH {
+        let saved = ReturnPoint { address: next_pc, offset: ge.offset, base: None };
+        if list.push(saved) {
+            return target;
+        }
     }
-    let done = done as u32;
-    list.pc = pc.wrapping_add(4 * done);
-    *commands += done;
-    (done, stopped_at)
+    next_pc
+}
+
+/// RET: the return point's address (offset and BASE restored), or
+/// `next_pc` with an empty stack (ignored, like on hardware).
+#[inline(always)]
+fn ret(list: &mut DisplayList, ge: &mut GeState, next_pc: u32) -> u32 {
+    match list.pop() {
+        Some(point) => {
+            ge.offset = point.offset;
+            if let Some(base) = point.base {
+                ge.set_register(Command(((op::BASE as u32) << 24) | base));
+            }
+            physical(point.address)
+        }
+        None => next_pc,
+    }
 }
 
 /// `count`, or fewer if the stall address comes sooner: how many of the
@@ -651,6 +695,11 @@ pub enum PlainAction {
     /// ~1,570 of the ~7,400 commands per frame that ended a plain run
     /// (each such stop goes round the main loop, a few hundred cycles).
     Address,
+    /// CALL / RET for a visitor that doesn't want them: the run follows
+    /// them into the window of the new depth. MTX calls a sub-list for
+    /// nearly every draw: ~3,580 of the run-ending commands per race frame.
+    Call,
+    Ret,
     /// Not plain, or the visitor wants it: `walk` handles it.
     Stop,
 }
@@ -671,6 +720,10 @@ impl PlainActions {
                 PlainAction::Stop
             } else if is_address(opcode) && !crate::bench::experiment(crate::bench::NO_ADDRESS_RUNS) {
                 PlainAction::Address
+            } else if opcode == op::CALL && !crate::bench::experiment(crate::bench::NO_CALL_RUNS) {
+                PlainAction::Call
+            } else if opcode == op::RET && !crate::bench::experiment(crate::bench::NO_CALL_RUNS) {
+                PlainAction::Ret
             } else if !PLAIN_COMMANDS[opcode as usize] {
                 PlainAction::Stop
             } else if is_matrix_data(opcode) {
