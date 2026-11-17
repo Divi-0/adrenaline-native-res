@@ -75,6 +75,9 @@ pub const NO_CALL_RUNS: u32 = 262144;
 /// Wanted plain commands (CLUT_LOAD) and PRIM batches end the walk's plain
 /// runs, as before (`display_list::PlainAction::Visit` / `Prims`).
 pub const NO_VISIT_RUNS: u32 = 524288;
+/// A PRIM batch's calls array is cleared whole first (512 bytes), as before
+/// (`recorder::record_prims`).
+pub const ZEROED_CALLS: u32 = 1048576;
 
 /// True if experiment `bit` is on.
 #[inline]

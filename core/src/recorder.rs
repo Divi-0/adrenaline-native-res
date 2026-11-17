@@ -489,18 +489,24 @@ fn record_prims(
 ) {
     let format = ge.vertex_format();
     let vertex_size = ge.vertex_layout().size;
-    let mut calls = [PrimCall::EMPTY; MAX_PRIM_BATCH];
+    // Only the batch's own calls are written: clearing all 32 first was
+    // 512 bytes of stores per batch for nothing.
+    let mut calls = [core::mem::MaybeUninit::<PrimCall>::uninit(); MAX_PRIM_BATCH];
+    if crate::bench::experiment(crate::bench::ZEROED_CALLS) {
+        calls.fill(core::mem::MaybeUninit::new(PrimCall::EMPTY));
+    }
     let (mut vertex_address, mut index_address) = (ge.vertex_address, ge.index_address);
     let len = prims.len().min(MAX_PRIM_BATCH);
     for (call, prim) in calls.iter_mut().zip(&prims[..len]) {
         let count = prim.data() & 0xFFFF;
-        *call = PrimCall { primitive_type: (prim.data() >> 16) & 7, count, vertex_address, index_address };
+        call.write(PrimCall { primitive_type: (prim.data() >> 16) & 7, count, vertex_address, index_address });
         match format.index_format() {
             IndexFormat::None => vertex_address = vertex_address.wrapping_add(count * vertex_size),
             index => index_address = index_address.wrapping_add(count * index.size()),
         }
     }
-    let calls = &calls[..len];
+    // Safe: the loop wrote the first `len` calls.
+    let calls = unsafe { core::slice::from_raw_parts(calls.as_ptr() as *const PrimCall, len) };
     if calls.len() > 1 && can_batch(ge, calls) {
         queue_batch(frame, catalog, stats, palette, draw_states, ge, memory, calls, stream);
     } else if calls.len() > 1 && can_batch_indexed(ge, calls) {
