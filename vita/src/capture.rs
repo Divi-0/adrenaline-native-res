@@ -248,7 +248,9 @@ fn copy_psp_bytes(address: u32, out: &mut [u8]) -> bool {
         unsafe { platform::psp_copy(out.as_mut_ptr(), source, out.len() as u32) };
         return true;
     }
-    let mut staging = [0u32; STAGING_BYTES / 4];
+    // Not zeroed: only the bytes `psp_copy` wrote are read back (a zeroed
+    // 2 KiB buffer cost every unaligned task a memset: ~1 in 4 of MTX's).
+    let mut staging = core::mem::MaybeUninit::<[u32; STAGING_BYTES / 4]>::uninit();
     let mut done = 0;
     while done < out.len() {
         let from = skew + done; // bytes from the first word
@@ -258,7 +260,7 @@ fn copy_psp_bytes(address: u32, out: &mut [u8]) -> bool {
         // Safe: `staging` holds `read` bytes; the words read lie inside the
         // `words_bytes` mapped above.
         unsafe { platform::psp_copy(staging.as_mut_ptr() as *mut u8, source.add(from - lead), read as u32) };
-        // Safe to view as bytes: `read` bytes of `staging` were written.
+        // Safe to view as bytes: `read` bytes of `staging` were written just now.
         let bytes = unsafe { core::slice::from_raw_parts(staging.as_ptr() as *const u8, read) };
         out[done..done + take].copy_from_slice(&bytes[lead..lead + take]);
         done += take;
