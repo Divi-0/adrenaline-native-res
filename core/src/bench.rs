@@ -36,6 +36,9 @@ pub const SKIP_STAGE_B_PLAIN: u32 = 32;
 /// The capture's stage A passes every plain register write on, also those
 /// that change nothing (`walk_stream::StreamWriter`); not frame-changing.
 pub const NO_WRITE_FILTER: u32 = 64;
+/// The capture thread's raw draws work their table entries out every time,
+/// also when they repeat the previous draw's (`frame_builder::LastEntries`).
+pub const NO_REPEATED_ENTRIES: u32 = 128;
 
 /// True if experiment `bit` is on.
 #[inline]

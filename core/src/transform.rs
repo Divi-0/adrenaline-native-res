@@ -507,6 +507,12 @@ impl TransformInputs {
         (self.base_change, self.lighting_change)
     }
 
+    /// When the bones last changed (`TransformCache`'s number; 0 for inputs
+    /// made with `of`).
+    pub fn bone_change(&self) -> u32 {
+        self.bone_change
+    }
+
     /// The bones the format's weights use (4x3 each, column by column, as
     /// uploaded); empty without weights.
     pub fn bones(&self) -> &[[f32; 12]] {

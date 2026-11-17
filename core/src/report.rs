@@ -111,19 +111,21 @@ pub fn write_frame(out: &mut impl Write, stats: &FrameStats) -> fmt::Result {
     }
     // Raw draws the capture thread wrote itself (`frame_builder`):
     // direct=<PRIMs>/<draws>/<copy tasks>/<KiB>/<gathered spans>/<sparse spans
-    // copied whole>/<fallback segments>
+    // copied whole>/<fallback segments>/<draws that repeated the previous
+    // draw's table entries>
     let direct = &stats.direct;
     if direct.prims + direct.segments > 0 {
         write!(
             out,
-            " direct={}/{}/{}/{}k/{}/{}/{}",
+            " direct={}/{}/{}/{}k/{}/{}/{}/{}",
             direct.prims,
             direct.draws,
             direct.tasks,
             direct.task_bytes / 1024,
             direct.gathered,
             direct.sparse,
-            direct.segments
+            direct.segments,
+            direct.repeated
         )?;
     }
 

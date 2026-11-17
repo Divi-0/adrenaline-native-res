@@ -122,6 +122,25 @@ impl DirectLists {
     }
 }
 
+/// The previous raw draw's table entries and what they were worked out
+/// from. A draw with the same vertex format, the same transform inputs (by
+/// their change numbers, `TransformInputs::changes`) and the same raw colours
+/// gets the same entries: the tables' own lookups (`raw_blocks::raw_transform`
+/// against the newest entry, `RawTables::add_bones`, `add_raw_colors`) would
+/// find exactly these again, since nothing else writes the tables between two
+/// raw draws of this thread (the sprite path forgets them). About half the
+/// draws repeat the one before (MTX's race: ~1,250 calls make ~650 draws).
+#[derive(Clone, Copy)]
+struct LastEntries {
+    format: u32,
+    /// Base, bone and lighting change numbers (never 0: inputs without
+    /// numbers aren't remembered).
+    changes: (u32, u32, u32),
+    colors: RawColors,
+    /// Transform, raw colours, bones (`Draw::transform`, `raw_colors`, `bones`).
+    entries: (u32, u32, u32),
+}
+
 /// Counted per frame for the capture log (`FrameStats::direct`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DirectStats {
@@ -137,10 +156,13 @@ pub struct DirectStats {
     pub sparse: u32,
     /// Fallback segments (stretches of recorder draws).
     pub segments: u32,
+    /// Draws that took the previous draw's table entries (`LastEntries`).
+    pub repeated: u32,
 }
 
 impl DirectStats {
-    pub const EMPTY: DirectStats = DirectStats { prims: 0, draws: 0, tasks: 0, task_bytes: 0, gathered: 0, sparse: 0, segments: 0 };
+    pub const EMPTY: DirectStats =
+        DirectStats { prims: 0, draws: 0, tasks: 0, task_bytes: 0, gathered: 0, sparse: 0, segments: 0, repeated: 0 };
 }
 
 pub struct FrameBuilder {
@@ -155,6 +177,8 @@ pub struct FrameBuilder {
     /// vertex cache, given back when switched off).
     raw: Option<RawArena>,
     ring: Option<RawArena>,
+    /// The previous raw draw's entries this frame (`LastEntries`).
+    last_entries: Option<LastEntries>,
     pub stats: DirectStats,
 }
 
@@ -169,6 +193,7 @@ impl FrameBuilder {
             active: false,
             raw: None,
             ring: None,
+            last_entries: None,
             stats: DirectStats::EMPTY,
         }
     }
@@ -217,6 +242,8 @@ impl FrameBuilder {
         self.order_count = 0;
         self.fallback_segments = 0;
         self.gather_count = 0;
+        // The frame's tables start empty.
+        self.last_entries = None;
         self.stats = DirectStats::EMPTY;
         self.active
     }
@@ -306,6 +333,7 @@ impl FrameBuilder {
             stats: &mut self.stats,
             gather,
             gather_count: &mut self.gather_count,
+            last_entries: &mut self.last_entries,
         };
         let draw = Draw { first_vertex: 0, first_index: out.geometry.index_count(), ..prepared.draw };
         let all_triangles = calls.iter().all(|call| (primitive::TRIANGLES..=primitive::TRIANGLE_FAN).contains(&call.primitive_type));
@@ -421,12 +449,33 @@ struct Writer<'g, 'a, M: PspMemory> {
     stats: &'g mut DirectStats,
     gather: &'g mut [u16; GATHER_ENTRIES],
     gather_count: &'g mut usize,
+    last_entries: &'g mut Option<LastEntries>,
 }
 
 impl<M: PspMemory> Writer<'_, '_, M> {
     /// The draw's table entries: transform, colours, bones (as
     /// `recorder::raw_table_entries`, each part in its own profile phase).
     fn entries(&mut self, format: VertexFormat, inputs: &TransformInputs, colors: &RawColors) -> Result<(u32, u32, u32), usize> {
+        let (base, lighting) = inputs.changes();
+        let changes = (base, inputs.bone_change(), lighting);
+        let remembered = base != 0 && !crate::bench::experiment(crate::bench::NO_REPEATED_ENTRIES);
+        if remembered {
+            if let Some(last) = self.last_entries.as_ref() {
+                if last.format == format.0 && last.changes == changes && last.colors.words() == colors.words() {
+                    self.stats.repeated += 1;
+                    return Ok(last.entries);
+                }
+            }
+        }
+        // Forgotten first: a lookup that fails half-way has changed the tables.
+        *self.last_entries = None;
+        let entries = self.work_out_entries(format, inputs, colors)?;
+        *self.last_entries = remembered.then_some(LastEntries { format: format.0, changes, colors: *colors, entries });
+        Ok(entries)
+    }
+
+    /// The table entries looked up or added (`entries` without the repeat).
+    fn work_out_entries(&mut self, format: VertexFormat, inputs: &TransformInputs, colors: &RawColors) -> Result<(u32, u32, u32), usize> {
         use crate::phase::{DIRECT_BONES, DIRECT_COLORS, DIRECT_TRANSFORM};
         let tables = self.geometry.raw_tables().ok_or(fallback::TABLES_FULL)?;
         let lit = colors.rules[0] == crate::raw_vertex::lighting::LIGHTS;
@@ -729,6 +778,9 @@ impl<M: PspMemory> Writer<'_, '_, M> {
         let stride = layout.size;
         let pair = 2 * stride;
         let length = stride * (2 * sprites - 1) + format.bytes_used(layout);
+        // Entries of their own (no lights): the next draw can't repeat the
+        // remembered ones without the tables' lookups (`LastEntries`).
+        *self.last_entries = None;
         let tables = self.geometry.raw_tables().ok_or(fallback::TABLES_FULL)?;
         let number = crate::raw_blocks::raw_transform(tables, inputs, None).ok_or(fallback::TABLES_FULL)?;
         let colors_number = tables.add_raw_colors(colors).ok_or(fallback::TABLES_FULL)?;
