@@ -689,6 +689,11 @@ pub struct Frame {
     /// The texture cache compares it with the data it decoded. Part of the
     /// catalog; entries of textures not in the frame are stale.
     pub texture_samples: [u32; MAX_TEXTURES],
+    /// Per texture one bit: its sample was taken in this frame, or handed
+    /// to the copier (`Catalog::texture_sample_place`). Only used while
+    /// recording; a texture's bit is cleared when it is added. Part of the
+    /// catalog.
+    pub texture_sampled: [u32; MAX_TEXTURES / 32],
     /// The objects and cameras of raw draws (`Draw::transform` of draws with
     /// `draw_flags::RAW_VERTICES`, `RawTransform::camera`). Part of the
     /// geometry.
@@ -807,6 +812,7 @@ impl Frame {
             palette_hashes,
             texture_levels,
             texture_samples,
+            texture_sampled,
             raw_transform_count,
             raw_transforms,
             raw_camera_count,
@@ -852,7 +858,8 @@ impl Frame {
                 palettes,
                 palette_slots,
                 texture_levels,
-                texture_samples,
+                texture_samples: texture_samples.as_mut_ptr(),
+                texture_sampled,
             },
         )
     }
@@ -946,7 +953,8 @@ impl Frame {
             palettes: &mut *addr_of_mut!((*frame).palettes),
             palette_slots: &mut *addr_of_mut!((*frame).palette_slots),
             texture_levels: &mut *addr_of_mut!((*frame).texture_levels),
-            texture_samples: &mut *addr_of_mut!((*frame).texture_samples),
+            texture_samples: addr_of_mut!((*frame).texture_samples) as *mut u32,
+            texture_sampled: &mut *addr_of_mut!((*frame).texture_sampled),
         }
     }
 
@@ -1886,7 +1894,11 @@ pub struct Catalog<'a> {
     palettes: &'a mut [FramePalette; MAX_FRAME_PALETTES],
     palette_slots: &'a mut [u16; PALETTE_SLOTS],
     texture_levels: &'a mut [TextureLevels; MAX_TEXTURES],
-    texture_samples: &'a mut [u32; MAX_TEXTURES],
+    /// `Frame::texture_samples` (`MAX_TEXTURES` entries), by pointer: the
+    /// copier writes the entries it was handed (`texture_sample_place`)
+    /// while the catalog is in use.
+    texture_samples: *mut u32,
+    texture_sampled: &'a mut [u32; MAX_TEXTURES / 32],
 }
 
 /// A palette's place in a frame (`Catalog::add_palette`).
@@ -1906,15 +1918,43 @@ impl Catalog<'_> {
 
     /// The mip levels of the texture at `index` (one with
     /// `texture_flags::LEVELS_SHIFT`).
-    /// `Frame::texture_samples` of texture `index` (0 = not sampled yet).
-    pub fn texture_sample(&self, index: u32) -> u32 {
-        self.texture_samples.get(index as usize).copied().unwrap_or(0)
+    /// True if texture `index`'s sample was taken in this frame or handed
+    /// to the copier (`texture_sample_place`); also for an index out of
+    /// range (nothing to sample).
+    pub fn is_sampled(&self, index: u32) -> bool {
+        let index = index as usize;
+        index >= MAX_TEXTURES || self.texture_sampled[index / 32] & (1 << (index % 32)) != 0
     }
 
-    pub fn set_texture_sample(&mut self, index: u32, sample: u32) {
-        if let Some(entry) = self.texture_samples.get_mut(index as usize) {
-            *entry = sample;
+    /// Takes back `texture_sample_place`'s note for a sample that wasn't
+    /// handed to the copier after all.
+    pub fn unmark_sampled(&mut self, index: u32) {
+        let index = index as usize;
+        if index < MAX_TEXTURES {
+            self.texture_sampled[index / 32] &= !(1 << (index % 32));
         }
+    }
+
+    /// Stores texture `index`'s sample, taken now (`texture::quick_sample`).
+    pub fn set_texture_sample(&mut self, index: u32, sample: u32) {
+        if let Some(entry) = self.texture_sample_place(index) {
+            // Safe: the entry is in the frame and this texture's alone.
+            unsafe { entry.write(sample) };
+        }
+    }
+
+    /// Texture `index`'s `Frame::texture_samples` entry, noted as sampled:
+    /// for a sample task (`copy_tasks::Layout::Sample`), whose copier writes
+    /// it. Nobody else writes it until the texture is added again in a later
+    /// frame (`add_texture`), when every task is done. `None` out of range.
+    pub fn texture_sample_place(&mut self, index: u32) -> Option<*mut u32> {
+        let index = index as usize;
+        if index >= MAX_TEXTURES {
+            return None;
+        }
+        self.texture_sampled[index / 32] |= 1 << (index % 32);
+        // Safe: `texture_samples` points to `MAX_TEXTURES` entries.
+        Some(unsafe { self.texture_samples.add(index) })
     }
 
     pub fn set_texture_levels(&mut self, index: u32, levels: &TextureLevels) {
@@ -1948,7 +1988,12 @@ impl Catalog<'_> {
             return None;
         }
         self.textures[*self.texture_count as usize] = texture;
-        self.texture_samples[*self.texture_count as usize] = 0; // sampled by the recorder (`set_texture_sample`)
+        // Not sampled yet (`recorder::sample_texture`). Safe: the index is
+        // below MAX_TEXTURES (checked above), and no task of this frame has
+        // its entry yet.
+        let index = *self.texture_count as usize;
+        unsafe { self.texture_samples.add(index).write(0) };
+        self.texture_sampled[index / 32] &= !(1 << (index % 32));
         *self.texture_count += 1;
         self.texture_lookup[slot] = *self.texture_count as u16;
         *self.last_texture = *self.texture_count - 1;

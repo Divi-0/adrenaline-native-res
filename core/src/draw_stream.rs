@@ -505,7 +505,7 @@ impl DrawStream {
     /// if there was none (or no reader to copy with).
     fn copy_one_task(&self) -> bool {
         match self.reader {
-            Some(reader) => self.tasks.copy_one(&mut ReaderSource(reader.copy_bytes), STABLE_COPIES.load(Ordering::Relaxed)),
+            Some(reader) => self.tasks.copy_one(&mut ReaderSource { copy_bytes: reader.copy_bytes, sample: reader.sample }, STABLE_COPIES.load(Ordering::Relaxed)),
             None => false,
         }
     }
@@ -613,16 +613,24 @@ impl DrawStream {
     /// couldn't be read (zeros written then; the caller should drop the
     /// draw).
     pub(crate) fn copy_task(&mut self, memory: &mut impl PspMemory, task: CopyTask) -> bool {
+        self.hand_over_task(memory, task)
+            || crate::copy_tasks::run(&task, &mut MemorySource(memory), STABLE_COPIES.load(Ordering::Relaxed))
+    }
+
+    /// `copy_task`'s first half: `task` published for the copier if there
+    /// is one and it can read the source now (`PspMemory::defer`). False:
+    /// nothing done, the caller copies it its own way.
+    pub(crate) fn hand_over_task(&mut self, memory: &mut impl PspMemory, task: CopyTask) -> bool {
         let start = task.source & !3;
         let span = (task.source - start) + task.length;
         let stable = STABLE_COPIES.load(Ordering::Relaxed);
         let (Some(copier), Some(reader)) = (self.copier, self.reader) else {
-            return crate::copy_tasks::run(&task, &mut MemorySource(memory), stable);
+            return false;
         };
         if !memory.defer(start, span.next_multiple_of(4)) {
-            return crate::copy_tasks::run(&task, &mut MemorySource(memory), stable);
+            return false;
         }
-        self.tasks.push(task, |tasks| tasks.copy_one(&mut ReaderSource(reader.copy_bytes), stable));
+        self.tasks.push(task, |tasks| tasks.copy_one(&mut ReaderSource { copy_bytes: reader.copy_bytes, sample: reader.sample }, stable));
         // Published (and the copier woken) every `TASK_BATCH` tasks: each
         // publish and wake is three barriers (`copy_thread::wake`). Whoever
         // then waits for the copies publishes the rest first

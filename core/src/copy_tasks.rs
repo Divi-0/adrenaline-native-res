@@ -66,6 +66,13 @@ pub enum Layout {
     /// them. A source that can't be read whole: the words up to the first
     /// unreadable one (`recorder::store_palette`).
     Palette { words: u32, hash: *mut u32 },
+    /// A texture's quick sample (`texture::quick_sample`, taken at the
+    /// texture's first use in a frame: `recorder::sample_texture`): the
+    /// words at `texture::quick_sample_positions_in(words)` of the data at
+    /// `source` folded into one word, written to the destination (the
+    /// texture's `Frame::texture_samples` entry); 0 ("not sampled") if one
+    /// can't be read. `length` covers the words read (for `PspMemory::defer`).
+    Sample { words: u32 },
 }
 
 /// One copy.
@@ -82,7 +89,8 @@ pub struct CopyTask {
 
 // Safe to send: the destination is memory the task's producer reserved for
 // it (the raw arena; a palette's place and hash entry in the frame, given
-// to this palette alone by `Catalog::add_palette`), touched by nobody else
+// to this palette alone by `Catalog::add_palette`; a texture's sample entry,
+// handed out once per frame by `Catalog::texture_sample_place`), touched by nobody else
 // until the task is done, and a gather list stays unchanged until then.
 unsafe impl Send for CopyTask {}
 
@@ -97,6 +105,7 @@ impl CopyTask {
             Layout::Sprites { pair } => 4 * pair as usize * length.div_ceil(pair as usize),
             Layout::Gather { stride, .. } => length * stride as usize,
             Layout::Palette { words, .. } => 4 * words as usize,
+            Layout::Sample { .. } => 4,
         }
     }
 }
@@ -105,14 +114,35 @@ impl CopyTask {
 /// alignment). False if they can't be read.
 pub trait ByteSource {
     fn read_bytes(&mut self, address: u32, out: &mut [u8]) -> bool;
+
+    /// The words at word-aligned `address + 4 * positions[i]` into `out[i]`
+    /// (a sample task's). False if one can't be read. Default: word by word
+    /// with `read_bytes`.
+    fn read_samples(&mut self, address: u32, positions: &[usize], out: &mut [u32]) -> bool {
+        positions.iter().zip(out.iter_mut()).all(|(&position, word)| {
+            let mut bytes = [0u8; 4];
+            let readable = self.read_bytes(address.wrapping_add(4 * position as u32), &mut bytes);
+            *word = u32::from_le_bytes(bytes);
+            readable
+        })
+    }
 }
 
-/// A copier's way to PSP memory (`DeferredReader::copy_bytes`).
-pub struct ReaderSource(pub fn(address: u32, out: &mut [u8]) -> bool);
+/// A copier's way to PSP memory (`DeferredReader::copy_bytes`, and
+/// `DeferredReader::sample` for sample tasks: the address translated once,
+/// a load per word; 4-byte `copy_bytes` reads went through a staging buffer).
+pub struct ReaderSource {
+    pub copy_bytes: fn(address: u32, out: &mut [u8]) -> bool,
+    pub sample: fn(address: u32, positions: &[usize], out: &mut [u32]) -> bool,
+}
 
 impl ByteSource for ReaderSource {
     fn read_bytes(&mut self, address: u32, out: &mut [u8]) -> bool {
-        (self.0)(address, out)
+        (self.copy_bytes)(address, out)
+    }
+
+    fn read_samples(&mut self, address: u32, positions: &[usize], out: &mut [u32]) -> bool {
+        (self.sample)(address, positions, out)
     }
 }
 
@@ -149,6 +179,9 @@ pub fn run(task: &CopyTask, source: &mut impl ByteSource, stable: bool) -> bool 
     if let Layout::Palette { words, hash } = task.layout {
         return palette(task, (words, hash), source, stable);
     }
+    if let Layout::Sample { words } = task.layout {
+        return sample(task, words, source);
+    }
     // Safe: the destination holds `written()` bytes reserved for this task
     // (see `CopyTask`).
     let out = unsafe { core::slice::from_raw_parts_mut(task.destination, task.written()) };
@@ -160,7 +193,7 @@ pub fn run(task: &CopyTask, source: &mut impl ByteSource, stable: bool) -> bool 
             let list = unsafe { core::slice::from_raw_parts(list, task.length as usize) };
             gather(task.source, (stride, used), list, source, out)
         }
-        Layout::Palette { .. } => unreachable!("handled above"),
+        Layout::Palette { .. } | Layout::Sample { .. } => unreachable!("handled above"),
     };
     if !read {
         out.fill(0);
@@ -187,6 +220,24 @@ fn palette(task: &CopyTask, (words, hash): (u32, *mut u32), source: &mut impl By
     };
     stored[readable..].fill(0);
     *hash = crate::texture::hash_words(stored);
+    whole
+}
+
+/// A sample task (`Layout::Sample`): the texture's sample words read once
+/// each (as the capture thread read them, `PspMemory::read_samples`) and
+/// folded. False if one couldn't be read (counted in `UNREADABLE_TASKS`).
+fn sample(task: &CopyTask, words: u32, source: &mut impl ByteSource) -> bool {
+    let positions = crate::texture::quick_sample_positions_in(words as usize);
+    let mut read = [0u32; crate::texture::QUICK_SAMPLES];
+    let whole = source.read_samples(task.source, &positions, &mut read);
+    let sample = if whole {
+        crate::texture::quick_sample(&read)
+    } else {
+        UNREADABLE_TASKS.fetch_add(1, Ordering::Relaxed);
+        0
+    };
+    // Safe: the destination is the texture's own sample entry (see `CopyTask`).
+    unsafe { (task.destination as *mut u32).write(sample) };
     whole
 }
 
@@ -480,6 +531,26 @@ mod tests {
             assert_eq!(&words[..4], &expected[..]);
             assert_eq!(words[4], 0xEEEE_EEEE, "nothing after its place");
             assert_eq!(hash, crate::texture::hash_words(&expected));
+        }
+    }
+
+    #[test]
+    fn a_sample_task_writes_the_quick_sample_of_its_words() {
+        let word = |at: u32| u32::from_le_bytes([at as u8, at as u8 + 1, at as u8 + 2, at as u8 + 3]);
+        // A 64x64 16-bit texture: 2,048 words, read at the middle of each eighth.
+        let (source, words) = (0x1000u32, 2048u32);
+        let positions = crate::texture::quick_sample_positions_in(words as usize);
+        assert_eq!(positions, [128, 384, 640, 896, 1152, 1408, 1664, 1920]);
+        let expected = crate::texture::quick_sample(&positions.map(|position| word(source + 4 * position as u32)));
+        for (fail_at, wanted) in [(None, expected), (Some(source + 4 * 640), 0)] {
+            let mut entries = [0xEEEE_EEEEu32; 2];
+            let layout = Layout::Sample { words };
+            let task = CopyTask { source, length: 4 * 1921, destination: entries.as_mut_ptr() as *mut u8, layout };
+            assert_eq!(task.written(), 4);
+            let mut memory = Counting { reads: 0, fail_at };
+            assert_eq!(run(&task, &mut memory, true), fail_at.is_none());
+            assert_eq!(entries, [wanted, 0xEEEE_EEEE], "its entry only");
+            assert!(memory.reads <= 8, "each sample word read once, not the whole range");
         }
     }
 

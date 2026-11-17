@@ -74,17 +74,31 @@ pub mod approx {
 
 /// Samples the data of the draw's texture at its first use in the frame
 /// (`Frame::texture_samples`, `texture::quick_sample`): 8 words straight from
-/// PSP RAM (~1 us), while the GE sync holds the game at this frame. Not for
-/// VRAM textures (read from the plugin's copy, which has its own update
-/// rules: `vram_requests`).
-fn sample_texture(catalog: &mut Catalog, memory: &mut impl PspMemory, prepared: &Prepared) {
+/// PSP RAM, while the GE sync holds the game at this frame. Not for VRAM
+/// textures (read from the plugin's copy, which has its own update rules:
+/// `vram_requests`).
+///
+/// The copier reads them (a sample task, `copy_tasks::Layout::Sample`)
+/// where it can read the memory now: 8 uncached reads for each of ~400
+/// textures per MTX race frame were ~1 ms of the capture thread's run, the
+/// thread the game waits for. The GE sync and the frame's end wait for the
+/// tasks, so the sample is still taken while the game is held.
+fn sample_texture(catalog: &mut Catalog, stats: &mut FrameStats, memory: &mut impl PspMemory, stream: &mut DrawStream, prepared: &Prepared) {
+    let started = crate::cycles::start(crate::cycles::SAMPLE);
+    sample_texture_now(catalog, stats, memory, stream, prepared);
+    crate::cycles::add(crate::cycles::SAMPLE, started);
+}
+
+fn sample_texture_now(catalog: &mut Catalog, stats: &mut FrameStats, memory: &mut impl PspMemory, stream: &mut DrawStream, prepared: &Prepared) {
+    let index = prepared.draw.texture;
     if prepared.draw.flags & draw_flags::TEXTURED == 0
-        || catalog.texture_sample(prepared.draw.texture) != 0
+        || crate::bench::experiment(crate::bench::SKIP_TEXTURE_SAMPLES)
+        || catalog.is_sampled(index)
         || !crate::texture_cache::QUICK_CHECKS.load(core::sync::atomic::Ordering::Relaxed)
     {
         return;
     }
-    let Some(texture) = catalog.textures().get(prepared.draw.texture as usize).copied() else {
+    let Some(texture) = catalog.textures().get(index as usize).copied() else {
         return;
     };
     let address = physical(texture.address);
@@ -94,9 +108,26 @@ fn sample_texture(catalog: &mut Catalog, memory: &mut impl PspMemory, prepared: 
     let Some(positions) = crate::texture::quick_sample_positions(&texture) else {
         return;
     };
+    // (The copier's word loads need a word-aligned address.)
+    if address % 4 == 0 && !crate::bench::experiment(crate::bench::NO_SAMPLE_TASKS) {
+        // `quick_sample_positions` had data: `data_size` is some.
+        let words = crate::texture::data_size(&texture).unwrap_or(0) / 4;
+        let last = positions[crate::texture::QUICK_SAMPLES - 1] as u32;
+        if let Some(place) = catalog.texture_sample_place(index) {
+            let layout = crate::copy_tasks::Layout::Sample { words };
+            let task = crate::copy_tasks::CopyTask { source: address, length: 4 * (last + 1), destination: place as *mut u8, layout };
+            if stream.hand_over_task(memory, task) {
+                stats.texture_sample_tasks += 1;
+                return;
+            }
+            // Read here after all (below); a failed read leaves it unsampled.
+            catalog.unmark_sampled(index);
+        }
+    }
     let mut words = [0u32; crate::texture::QUICK_SAMPLES];
     if memory.read_samples(address, &positions, &mut words).is_some() {
         catalog.set_texture_sample(prepared.draw.texture, crate::texture::quick_sample(&words));
+        stats.texture_samples_taken += 1;
     }
 }
 
@@ -606,7 +637,7 @@ fn queue_batch(
         return;
     };
     count_approximations(stats, prepared.approximations, calls.len() as u32);
-    sample_texture(catalog, memory, &prepared);
+    sample_texture(catalog, stats, memory, &mut *queues.stream, &prepared);
     let format = ge.vertex_format();
     let vertices = calls.iter().map(|call| call.count).sum::<u32>() * ge.vertex_layout().size;
     let previous = crate::phase::enter(crate::phase::TRANSFORM);
@@ -680,7 +711,7 @@ fn queue_draw(
         return;
     };
     count_approximations(stats, prepared.approximations, calls.len() as u32);
-    sample_texture(catalog, memory, &prepared);
+    sample_texture(catalog, stats, memory, &mut *queues.stream, &prepared);
     let mut refused = None;
     if !ge.vertex_format().is_through() && queues.builder.is_some() {
         let previous = crate::phase::enter(crate::phase::TRANSFORM);
@@ -4651,6 +4682,81 @@ mod tests {
         assert!(alone.corner_count() > 10_000);
         assert_eq!(corners(&threaded), corners(&alone));
         assert_eq!(threaded.draws().len(), alone.draws().len());
+    }
+
+    static SAMPLE_TEST_MEMORY: std::sync::Mutex<Option<TestMemory>> = std::sync::Mutex::new(None);
+    static SAMPLE_TEST_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn sample_test_bytes(address: u32, out: &mut [u8]) -> bool {
+        SAMPLE_TEST_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut memory = SAMPLE_TEST_MEMORY.lock().unwrap();
+        let memory = memory.as_mut().unwrap();
+        out.iter_mut().enumerate().all(|(n, byte)| {
+            let at = address + n as u32;
+            memory.read_u32(at & !3).map(|word| *byte = (word >> (8 * (at & 3))) as u8).is_some()
+        })
+    }
+
+    #[test]
+    fn a_texture_sampled_by_the_copier_gets_the_sample_the_capture_thread_takes() {
+        use crate::draw_stream::{CopierHooks, DeferredReader};
+        use std::sync::atomic::Ordering;
+        let mut memory = TestMemory::default();
+        vertex(&mut memory, VERTICES, 0, 0, 0, 0, 0xFFFF_FFFF);
+        vertex(&mut memory, VERTICES + 16, 32, 16, 32, 16, 0xFFFF_FFFF);
+        // A 64 x 32 32-bit texture (2,048 words), every word different.
+        let words: Vec<u32> = (0..2048u32).map(|n| n.wrapping_mul(0x9E37_79B9) | 1).collect();
+        memory.write(0x0895_0000, &words);
+        *SAMPLE_TEST_MEMORY.lock().unwrap() = Some(memory.clone());
+        let mut ge = ge_for_sprites();
+        ge.set_register(cmd(op::TEXTURE_MAP_ENABLE, 1));
+        ge.set_register(cmd(op::TEXTURE_FORMAT, 3));
+        ge.set_register(cmd(op::TEXTURE_SIZE_0, 6 | (5 << 8)));
+        ge.set_register(cmd(op::TEXTURE_ADDRESS_0, 0x95_0000));
+        ge.set_register(cmd(op::TEXTURE_BUFFER_WIDTH_0, 0x08_0040));
+        let prim = cmd(op::PRIM, (primitive::RECTANGLES << 16) | 2);
+        let mut memory = DeferrableTestMemory(memory);
+        // Two draws with the texture: sampled at the first only.
+        let mut record = |frame: &mut Frame, stream: &mut DrawStream| {
+            let (mut states, mut palette, mut stats) = (DrawStateCache::new(), LoadedPalette::new(), FrameStats::new());
+            let frame: *mut Frame = frame;
+            for _ in 0..2 {
+                // Safe: the catalog is only used by this (the producer's) thread.
+                let mut catalog = unsafe { Frame::catalog_raw(frame) };
+                let queues = &mut Queues { stream: &mut *stream, builder: None };
+                record_prims(frame, &mut catalog, &mut stats, &mut palette, &mut states, &ge, &mut memory, &[prim], queues);
+            }
+            stream.finish(&mut stats);
+        };
+
+        let mut alone = new_boxed_frame();
+        record(&mut alone, &mut DrawStream::new());
+        let positions = crate::texture::quick_sample_positions_in(words.len());
+        assert_eq!(alone.texture_sample(0), crate::texture::quick_sample(&positions.map(|position| words[position])));
+
+        // The jobs' memory (the vertices) from this test's memory too.
+        fn read(address: u32, out: &mut [u32]) -> bool {
+            let mut memory = SAMPLE_TEST_MEMORY.lock().unwrap();
+            let memory = memory.as_mut().unwrap();
+            out.iter_mut().enumerate().all(|(n, word)| memory.read_u32(address + 4 * n as u32).map(|value| *word = value).is_some())
+        }
+        // The texture's sample words counted (the jobs sample their vertices
+        // with it too).
+        fn sample(address: u32, positions: &[usize], out: &mut [u32]) -> bool {
+            if address == 0x0895_0000 {
+                SAMPLE_TEST_READS.fetch_add(positions.len(), std::sync::atomic::Ordering::Relaxed);
+            }
+            positions.iter().zip(out.iter_mut()).all(|(&position, word)| read(address + 4 * position as u32, core::slice::from_mut(word)))
+        }
+        const READER: DeferredReader = DeferredReader { read, sample, copy_bytes: sample_test_bytes };
+        static COPIER: CopierHooks = CopierHooks { wake: || {} };
+        let mut stream = Box::new(DrawStream::new());
+        stream.set_reader(Some(READER));
+        stream.set_copier(Some(&COPIER));
+        let mut tasked = new_boxed_frame();
+        record(&mut tasked, &mut stream);
+        assert_eq!(tasked.texture_sample(0), alone.texture_sample(0));
+        assert_eq!(SAMPLE_TEST_READS.load(Ordering::Relaxed), 8, "the copier's reader sampled the 8 words, once");
     }
 
     #[test]

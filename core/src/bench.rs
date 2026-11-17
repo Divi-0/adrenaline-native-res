@@ -51,6 +51,12 @@ pub const NO_TASK_BATCHES: u32 = 1024;
 /// Palettes of the capture thread's draws go to the recorder as jobs, as
 /// before, instead of as copy tasks (`recorder::Queues::write_direct`).
 pub const NO_PALETTE_TASKS: u32 = 2048;
+/// Textures are not sampled at their first use in a frame
+/// (`recorder::sample_texture`): timing only, the texture checks go wrong.
+pub const SKIP_TEXTURE_SAMPLES: u32 = 4096;
+/// Textures are sampled on the capture thread, as before, instead of by the
+/// copier (`recorder::sample_texture`'s sample tasks).
+pub const NO_SAMPLE_TASKS: u32 = 8192;
 
 /// True if experiment `bit` is on.
 #[inline]

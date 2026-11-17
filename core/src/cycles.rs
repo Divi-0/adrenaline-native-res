@@ -75,7 +75,10 @@ pub const DIRECT_COLORS: usize = 23;
 pub const DIRECT_COPY: usize = 24;
 pub const DIRECT_RESERVE: usize = 25;
 pub const DIRECT_FINISH: usize = 26;
-pub const COUNT: usize = 27;
+/// Inside PRIMS: a draw's texture sampled at its first use in the frame
+/// (`recorder::sample_texture`).
+pub const SAMPLE: usize = 27;
+pub const COUNT: usize = 28;
 pub const NAMES: [&str; COUNT] = [
     "jobs",
     "copies",
@@ -104,6 +107,7 @@ pub const NAMES: [&str; COUNT] = [
     "d_copy",
     "d_reserve",
     "d_finish",
+    "sample",
 ];
 
 /// Readings left out because they came out implausibly large (from 2^30

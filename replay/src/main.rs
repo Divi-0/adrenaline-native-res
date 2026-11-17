@@ -355,6 +355,16 @@ fn run(dump_path: &str, png_path: &str, trace: bool) -> Result<(), String> {
         frame.is_overflowed() as u32,
         frame.description_hash()
     );
+    // The capture's texture samples (`recorder::sample_texture`; not in the
+    // description hash): the same with and without a copier thread.
+    let samples: Vec<u32> = (0..frame.textures().len()).map(|index| frame.texture_sample(index)).collect();
+    let samples_hash = samples.iter().fold(0xCBF2_9CE4_8422_2325u64, |hash, &sample| (hash ^ sample as u64).wrapping_mul(0x100_0000_01B3));
+    println!(
+        "texture samples: {} of {} textures sampled, hash {:016x}",
+        samples.iter().filter(|&&sample| sample != 0).count(),
+        samples.len(),
+        samples_hash
+    );
     let gpu_draws: Vec<_> = frame.draws().iter().filter(|draw| draw.transform != 0).collect();
     println!(
         "gpu transform: {} transforms, {} draws, {} of {} vertices",

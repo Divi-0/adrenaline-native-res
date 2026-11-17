@@ -227,7 +227,13 @@ pub fn quick_sample_positions(texture: &TextureDescriptor) -> Option<[usize; QUI
     if words == 0 {
         return None;
     }
-    Some(core::array::from_fn(|sample| (2 * sample + 1) * words / (2 * QUICK_SAMPLES)))
+    Some(quick_sample_positions_in(words))
+}
+
+/// `quick_sample_positions` of data `words` words long (not 0): what the
+/// copier reads for a sample task (`copy_tasks::Layout::Sample`).
+pub fn quick_sample_positions_in(words: usize) -> [usize; QUICK_SAMPLES] {
+    core::array::from_fn(|sample| (2 * sample + 1) * words / (2 * QUICK_SAMPLES))
 }
 
 /// A few of a texture's data words folded into one value (never 0, which

@@ -67,7 +67,8 @@ pub fn write_frame(out: &mut impl Write, stats: &FrameStats) -> fmt::Result {
     }
     out.write_str("]")?;
 
-    write!(out, " textures={} targets=[", stats.textures.count())?;
+    // Textures sampled at their first use: on the capture thread / by the copier.
+    write!(out, " textures={} samples={}/{} targets=[", stats.textures.count(), stats.texture_samples_taken, stats.texture_sample_tasks)?;
     for (index, address) in stats.render_targets.as_slice().iter().enumerate() {
         if index > 0 {
             out.write_char(' ')?;

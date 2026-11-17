@@ -200,6 +200,11 @@ pub struct FrameStats {
     pub inline_words: u32,
     /// Draws that write no colour (all RGB bits masked), not rendered.
     pub color_masked_draws: u32,
+    /// Textures sampled at their first use (`recorder::sample_texture`): on
+    /// the capture thread, and handed to the copier as sample tasks (capture
+    /// log `samples=`).
+    pub texture_samples_taken: u32,
+    pub texture_sample_tasks: u32,
     /// PRIMs whose vertices were decoded on the CPU, and their PSP
     /// vertices, by reason (`recorder::fallback`; capture log `cpu=`).
     pub fallback_prims: [u32; crate::recorder::fallback::COUNT],
@@ -254,6 +259,8 @@ impl FrameStats {
             inline_draws: 0,
             inline_words: 0,
             color_masked_draws: 0,
+            texture_samples_taken: 0,
+            texture_sample_tasks: 0,
             fallback_prims: [0; crate::recorder::fallback::COUNT],
             fallback_vertices: [0; crate::recorder::fallback::COUNT],
             displayed: None,
