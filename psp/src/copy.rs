@@ -322,9 +322,14 @@ fn known() -> &'static KnownRanges {
 /// Copies blocks of the recent ranges (`recent`) or of the others whose
 /// samples changed, and counts them in `changes`.
 fn check_for_changes(recent: bool) {
+    check_ranges_for_changes(get!(recent_mask), recent);
+}
+
+/// `check_for_changes` with the recent ranges given by `recent_mask`.
+fn check_ranges_for_changes(recent_mask: u32, recent: bool) {
     let (vram, copy) = (VRAM_UNCACHED as *const u32, VRAM_COPY_ADDRESS as *const u32);
     let changed = known().changed_blocks(
-        get!(recent_mask),
+        recent_mask,
         recent,
         // Safe: blocks inside VRAM and the copy area (changed_blocks stops
         // at VRAM's end), word inside the block.
@@ -340,14 +345,17 @@ fn check_for_changes(recent: bool) {
 }
 
 /// At a list's enqueue, before the Vita side hears of it: the recent
-/// ranges' changed blocks are copied now (game's thread; not extra time,
-/// only earlier than at the sync).
+/// ranges copied whole while they fit the Vita side's `whole_bytes` (core
+/// `psp_copy::WHOLE_AT_ENQUEUE_BYTES`: the change check's samples missed
+/// moved vertices), the others' changed blocks (game's thread).
 pub fn refresh_before_walk() {
     if known().count == 0 {
         return;
     }
     let start = now_us();
-    check_for_changes(true);
+    let recent = get!(recent_mask);
+    let whole = known().copy_recent_whole(recent, get!(whole_bytes), |offset, size| copy_vram(offset, size));
+    check_ranges_for_changes(recent & !whole, true);
     add!(enqueue_checks, 1);
     set!(last_enqueue_check_us, now_us().wrapping_sub(start));
 }

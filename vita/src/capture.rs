@@ -409,6 +409,15 @@ pub fn set_vram_requests(on: u32) {
     VRAM_REQUESTS_WANTED.store(on != 0, Ordering::Relaxed);
 }
 
+/// Bytes of the recent VRAM ranges the plugin copies whole at a list's
+/// enqueue (`nativeres_core::psp_copy::WHOLE_AT_ENQUEUE_BYTES`; 0: only
+/// the change check's samples, as before 2026-11-17).
+static VRAM_WHOLE_BYTES: AtomicU32 = AtomicU32::new(nativeres_core::psp_copy::WHOLE_AT_ENQUEUE_BYTES);
+
+pub fn set_vram_whole_bytes(bytes: u32) {
+    VRAM_WHOLE_BYTES.store(bytes, Ordering::Relaxed);
+}
+
 /// Menu "NativeRes Distant Textures" (Adrenaline config byte
 /// MIP_MODE, pushed by the display every frame): see
 /// `nativeres_core::texture::MIP_MODE`.
@@ -736,6 +745,11 @@ impl CaptureState {
 /// # Safety
 /// `table` must point to the mapped request table.
 unsafe fn publish_vram_plan(table: *mut VramRequestTable, plan: &Plan) -> Option<u32> {
+    let whole = VRAM_WHOLE_BYTES.load(Ordering::Relaxed);
+    if read_volatile(addr_of!((*table).whole_bytes)) != whole {
+        write_volatile(addr_of_mut!((*table).whole_bytes), whole);
+        crate::adrenaline::writeback(addr_of_mut!((*table).whole_bytes) as *mut c_void, 4);
+    }
     if read_volatile(addr_of!((*table).recent_mask)) != plan.recent_mask {
         write_volatile(addr_of_mut!((*table).recent_mask), plan.recent_mask);
         crate::adrenaline::writeback(addr_of_mut!((*table).recent_mask) as *mut c_void, 4);

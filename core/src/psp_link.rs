@@ -148,9 +148,13 @@ pub struct VramRequestTable {
     /// one's time.
     pub enqueue_checks: u32,
     pub last_enqueue_check_us: u32,
+    /// Vita: at a list's enqueue the plugin copies the recent ranges whole
+    /// while they fit this many bytes, the rest by the change check
+    /// (`psp_copy::WHOLE_AT_ENQUEUE_BYTES`; 0: change check only).
+    pub whole_bytes: u32,
 }
 
-const _: () = assert!(core::mem::size_of::<VramRequestTable>() == 376);
+const _: () = assert!(core::mem::size_of::<VramRequestTable>() == 380);
 // The ring fits before the table, the table into the page.
 const _: () = assert!(
     core::mem::size_of::<RingHeader>() + CAPACITY as usize * core::mem::size_of::<RawEvent>()

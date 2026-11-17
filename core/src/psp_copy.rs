@@ -17,6 +17,17 @@ pub const CHECK_WORDS_PER_BLOCK: u32 = 2;
 /// thread refreshes at most this many bytes, cycling through all ranges,
 /// for changes the samples miss.
 pub const REFRESH_BYTES_PER_FRAME: u32 = 4 * 1024;
+/// At a list's enqueue the recent ranges are copied whole, not checked by
+/// samples, while they fit this many bytes (the Vita side's default for
+/// `VramRequestTable::whole_bytes`; 0 = samples only, as before 2026-11-17).
+/// MTX keeps the vertices of its menu's 20 background tiles in VRAM and
+/// animates their positions during the rider <-> bike wipe; the samples (2
+/// words per KiB) hit the tiles' constant UVs and colours, so the copy kept
+/// old positions and the Vita drew the tiles where the game had moved them
+/// away from, over leftover texture memory (photo-like tiles for ~8 frames,
+/// until the rolling refresh came by). The plugin's memcpy copies VRAM at
+/// ~6.8 us per KiB (MTX menu: ~116 KiB, ~0.9 ms per enqueue).
+pub const WHOLE_AT_ENQUEUE_BYTES: u32 = 256 * 1024;
 
 /// What a VRAM copy of `size` bytes at `offset` really copies: the offset
 /// aligned down to a word, the size rounded up to one; None when that is
@@ -69,6 +80,29 @@ impl KnownRanges {
                 && u64::from(block) + u64::from(CHECK_BLOCK_BYTES) > u64::from(range.offset)
                 && u64::from(block) < u64::from(range.offset) + u64::from(range.size)
         })
+    }
+
+    /// At a list's enqueue: the recent ranges (bit set in `recent_mask`)
+    /// copied whole with `copy(offset, size)`, in table order, those that
+    /// still fit `budget` bytes. Returns the mask of the ranges copied (the
+    /// change check skips them).
+    pub fn copy_recent_whole(&self, recent_mask: u32, budget: u32, mut copy: impl FnMut(u32, u32)) -> u32 {
+        let (mut done, mut left) = (0u32, budget);
+        for (i, range) in self.ranges().iter().enumerate() {
+            if (recent_mask >> i) & 1 == 0 {
+                continue;
+            }
+            let Some((offset, size)) = copy_span(range.offset, range.size) else {
+                continue;
+            };
+            if size > left {
+                continue;
+            }
+            copy(offset, size);
+            left -= size;
+            done |= 1 << i;
+        }
+        done
     }
 
     /// The change check over the recent ranges (`recent`, bit set in
@@ -357,6 +391,66 @@ mod tests {
             assert_eq!(block, 0x400)
         });
         assert_eq!(changed, 1);
+    }
+
+    /// MTX rider <-> bike select (2026-11-17, "graphics glitch again"): the
+    /// 20 background tiles are triangle strips whose vertices MTX keeps in
+    /// VRAM (0x041C29D4.., 4 vertices of 16 bytes per tile) and moves during
+    /// the wipe. Only the positions change; the change check's two words in
+    /// the block are a UV and a colour, so it found nothing and the copy kept
+    /// the old positions (tiles drawn in a grid over leftover texture memory
+    /// for ~8 frames; Sony's picture clean). Copied whole at the enqueue,
+    /// the copy has the new positions.
+    #[test]
+    fn moved_vertices_the_samples_miss_are_copied_whole_at_the_enqueue() {
+        const BLOCK_WORDS: usize = (CHECK_BLOCK_BYTES / 4) as usize;
+        let block = 0x1C_2800u32;
+        let known = known(&[(block, 2 * CHECK_BLOCK_BYTES)]);
+        // vtype 0x13a, 16 bytes per vertex: u, v (16 bit); colour (16 bit),
+        // normal x, y; normal z, pad, x; y, z (positions 16 bit). The wipe
+        // moves the tiles sideways: only the x halfwords change.
+        let tiles = |moved: i16| {
+            let mut words = vec![0u32; 2 * BLOCK_WORDS];
+            let first = (0x29D4 - 0x2800) / 4;
+            for tile in 0..20 {
+                for vertex in 0..4 {
+                    let at = first + tile * 16 + vertex * 4;
+                    let x = (96 * (tile % 5) as i16 + 96 * (vertex as i16 & 1)).wrapping_add(moved);
+                    let (y, z) = (97 * (tile / 5) as i16 + 97 * (vertex as i16 >> 1), 300i16);
+                    words[at] = 0x0080_0000 | vertex as u32;
+                    words[at + 1] = 0x7F00_FFFF;
+                    words[at + 2] = (x as u16 as u32) << 16 | 0x7F;
+                    words[at + 3] = (z as u16 as u32) << 16 | y as u16 as u32;
+                }
+            }
+            words
+        };
+        let vram = tiles(-37); // the game moved every tile
+        let mut copy = tiles(0);
+        let differs = |b: u32, word: u32| {
+            let index = ((b - block) / 4 + word) as usize;
+            vram[index] != copy[index]
+        };
+        assert_eq!(known.changed_blocks(1, true, differs, |_| {}), 0, "the samples see nothing (the bug)");
+
+        let whole = known.copy_recent_whole(1, WHOLE_AT_ENQUEUE_BYTES, |offset, size| {
+            let (from, count) = (((offset - block) / 4) as usize, (size / 4) as usize);
+            copy[from..from + count].copy_from_slice(&vram[from..from + count]);
+        });
+        assert_eq!(whole, 1);
+        assert_eq!(copy, vram, "the new positions");
+    }
+
+    #[test]
+    fn whole_copies_stay_within_the_budget_and_skip_the_others() {
+        // Range 0 recent and small, 1 not recent, 2 recent but too big for
+        // what is left, 3 recent and fits.
+        let known = known(&[(0x0000, 0x400), (0x1000, 0x400), (0x2000, 0x8000), (0xA000, 0x400)]);
+        let mut copied = Vec::new();
+        let whole = known.copy_recent_whole(0b1101, 0x1000, |offset, size| copied.push((offset, size)));
+        assert_eq!(copied, [(0x0000, 0x400), (0xA000, 0x400)]);
+        assert_eq!(whole, 0b1001, "range 2 is left to the samples");
+        assert_eq!(known.copy_recent_whole(0b1101, 0, |_, _| panic!("budget 0: samples only")), 0);
     }
 
     #[test]
