@@ -260,10 +260,22 @@ impl VramRequests {
                 plan.recent_mask |= 1 << i;
             }
         }
-        plan.count = self.add_block_ranges(&mut plan.ranges, self.texture_count);
-        for i in self.texture_count..plan.count {
-            plan.recent_mask |= 1 << i; // lists are read in every frame that uses them
+        // The capture's blocks: those read in the latest frames in runs of
+        // their own, recent (the plugin copies recent ranges whole at the
+        // enqueue while they fit `psp_copy::WHOLE_AT_ENQUEUE_BYTES`); the
+        // older ones, still kept, after them. One run over both was ~616
+        // KiB when MTX's title (attract demo lists) was left for the rider
+        // select: too big to copy whole, and its wipe showed stale tiles.
+        let hot = self.add_block_ranges(&mut plan.ranges, self.texture_count, MAX_RANGES - 1, |requests, block| {
+            requests.block_used(block) && requests.block_recent(block)
+        });
+        for i in self.texture_count..hot {
+            plan.recent_mask |= 1 << i;
         }
+        plan.count = self.add_block_ranges(&mut plan.ranges, hot, MAX_RANGES, |requests, block| {
+            requests.block_used(block) && !requests.block_recent(block)
+        });
+        self.capture_blocks = (0..BLOCKS).filter(|&block| self.block_used(block)).count() as u32;
 
         // Only whole blocks a range covers are kept up to date by the plugin
         // (a texture range can start or end inside a block).
@@ -325,39 +337,50 @@ impl VramRequests {
         last != 0 && self.frame.wrapping_sub(last) < KEEP_FRAMES
     }
 
-    /// Appends the runs of recently read blocks to `ranges[count..]`; if
-    /// they don't fit, larger gaps are joined. Returns the new count.
-    fn add_block_ranges(&mut self, ranges: &mut [VramRange; MAX_RANGES], count: usize) -> usize {
+    /// Read within the latest [`RECENT_FRAMES`] frames.
+    fn block_recent(&self, block: usize) -> bool {
+        let last = self.block_last_used[block];
+        last != 0 && self.frame.wrapping_sub(last) < RECENT_FRAMES
+    }
+
+    /// Appends the runs of the blocks `wanted` picks to `ranges[count..]`,
+    /// using at most `ranges[..limit]`; if they don't fit, larger gaps are
+    /// joined. Returns the new count.
+    fn add_block_ranges(
+        &self,
+        ranges: &mut [VramRange; MAX_RANGES],
+        count: usize,
+        limit: usize,
+        wanted: impl Fn(&Self, usize) -> bool,
+    ) -> usize {
+        let limit = limit.min(MAX_RANGES);
         let mut gap = GAP_BLOCKS;
         loop {
             let mut n = count;
-            let mut blocks = 0;
             let mut fits = true;
             let mut block = 0;
             while block < BLOCKS {
-                if !self.block_used(block) {
+                if !wanted(self, block) {
                     block += 1;
                     continue;
                 }
-                let mut end = block + 1; // one past the run's last used block
+                let mut end = block + 1; // one past the run's last wanted block
                 let mut next = end;
                 while next < BLOCKS && next <= end + gap {
-                    if self.block_used(next) {
+                    if wanted(self, next) {
                         end = next + 1;
                     }
                     next += 1;
                 }
-                if n == MAX_RANGES {
+                if n >= limit {
                     fits = false;
                     break;
                 }
                 ranges[n] = VramRange { offset: block as u32 * BLOCK_SIZE, size: (end - block) as u32 * BLOCK_SIZE };
-                blocks += end - block;
                 n += 1;
                 block = end;
             }
             if fits || gap >= BLOCKS {
-                self.capture_blocks = blocks as u32;
                 return n;
             }
             gap *= 2;
@@ -479,6 +502,41 @@ mod tests {
                 "run {run} requested"
             );
         }
+    }
+
+    /// MTX, cold boot -> title -> exhibition -> single race (2026-11-17,
+    /// user: "the glitch still exists but only once when I come from the
+    /// title menu"): the title's attract-demo lists were still kept, and one
+    /// run over them and the menu's blocks was 616 KiB, too big for the
+    /// whole copy at the enqueue, so the rider select's wipe ran on the
+    /// change check's samples (stale tile vertices). The blocks read lately
+    /// get runs of their own, the only recent ones.
+    #[test]
+    fn blocks_read_lately_get_recent_runs_of_their_own() {
+        let mut requests = Box::new(VramRequests::new());
+        let read = |requests: &mut VramRequests, blocks: core::ops::Range<u32>| {
+            for block in blocks {
+                requests.block_last_used[block as usize] = requests.frame + 1;
+            }
+        };
+        // The title's lists, then 30 frames of the menu's (8 blocks apart:
+        // one run if they were joined).
+        read(&mut requests, 0x100..0x300);
+        frame(&mut requests, 0, 1);
+        for _ in 0..30 {
+            read(&mut requests, 0x308..0x380);
+            frame(&mut requests, 0, 1);
+        }
+        read(&mut requests, 0x308..0x380);
+        let plan = frame(&mut requests, 0, 1);
+        let recent: Vec<VramRange> =
+            plan.ranges().iter().enumerate().filter(|(i, _)| plan.recent_mask & (1 << i) != 0).map(|(_, r)| *r).collect();
+        assert_eq!(recent, [VramRange { offset: 0x308 * BLOCK_SIZE, size: 0x78 * BLOCK_SIZE }], "only the menu's 120 KiB");
+        let whole: u32 = recent.iter().map(|range| range.size).sum();
+        assert!(whole <= crate::psp_copy::WHOLE_AT_ENQUEUE_BYTES);
+        // The title's blocks are still requested (kept ready), not recent.
+        assert!(plan.ranges().iter().any(|r| r.offset <= 0x100 * BLOCK_SIZE && r.offset + r.size >= 0x300 * BLOCK_SIZE));
+        assert_eq!(requests.capture_blocks(), 0x200 + 0x78);
     }
 
     #[test]
