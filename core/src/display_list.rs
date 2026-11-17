@@ -8,7 +8,7 @@
 //!
 //! Control-flow semantics follow PPSSPP's `GPUCommon::Execute_*` functions.
 
-use crate::block_cache::LINE_SIZE;
+use crate::block_cache::{BLOCK_SIZE, BLOCK_WORDS, LINE_SIZE};
 use crate::command::{op, Command, SignalBehaviour, TargetKind};
 use crate::ge_state::GeState;
 use crate::memory::{is_valid_address, physical, PspMemory};
@@ -60,14 +60,24 @@ pub struct DisplayList {
 /// main list stops the plain-command run every one or two commands (PRIM,
 /// VADDR, ...); going through the memory layers (GE writes, block cache,
 /// line fill) for each of them was ~30% of the walk.
+///
+/// When the walk runs off the window's end into the next line (63 % of
+/// MTX's ~1,140 refills per race frame), the list goes on there: the window
+/// then takes the rest of the block (`READ_AHEAD_WORDS`) in one refill
+/// instead of one refill per line. Those lines would be read from PSP RAM a
+/// refill later anyway; only lines past a list's end are read for nothing.
 struct ListWindow {
-    words: [u32; LINE_WORDS],
+    words: [u32; READ_AHEAD_WORDS],
     /// Physical address of `words[0]`; `len` words are valid (0 = none).
     start: u32,
     len: usize,
 }
 
 const LINE_WORDS: usize = LINE_SIZE as usize / 4;
+
+/// The most a window holds: up to the end of a block (`BLOCK_SIZE`), which
+/// the block cache lends in one piece.
+const READ_AHEAD_WORDS: usize = BLOCK_WORDS;
 
 /// `walk` keeps a window per call depth (the deepest one shared by all
 /// deeper calls): after a RET the caller's window still holds its line.
@@ -77,7 +87,7 @@ const KEPT_WINDOWS: usize = 4;
 
 impl ListWindow {
     fn new() -> Self {
-        ListWindow { words: [0; LINE_WORDS], start: 0, len: 0 }
+        ListWindow { words: [0; READ_AHEAD_WORDS], start: 0, len: 0 }
     }
 
     /// The words from `pc` to the end of its line, at most `limit` of them
@@ -110,11 +120,22 @@ impl ListWindow {
     /// `refill` without the measuring: the window's length, if any.
     fn refill_now(&mut self, memory: &mut impl PspMemory, pc: u32) -> Option<()> {
         let to_line_end = ((LINE_SIZE - pc % LINE_SIZE) / 4) as usize;
+        // Ran off the window's end at a line start: read ahead.
+        let sequential = self.len > 0 && pc == self.start.wrapping_add(4 * self.len as u32) && pc % LINE_SIZE == 0;
         self.len = 0;
         if pc % 4 != 0 {
             return None;
         }
         let mut len = to_line_end;
+        if sequential && !crate::bench::experiment(crate::bench::NO_READ_AHEAD) {
+            let to_block_end = ((BLOCK_SIZE - pc % BLOCK_SIZE) / 4) as usize;
+            if let Some(words) = memory.borrow_words(pc, to_block_end) {
+                self.words[..to_block_end].copy_from_slice(words);
+                self.start = pc;
+                self.len = to_block_end;
+                return Some(());
+            }
+        }
         // Through the block cache (not `read_words`, which reads a whole
         // line straight from the source each time: after every RET the
         // caller's line would be read from PSP RAM again).

@@ -63,6 +63,9 @@ pub const NO_CAMERA_MEMO: u32 = 16384;
 /// Raw draws work out and look up their light set every time, also when
 /// its change numbers are the newest lookup's (`RawTables::add_light_set_of`).
 pub const NO_LIGHTS_MEMO: u32 = 32768;
+/// The walk's list windows take one line per refill, as before, also when
+/// the walk ran off the window's end (`display_list::ListWindow`'s read-ahead).
+pub const NO_READ_AHEAD: u32 = 65536;
 
 /// True if experiment `bit` is on.
 #[inline]
