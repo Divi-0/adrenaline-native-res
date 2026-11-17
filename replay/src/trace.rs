@@ -30,6 +30,11 @@ pub struct DrawTracer {
     /// REPLAY_LIGHTS=1: how the frame's lit draws light (`print_light_survey`).
     survey_lights: bool,
     light_kinds: std::collections::BTreeMap<String, u32>,
+    /// Whether it needs to see every command (tracing, `--opcodes`, the
+    /// REPLAY_* surveys). Otherwise it wants none, so `walk` runs the plain
+    /// commands in its fast runs exactly as on the Vita (where the capture's
+    /// tracer is `NoTrace`) and the regression suite tests that path.
+    wants_all: bool,
 }
 
 impl DrawTracer {
@@ -44,6 +49,9 @@ impl DrawTracer {
             before_prim: [0; 256],
             survey_lights: std::env::var("REPLAY_LIGHTS").is_ok(),
             light_kinds: std::collections::BTreeMap::new(),
+            wants_all: enabled
+                || std::env::args().any(|arg| arg == "--opcodes")
+                || ["REPLAY_CLUT_LOADS", "REPLAY_LIGHTS", "REPLAY_OPS"].iter().any(|name| std::env::var(name).is_ok()),
         }
     }
 
@@ -164,6 +172,10 @@ impl CommandVisitor for DrawTracer {
     /// Tracing prints each PRIM with its vertices: one by one then.
     fn batches_prims(&self) -> bool {
         !self.enabled
+    }
+
+    fn wants(&self, _opcode: u8) -> bool {
+        self.wants_all
     }
 
     fn visit<M: PspMemory>(&mut self, command: Command, ge: &GeState, memory: &mut M) {

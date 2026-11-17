@@ -66,6 +66,9 @@ pub const NO_LIGHTS_MEMO: u32 = 32768;
 /// The walk's list windows take one line per refill, as before, also when
 /// the walk ran off the window's end (`display_list::ListWindow`'s read-ahead).
 pub const NO_READ_AHEAD: u32 = 65536;
+/// VERTEX_ADDRESS, INDEX_ADDRESS and OFFSET_ADDRESS end the walk's plain
+/// runs, as before (`display_list::PlainAction::Address`).
+pub const NO_ADDRESS_RUNS: u32 = 131072;
 
 /// True if experiment `bit` is on.
 #[inline]

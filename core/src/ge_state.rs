@@ -624,6 +624,19 @@ impl GeState {
         taken
     }
 
+    /// What VERTEX_ADDRESS, INDEX_ADDRESS and OFFSET_ADDRESS do besides
+    /// setting their register (`walk`'s main loop and the plain runs both
+    /// call this, then `set_register`). Other opcodes: nothing.
+    #[inline]
+    pub fn apply_address(&mut self, command: Command) {
+        match command.opcode() {
+            op::OFFSET_ADDRESS => self.offset = command.data() << 8,
+            op::VERTEX_ADDRESS => self.vertex_address = self.relative_address(command.data()),
+            op::INDEX_ADDRESS => self.index_address = self.relative_address(command.data()),
+            _ => {}
+        }
+    }
+
     /// Turns the 24-bit argument of JUMP, CALL, VERTEX_ADDRESS, ... into a
     /// full address: BASE supplies bits 24..28, then the offset is added.
     pub fn relative_address(&self, data: u32) -> u32 {

@@ -449,6 +449,13 @@ fn apply_run<M: PspMemory, V: CommandVisitor>(
                 done += 1;
             }
             PlainAction::MatrixRun => done += ge.upload_matrix_run(&words[done..]),
+            // Not in stage A's runs (`StreamWriter` wants them as specials);
+            // as `run_plain_commands` runs them all the same.
+            PlainAction::Address => {
+                ge.apply_address(command);
+                ge.set_register(command);
+                done += 1;
+            }
             PlainAction::Stop => {
                 ge.set_register(command);
                 visitor.visit(command, ge, memory);

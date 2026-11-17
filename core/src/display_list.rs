@@ -75,6 +75,9 @@ struct ListWindow {
 
 const LINE_WORDS: usize = LINE_SIZE as usize / 4;
 
+/// PROBE (temporary): walk-loop stops per opcode.
+pub static PROBE: [core::sync::atomic::AtomicU32; 256] = [const { core::sync::atomic::AtomicU32::new(0) }; 256];
+
 /// The most a window holds: up to the end of a block (`BLOCK_SIZE`), which
 /// the block cache lends in one piece.
 const READ_AHEAD_WORDS: usize = BLOCK_WORDS;
@@ -398,6 +401,7 @@ fn walk_list(
         };
         *commands += 1;
         let command = Command(word);
+        PROBE[command.opcode() as usize].fetch_add(1, core::sync::atomic::Ordering::Relaxed); // PROBE
 
         // A PRIM and the PRIMs right after it go to the visitor together.
         if command.opcode() == op::PRIM && visitor.batches_prims() && visitor.wants(op::PRIM) {
@@ -496,9 +500,7 @@ fn walk_list(
             }
 
             op::ORIGIN => ge.offset = pc,
-            op::OFFSET_ADDRESS => ge.offset = command.data() << 8,
-            op::VERTEX_ADDRESS => ge.vertex_address = ge.relative_address(command.data()),
-            op::INDEX_ADDRESS => ge.index_address = ge.relative_address(command.data()),
+            op::OFFSET_ADDRESS | op::VERTEX_ADDRESS | op::INDEX_ADDRESS => ge.apply_address(command),
             _ => {}
         }
 
@@ -607,6 +609,11 @@ fn run_plain_commands(
                 crate::cycles::add(crate::cycles::MATRIX, started);
                 crate::phase::enter(crate::phase::PLAIN);
             }
+            PlainAction::Address => {
+                ge.apply_address(command);
+                ge.set_register(command);
+                done += 1;
+            }
             PlainAction::Stop => {
                 stopped_at = Some(command.0);
                 break;
@@ -638,6 +645,12 @@ pub enum PlainAction {
     SetRegister,
     /// A matrix DATA command: the run of them at once.
     MatrixRun,
+    /// VERTEX_ADDRESS, INDEX_ADDRESS, OFFSET_ADDRESS
+    /// (`GeState::apply_address`), for a visitor that doesn't want them:
+    /// they only set an address, as `walk`'s main loop would. In MTX's race
+    /// ~1,570 of the ~7,400 commands per frame that ended a plain run
+    /// (each such stop goes round the main loop, a few hundred cycles).
+    Address,
     /// Not plain, or the visitor wants it: `walk` handles it.
     Stop,
 }
@@ -654,7 +667,11 @@ impl PlainActions {
     pub(crate) fn for_visitor(visitor: &impl CommandVisitor) -> Self {
         PlainActions(core::array::from_fn(|opcode| {
             let opcode = opcode as u8;
-            if !PLAIN_COMMANDS[opcode as usize] || visitor.wants(opcode) {
+            if visitor.wants(opcode) {
+                PlainAction::Stop
+            } else if is_address(opcode) && !crate::bench::experiment(crate::bench::NO_ADDRESS_RUNS) {
+                PlainAction::Address
+            } else if !PLAIN_COMMANDS[opcode as usize] {
                 PlainAction::Stop
             } else if is_matrix_data(opcode) {
                 PlainAction::MatrixRun
@@ -663,6 +680,10 @@ impl PlainActions {
             }
         }))
     }
+}
+
+fn is_address(opcode: u8) -> bool {
+    matches!(opcode, op::VERTEX_ADDRESS | op::INDEX_ADDRESS | op::OFFSET_ADDRESS)
 }
 
 fn is_matrix_data(opcode: u8) -> bool {
