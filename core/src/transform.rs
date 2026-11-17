@@ -433,6 +433,15 @@ pub struct TransformInputs {
     base_change: u32,
     bone_change: u32,
     lighting_change: u32,
+    /// When the camera's part of the base last changed: the view and
+    /// projection matrices and `TRANSFORM_REGISTERS`, all `raw_camera`
+    /// reads. Kept when the base changed but these didn't (MTX: a new
+    /// world matrix per object, the camera once per frame).
+    camera_change: u32,
+    /// When the lighting registers last changed (`lighting`): kept when the
+    /// base changed but they didn't. With `camera_change` (the view) it
+    /// names a draw's GPU light set (`Lights::gpu` reads nothing else).
+    lights_change: u32,
 }
 
 impl TransformInputs {
@@ -448,6 +457,8 @@ impl TransformInputs {
         base_change: 0,
         bone_change: 0,
         lighting_change: 0,
+        camera_change: 0,
+        lights_change: 0,
     };
 
     /// The inputs of a draw with the current GE state in `format`, on their
@@ -460,16 +471,22 @@ impl TransformInputs {
         inputs
     }
 
-    /// The matrices, VERTEX_TYPE and `TRANSFORM_REGISTERS`.
-    fn take_base(&mut self, ge: &GeState, format: VertexFormat) {
+    /// The matrices, VERTEX_TYPE and `TRANSFORM_REGISTERS`. True if the
+    /// camera's part (view, projection, registers) changed, bit for bit.
+    fn take_base(&mut self, ge: &GeState, format: VertexFormat) -> bool {
         let Matrices { world, view, projection, .. } = &ge.matrices;
+        let same_bits = |old: &[f32], new: &[f32]| old.iter().zip(new).all(|(a, b)| a.to_bits() == b.to_bits());
+        let mut camera_changed = !same_bits(&self.view, view) || !same_bits(&self.projection, projection);
         self.format = format.0;
         self.world = *world;
         self.view = *view;
         self.projection = *projection;
         for (value, &opcode) in self.registers.iter_mut().zip(&TRANSFORM_REGISTERS) {
-            *value = ge.register(opcode);
+            let register = ge.register(opcode);
+            camera_changed |= *value != register;
+            *value = register;
         }
+        camera_changed
     }
 
     /// The bones the format's weights use (none without weights).
@@ -505,6 +522,19 @@ impl TransformInputs {
     /// with `of`): equal numbers, equal parts.
     pub fn changes(&self) -> (u32, u32) {
         (self.base_change, self.lighting_change)
+    }
+
+    /// When the camera's part of the base last changed (`TransformCache`'s
+    /// number; 0 for inputs made with `of`): equal numbers, equal
+    /// `raw_camera`.
+    pub fn camera_change(&self) -> u32 {
+        self.camera_change
+    }
+
+    /// When the lighting registers last changed (`TransformCache`'s number;
+    /// 0 for inputs made with `of`): equal numbers, equal `lighting()`.
+    pub fn lights_change(&self) -> u32 {
+        self.lights_change
     }
 
     /// When the bones last changed (`TransformCache`'s number; 0 for inputs
@@ -584,6 +614,8 @@ impl TransformInputs {
             base_change,
             bone_change,
             lighting_change,
+            camera_change,
+            lights_change,
         } = self;
         target.format = *format;
         target.world = *world;
@@ -600,6 +632,8 @@ impl TransformInputs {
         target.base_change = *base_change;
         target.bone_change = *bone_change;
         target.lighting_change = *lighting_change;
+        target.camera_change = *camera_change;
+        target.lights_change = *lights_change;
     }
 }
 
@@ -662,12 +696,21 @@ impl TransformCache {
         if !same_base {
             self.generation = self.generation.wrapping_add(1);
             let inputs = &mut self.inputs;
-            inputs.take_base(ge, format);
+            let camera_changed = inputs.take_base(ge, format);
             inputs.take_bones(ge, format);
-            inputs.lighting = LightingRegisters::of(ge);
+            let lighting = LightingRegisters::of(ge);
+            if inputs.lighting != lighting || inputs.lights_change == 0 {
+                inputs.lights_change = self.generation;
+            }
+            inputs.lighting = lighting;
             inputs.base_change = self.generation;
             inputs.bone_change = self.generation;
             inputs.lighting_change = self.generation;
+            // The camera's number stays while its parts are the same bits
+            // (also across `forget`: the numbers only promise equal parts).
+            if camera_changed || inputs.camera_change == 0 {
+                inputs.camera_change = self.generation;
+            }
             self.valid = true;
         } else {
             if format.has_weights() && self.bone_generation != ge.bone_generation() {
@@ -684,6 +727,7 @@ impl TransformCache {
                     self.generation = self.generation.wrapping_add(1);
                     self.inputs.lighting = lighting;
                     self.inputs.lighting_change = self.generation;
+                    self.inputs.lights_change = self.generation;
                 }
             }
         }

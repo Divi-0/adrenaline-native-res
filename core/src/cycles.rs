@@ -78,7 +78,12 @@ pub const DIRECT_FINISH: usize = 26;
 /// Inside PRIMS: a draw's texture sampled at its first use in the frame
 /// (`recorder::sample_texture`).
 pub const SAMPLE: usize = 27;
-pub const COUNT: usize = 28;
+/// Inside DIRECT_TRANSFORM: the camera worked out and looked up
+/// (`TransformInputs::raw_camera`, `RawTables::add_raw_camera`), the light
+/// set (`gpu_lights_cached`, `add_light_set`).
+pub const DIRECT_CAMERA: usize = 28;
+pub const DIRECT_LIGHTS: usize = 29;
+pub const COUNT: usize = 30;
 pub const NAMES: [&str; COUNT] = [
     "jobs",
     "copies",
@@ -108,6 +113,8 @@ pub const NAMES: [&str; COUNT] = [
     "d_reserve",
     "d_finish",
     "sample",
+    "d_camera",
+    "d_lights",
 ];
 
 /// Readings left out because they came out implausibly large (from 2^30

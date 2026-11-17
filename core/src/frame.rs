@@ -701,6 +701,16 @@ pub struct Frame {
     pub raw_transforms: [RawTransform; MAX_RAW_TRANSFORMS],
     pub raw_camera_count: u32,
     pub raw_cameras: [RawCamera; MAX_RAW_CAMERAS],
+    /// Only used while recording: the camera change number
+    /// (`TransformInputs::camera_change`) of the newest camera lookup
+    /// (`RawTables::add_raw_camera_of`) and the camera it gave; `[0, _]`:
+    /// none. Part of the geometry's raw tables.
+    pub raw_camera_last: [u32; 2],
+    /// Only used while recording: the lights and camera change numbers and
+    /// the lighting key of the newest light set lookup
+    /// (`RawTables::add_light_set_of`) and the light set it gave; `[0, ..]`:
+    /// none. Part of the geometry's raw tables.
+    pub light_set_last: [u32; 4],
     /// Only used while recording: draws before this one are never merged
     /// with a new one (`Geometry::seal`): the capture thread's draws
     /// (`frame_builder`) go between them when the frame is finished. Part of
@@ -753,6 +763,8 @@ impl Frame {
         self.bone_float_count = 0;
         self.raw_transform_count = 0;
         self.raw_camera_count = 0;
+        self.raw_camera_last = [0, 0];
+        self.light_set_last = [0; 4];
         self.draw_merge_floor = 0;
         self.palette_count = 0;
         self.palette_slots = [0; PALETTE_SLOTS];
@@ -817,6 +829,8 @@ impl Frame {
             raw_transforms,
             raw_camera_count,
             raw_cameras,
+            raw_camera_last,
+            light_set_last,
             draw_merge_floor,
             ..
         } = self;
@@ -845,6 +859,8 @@ impl Frame {
                     raw_transforms,
                     raw_camera_count,
                     raw_cameras,
+                    raw_camera_last,
+                    light_set_last,
                 }),
             },
             Catalog {
@@ -912,6 +928,8 @@ impl Frame {
             raw_transforms: &mut *addr_of_mut!((*frame).raw_transforms),
             raw_camera_count: &mut *addr_of_mut!((*frame).raw_camera_count),
             raw_cameras: &mut *addr_of_mut!((*frame).raw_cameras),
+            raw_camera_last: &mut *addr_of_mut!((*frame).raw_camera_last),
+            light_set_last: &mut *addr_of_mut!((*frame).light_set_last),
         }
     }
 
@@ -1352,6 +1370,8 @@ pub struct RawTables<'a> {
     raw_transforms: &'a mut [RawTransform; MAX_RAW_TRANSFORMS],
     raw_camera_count: &'a mut u32,
     raw_cameras: &'a mut [RawCamera; MAX_RAW_CAMERAS],
+    raw_camera_last: &'a mut [u32; 2],
+    light_set_last: &'a mut [u32; 4],
 }
 
 /// How many of the newest table entries `RawTables::add_raw_colors` checks
@@ -1507,6 +1527,8 @@ impl RawTables<'_> {
     /// added if it is the same, else a new entry. `None` if the table is
     /// full (the caller lights on the CPU instead).
     pub fn add_light_set(&mut self, lights: &GpuLights) -> Option<u32> {
+        // The table may change: `add_light_set_of`'s note no longer holds.
+        self.light_set_last[0] = 0;
         let count = *self.light_set_count as usize;
         if count > 0 && self.light_sets[count - 1].words() == lights.words() {
             return Some(count as u32);
@@ -1552,6 +1574,8 @@ impl RawTables<'_> {
     /// scales: 45 entries per race-start frame with only the newest checked),
     /// else a new one. `None` if the table is full.
     pub fn add_raw_camera(&mut self, camera: &RawCamera) -> Option<u16> {
+        // The table may change: `add_raw_camera_of`'s note no longer holds.
+        self.raw_camera_last[0] = 0;
         let count = *self.raw_camera_count as usize;
         let recent = count.saturating_sub(RAW_CAMERAS_RECENT);
         if let Some(found) = (recent..count).rev().find(|&index| self.raw_cameras[index].words() == camera.words()) {
@@ -1563,6 +1587,46 @@ impl RawTables<'_> {
         self.raw_cameras[count] = *camera;
         *self.raw_camera_count += 1;
         Some(count as u16)
+    }
+
+    /// `add_raw_camera(&inputs.raw_camera())`, but a draw whose camera
+    /// change number is the one of the newest lookup takes that lookup's
+    /// camera without building and comparing a `RawCamera` (equal numbers,
+    /// equal view, projection and registers: `TransformCache`). MTX race:
+    /// ~230 lookups per frame, ~1,600 cycles each, for one or two cameras.
+    pub fn add_raw_camera_of(&mut self, inputs: &crate::transform::TransformInputs) -> Option<u16> {
+        let change = inputs.camera_change();
+        if change != 0 && self.raw_camera_last[0] == change && !crate::bench::experiment(crate::bench::NO_CAMERA_MEMO) {
+            return Some(self.raw_camera_last[1] as u16);
+        }
+        let number = self.add_raw_camera(&inputs.raw_camera())?;
+        *self.raw_camera_last = [change, number as u32];
+        Some(number)
+    }
+
+    /// `add_light_set` of the light set `work_out` gives for a draw with
+    /// `inputs` the GPU lights with lighting `key` (`raw_blocks::lighting_key`),
+    /// but with the lights, camera and key of the newest lookup it takes that
+    /// lookup's set without working it out or comparing it (equal numbers:
+    /// equal lighting registers and view, `TransformCache`). MTX race start:
+    /// 88 % of the lit lookups, ~1,900 cycles each.
+    pub fn add_light_set_of(
+        &mut self,
+        inputs: &crate::transform::TransformInputs,
+        key: u32,
+        work_out: impl FnOnce() -> Option<GpuLights>,
+    ) -> Option<u32> {
+        let numbers = [inputs.lights_change(), inputs.camera_change(), key];
+        if numbers[0] != 0
+            && numbers[1] != 0
+            && self.light_set_last[..3] == numbers
+            && !crate::bench::experiment(crate::bench::NO_LIGHTS_MEMO)
+        {
+            return Some(self.light_set_last[3]);
+        }
+        let number = self.add_light_set(&work_out()?)?;
+        *self.light_set_last = [numbers[0], numbers[1], numbers[2], number];
+        Some(number)
     }
 
     /// The light set `number` (+ 1, as `GpuTransform::light_set`) holds.

@@ -57,6 +57,12 @@ pub const SKIP_TEXTURE_SAMPLES: u32 = 4096;
 /// Textures are sampled on the capture thread, as before, instead of by the
 /// copier (`recorder::sample_texture`'s sample tasks).
 pub const NO_SAMPLE_TASKS: u32 = 8192;
+/// Raw draws build and look up their camera every time, also when its
+/// change number is the newest lookup's (`RawTables::add_raw_camera_of`).
+pub const NO_CAMERA_MEMO: u32 = 16384;
+/// Raw draws work out and look up their light set every time, also when
+/// its change numbers are the newest lookup's (`RawTables::add_light_set_of`).
+pub const NO_LIGHTS_MEMO: u32 = 32768;
 
 /// True if experiment `bit` is on.
 #[inline]

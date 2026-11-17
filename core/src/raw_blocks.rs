@@ -73,18 +73,26 @@ pub fn raw_transform_with(
     }
     let (camera, world) = match same_base {
         Some(known) => known,
-        None => (tables.add_raw_camera(&inputs.raw_camera())?, inputs.raw_world()),
+        None => {
+            let started = crate::cycles::start(crate::cycles::DIRECT_CAMERA);
+            let camera = tables.add_raw_camera_of(inputs);
+            crate::cycles::add(crate::cycles::DIRECT_CAMERA, started);
+            (camera?, inputs.raw_world())
+        }
     };
+    let started = crate::cycles::start(crate::cycles::DIRECT_LIGHTS);
     let light_set = match lit {
         Some((has_color, opaque)) => {
-            let set = match lights {
-                Some(cache) => inputs.gpu_lights_cached(has_color, opaque, cache)?,
-                None => inputs.gpu_lights(has_color, opaque)?,
+            let work_out = || match lights {
+                Some(cache) => inputs.gpu_lights_cached(has_color, opaque, cache),
+                None => inputs.gpu_lights(has_color, opaque),
             };
-            tables.add_light_set(&set)? as u16
+            tables.add_light_set_of(inputs, key, work_out).map(|number| number as u16)
         }
-        None => 0,
+        None => Some(0),
     };
+    crate::cycles::add(crate::cycles::DIRECT_LIGHTS, started);
+    let light_set = light_set?;
     if let Some((number, last)) = tables.last_raw_transform() {
         // Other inputs, the same numbers (bones or the format changed, or a
         // matrix was uploaded again unchanged in another context): that one,
@@ -320,5 +328,128 @@ mod tests {
         drop(geometry);
         assert_eq!(frame.raw_camera_count, 1, "one camera");
         assert_eq!(frame.raw_transforms[0].camera, frame.raw_transforms[1].camera);
+    }
+
+    /// The camera change number stays while only the world matrix changes,
+    /// and moves with the view, the projection and every camera register,
+    /// also when the GE state is forgotten in between: equal numbers always
+    /// mean equal `raw_camera`s. A matrix uploaded again with the same bits
+    /// keeps it.
+    #[test]
+    fn the_camera_change_number_follows_the_cameras_parts() {
+        let mut ge = scene();
+        let format = VertexFormat(2 | 2 << 7);
+        let mut cache = TransformCache::new();
+        let command = |ge: &mut GeState, opcode: u8, data: u32| ge.set_register(crate::command::Command((opcode as u32) << 24 | data));
+        let first = cache.get(&ge, format).camera_change();
+        assert_ne!(first, 0);
+        command(&mut ge, op::WORLD_MATRIX_NUMBER, 9);
+        command(&mut ge, op::WORLD_MATRIX_DATA, 7.0f32.to_bits() >> 8);
+        let inputs = *cache.get(&ge, format);
+        assert_ne!(inputs.changes().0, first, "a new base");
+        assert_eq!(inputs.camera_change(), first, "the same camera");
+        // The view's first value uploaded again, unchanged.
+        command(&mut ge, op::VIEW_MATRIX_NUMBER, 0);
+        command(&mut ge, op::VIEW_MATRIX_DATA, 1.0f32.to_bits() >> 8);
+        cache.forget();
+        assert_eq!(cache.get(&ge, format).camera_change(), first, "same bits, forgotten or not");
+        let mut seen = vec![first];
+        let changes: [&dyn Fn(&mut GeState); 4] = [
+            &|ge| {
+                set(ge, op::VIEW_MATRIX_NUMBER, 11);
+                set_float(ge, op::VIEW_MATRIX_DATA, -41.0);
+            },
+            &|ge| {
+                set(ge, op::PROJECTION_MATRIX_NUMBER, 0);
+                set_float(ge, op::PROJECTION_MATRIX_DATA, 1.8);
+            },
+            &|ge| set_float(ge, op::TEXTURE_OFFSET_V, 0.5),
+            &|ge| set(ge, op::FOG_ENABLE, 0),
+        ];
+        for change in changes {
+            change(&mut ge);
+            let number = cache.get(&ge, format).camera_change();
+            assert!(!seen.contains(&number), "a new camera number");
+            seen.push(number);
+        }
+    }
+
+    /// Draws that keep the camera's number take the newest lookup's camera:
+    /// the same table and the same numbers as looking each camera up.
+    #[test]
+    fn camera_lookups_by_number_give_what_full_lookups_give() {
+        let format = VertexFormat(2 | 2 << 7);
+        let run = |by_number: bool| {
+            let mut frame: Box<Frame> = crate::frame::new_boxed_frame();
+            let mut ge = scene();
+            let mut cache = TransformCache::new();
+            let mut geometry = frame.split().0;
+            let tables = geometry.raw_tables().unwrap();
+            let mut numbers = Vec::new();
+            for object in 0..12u32 {
+                let mut command = |opcode: u8, data: u32| ge.set_register(crate::command::Command((opcode as u32) << 24 | data));
+                command(op::WORLD_MATRIX_NUMBER, 9);
+                command(op::WORLD_MATRIX_DATA, (object as f32).to_bits() >> 8);
+                // Two texture scales, switched every third object.
+                command(op::TEXTURE_SCALE_U, if object / 3 % 2 == 0 { 2.0f32 } else { 4.0 }.to_bits() >> 8);
+                let inputs = cache.get(&ge, format);
+                numbers.push(if by_number { tables.add_raw_camera_of(inputs) } else { tables.add_raw_camera(&inputs.raw_camera()) });
+            }
+            drop(geometry);
+            (numbers, frame.raw_cameras[..frame.raw_camera_count as usize].iter().map(|camera| camera.words().to_vec()).collect::<Vec<_>>())
+        };
+        let full = run(false);
+        assert_eq!(full.1.len(), 2);
+        assert_eq!(run(true), full);
+    }
+
+    /// Lit objects (MTX's riders: a new world matrix per part, the material
+    /// colour changed every few parts, the view turned once, an unlit part
+    /// and another lighting key between): light sets taken by change number
+    /// are the ones worked out whole for every draw (inputs without numbers,
+    /// `TransformInputs::of`): the same numbers, the same table.
+    #[test]
+    fn light_set_lookups_by_number_give_what_full_lookups_give() {
+        let format = VertexFormat(2 | 2 << 7);
+        let run = |by_number: bool| {
+            let mut frame: Box<Frame> = crate::frame::new_boxed_frame();
+            let mut ge = scene();
+            set(&mut ge, op::LIGHTING_ENABLE, 1);
+            set(&mut ge, op::LIGHT_ENABLE_0, 1);
+            set_float(&mut ge, op::LIGHT_X_0 + 2, 1.0);
+            set(&mut ge, op::LIGHT_AMBIENT_0 + 1, 0xFF_FFFF);
+            set(&mut ge, op::MATERIAL_DIFFUSE, 0x80_8080);
+            let mut cache = TransformCache::new();
+            let mut lights = crate::lighting::GpuLightsCache::new();
+            let mut geometry = frame.split().0;
+            let tables = geometry.raw_tables().unwrap();
+            let mut numbers = Vec::new();
+            for object in 0..16u32 {
+                set(&mut ge, op::WORLD_MATRIX_NUMBER, 9);
+                set_float(&mut ge, op::WORLD_MATRIX_DATA, object as f32);
+                if object % 4 == 3 {
+                    set(&mut ge, op::MATERIAL_DIFFUSE, 0x10_2030 * object);
+                }
+                if object == 8 {
+                    set(&mut ge, op::VIEW_MATRIX_NUMBER, 0);
+                    set_float(&mut ge, op::VIEW_MATRIX_DATA, 0.5);
+                }
+                let lit = match object {
+                    5 => None,
+                    11 => Some((true, false)),
+                    _ => Some((false, true)),
+                };
+                let numbered = *cache.get(&ge, format);
+                let inputs = if by_number { numbered } else { crate::transform::TransformInputs::of(&ge, format) };
+                let transform = raw_transform_with(tables, &inputs, lit, Some(&mut lights)).unwrap();
+                numbers.push(tables.last_raw_transform().map(|(number, last)| (number == transform, last.light_set)));
+            }
+            drop(geometry);
+            let sets: Vec<Vec<u32>> = frame.light_sets[..frame.light_set_count as usize].iter().map(|set| set.words().to_vec()).collect();
+            (numbers, sets)
+        };
+        let full = run(false);
+        assert_eq!(full.1.len(), 6, "a set per material, view and key change");
+        assert_eq!(run(true), full);
     }
 }
