@@ -59,6 +59,11 @@ fn main() -> ExitCode {
     if std::env::var("NATIVERES_LIGHTS").is_ok_and(|value| value == "0") {
         nativeres_core::lighting::LIGHTS_ON.store(false, std::sync::atomic::Ordering::Relaxed);
     }
+    // NATIVERES_EXPERIMENT=<mask>: the debug server's `benchexp` bits
+    // (`bench::EXPERIMENT`), for A/Bs of the same frame.
+    if let Some(mask) = std::env::var("NATIVERES_EXPERIMENT").ok().and_then(|value| value.parse::<u32>().ok()) {
+        nativeres_core::bench::EXPERIMENT.store(mask, std::sync::atomic::Ordering::Relaxed);
+    }
     if args.iter().any(|arg| arg == "--sublists") {
         return match print_sublists(&args[1]) {
             Ok(()) => ExitCode::SUCCESS,

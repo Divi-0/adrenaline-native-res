@@ -42,6 +42,12 @@ pub const NO_REPEATED_ENTRIES: u32 = 128;
 /// The capture thread's raw draws work their light sets out whole every
 /// time, also when only the material changed (`lighting::GpuLightsCache`).
 pub const NO_LIGHTS_CACHE: u32 = 256;
+/// The capture thread's raw draws never extend the previous draw in place
+/// (`frame_builder::LastRun`): every call takes the whole way.
+pub const NO_JOINED_CALLS: u32 = 512;
+/// Copy tasks are published to the copier one by one, each with a wake
+/// (`draw_stream::TASK_BATCH` off).
+pub const NO_TASK_BATCHES: u32 = 1024;
 
 /// True if experiment `bit` is on.
 #[inline]

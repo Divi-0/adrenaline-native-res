@@ -167,11 +167,45 @@ pub struct DirectStats {
     pub segments: u32,
     /// Draws that took the previous draw's table entries (`LastEntries`).
     pub repeated: u32,
+    /// Calls that extended the previous draw in place (`LastRun`; also
+    /// counted in `repeated`).
+    pub joined: u32,
 }
 
 impl DirectStats {
     pub const EMPTY: DirectStats =
-        DirectStats { prims: 0, draws: 0, tasks: 0, task_bytes: 0, gathered: 0, sparse: 0, segments: 0, repeated: 0 };
+        DirectStats { prims: 0, draws: 0, tasks: 0, task_bytes: 0, gathered: 0, sparse: 0, segments: 0, repeated: 0, joined: 0 };
+}
+
+/// The previous call, if it was a plain run (`Writer::run`: no indices, in
+/// the arena, not PSP RAM) whose last PRIM used all its vertices, and nothing
+/// was written after it. MTX draws a model as many calls of one state, each
+/// one's vertices right after the last one's (race start: 676 of 1,427
+/// calls). The whole way would give such a call the same table entries
+/// (`LastEntries`), reserve its vertices right behind the last call's
+/// (runs start stride-aligned, and the last one ended less than a stride
+/// before), write its index runs right behind the last ones, and
+/// `Geometry::finish_raw_draw` would merge it into the newest draw. A call
+/// that goes on like that (`FrameBuilder::join`) does exactly that, without
+/// the rest: the frame comes out bit-identical.
+#[derive(Clone, Copy)]
+struct LastRun {
+    /// The draw's state as the call was given it (`Prepared::draw`, before
+    /// its entries are filled in): a joining call's must be the same
+    /// (`Draw::same_state`; its entries are checked by `LastEntries`).
+    state: Draw,
+    /// Where the next call's vertices start in PSP memory to go on.
+    source_end: u32,
+    /// Where its run lands in the arena: the byte offset (`Placed::offset`),
+    /// the window, and its first vertex's number in the window.
+    next_offset: u32,
+    window: u32,
+    next_first: u32,
+    /// The format's vertex size and the bytes its last vertex uses
+    /// (`VertexLayout::size`, `VertexFormat::bytes_used`; a joining call has
+    /// the same format).
+    stride: u32,
+    tail: u32,
 }
 
 pub struct FrameBuilder {
@@ -188,6 +222,8 @@ pub struct FrameBuilder {
     ring: Option<RawArena>,
     /// The previous raw draw's entries this frame (`LastEntries`).
     last_entries: Option<LastEntries>,
+    /// The previous call, while the next may extend its draw (`LastRun`).
+    last_run: Option<LastRun>,
     /// The last light set's lights (kept across frames: it depends on
     /// registers only).
     lights: crate::lighting::GpuLightsCache,
@@ -206,6 +242,7 @@ impl FrameBuilder {
             raw: None,
             ring: None,
             last_entries: None,
+            last_run: None,
             lights: crate::lighting::GpuLightsCache::new(),
             stats: DirectStats::EMPTY,
         }
@@ -257,6 +294,7 @@ impl FrameBuilder {
         self.gather_count = 0;
         // The frame's tables start empty.
         self.last_entries = None;
+        self.last_run = None;
         self.stats = DirectStats::EMPTY;
         self.active
     }
@@ -277,6 +315,8 @@ impl FrameBuilder {
         if !self.active {
             return 0;
         }
+        // The recorder's draws will go between: nothing to go on with.
+        self.last_run = None;
         let Some(lists) = self.lists.as_deref_mut() else {
             return 0;
         };
@@ -323,6 +363,13 @@ impl FrameBuilder {
             timed(crate::cycles::DIRECT_COLORS, || crate::recorder::raw_colors_if_enabled(prepared, material_color, inputs.lighting(), format))
         })
         .ok_or(None)?;
+        // Taken: whatever happens below, the previous call is no longer the
+        // last thing written (`run` notes this one if it can be gone on with).
+        if let Some(last) = self.last_run.take() {
+            if let Some(written) = self.join(&last, stream, memory, format, prepared, inputs, calls, &colors) {
+                return written;
+            }
+        }
         let (Some(lists), Some(raw)) = (self.lists.as_deref_mut(), self.raw.as_mut()) else {
             return Err(None);
         };
@@ -347,6 +394,7 @@ impl FrameBuilder {
             gather,
             gather_count: &mut self.gather_count,
             last_entries: &mut self.last_entries,
+            last_run: &mut self.last_run,
             lights: &mut self.lights,
         };
         let draw = Draw { first_vertex: 0, first_index: out.geometry.index_count(), ..prepared.draw };
@@ -378,6 +426,106 @@ impl FrameBuilder {
             }
             Err(reason) => Err(Some(reason)),
         }
+    }
+
+    /// Extends the newest draw with `calls` if they go on where the previous
+    /// call (`last`) stopped, as `LastRun` describes: `None` if they don't
+    /// (nothing written: `try_record` takes the whole way), else what the
+    /// whole way would have returned, with the same frame written.
+    #[allow(clippy::too_many_arguments)]
+    fn join(
+        &mut self,
+        last: &LastRun,
+        stream: &mut DrawStream,
+        memory: &mut impl PspMemory,
+        format: VertexFormat,
+        prepared: &Prepared,
+        inputs: &TransformInputs,
+        calls: &[PrimCall],
+        colors: &RawColors,
+    ) -> Option<Result<(), Option<usize>>> {
+        if crate::bench::experiment(crate::bench::NO_JOINED_CALLS) {
+            return None;
+        }
+        let entries = self.last_entries.as_ref()?;
+        let (base, lighting) = inputs.changes();
+        // The whole way's choices, cheapest first: a plain run (`run`) whose
+        // vertices follow the last call's, with the same state and the same
+        // entries (`Writer::entries` would repeat them).
+        let address = calls[0].vertex_address;
+        let goes_on = address == last.source_end
+            && format.index_format() == IndexFormat::None
+            && calls.iter().all(|call| (primitive::TRIANGLES..=primitive::TRIANGLE_FAN).contains(&call.primitive_type))
+            && entries.format == format.0
+            && entries.changes == (base, inputs.bone_change(), lighting)
+            && entries.colors.words() == colors.words()
+            && last.state.same_state(&prepared.draw);
+        if !goes_on {
+            return None;
+        }
+        let (used, whole) = run_vertices(calls)?;
+        let stride = last.stride;
+        let length = stride * (used - 1) + last.tail;
+        if crate::raw_arena::zero_copy_wanted(address, length, format) {
+            return None;
+        }
+        let runs = calls.iter().filter(|call| crate::recorder::triangle_count(call.primitive_type, call.count) > 0).count();
+        let (Some(lists), Some(raw)) = (self.lists.as_deref_mut(), self.raw.as_mut()) else {
+            return None;
+        };
+        let index_start = self.counts.index_count as usize;
+        let newest = (self.counts.draw_count as usize).checked_sub(1)?;
+        if runs == 0 || index_start + 3 * runs > lists.indices.len() {
+            return None;
+        }
+        debug_assert!(
+            lists.draws[newest].first_index + lists.draws[newest].index_count == index_start as u32
+                && lists.draws[newest].first_vertex == last.window,
+            "the previous call's draw is the newest and ends with the indices"
+        );
+        // From here on the whole way would have taken the same steps.
+        self.stats.repeated += 1;
+        let Some((placed, out)) = in_phase(crate::phase::DIRECT_ARENA, || timed(crate::cycles::DIRECT_RESERVE, || raw.reserve(length, stride)))
+        else {
+            return Some(Err(Some(fallback::ARENA_FULL)));
+        };
+        let destination = out.as_mut_ptr();
+        if placed.window != last.window || placed.offset != last.next_offset {
+            // The next window: a draw of its own.
+            raw.undo_last();
+            self.stats.repeated -= 1;
+            return None;
+        }
+        let task = CopyTask { source: address, length, destination, layout: Layout::Plain };
+        if !in_phase(crate::phase::DIRECT_COPY, || timed(crate::cycles::DIRECT_COPY, || stream.copy_task(memory, task))) {
+            raw.undo_last();
+            return Some(Err(Some(fallback::UNREADABLE)));
+        }
+        self.stats.tasks += 1;
+        self.stats.task_bytes += length;
+        let mut first = last.next_first;
+        let mut records = lists.indices[index_start..index_start + 3 * runs].chunks_exact_mut(3);
+        for call in calls {
+            if crate::recorder::triangle_count(call.primitive_type, call.count) > 0 {
+                let record = records.next().expect("room for every run");
+                record.copy_from_slice(&[call.primitive_type as u16, call.count as u16, first as u16]);
+            }
+            first += call.count;
+        }
+        self.counts.index_count += 3 * runs as u32;
+        lists.draws[newest].index_count += 3 * runs as u32;
+        raw.stats.lit += (colors.rules[0] == crate::raw_vertex::lighting::LIGHTS) as u32;
+        self.stats.prims += calls.len() as u32;
+        self.stats.joined += 1;
+        if whole {
+            self.last_run = Some(LastRun {
+                source_end: address.wrapping_add(stride * used),
+                next_offset: placed.offset + stride * used,
+                next_first: first,
+                ..*last
+            });
+        }
+        Some(Ok(()))
     }
 
     /// The frame's end (the recorder idle, every copy task done): the
@@ -464,6 +612,7 @@ struct Writer<'g, 'a, M: PspMemory> {
     gather: &'g mut [u16; GATHER_ENTRIES],
     gather_count: &'g mut usize,
     last_entries: &'g mut Option<LastEntries>,
+    last_run: &'g mut Option<LastRun>,
     lights: &'g mut crate::lighting::GpuLightsCache,
 }
 
@@ -545,29 +694,21 @@ impl<M: PspMemory> Writer<'_, '_, M> {
         mut draw: Draw,
     ) -> Result<(), usize> {
         // All vertices up to the last PRIM's last whole triangle.
-        let (last, before) = calls.split_last().ok_or(fallback::REFUSED)?;
-        let last_used = match last.primitive_type {
-            primitive::TRIANGLES => last.count / 3 * 3,
-            _ if last.count >= 3 => last.count,
-            _ => 0,
-        };
-        let used = before.iter().map(|call| call.count).sum::<u32>() + last_used;
-        if used == 0 || used > 65_536 {
-            return Err(fallback::REFUSED);
-        }
+        let state = draw;
+        let (used, whole) = run_vertices(calls).ok_or(fallback::REFUSED)?;
         let stride = layout.size;
         let address = calls[0].vertex_address;
         let length = stride * (used - 1) + format.bytes_used(layout);
         let (number, colors_number, bones) = self.entries(format, inputs, colors)?;
         let in_psp_ram = self.zero_copy(address, length, format);
-        let (window, mut first, copy) = if in_psp_ram {
+        let (window, offset, mut first, copy) = if in_psp_ram {
             self.raw.stats.psp_ram += 1;
             self.raw.stats.psp_ram_bytes += length;
-            (address, 0, None)
+            (address, 0, 0, None)
         } else {
             let (placed, out) = in_phase(crate::phase::DIRECT_ARENA, || timed(crate::cycles::DIRECT_RESERVE, || self.raw.reserve(length, stride)))
                 .ok_or(fallback::ARENA_FULL)?;
-            (placed.window, placed.first_vertex(stride), Some(out.as_mut_ptr()))
+            (placed.window, placed.offset, placed.first_vertex(stride), Some(out.as_mut_ptr()))
         };
         let previous = crate::phase::enter(crate::phase::DIRECT_ARENA);
         let runs = calls.iter().filter(|call| crate::recorder::triangle_count(call.primitive_type, call.count) > 0).count();
@@ -604,6 +745,19 @@ impl<M: PspMemory> Writer<'_, '_, M> {
                 }
             })
         });
+        // The next call may go on from here (`LastRun`): the newest draw is
+        // this one (or this one merged in), its entries remembered.
+        if !in_psp_ram && whole && runs > 0 && !self.geometry.is_overflowed() && self.last_entries.is_some() {
+            *self.last_run = Some(LastRun {
+                state,
+                source_end: address.wrapping_add(stride * used),
+                next_offset: offset + stride * used,
+                window,
+                next_first: first,
+                stride,
+                tail: format.bytes_used(layout),
+            });
+        }
         Ok(())
     }
 
@@ -825,6 +979,20 @@ impl<M: PspMemory> Writer<'_, '_, M> {
         self.geometry.finish_raw_draw(draw, placed.window);
         Ok(())
     }
+}
+
+/// A plain run's vertices (`Writer::run`): all of them up to the last PRIM's
+/// last whole triangle, and whether that is all of the last PRIM's. `None`
+/// if none or more than 16-bit indices reach.
+fn run_vertices(calls: &[PrimCall]) -> Option<(u32, bool)> {
+    let (last, before) = calls.split_last()?;
+    let last_used = match last.primitive_type {
+        primitive::TRIANGLES => last.count / 3 * 3,
+        _ if last.count >= 3 => last.count,
+        _ => 0,
+    };
+    let used = before.iter().map(|call| call.count).sum::<u32>() + last_used;
+    (used > 0 && used <= 65_536).then_some((used, last_used == last.count))
 }
 
 /// The lowest and highest of `indices` (`SIZE` bytes each, little-endian;

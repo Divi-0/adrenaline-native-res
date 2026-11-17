@@ -87,6 +87,11 @@ const MAX_JOB_WORDS: usize = MAX_WORDS / 4;
 /// 90-93% (the recorder waits for the copier).
 pub static COPIER_LAG_JOBS: AtomicU32 = AtomicU32::new(64);
 
+/// Copy tasks are published to the copier this many at a time
+/// (`DrawStream::copy_task`; the rest whenever the producer waits for
+/// copies). A power of two (the check is a mask on the A9).
+const TASK_BATCH: u32 = 8;
+
 /// Jobs the producer copied itself because the copier was behind, since the
 /// session started (capture log `copier=`); never reset here.
 pub static PRODUCER_COPIES: AtomicU32 = AtomicU32::new(0);
@@ -579,6 +584,7 @@ impl DrawStream {
     /// without a copier: the producer copied it when it queued the job).
     /// The GE sync waits for this (capture.rs).
     pub fn copies_complete(&self) -> bool {
+        self.publish_tasks();
         (self.copier.is_none() || self.copies_finished.load(Ordering::Acquire) == self.job_position) && self.tasks.complete()
     }
 
@@ -587,6 +593,7 @@ impl DrawStream {
     /// instead of waiting for the copier to reach them. The copier may
     /// still be copying jobs it took (`copies_complete` tells).
     pub fn copy_untaken(&self) {
+        self.publish_tasks();
         if self.copier.is_some() {
             let previous = crate::phase::enter(crate::phase::HELP);
             while self.copy_one() {
@@ -616,7 +623,15 @@ impl DrawStream {
             return crate::copy_tasks::run(&task, &mut MemorySource(memory), stable);
         }
         self.tasks.push(task, |tasks| tasks.copy_one(&mut ReaderSource(reader.copy_bytes), stable));
-        (copier.wake)();
+        // Published (and the copier woken) every `TASK_BATCH` tasks: each
+        // publish and wake is three barriers (`copy_thread::wake`). Whoever
+        // then waits for the copies publishes the rest first
+        // (`publish_tasks`).
+        if self.tasks.pushed() % TASK_BATCH == 0 || crate::bench::experiment(crate::bench::NO_TASK_BATCHES) {
+            if self.tasks.publish() {
+                (copier.wake)();
+            }
+        }
         // A lagging copier (preempted): the oldest tasks copied here, as
         // `help_a_lagging_copier` does for jobs. Checked every 16th task:
         // `untaken` reads the counter the copier swaps all the time, a cache
@@ -630,6 +645,17 @@ impl DrawStream {
             crate::phase::leave(previous);
         }
         true
+    }
+
+    /// Producer: publishes the copy tasks pushed since the last batch
+    /// (`copy_task`) and wakes the copier for them. Before anything that
+    /// waits for the copies or copies the untaken ones itself.
+    fn publish_tasks(&self) {
+        if self.tasks.publish() {
+            if let Some(copier) = self.copier {
+                (copier.wake)();
+            }
+        }
     }
 
     /// From now on (frame start, the consumer idle) whoever records the jobs
@@ -832,6 +858,7 @@ impl DrawStream {
     /// Producer: until every copy task is done (the frame's draws read
     /// them): copies those nobody took, then waits for the copier's.
     pub fn wait_for_tasks(&self) {
+        self.publish_tasks();
         while self.copy_one_task() {
             crate::copy_tasks::PRODUCER_TASKS.fetch_add(1, Ordering::Relaxed);
         }
@@ -858,6 +885,7 @@ impl DrawStream {
     /// (if one is set), then records the jobs itself.
     fn drain(&self) {
         if self.copier.is_some() {
+            self.publish_tasks();
             self.copy_published();
         }
         self.record_published();

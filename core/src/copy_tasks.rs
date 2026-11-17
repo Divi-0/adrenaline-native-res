@@ -275,15 +275,19 @@ impl CopyTasks {
         }
     }
 
-    /// Producer: publishes `task`. Its slot's task before it must be done:
-    /// known done (`known_done`), or else if nobody has taken it, the
-    /// producer copies the oldest tasks itself (`copy`) until it is taken,
-    /// then waits the moment its copier needs.
+    /// Producer: adds `task`, published with the next `publish`. Its slot's
+    /// task before it must be done: known done (`known_done`), or else if
+    /// nobody has taken it, the producer copies the oldest tasks itself
+    /// (`copy`) until it is taken, then waits the moment its copier needs.
+    /// (That task is published: fewer than `MAX_TASKS` wait unpublished.)
     pub fn push(&mut self, task: CopyTask, mut copy: impl FnMut(&CopyTasks) -> bool) {
         let slot = self.position as usize % MAX_TASKS;
         let before = self.position.wrapping_sub(MAX_TASKS as u32);
         let reused = self.position as usize >= MAX_TASKS;
         if reused && before.wrapping_sub(self.known_done.load(Ordering::Relaxed)) as i32 >= 0 {
+            // Whatever waits unpublished is newer than `before`: published,
+            // the copiers (and `copy`) can reach it.
+            self.publish();
             while self.claimed.0.load(Ordering::Acquire).wrapping_sub(before) as i32 <= 0 {
                 if copy(self) {
                     PRODUCER_TASKS.fetch_add(1, Ordering::Relaxed);
@@ -297,7 +301,18 @@ impl CopyTasks {
         // before it is published below.
         unsafe { (*self.tasks.get())[slot] = task };
         self.position = self.position.wrapping_add(1);
+    }
+
+    /// Producer: publishes the tasks pushed so far (release: their slots are
+    /// written before a copier can take them). False if there were none
+    /// new. The counter is the producer's: reading it is cheap, the store is
+    /// one barrier for however many tasks.
+    pub fn publish(&self) -> bool {
+        if self.published.0.load(Ordering::Relaxed) == self.position {
+            return false;
+        }
         self.published.0.store(self.position, Ordering::Release);
+        true
     }
 
     /// Takes the oldest published task nobody has taken yet; `None` if
@@ -336,8 +351,8 @@ impl CopyTasks {
         self.claimed.0.load(Ordering::Relaxed) == self.published.0.load(Ordering::Acquire)
     }
 
-    /// Producer: true if every task it published is copied (noted for
-    /// `push`: their slots are free).
+    /// Producer: true if every task it pushed is copied (noted for `push`:
+    /// their slots are free). Never while some aren't published yet.
     pub fn complete(&self) -> bool {
         let complete = self.finished.0.load(Ordering::Acquire) == self.position;
         if complete {
@@ -346,12 +361,12 @@ impl CopyTasks {
         complete
     }
 
-    /// Producer: published tasks nobody has taken yet.
+    /// Producer: pushed tasks nobody has taken yet (published or not).
     pub fn untaken(&self) -> u32 {
         self.position.wrapping_sub(self.claimed.0.load(Ordering::Relaxed))
     }
 
-    /// Producer: tasks published so far (counts up for ever, wrapping).
+    /// Producer: tasks pushed so far (counts up for ever, wrapping).
     pub fn pushed(&self) -> u32 {
         self.position
     }
@@ -431,6 +446,7 @@ mod tests {
             tasks.push(task, |ring| ring.copy_one(&mut source, false));
         }
         assert!(!tasks.complete());
+        assert!(tasks.publish());
         while tasks.copy_one(&mut Counting { reads: 0, fail_at: None }, false) {}
         assert!(tasks.complete() && tasks.all_taken());
         assert!(out.iter().enumerate().all(|(n, &byte)| byte == n as u8));
@@ -458,5 +474,26 @@ mod tests {
         assert!(tasks.take().is_none());
         assert!(!tasks.copy_one(&mut Counting { reads: 0, fail_at: None }, false));
         assert!(tasks.complete() && tasks.all_taken());
+    }
+
+    /// Pushed tasks wait for `publish` (published in batches): until then no
+    /// copier takes them and the ring isn't complete, so a GE sync or frame
+    /// end that publishes first can't miss them.
+    #[test]
+    fn pushed_tasks_wait_for_publish() {
+        let mut tasks = CopyTasks::new();
+        let mut out = [0u8; 2];
+        let mut source = Counting { reads: 0, fail_at: None };
+        for n in 0..2 {
+            let destination = unsafe { out.as_mut_ptr().add(n) };
+            tasks.push(CopyTask { source: 0x10 + n as u32, length: 1, destination, layout: Layout::Plain }, |_| false);
+        }
+        assert!(!tasks.copy_one(&mut source, false), "not published yet");
+        assert!(!tasks.complete() && tasks.all_taken() && tasks.untaken() == 2);
+        assert!(tasks.publish());
+        assert!(!tasks.publish(), "nothing new");
+        while tasks.copy_one(&mut source, false) {}
+        assert!(tasks.complete());
+        assert_eq!(out, [0x10, 0x11]);
     }
 }
