@@ -101,6 +101,11 @@ pub static RAW_PLAIN: AtomicI32 = AtomicI32::new(1);
 /// the plain and the full program, as before. 1 = on (default).
 pub static RAW_VARIANTS: AtomicI32 = AtomicI32::new(1);
 
+/// Lit one- and four-bone draws whose light set is flat (`flat_lights`) get
+/// the flat programs (`RawVariant::Lit1Flat` / `Lit4Flat`: no pow, three
+/// lights; the same picture). 1 = on (default), 0 = the general ones.
+pub static RAW_FLAT_LIGHTS: AtomicI32 = AtomicI32::new(1);
+
 /// Measuring only (0 = off): our scene draws only
 /// its top <rows> pixel rows, to see how the GPU time scales with the area
 /// drawn.
@@ -883,12 +888,22 @@ impl Draws {
                 let plain = RAW_PLAIN.load(Ordering::Relaxed) != 0;
                 let variants = RAW_VARIANTS.load(Ordering::Relaxed) != 0;
                 let mut variant = raw_variant(weights, lit_with_lights, plain, variants);
+                if variant != variant.flat() && RAW_FLAT_LIGHTS.load(Ordering::Relaxed) != 0 {
+                    let flat = frame.raw_transform_of(draw).and_then(|(transform, _)| raw_light_set(frame, transform)).is_some_and(flat_lights);
+                    if flat && self.programs.raw_set(variant.flat()).ready() {
+                        variant = variant.flat();
+                    }
+                }
                 if !self.programs.raw_set(variant).ready() {
                     variant = RawVariant::Full;
                 }
                 match variant {
                     RawVariant::Plain => stats().plain_draws += 1,
                     RawVariant::Lit1 | RawVariant::Lit4 => stats().lit_variant_draws += 1,
+                    RawVariant::Lit1Flat | RawVariant::Lit4Flat => {
+                        stats().lit_variant_draws += 1;
+                        stats().flat_light_draws += 1;
+                    }
                     RawVariant::Full => {}
                 }
                 RawSetChoice::Raw(variant)
@@ -1326,6 +1341,17 @@ fn raw_variant(weights: u32, lit_with_lights: bool, plain: bool, variants: bool)
     } else {
         RawVariant::Full
     }
+}
+
+/// Whether the flat programs (`RawVariant::Lit1Flat` / `Lit4Flat`,
+/// nativeres_raw_v.cg RAW_FLAT_LIGHTS) light with `lights` exactly as the
+/// general ones: the specular coefficient is 0 or less (the GE's pow is 1
+/// for every light) and the fourth light is all zeros (direction, colours,
+/// flags: it adds exactly 0; unused lights are zeros, `Lights::gpu`).
+fn flat_lights(lights: &GpuLights) -> bool {
+    let coefficient = lights.emissive[3];
+    let zeros = |values: &[f32; 4]| values.iter().all(|value| value.to_bits() == 0);
+    coefficient <= 0.0 && zeros(&lights.to_light[3]) && zeros(&lights.diffuse[3]) && zeros(&lights.specular[3])
 }
 
 /// The raw programs' uniforms beyond the ones the sprite program shares

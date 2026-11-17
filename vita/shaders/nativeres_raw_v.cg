@@ -69,6 +69,14 @@
 // - RAW_LIT1 (nativeres_raw_lit1_v.cg): lights, one bone (RAW_ONE_BONE).
 // - RAW_LIT4 (nativeres_raw_lit4_v.cg): lights, up to four bones
 //   (RAW_FOUR_BONES: aWeights0 only, uBones[12]).
+// - RAW_LIT1_FLAT, RAW_LIT4_FLAT (nativeres_raw_lit1flat_v.cg, _lit4flat_v):
+//   as RAW_LIT1 / RAW_LIT4 for light sets whose specular coefficient is 0
+//   or less and whose fourth light is all zeros (RAW_FLAT_LIGHTS, draw.rs
+//   `flat_lights`). The GE's pow is 1 then (PspPow), so the powered
+//   diffuse and the specular factor need no pow and no half vector, and the
+//   fourth light, which adds exactly 0, is left out: the same sums, bit for
+//   bit. MTX's riders: three lights with specular, coefficient 0 (2026-11-17,
+//   every lit draw of the four dumps).
 // One bone (RAW_ONE_BONE) is skinned without a branch: aWeight is the first
 // weight, uSkin y its scale, z added to it: formats without weights get
 // weight 0 x 0 + 1 and the identity as bone 0, which leaves position and
@@ -82,6 +90,14 @@
 #endif
 #ifdef RAW_LIT4
 #define RAW_FOUR_BONES 1
+#endif
+#ifdef RAW_LIT1_FLAT
+#define RAW_ONE_BONE 1
+#define RAW_FLAT_LIGHTS 1
+#endif
+#ifdef RAW_LIT4_FLAT
+#define RAW_FOUR_BONES 1
+#define RAW_FLAT_LIGHTS 1
 #endif
 
 // The number above the low bits of a whole number v (1 / 2^low = inverse):
@@ -245,6 +261,18 @@ void main(
 		float coefficient = uLights[17].a;
 		float3 diffuse = float3(0.0f, 0.0f, 0.0f);
 		float3 specular = float3(0.0f, 0.0f, 0.0f);
+#ifdef RAW_FLAT_LIGHTS
+		// Coefficient <= 0: PspPow gives 1 (powered diffuse 1, specular
+		// factor 1); the fourth light is zeros (see the variants above).
+		for (int i = 0; i < 3; i++) {
+			float lightDot = dot(uLights[i].xyz, n);
+			if (uLights[8 + i].a > 0.5f)
+				lightDot = 1.0f;
+			diffuse += uLights[8 + i].rgb * max(lightDot, 0.0f);
+			if (uLights[12 + i].a > 0.5f && lightDot >= 0.0f)
+				specular += uLights[12 + i].rgb;
+		}
+#else
 		for (int i = 0; i < 4; i++) {
 			float lightDot = dot(uLights[i].xyz, n);
 			if (uLights[8 + i].a > 0.5f)
@@ -253,6 +281,7 @@ void main(
 			if (uLights[12 + i].a > 0.5f && lightDot >= 0.0f)
 				specular += uLights[12 + i].rgb * PspPow(dot(uLights[4 + i].xyz, n), coefficient);
 		}
+#endif
 		float4 lit;
 		float3 specularPart = specular * specularColor;
 		if (uLights[20].a > 0.5f) {

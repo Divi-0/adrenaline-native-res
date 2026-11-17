@@ -15,7 +15,7 @@
 //! - the 3D program (nativeres_3d_v.cg): the same outputs for vertices in
 //!   model space (the GPU transform and lighting);
 //! - the raw programs (nativeres_raw_v.cg and its variants _raw_plain_v,
-//!   _raw_lit1_v, _raw_lit4_v): raw PSP vertices, one patched program per
+//!   _raw_lit1_v, _raw_lit4_v, _raw_lit1flat_v, _raw_lit4flat_v): raw PSP vertices, one patched program per
 //!   PSP vertex format;
 //! - the raw sprite programs (nativeres_raw_sprite_v.cg);
 //! - blend programs: GXM bakes blending into the fragment program, so every
@@ -131,6 +131,11 @@ pub enum RawVariant {
     Lit1,
     /// Up to four bones, lights (nativeres_raw_lit4_v.cg).
     Lit4,
+    /// `Lit1` / `Lit4` for flat light sets: specular coefficient <= 0 and
+    /// at most three lights (nativeres_raw_lit1flat_v.cg, _lit4flat_v.cg;
+    /// draw.rs `flat_lights`).
+    Lit1Flat,
+    Lit4Flat,
 }
 
 impl RawVariant {
@@ -138,8 +143,8 @@ impl RawVariant {
     pub fn bones(self) -> u32 {
         match self {
             RawVariant::Full => 8,
-            RawVariant::Lit4 => 4,
-            RawVariant::Plain | RawVariant::Lit1 => 1,
+            RawVariant::Lit4 | RawVariant::Lit4Flat => 4,
+            RawVariant::Plain | RawVariant::Lit1 | RawVariant::Lit1Flat => 1,
         }
     }
 
@@ -154,6 +159,18 @@ impl RawVariant {
             RawVariant::Plain => " (plain)",
             RawVariant::Lit1 => " (lit, one bone)",
             RawVariant::Lit4 => " (lit, four bones)",
+            RawVariant::Lit1Flat => " (flat lights, one bone)",
+            RawVariant::Lit4Flat => " (flat lights, four bones)",
+        }
+    }
+
+    /// The same program for a flat light set (`Lit1Flat` / `Lit4Flat`);
+    /// the others as they are.
+    pub fn flat(self) -> RawVariant {
+        match self {
+            RawVariant::Lit1 => RawVariant::Lit1Flat,
+            RawVariant::Lit4 => RawVariant::Lit4Flat,
+            other => other,
         }
     }
 }
@@ -299,6 +316,8 @@ pub struct Programs {
     pub raw_plain: RawSet,
     pub raw_lit1: RawSet,
     pub raw_lit4: RawSet,
+    pub raw_lit1_flat: RawSet,
+    pub raw_lit4_flat: RawSet,
     pub sprites: SpriteSet,
     blend: [BlendProgram; MAX_BLEND_PROGRAMS],
     blend_count: usize,
@@ -347,6 +366,8 @@ impl RawSet {
             RawVariant::Plain => gxp(&shaders::nativeres_raw_plain_v),
             RawVariant::Lit1 => gxp(&shaders::nativeres_raw_lit1_v),
             RawVariant::Lit4 => gxp(&shaders::nativeres_raw_lit4_v),
+            RawVariant::Lit1Flat => gxp(&shaders::nativeres_raw_lit1flat_v),
+            RawVariant::Lit4Flat => gxp(&shaders::nativeres_raw_lit4flat_v),
         };
         let Some(id) = register(program) else {
             render_log::line(format_args!("raw program{}: invalid or not registered\n", self.label()));
@@ -598,6 +619,8 @@ impl Programs {
             raw_plain: RawSet::new(RawVariant::Plain),
             raw_lit1: RawSet::new(RawVariant::Lit1),
             raw_lit4: RawSet::new(RawVariant::Lit4),
+            raw_lit1_flat: RawSet::new(RawVariant::Lit1Flat),
+            raw_lit4_flat: RawSet::new(RawVariant::Lit4Flat),
             sprites: SpriteSet::new(),
             blend: [NO_BLEND_PROGRAM; MAX_BLEND_PROGRAMS],
             blend_count: 0,
@@ -611,6 +634,8 @@ impl Programs {
             RawVariant::Plain => &mut self.raw_plain,
             RawVariant::Lit1 => &mut self.raw_lit1,
             RawVariant::Lit4 => &mut self.raw_lit4,
+            RawVariant::Lit1Flat => &mut self.raw_lit1_flat,
+            RawVariant::Lit4Flat => &mut self.raw_lit4_flat,
         }
     }
 
