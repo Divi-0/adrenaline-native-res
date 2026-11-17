@@ -85,7 +85,16 @@ const MAX_JOB_WORDS: usize = MAX_WORDS / 4;
 /// copier on all cores): 32 -> the capture copied ~360 jobs per frame, 97-98%
 /// of frames recorded; 64 -> ~240, 98-99%; 128 -> ~160, 95-98%; 256 -> ~20,
 /// 90-93% (the recorder waits for the copier).
-pub static COPIER_LAG_JOBS: AtomicU32 = AtomicU32::new(64);
+///
+/// The same limit counts copy tasks (`hand_over_task`). Since the capture
+/// thread writes raw draws itself, tasks are nearly all of the copier's
+/// work and only the GE sync waits for them (`copy_untaken`), so the copier
+/// may fall further behind: it catches up while the walk goes on. Live A/B
+/// 2026-11-17 (MTX), 64 -> 512: paused race help 3.1 -> 0.25 % of the
+/// capture thread, capture CPU 32.0 -> 30.9 ms, the copies still done at
+/// the sync (wait 0.0-0.3 ms); start gate, two rounds each: game 27.6 ->
+/// 28.75 fps, walk p50 29.5 -> 27.3 ms, late flips 158 -> ~117.
+pub static COPIER_LAG_JOBS: AtomicU32 = AtomicU32::new(512);
 
 /// Copy tasks are published to the copier this many at a time
 /// (`DrawStream::copy_task`; the rest whenever the producer waits for
