@@ -582,7 +582,8 @@ pub struct TextureDescriptor {
 /// capture thread only reserves the place; the words are copied from PSP
 /// memory by the draw stream's copier and stored by the recorder thread
 /// (`Geometry::fill_palette`), off the capture thread (see
-/// `recorder::LoadedPalette`).
+/// `recorder::LoadedPalette`); for the capture thread's own draws the
+/// copier stores them itself (`copy_tasks::Layout::Palette`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FramePalette {
@@ -905,6 +906,26 @@ impl Frame {
             raw_camera_count: &mut *addr_of_mut!((*frame).raw_camera_count),
             raw_cameras: &mut *addr_of_mut!((*frame).raw_cameras),
         }
+    }
+
+    /// Where palette `place`'s words and its hash go, as pointers for the
+    /// copy task that stores them (`copy_tasks::Layout::Palette`, the
+    /// capture thread's draws); `None` if the place lies outside the lists.
+    /// Nobody else writes them: the place is this palette's alone
+    /// (`Catalog::add_palette`), and the recorder stores only the palettes
+    /// its jobs carry.
+    ///
+    /// # Safety
+    /// `frame` must point to a frame.
+    pub unsafe fn palette_place_raw(frame: *mut Frame, place: PalettePlace) -> Option<(*mut u32, *mut u32)> {
+        use core::ptr::addr_of_mut;
+        let end = (place.offset as usize).checked_add(place.word_count as usize)?;
+        if end > MAX_PALETTE_WORDS || place.index as usize >= MAX_FRAME_PALETTES {
+            return None;
+        }
+        let words = addr_of_mut!((*frame).palette_words) as *mut u32;
+        let hashes = addr_of_mut!((*frame).palette_hashes) as *mut u32;
+        Some((words.add(place.offset as usize), hashes.add(place.index as usize)))
     }
 
     /// The catalog part of `split`, from a pointer: for the recorder's

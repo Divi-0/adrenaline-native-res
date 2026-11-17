@@ -48,6 +48,9 @@ pub const NO_JOINED_CALLS: u32 = 512;
 /// Copy tasks are published to the copier one by one, each with a wake
 /// (`draw_stream::TASK_BATCH` off).
 pub const NO_TASK_BATCHES: u32 = 1024;
+/// Palettes of the capture thread's draws go to the recorder as jobs, as
+/// before, instead of as copy tasks (`recorder::Queues::write_direct`).
+pub const NO_PALETTE_TASKS: u32 = 2048;
 
 /// True if experiment `bit` is on.
 #[inline]

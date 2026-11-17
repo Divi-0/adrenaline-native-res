@@ -58,6 +58,14 @@ pub enum Layout {
     /// lives in the builder's lists until the frame's end, when every task
     /// is done.
     Gather { stride: u32, used: u32, list: *const u16 },
+    /// A palette's words (`frame_builder`'s draws: no job carries them):
+    /// `length` bytes read into the first of `words` words at the
+    /// destination (its place in `Frame::palette_words`), the rest zeros,
+    /// and `texture::hash_words` of all `words` written to `hash` (its
+    /// `Frame::palette_hashes` entry), as `Geometry::fill_palette` stores
+    /// them. A source that can't be read whole: the words up to the first
+    /// unreadable one (`recorder::store_palette`).
+    Palette { words: u32, hash: *mut u32 },
 }
 
 /// One copy.
@@ -73,8 +81,9 @@ pub struct CopyTask {
 }
 
 // Safe to send: the destination is memory the task's producer reserved for
-// it (the raw arena), touched by nobody else until the task is done, and a
-// gather list stays unchanged until then.
+// it (the raw arena; a palette's place and hash entry in the frame, given
+// to this palette alone by `Catalog::add_palette`), touched by nobody else
+// until the task is done, and a gather list stays unchanged until then.
 unsafe impl Send for CopyTask {}
 
 impl CopyTask {
@@ -87,6 +96,7 @@ impl CopyTask {
             Layout::Plain => length,
             Layout::Sprites { pair } => 4 * pair as usize * length.div_ceil(pair as usize),
             Layout::Gather { stride, .. } => length * stride as usize,
+            Layout::Palette { words, .. } => 4 * words as usize,
         }
     }
 }
@@ -135,6 +145,10 @@ impl<M: PspMemory> ByteSource for MemorySource<'_, M> {
 /// Copies `task` with `source`. A source that can't be read leaves zeros
 /// (counted in `UNREADABLE_TASKS`); false then.
 pub fn run(task: &CopyTask, source: &mut impl ByteSource, stable: bool) -> bool {
+    // Zeros and the count of its own (only what can't be read).
+    if let Layout::Palette { words, hash } = task.layout {
+        return palette(task, (words, hash), source, stable);
+    }
     // Safe: the destination holds `written()` bytes reserved for this task
     // (see `CopyTask`).
     let out = unsafe { core::slice::from_raw_parts_mut(task.destination, task.written()) };
@@ -146,12 +160,34 @@ pub fn run(task: &CopyTask, source: &mut impl ByteSource, stable: bool) -> bool 
             let list = unsafe { core::slice::from_raw_parts(list, task.length as usize) };
             gather(task.source, (stride, used), list, source, out)
         }
+        Layout::Palette { .. } => unreachable!("handled above"),
     };
     if !read {
         out.fill(0);
         UNREADABLE_TASKS.fetch_add(1, Ordering::Relaxed);
     }
     read
+}
+
+/// A palette task (`Layout::Palette`): its words stored and hashed. False
+/// if they couldn't all be read (counted in `UNREADABLE_TASKS`).
+fn palette(task: &CopyTask, (words, hash): (u32, *mut u32), source: &mut impl ByteSource, stable: bool) -> bool {
+    // Safe: the destination is the palette's place, `words` aligned words
+    // reserved for it, and `hash` its own entry (see `CopyTask`).
+    let (stored, hash) = unsafe { (core::slice::from_raw_parts_mut(task.destination as *mut u32, words as usize), &mut *hash) };
+    let bytes = (task.length as usize).min(4 * stored.len()) / 4 * 4;
+    // Safe to view the words as bytes (the Vita and the PC are little-endian).
+    let out = unsafe { core::slice::from_raw_parts_mut(stored.as_mut_ptr() as *mut u8, bytes) };
+    let whole = read_stable(source, task.source, out, stable);
+    let readable = if whole {
+        bytes / 4
+    } else {
+        UNREADABLE_TASKS.fetch_add(1, Ordering::Relaxed);
+        (0..bytes / 4).take_while(|&n| source.read_bytes(task.source.wrapping_add(4 * n as u32), &mut out[4 * n..4 * n + 4])).count()
+    };
+    stored[readable..].fill(0);
+    *hash = crate::texture::hash_words(stored);
+    whole
 }
 
 /// Reads `out.len()` bytes at `address`; a small range again until two
@@ -423,6 +459,27 @@ mod tests {
         for corner in 0..4 {
             assert_eq!(&out[6 * corner..6 * corner + 6], &[0, 1, 2, 3, 4, 5]);
             assert_eq!(&out[24 + 6 * corner..24 + 6 * corner + 4], &[6, 7, 8, 9]);
+        }
+    }
+
+    /// A palette task stores its words, zeros after them, and the hash
+    /// `Geometry::fill_palette` gives; partly unreadable, the words up to
+    /// the first unreadable one (as `recorder::store_palette`).
+    #[test]
+    fn a_palette_task_stores_and_hashes_its_words() {
+        let word = |n: u32| u32::from_le_bytes([n as u8, n as u8 + 1, n as u8 + 2, n as u8 + 3]);
+        for (fail_at, readable) in [(None, 3), (Some(0x308), 2)] {
+            let mut words = [0xEEEE_EEEEu32; 5];
+            let mut hash = 0u32;
+            let layout = Layout::Palette { words: 4, hash: &mut hash };
+            let task = CopyTask { source: 0x300, length: 12, destination: words.as_mut_ptr() as *mut u8, layout };
+            assert_eq!(task.written(), 16);
+            let whole = run(&task, &mut Counting { reads: 0, fail_at }, true);
+            assert_eq!(whole, fail_at.is_none());
+            let expected: Vec<u32> = (0..4).map(|n| if n < readable { word(0x300 + 4 * n) } else { 0 }).collect();
+            assert_eq!(&words[..4], &expected[..]);
+            assert_eq!(words[4], 0xEEEE_EEEE, "nothing after its place");
+            assert_eq!(hash, crate::texture::hash_words(&expected));
         }
     }
 

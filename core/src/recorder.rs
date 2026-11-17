@@ -516,6 +516,23 @@ impl Queues<'_> {
         crate::phase::leave(previous);
         written?;
         if let Some(fill) = palette.take_unstored() {
+            // The copier stores it (and hashes it) straight into the frame,
+            // as the recorder would have (`copy_tasks::Layout::Palette`):
+            // one copy task instead of a job through the recorder. Words
+            // restored from an old state (address 0) still go as a job.
+            // Safe: `frame` is the frame being recorded.
+            let place = (fill.address != 0 && !crate::bench::experiment(crate::bench::NO_PALETTE_TASKS))
+                .then(|| unsafe { Frame::palette_place_raw(frame, fill.place) })
+                .flatten();
+            if let Some((words, hash)) = place {
+                let count = (fill.place.word_count as usize).min(MAX_PALETTE_WORDS) as u32;
+                let layout = crate::copy_tasks::Layout::Palette { words: fill.place.word_count, hash };
+                let task = crate::copy_tasks::CopyTask { source: fill.address, length: 4 * count, destination: words as *mut u8, layout };
+                // False only if copied at once and unreadable: stored as
+                // far as readable either way.
+                self.stream.copy_task(memory, task);
+                return Ok(());
+            }
             let draw = QueuedDraw {
                 kind: JobKind::Palette,
                 prepared: *prepared,
