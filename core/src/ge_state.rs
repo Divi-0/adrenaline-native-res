@@ -6,6 +6,9 @@
 //! argument of every opcode and decode fields on demand.
 
 use crate::command::{op, Command};
+use crate::event_ring::{
+    GE_STATE_BONES, GE_STATE_PROJECTION, GE_STATE_REGISTERS, GE_STATE_TEXGEN, GE_STATE_VIEW, GE_STATE_WORDS, GE_STATE_WORLD,
+};
 use crate::memory::physical;
 use crate::snapshot::{Reader, Writer};
 use crate::vertex::{IndexFormat, VertexFormat, VertexLayout};
@@ -138,6 +141,41 @@ const fn command_flag_table() -> [u8; 256] {
         index += 1;
     }
     flags
+}
+
+/// Registers `GeState::take_hardware_state` leaves alone: commands that do
+/// something rather than hold a value (drawing, list flow, CLUT load,
+/// texture flush/sync, block transfer), the address commands whose effect
+/// isn't the register (offset, origin; the vertex and index addresses move
+/// on with every draw), the matrix commands (the matrices come whole) and
+/// the unused top range.
+fn keeps_own_register(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        0x00..=0x0F
+            | op::OFFSET_ADDRESS
+            | op::ORIGIN
+            | op::BONE_MATRIX_NUMBER
+            | op::BONE_MATRIX_DATA
+            | 0x3A..=0x41
+            | op::CLUT_LOAD
+            | 0xCB // texture flush
+            | 0xCC // texture sync
+            | op::TRANSFER_START
+            | 0xF0..=0xFF
+    )
+}
+
+/// Writes the 24-bit floats `words` into `matrix`; returns how many
+/// elements changed.
+fn take_matrix(matrix: &mut [f32], words: &[u32]) -> u32 {
+    let mut changed = 0;
+    for (element, &word) in matrix.iter_mut().zip(words) {
+        let value = float24(word & 0x00FF_FFFF);
+        changed += (element.to_bits() != value.to_bits()) as u32;
+        *element = value;
+    }
+    changed
 }
 
 /// Number of skinning bone matrices.
@@ -441,6 +479,37 @@ impl GeState {
         self.bone_generation = self.bone_generation.wrapping_add(1);
         self.transform_changes = self.transform_changes.wrapping_add(1);
         self.lighting_changes = self.lighting_changes.wrapping_add(1);
+    }
+
+    /// Takes over the GE's own registers and matrices (the plugin's
+    /// `EVENT_GE_STATE` block, `event_ring::GE_STATE_*` layout). Registers
+    /// that act rather than hold a value (`keeps_own_register`) stay as
+    /// they are. Returns how many registers and matrix elements differed
+    /// from ours: 0 and 0 when our walk had the GE's state (the check
+    /// `gestate` makes in a running game).
+    pub fn take_hardware_state(&mut self, block: &[u32; GE_STATE_WORDS]) -> (u32, u32) {
+        let mut register_differences = 0;
+        for opcode in 0..=255u8 {
+            if keeps_own_register(opcode) {
+                continue;
+            }
+            let data = block[GE_STATE_REGISTERS + opcode as usize] & 0x00FF_FFFF;
+            register_differences += (self.registers[opcode as usize] != data) as u32;
+            self.set_register(Command(((opcode as u32) << 24) | data));
+        }
+        let matrices = &mut self.matrices;
+        let matrix_differences = take_matrix(&mut matrices.bones, &block[GE_STATE_BONES..GE_STATE_WORLD])
+            + take_matrix(&mut matrices.world, &block[GE_STATE_WORLD..GE_STATE_VIEW])
+            + take_matrix(&mut matrices.view, &block[GE_STATE_VIEW..GE_STATE_PROJECTION])
+            + take_matrix(&mut matrices.projection, &block[GE_STATE_PROJECTION..GE_STATE_TEXGEN]);
+        // The game sends a NUMBER command before its DATA commands.
+        matrices.world_next = 0;
+        matrices.view_next = 0;
+        matrices.projection_next = 0;
+        matrices.bone_next = 0;
+        self.matrix_generation = self.matrix_generation.wrapping_add(1);
+        self.bone_generation = self.bone_generation.wrapping_add(1);
+        (register_differences, matrix_differences)
     }
 
     /// Changes whenever the world, view or projection matrix is uploaded to.

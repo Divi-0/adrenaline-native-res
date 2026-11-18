@@ -32,9 +32,10 @@ use core::ptr::{addr_of_mut, read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering::Relaxed};
 
 use nativeres_core::event_ring::{
-    Ring, CAPACITY, EVENT_FRAMEBUFFER_FLIP, EVENT_GE_RESTORE_CONTEXT, EVENT_GE_SAVE_CONTEXT, EVENT_GE_SYNC,
-    EVENT_LIST_ENQUEUE, EVENT_LIST_ENQUEUE_HEAD,
-    EVENT_STALL_UPDATE, MAGIC, RING_ADDRESS, SYNC_TIMEOUT_US, SYNC_WANTED, VERSION,
+    Ring, CAPACITY, EVENT_FRAMEBUFFER_FLIP, EVENT_GE_RESTORE_CONTEXT, EVENT_GE_SAVE_CONTEXT, EVENT_GE_STATE, EVENT_GE_SYNC,
+    EVENT_LIST_ENQUEUE, EVENT_LIST_ENQUEUE_HEAD, EVENT_STALL_UPDATE, GE_STATE_BONES, GE_STATE_PROJECTION,
+    GE_STATE_REGISTERS, GE_STATE_TEXGEN, GE_STATE_VIEW, GE_STATE_WORDS, GE_STATE_WORLD, MAGIC, RING_ADDRESS,
+    SYNC_TIMEOUT_US, SYNC_WANTED, VERSION,
 };
 use nativeres_core::psp_copy::SyncStall;
 use nativeres_core::psp_link::{copy_method, VramRequestTable, VRAM_REQUESTS_ADDRESS};
@@ -50,6 +51,9 @@ const NID_GE_DRAW_SYNC: u32 = 0xB287_BD61;
 const NID_GE_LIST_SYNC: u32 = 0x0344_4EB4;
 const NID_GE_SAVE_CONTEXT: u32 = 0x438A_385A;
 const NID_GE_RESTORE_CONTEXT: u32 = 0x0BF6_08FB;
+/// Called, not hooked (the GE state block, `answer_state_request`).
+const NID_GE_GET_CMD: u32 = 0xDC93_CFEF;
+const NID_GE_GET_MTX: u32 = 0x57C8_945B;
 
 type EnqueueFn = unsafe extern "C" fn(list: u32, stall: u32, callback: i32, args: u32) -> i32;
 type StallFn = unsafe extern "C" fn(queue: i32, stall: u32) -> i32;
@@ -57,6 +61,8 @@ type FrameBufFn = unsafe extern "C" fn(address: u32, width: i32, format: i32, sy
 type DrawSyncFn = unsafe extern "C" fn(mode: i32) -> i32;
 type ListSyncFn = unsafe extern "C" fn(queue: i32, mode: i32) -> i32;
 type ContextFn = unsafe extern "C" fn(context: u32) -> i32;
+type GetCmdFn = unsafe extern "C" fn(cmd: i32) -> u32;
+type GetMtxFn = unsafe extern "C" fn(kind: i32, matrix: *mut u32) -> i32;
 
 /// The original functions (0 until hooked; set before the system call is
 /// patched, so a hook never sees 0).
@@ -68,6 +74,8 @@ static ORIGINAL_DRAW_SYNC: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_LIST_SYNC: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_SAVE_CONTEXT: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_RESTORE_CONTEXT: AtomicUsize = AtomicUsize::new(0);
+static GE_GET_CMD: AtomicUsize = AtomicUsize::new(0);
+static GE_GET_MTX: AtomicUsize = AtomicUsize::new(0);
 
 /// A mutable static for the plugin's single-CPU threads. Who touches what,
 /// and with which care, is said at each one (as the C plugin's statics).
@@ -291,9 +299,87 @@ fn wait_for_vita() -> u32 {
     waited
 }
 
+/// The GE state block (`EVENT_GE_STATE`), cache-line aligned so the
+/// write-back covers only it.
+#[repr(C, align(64))]
+struct GeStateBlock([u32; GE_STATE_WORDS]);
+
+/// Written only by `answer_state_request` (game threads at their GE syncs,
+/// one at a time: interrupts stay on, but a request is answered once).
+static GE_STATE: Global<GeStateBlock> = Global::new(GeStateBlock([0; GE_STATE_WORDS]));
+
+/// sceGeGetMtx's matrix numbers: bones 0..7, then world, view, projection,
+/// texture generation (pspge.h PSP_GE_MTX_*), with where each goes in the
+/// block.
+const GE_MATRICES: [(i32, usize); 12] = [
+    (0, GE_STATE_BONES),
+    (1, GE_STATE_BONES + 12),
+    (2, GE_STATE_BONES + 24),
+    (3, GE_STATE_BONES + 36),
+    (4, GE_STATE_BONES + 48),
+    (5, GE_STATE_BONES + 60),
+    (6, GE_STATE_BONES + 72),
+    (7, GE_STATE_BONES + 84),
+    (8, GE_STATE_WORLD),
+    (9, GE_STATE_VIEW),
+    (10, GE_STATE_PROJECTION),
+    (11, GE_STATE_TEXGEN),
+];
+
+/// If the Vita side asked for the GE's state (`vita_state_request` differs
+/// from `state_answered`): reads every register (sceGeGetCmd) and matrix
+/// (sceGeGetMtx) into `GE_STATE` and sends `EVENT_GE_STATE`. Called after
+/// the game's GE sync, so the GE is idle and its registers are those the
+/// lists so far left. The Vita side asks after a new session: a loaded
+/// savestate brings back the GE registers of its moment, which the game
+/// never sends again.
+fn answer_state_request() {
+    let request = header_get(header!(vita_state_request));
+    if request == header_get(header!(state_answered)) {
+        return;
+    }
+    header_set(header!(state_answered), request);
+    let start = now_us();
+    let (get_cmd, get_mtx) = (original(&GE_GET_CMD), original(&GE_GET_MTX));
+    // Safe: only this function writes the block, once per request.
+    let block = unsafe { &mut GE_STATE.get().0 };
+    let mut result = 0u32;
+    if get_cmd == 0 || get_mtx == 0 {
+        result = 0x8000_0001; // not found: the Vita side keeps its registers
+    } else {
+        // Safe: the kernel functions' addresses, of these types.
+        let (get_cmd, get_mtx) =
+            unsafe { (core::mem::transmute::<usize, GetCmdFn>(get_cmd), core::mem::transmute::<usize, GetMtxFn>(get_mtx)) };
+        // In the game's system call k1 says "user-mode caller": the GE
+        // driver would refuse our kernel buffer.
+        let k1 = set_k1(0);
+        // Raw pointers rather than slices: the plugin may link no panic
+        // path (bounds checks).
+        let words = block.as_mut_ptr();
+        for cmd in 0..256 {
+            // Safe: a plain kernel call with a valid register number; the
+            // register part of the block has 256 words.
+            unsafe { *words.add(GE_STATE_REGISTERS + cmd) = get_cmd(cmd as i32) };
+        }
+        for (kind, at) in GE_MATRICES {
+            // Safe: the block has room at `at` for the matrix (16 words for
+            // the projection, 12 for the others; PPSSPP sceGeGetMtx).
+            let error = unsafe { get_mtx(kind, words.add(at)) };
+            if error < 0 && result == 0 {
+                result = error as u32;
+            }
+        }
+        set_k1(k1);
+    }
+    // Safe: the block, in kernel RAM the Vita side reads directly.
+    unsafe { sceKernelDcacheWritebackRange(block.as_ptr().cast(), (GE_STATE_WORDS * 4) as u32) };
+    push_event(EVENT_GE_STATE, [block.as_ptr() as u32, request, result, now_us().wrapping_sub(start)]);
+}
+
 /// `kind` 1 = sceGeDrawSync, 2 = sceGeListSync (`queue`); `ge_us`: how
 /// long Sony's sync took (the game waiting for the GE).
 fn after_ge_sync(kind: u32, queue: i32, ge_us: u32) {
+    answer_state_request();
     let waited = wait_for_vita();
     copy::probe_ge_at_sync();
     if header_get(header!(vita_sync_events)) == SYNC_WANTED {
@@ -372,6 +458,8 @@ fn init_ring() {
     header_set(header!(write_count), 0);
     header_set(header!(vita_sync_wanted), 0); // until the Vita side asks again
     header_set(header!(vita_sync_events), 0);
+    header_set(header!(vita_state_request), 0);
+    header_set(header!(state_answered), 0);
     header_set(header!(sync_waits), 0);
     header_set(header!(sync_wait_us), 0);
     header_set(header!(sync_timeouts), 0);
@@ -410,6 +498,8 @@ pub unsafe extern "C" fn module_start(_args: u32, _argp: *mut c_void) -> i32 {
     hook_syscall(GE, GE_DRIVER, NID_GE_LIST_SYNC, ge_list_sync_hook as ListSyncFn as usize, &ORIGINAL_LIST_SYNC);
     hook_syscall(GE, GE_DRIVER, NID_GE_SAVE_CONTEXT, ge_save_context_hook as ContextFn as usize, &ORIGINAL_SAVE_CONTEXT);
     hook_syscall(GE, GE_DRIVER, NID_GE_RESTORE_CONTEXT, ge_restore_context_hook as ContextFn as usize, &ORIGINAL_RESTORE_CONTEXT);
+    GE_GET_CMD.store(sctrlHENFindFunction(GE.as_ptr(), GE_DRIVER.as_ptr(), NID_GE_GET_CMD) as usize, Relaxed);
+    GE_GET_MTX.store(sctrlHENFindFunction(GE.as_ptr(), GE_DRIVER.as_ptr(), NID_GE_GET_MTX) as usize, Relaxed);
 
     sceKernelDcacheWritebackInvalidateAll();
     sceKernelIcacheClearAll();

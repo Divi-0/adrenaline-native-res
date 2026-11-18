@@ -44,11 +44,15 @@ pub enum Event {
     StallUpdated { id: i32, stall: u32 },
     /// sceDisplaySetFrameBuf: the frame is finished.
     FramebufferShown { address: u32, stride: u32, pixel_format: u32 },
+    /// The GE's own registers and matrices, read by the plugin because we
+    /// asked (`event_ring::EVENT_GE_STATE`): the block's address; `ok`: all
+    /// reads succeeded.
+    GeStateTaken { address: u32, ok: bool, psp_us: u32 },
 }
 
 use crate::event_ring::{
-    EVENT_FRAMEBUFFER_FLIP, EVENT_GE_RESTORE_CONTEXT, EVENT_GE_SAVE_CONTEXT, EVENT_LIST_ENQUEUE, EVENT_LIST_ENQUEUE_HEAD,
-    EVENT_STALL_UPDATE,
+    EVENT_FRAMEBUFFER_FLIP, EVENT_GE_RESTORE_CONTEXT, EVENT_GE_SAVE_CONTEXT, EVENT_GE_STATE, EVENT_LIST_ENQUEUE,
+    EVENT_LIST_ENQUEUE_HEAD, EVENT_STALL_UPDATE, GE_STATE_WORDS,
 };
 
 impl Event {
@@ -62,6 +66,7 @@ impl Event {
             EVENT_GE_SAVE_CONTEXT => Event::ContextSaved { address: args[0], ok: args[1] as i32 >= 0 },
             EVENT_GE_RESTORE_CONTEXT => Event::ContextRestored { address: args[0], ok: args[1] as i32 >= 0 },
             EVENT_STALL_UPDATE => Event::StallUpdated { id: args[0] as i32, stall: args[1] },
+            EVENT_GE_STATE => Event::GeStateTaken { address: args[0], ok: args[2] == 0, psp_us: args[3] },
             EVENT_FRAMEBUFFER_FLIP => {
                 Event::FramebufferShown { address: args[0], stride: args[1], pixel_format: args[2] }
             }
@@ -85,6 +90,11 @@ pub struct Capture {
     ge_writes: GeWrites,
     current_frame: FrameStats,
     frames_completed: u32,
+    /// SCREEN_OFFSET_X at the last frame's end (`FrameStats::screen_offset_x_changed`).
+    last_screen_offset_x: u32,
+    /// A new session started and the GE's own state hasn't come yet
+    /// (`start_session`, `Event::GeStateTaken`).
+    waiting_for_ge_state: bool,
     /// Only follow the lists, without statistics or recording draws. For
     /// timing the walk on its own (`bench`); wrong for anything else.
     pub walk_only: bool,
@@ -128,6 +138,8 @@ impl Capture {
             ge_writes: GeWrites::new(),
             current_frame: FrameStats::new(),
             frames_completed: 0,
+            last_screen_offset_x: 0,
+            waiting_for_ge_state: false,
             walk_only: false,
             pipelined: false,
             walk_stream: WalkStream::new(),
@@ -150,9 +162,64 @@ impl Capture {
     /// capture thread's stack. Queue slots past `queue_len` are never read,
     /// so they don't need clearing.
     pub fn reset(&mut self) {
+        self.forget(true);
+    }
+
+    /// A new session of the PSP plugin: forgets the lists, frames and
+    /// palettes as `reset` does, but keeps the GE registers and matrices.
+    ///
+    /// A new session is either a game (re)start or an Adrenaline savestate
+    /// load: the state restores the plugin's RAM with it, so the session
+    /// number jumps too. After a load, Sony's GE has the registers of the
+    /// moment the state was made, and the game never sends registers it sets
+    /// once at boot again: Monster Hunter Freedom's scissor came out as
+    /// 0,0-0,0 after a load (GeState::new), every draw clipped away, a black
+    /// picture (2026-11-18). The registers we had are the closest we know.
+    /// A game that really starts sets all its state again anyway.
+    ///
+    /// The GE's own state is asked for meanwhile (the Vita side writes the
+    /// request into the ring) and replaces ours when it comes
+    /// (`Event::GeStateTaken`); until then `waiting_for_ge_state`.
+    pub fn start_session(&mut self) {
+        self.forget(false);
+        self.waiting_for_ge_state = true;
+    }
+
+    /// Since `start_session` or `expect_ge_state`, the GE's own state
+    /// hasn't come yet: frames walked meanwhile may use wrong registers.
+    pub fn waiting_for_ge_state(&self) -> bool {
+        self.waiting_for_ge_state
+    }
+
+    /// The Vita side asked the plugin for the GE's state (`repairs_needed`).
+    pub fn expect_ge_state(&mut self) {
+        self.waiting_for_ge_state = true;
+    }
+
+    /// Takes over the GE's own state from the plugin's block at `address`.
+    fn take_ge_state(&mut self, address: u32, memory: &mut impl PspMemory) {
+        self.waiting_for_ge_state = false;
+        let mut block = [0u32; GE_STATE_WORDS];
+        if memory.read_words(address, &mut block).is_none() {
+            self.current_frame.bad_addresses += 1;
+            return;
+        }
+        let (registers, matrices) = self.ge.take_hardware_state(&block);
+        self.current_frame.ge_states += 1;
+        self.current_frame.ge_state_register_differences += registers;
+        self.current_frame.ge_state_matrix_differences += matrices;
+        if self.pipelined {
+            // As a context restore: stage B's registers don't get it (yet).
+            self.current_frame.contexts_pipelined += 1;
+        }
+    }
+
+    fn forget(&mut self, registers_too: bool) {
         self.walk_stream.wait_until_read();
         self.queue_len = 0;
-        self.ge = GeState::new();
+        if registers_too {
+            self.ge = GeState::new();
+        }
         self.palette.clear(); // in place: LoadedPalette holds 2 KiB of words
         self.draw_states.forget();
         self.stream.clear();
@@ -161,12 +228,18 @@ impl Capture {
         self.current_frame = FrameStats::new();
         self.frames_completed = 0;
         self.walk_stream.clear();
-        self.stage_ge = GeState::new();
+        // Stage B starts from the walk's registers (as in `set_pipelined`).
+        if registers_too {
+            self.stage_ge = GeState::new();
+        } else {
+            self.stage_ge.clone_from(&self.ge);
+        }
         self.stage_writes.clear();
         self.stage_stats = FrameStats::new();
         self.write_filter.start(&self.stage_ge, crate::recorder::recorder_wants);
         self.stage_actions = None;
         self.contexts.clear();
+        self.waiting_for_ge_state = false;
     }
 
     /// The PSP put back the GE state saved at `address` (`ge_context`).
@@ -429,6 +502,14 @@ impl Capture {
                     self.restore_context(address);
                 }
             }
+            Event::GeStateTaken { address, ok, psp_us } => {
+                self.current_frame.ge_state_psp_us += psp_us;
+                if ok {
+                    self.take_ge_state(address, memory);
+                } else {
+                    self.waiting_for_ge_state = false;
+                }
+            }
             Event::StallUpdated { id, stall } => {
                 self.current_frame.stall_updates += 1;
                 if let Some(list) = self.queue[..self.queue_len].iter_mut().find(|list| list.id == id) {
@@ -599,6 +680,11 @@ impl Capture {
         finished.contexts_restored = walk.contexts_restored;
         finished.contexts_missing = walk.contexts_missing;
         finished.contexts_pipelined = walk.contexts_pipelined;
+        finished.ge_states = walk.ge_states;
+        finished.ge_state_register_differences = walk.ge_state_register_differences;
+        finished.ge_state_matrix_differences = walk.ge_state_matrix_differences;
+        finished.ge_state_psp_us = walk.ge_state_psp_us;
+        self.note_screen_offset_x(&mut finished);
         finished.transfers_skipped = self.ge_writes.transfers_skipped;
         self.ge_writes.clear();
         finished.displayed = Some(displayed);
@@ -620,9 +706,21 @@ impl Capture {
         let mut finished = self.current_frame;
         finished.displayed = Some(displayed);
         finished.lists_pending = self.queue_len as u32;
+        self.note_screen_offset_x(&mut finished);
         self.current_frame = FrameStats::new();
         self.frames_completed += 1;
         finished
+    }
+
+    /// SCREEN_OFFSET_X into the frame's stats when it changed since the
+    /// last frame's end (`FrameStats::screen_offset_x_changed`; once per
+    /// frame, not in the walk).
+    fn note_screen_offset_x(&mut self, finished: &mut FrameStats) {
+        let offset_x = self.ge.register(op::SCREEN_OFFSET_X);
+        if offset_x != self.last_screen_offset_x {
+            finished.screen_offset_x_changed = offset_x.max(1);
+            self.last_screen_offset_x = offset_x;
+        }
     }
 
     /// The recording's part of a frame's end: the draws still waiting for
@@ -937,6 +1035,108 @@ mod tests {
         assert_eq!(batched.3, one_by_one.3);
         // The second triangle is vertices 11, 12, 13.
         assert_eq!(batched.2[3].x, 110.0);
+    }
+
+    #[test]
+    fn a_new_session_keeps_registers_set_once() {
+        // MHF sets its scissor once at boot. After an Adrenaline savestate
+        // load (a new plugin session) the game never sends it again: with
+        // the registers forgotten, every draw was clipped to 0,0-0,0 and our
+        // picture went black (2026-11-18).
+        let mut memory = TestMemory::default();
+        let list = 0x0890_0000;
+        let scissor_end = (271 << 10) | 479;
+        memory.write(list, &[cmd(op::SCISSOR_1, 0), cmd(op::SCISSOR_2, scissor_end), cmd(op::PRIM, 3)]);
+        let mut capture = Capture::new();
+        capture.handle(Event::ListEnqueued { list, stall: list + 12, id: 1, context: 0 }, &mut memory, None);
+        assert_eq!(capture.ge.register(op::SCISSOR_2), scissor_end);
+
+        capture.start_session();
+        assert_eq!(capture.queue_len, 0, "the lists are forgotten");
+        assert_eq!(capture.ge.register(op::SCISSOR_2), scissor_end, "the registers are kept");
+        assert_eq!(capture.stage_ge.register(op::SCISSOR_2), capture.ge.register(op::SCISSOR_2));
+
+        capture.reset();
+        assert_eq!(capture.ge.register(op::SCISSOR_2), 0, "reset still forgets everything");
+    }
+
+    #[test]
+    fn the_ges_own_state_replaces_ours_after_a_new_session() {
+        // After a savestate load the registers we kept are the pre-load
+        // area's (MHF: the village's fog colour in the river field, the
+        // distance hazed over, 2026-11-18). The plugin's block of the GE's
+        // own registers and matrices replaces them.
+        use crate::event_ring::{GE_STATE_PROJECTION, GE_STATE_REGISTERS, GE_STATE_WORLD};
+        let mut memory = TestMemory::default();
+        let list = 0x0890_0000;
+        memory.write(list, &[cmd(op::FOG_COLOR, 0x7F604F), cmd(op::PRIM, 3)]);
+        let mut capture = Capture::new();
+        capture.handle(Event::ListEnqueued { list, stall: list + 8, id: 1, context: 0 }, &mut memory, None);
+        capture.start_session();
+        assert!(capture.waiting_for_ge_state());
+
+        let block_address = 0x0880_4000; // the plugin's buffer (kernel RAM)
+        let mut block = [0u32; GE_STATE_WORDS];
+        // As sceGeGetCmd gives them: with the opcode in the top byte.
+        block[GE_STATE_REGISTERS + op::FOG_COLOR as usize] = cmd(op::FOG_COLOR, 0x606050);
+        block[GE_STATE_REGISTERS + op::SCISSOR_2 as usize] = cmd(op::SCISSOR_2, (271 << 10) | 479);
+        block[GE_STATE_REGISTERS + op::PRIM as usize] = cmd(op::PRIM, 0x123); // acts: left alone
+        for scale in [op::TEXTURE_SCALE_U, op::TEXTURE_SCALE_V] {
+            block[GE_STATE_REGISTERS + scale as usize] = cmd(scale, 0x3F_8000); // 1.0, as ours
+        }
+        block[GE_STATE_WORLD] = 1.0f32.to_bits() >> 8; // 24-bit floats
+        block[GE_STATE_PROJECTION + 15] = 2.0f32.to_bits() >> 8;
+        memory.write(block_address, &block);
+        let matrices_before = capture.ge.matrix_generation();
+        capture.handle(Event::GeStateTaken { address: block_address, ok: true, psp_us: 0 }, &mut memory, None);
+
+        assert!(!capture.waiting_for_ge_state());
+        assert_eq!(capture.ge.register(op::FOG_COLOR), 0x606050);
+        assert_eq!(capture.ge.register(op::SCISSOR_2), (271 << 10) | 479);
+        assert_eq!(capture.ge.register(op::PRIM), 3, "a drawing command's register isn't taken over");
+        assert_eq!(capture.ge.matrices.world[0], 1.0);
+        assert_eq!(capture.ge.matrices.projection[15], 2.0);
+        assert_ne!(capture.ge.matrix_generation(), matrices_before, "transforms are worked out again");
+        let stats = capture.current_frame;
+        assert_eq!(stats.ge_states, 1);
+        assert_eq!(stats.ge_state_register_differences, 2, "fog colour and scissor differed");
+        assert_eq!(stats.ge_state_matrix_differences, 2);
+    }
+
+    #[test]
+    fn a_walk_stopped_early_misses_a_register_until_the_ges_state_comes() {
+        // MHF's river field turned upside down for good (2026-11-18): the
+        // walk stopped at a bad address (a VRAM sub-list not copied) and
+        // missed the command that set the viewport back after a pass with a
+        // flipped one; the game never sends it again. The frame says so
+        // (`walk_stopped_early`) and the GE's own state puts it right.
+        use crate::event_ring::GE_STATE_REGISTERS;
+        let flipped = 0x42_4140; // +48.3 as a 24-bit float
+        let normal = 0xC3_0800; // -136
+        let mut memory = TestMemory::default();
+        let list = 0x0890_0000;
+        // The flipped pass, then a jump into memory we can't read: the
+        // reset that follows there is the GE's alone.
+        memory.write(list, &[cmd(op::VIEWPORT_Y_SCALE, flipped), cmd(op::JUMP, 0x30_0000)]);
+        let mut capture = Capture::new();
+        capture.handle(Event::ListEnqueued { list, stall: 0, id: 1, context: 0 }, &mut memory, None);
+        let stats = capture.handle(shown(), &mut memory, None).expect("a frame");
+        assert!(stats.walk_stopped_early());
+        assert_eq!(capture.ge.register(op::VIEWPORT_Y_SCALE), flipped);
+
+        capture.expect_ge_state();
+        let block_address = 0x0880_4000;
+        let mut block = [0u32; GE_STATE_WORDS];
+        block[GE_STATE_REGISTERS + op::VIEWPORT_Y_SCALE as usize] = cmd(op::VIEWPORT_Y_SCALE, normal);
+        for scale in [op::TEXTURE_SCALE_U, op::TEXTURE_SCALE_V] {
+            block[GE_STATE_REGISTERS + scale as usize] = cmd(scale, 0x3F_8000);
+        }
+        memory.write(block_address, &block);
+        capture.handle(Event::GeStateTaken { address: block_address, ok: true, psp_us: 40 }, &mut memory, None);
+        assert!(!capture.waiting_for_ge_state());
+        assert_eq!(capture.ge.register(op::VIEWPORT_Y_SCALE), normal);
+        assert_eq!(capture.current_frame.ge_state_register_differences, 1);
+        assert_eq!(capture.current_frame.ge_state_psp_us, 40);
     }
 
     #[test]

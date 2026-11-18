@@ -43,6 +43,25 @@ pub const KEEP_FRAMES: u32 = 120;
 pub const RECENT_FRAMES: u32 = 2;
 /// Blocks after an unready one that are requested with it.
 pub const LOOKAHEAD_BLOCKS: usize = 64;
+/// A ready block read again after this many frames without reads is
+/// distrusted for [`DISTRUST_FRAMES`] frames. The plugin keeps only the
+/// recently read ranges current at each enqueue (copied whole, or checked in
+/// the game's thread); the others only in its copy thread, some time later.
+/// Monster Hunter Freedom (2026-11-18): entering the house, a list CALLed a
+/// model's sublist at 0x041B6400, a look-ahead block from the village still
+/// holding the village's bytes in our copy. The walk ran them as commands
+/// (SCREEN_OFFSET_X became 404, the game never sends it again) and the house
+/// stayed black for good, in 3 of 8 loads. A loading screen is far longer
+/// than this. Not for a block whose previous block was read this frame or
+/// the last one: MHF writes its lists in VRAM as a ring that moves on ~0.35
+/// KiB per frame, each new block read again one lap later; distrusting each
+/// in turn held the picture for ~4 s at a time (user: "I talked to the man
+/// and the game froze for a few seconds"). Read on from a block just read,
+/// it is what the copy kept current before this rule, and worked.
+pub const STALE_FRAMES: u32 = 16;
+/// How long a block back after a pause is not read: by then it has been
+/// recent at two enqueues, so the plugin has copied or checked it.
+pub const DISTRUST_FRAMES: u32 = 3;
 /// Unused blocks between used ones that are requested too, so the plugin
 /// gets few ranges (doubled until the ranges fit into the table).
 pub const GAP_BLOCKS: usize = 8;
@@ -90,6 +109,10 @@ pub struct VramRequests {
     missing: u32,
     /// Blocks the last plan requested for the capture (for the log).
     capture_blocks: u32,
+    /// `frame` up to which a block back after a pause is not read
+    /// ([`STALE_FRAMES`]); 0 = trusted. Not `ready`: stage B reads those
+    /// flags meanwhile (`ready_for_stage`).
+    distrusted_until: [u32; BLOCKS],
 }
 
 impl Default for VramRequests {
@@ -145,6 +168,7 @@ impl VramRequests {
             covered: [false; BLOCKS],
             missing: 0,
             capture_blocks: 0,
+            distrusted_until: [0; BLOCKS],
         }
     }
 
@@ -165,8 +189,20 @@ impl VramRequests {
         if block >= BLOCKS {
             return false;
         }
+        let last = self.block_last_used[block];
         self.block_last_used[block] = self.frame + 1;
         if self.ready[block] {
+            // Frames since its last read (0: read this frame already).
+            if last != 0 && (self.frame + 1).wrapping_sub(last) >= STALE_FRAMES && !self.previous_block_recent(block) {
+                self.distrusted_until[block] = self.frame + DISTRUST_FRAMES;
+            }
+            if self.distrusted_until[block] != 0 && (self.distrusted_until[block].wrapping_sub(self.frame) as i32) > 0 {
+                // Back after a pause: maybe stale (see STALE_FRAMES). Read
+                // as missing, so the walk stops here and the frame waits.
+                self.missing += 1;
+                return false;
+            }
+            self.distrusted_until[block] = 0;
             return true;
         }
         for next in block + 1..(block + LOOKAHEAD_BLOCKS).min(BLOCKS) {
@@ -174,6 +210,17 @@ impl VramRequests {
         }
         self.missing += 1;
         false
+    }
+
+    /// The block before `block` was read in this frame or the last one: a
+    /// read going on from it (a list growing through VRAM), see
+    /// [`STALE_FRAMES`].
+    fn previous_block_recent(&self, block: usize) -> bool {
+        let Some(previous) = block.checked_sub(1) else {
+            return false;
+        };
+        let last = self.block_last_used[previous];
+        last != 0 && (self.frame + 1).wrapping_sub(last) < RECENT_FRAMES
     }
 
     /// `block_ready` for the capture's stage B in another thread: only
@@ -464,6 +511,82 @@ mod tests {
         let plan = frame(&mut requests, 1, 1);
         assert_eq!(plan.count, 0);
         assert!(!requests.block_ready(block_address(10)));
+    }
+
+    /// MHF's black house (2026-11-18): a ready block read again after a
+    /// pause may hold old bytes in our copy (the plugin keeps only recently
+    /// read ranges current); it is not read for DISTRUST_FRAMES frames, then
+    /// trusted again. A block read every frame is never distrusted.
+    #[test]
+    fn a_block_back_after_a_pause_is_distrusted_for_a_few_frames() {
+        let mut requests = Box::new(VramRequests::new());
+        let sublist = block_address(0x6D9); // 0x041B6400
+        let every_frame = block_address(0x600);
+        requests.block_ready(sublist);
+        requests.block_ready(every_frame);
+        frame(&mut requests, 0, 1);
+        frame(&mut requests, 1, 1);
+        assert!(requests.block_ready(sublist));
+        requests.take_missing();
+        // The village goes on without the block (still kept and ready).
+        for _ in 0..STALE_FRAMES {
+            assert!(requests.block_ready(every_frame), "read every frame: always trusted");
+            frame(&mut requests, 1, 1);
+        }
+        // The house reads it again: not now, nor for the next frames.
+        assert!(!requests.block_ready(sublist), "back after a pause: distrusted");
+        assert_eq!(requests.take_missing(), 1);
+        assert!(!requests.block_ready(sublist), "the same frame again");
+        requests.take_missing();
+        for _ in 1..DISTRUST_FRAMES {
+            frame(&mut requests, 1, 1);
+            assert!(!requests.block_ready(sublist));
+            requests.take_missing();
+        }
+        frame(&mut requests, 1, 1);
+        assert!(requests.block_ready(sublist), "recent at the enqueues since: trusted again");
+        assert_eq!(requests.take_missing(), 0);
+        // Read every frame from now on: stays trusted.
+        frame(&mut requests, 1, 1);
+        assert!(requests.block_ready(sublist));
+    }
+
+    /// MHF's lists in VRAM move on as a ring (~0.35 KiB per frame); each
+    /// block comes back one lap later. Reading on from the block before it
+    /// (read this frame or the last) is trusted: distrusting every new block
+    /// in turn froze the picture for ~4 s (talking to a villager).
+    #[test]
+    fn a_list_growing_through_blocks_read_a_lap_ago_is_not_held() {
+        let mut requests = Box::new(VramRequests::new());
+        let ring: Vec<u32> = (0x500..0x510).map(block_address).collect();
+        for &block in &ring {
+            requests.block_ready(block);
+        }
+        frame(&mut requests, 0, 1);
+        frame(&mut requests, 1, 1);
+        // One lap: a block per frame.
+        for &block in &ring {
+            assert!(requests.block_ready(block));
+            frame(&mut requests, 1, 1);
+        }
+        for _ in 0..STALE_FRAMES {
+            frame(&mut requests, 1, 1);
+        }
+        requests.take_missing();
+        // The next lap: each block STALE_FRAMES+ frames after its last read,
+        // but read on from the block before it.
+        assert!(!requests.block_ready(ring[0]), "the lap's start, back after a pause, alone: distrusted");
+        requests.take_missing();
+        for _ in 0..DISTRUST_FRAMES {
+            frame(&mut requests, 1, 1);
+        }
+        assert!(requests.block_ready(ring[0]));
+        for pair in ring.windows(2) {
+            frame(&mut requests, 1, 1);
+            assert!(requests.block_ready(pair[0]), "the head, read last frame too");
+            assert!(requests.block_ready(pair[1]), "read on from the head");
+        }
+        assert_eq!(requests.take_missing(), 0, "no held frames in the lap");
     }
 
     #[test]

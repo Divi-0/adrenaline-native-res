@@ -161,6 +161,18 @@ pub struct FrameStats {
     pub contexts_restored: u32,
     pub contexts_missing: u32,
     pub contexts_pipelined: u32,
+    /// The GE's own state taken over (`EVENT_GE_STATE`, after a new
+    /// session), and how many registers / matrix elements of ours differed
+    /// from it (0 / 0 when our walk had the GE's state).
+    pub ge_states: u32,
+    pub ge_state_register_differences: u32,
+    pub ge_state_matrix_differences: u32,
+    /// Microseconds the plugin's reads took the game (`EVENT_GE_STATE`).
+    pub ge_state_psp_us: u32,
+    /// SCREEN_OFFSET_X (12.4 fixed point) at the frame's end, when it
+    /// differs from the previous frame's (0 otherwise): MHF's house came out
+    /// black with 404 where Sony's GE had 1808 (2026-11-18, under study).
+    pub screen_offset_x_changed: u32,
     /// Block transfers too big for `ge_writes` to follow (later reads of
     /// their destination see PSP memory as it is).
     pub transfers_skipped: u32,
@@ -217,6 +229,15 @@ pub struct FrameStats {
 }
 
 impl FrameStats {
+    /// The walk didn't run every command the GE ran (stopped at a bad
+    /// address, or a list ran away): registers those commands set are
+    /// missing from ours, maybe for good if the game sets them once (MHF's
+    /// field upside down after a stop at a VRAM sub-list, 2026-11-18). The
+    /// Vita side then asks for the GE's own state (`EVENT_GE_STATE`).
+    pub fn walk_stopped_early(&self) -> bool {
+        self.bad_addresses > 0 || self.endless_lists > 0
+    }
+
     pub const fn new() -> FrameStats {
         FrameStats {
             lists_enqueued: 0,
@@ -244,6 +265,11 @@ impl FrameStats {
             contexts_restored: 0,
             contexts_missing: 0,
             contexts_pipelined: 0,
+            ge_states: 0,
+            ge_state_register_differences: 0,
+            ge_state_matrix_differences: 0,
+            ge_state_psp_us: 0,
+            screen_offset_x_changed: 0,
             transfers_skipped: 0,
             cache: crate::vertex_cache::CacheStats { hits: 0, misses: 0, stored: 0, full: 0, cpu_only: 0, changing: 0, quick: 0, repeated: 0, raw_runs: 0, raw_bytes: 0, raw_full: 0, raw_lit: 0, raw_psp_ram: 0, raw_psp_ram_bytes: 0, raw_converted: 0, raw_gathered: 0, raw_full_at: [0; 4] },
             direct: crate::frame_builder::DirectStats::EMPTY,

@@ -12,7 +12,7 @@
 
 /// "RNSP" in memory.
 pub const MAGIC: u32 = 0x5053_4E52;
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 pub const CAPACITY: u32 = 100;
 /// Uncached PSP address of the ring (physical 0x0BCDF000).
 pub const RING_ADDRESS: u32 = 0xABCD_F000;
@@ -41,6 +41,32 @@ pub const EVENT_GE_SYNC: u32 = 5;
 pub const EVENT_GE_SAVE_CONTEXT: u32 = 6;
 /// sceGeRestoreContext: context address, result.
 pub const EVENT_GE_RESTORE_CONTEXT: u32 = 7;
+/// The GE's own registers and matrices, read by the plugin when the Vita
+/// side asked for them (`RingHeader::vita_state_request`), at a GE sync
+/// (the GE idle): address of the block ([`GE_STATE_WORDS`] words, layout
+/// below), the request it answers, 0 or the first error of the reads, the
+/// microseconds the reads took the game's thread.
+/// The Vita side asks after every new session: an Adrenaline savestate
+/// load restores PSP RAM (the plugin's too) but the game never sends the
+/// registers it set once again (MHF: scissor, fog; 2026-11-18). And after
+/// a frame whose walk stopped early: the GE ran the commands we didn't
+/// (MHF: a viewport reset missed, the field upside down for good).
+/// Version 7 added it.
+pub const EVENT_GE_STATE: u32 = 8;
+
+/// The GE state block of [`EVENT_GE_STATE`], in words: every register as
+/// sceGeGetCmd gives it (opcode 0..=255; the low 24 bits are the argument),
+/// then the matrices as sceGeGetMtx gives them (24-bit floats: the float's
+/// bits shifted right by 8, as the DATA commands carry them; PPSSPP
+/// sceGe.cpp GetMatrix24): bones 0..7 (12 each), world (12), view (12),
+/// projection (16), texture generation (12).
+pub const GE_STATE_REGISTERS: usize = 0;
+pub const GE_STATE_BONES: usize = 256;
+pub const GE_STATE_WORLD: usize = GE_STATE_BONES + 8 * 12;
+pub const GE_STATE_VIEW: usize = GE_STATE_WORLD + 12;
+pub const GE_STATE_PROJECTION: usize = GE_STATE_VIEW + 12;
+pub const GE_STATE_TEXGEN: usize = GE_STATE_PROJECTION + 16;
+pub const GE_STATE_WORDS: usize = GE_STATE_TEXGEN + 12;
 
 /// NativeResEvent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -78,7 +104,12 @@ pub struct RingHeader {
     pub sync_timeouts: u32,
     /// `SYNC_WANTED` while the Vita side wants the plugin's GE_SYNC events.
     pub vita_sync_events: u32,
-    pub reserved: [u32; 5],
+    /// GE state (`EVENT_GE_STATE`): the Vita side asks by making
+    /// `vita_state_request` differ from `state_answered`; the plugin answers
+    /// at its next GE sync and sets `state_answered` to it.
+    pub vita_state_request: u32,
+    pub state_answered: u32,
+    pub reserved: [u32; 3],
 }
 
 /// NATIVERES_SYNC_WANTED.

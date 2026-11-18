@@ -785,6 +785,16 @@ impl SharedRing {
         unsafe { write_volatile(addr_of!((*self.0).header.vita_handled) as *mut u32, count) };
     }
 
+    /// Asks the plugin for the GE's own state (`EVENT_GE_STATE`): a request
+    /// number different from the last one it answered.
+    fn request_ge_state(&self) {
+        // Safe: as `set_handled`; the plugin only reads the request.
+        unsafe {
+            let answered = read_volatile(addr_of!((*self.0).header.state_answered));
+            write_volatile(addr_of!((*self.0).header.vita_state_request) as *mut u32, answered.wrapping_add(1));
+        }
+    }
+
     /// GE sync: whether the plugin should wait for us.
     fn set_sync_wanted(&self, wanted: bool) {
         let value = if wanted { event_ring::SYNC_WANTED } else { 0 };
@@ -886,6 +896,22 @@ impl GeSyncs {
 /// Recorded frames whose list walk stopped early that are held back in a
 /// row before one is shown anyway (the main loop's `held_back`).
 const MAX_HELD_BACK: u32 = 3;
+
+/// Recorded frames held back after a new session while the GE's own state
+/// hasn't come (`Capture::waiting_for_ge_state`): the plugin answers at the
+/// game's next GE sync, normally within the first frame. A plugin that
+/// never answers costs this many frames, then the kept registers are used.
+const MAX_GE_STATE_FRAMES: u32 = 30;
+
+/// Recorded frames held back while the GE's state asked for after a frame
+/// whose walk stopped early (`FrameStats::walk_stopped_early`) hasn't come:
+/// the plugin answers at the next GE sync, within the next frame.
+const MAX_REPAIR_FRAMES: u32 = 3;
+
+/// Debug `gestate`: asks the plugin for the GE's state in a running game
+/// (no new session). It replaces ours; the log line's `gestate_regdiff=` /
+/// `gestate_mtxdiff=` say how far our walk was from it (0 / 0 = exact).
+pub static GE_STATE_CHECK: AtomicBool = AtomicBool::new(false);
 
 /// One line per frame, e.g. `frame=12 dt=16.7ms cpu=... lists=1/1 ...`.
 /// `sync`: the ring header, for the plugin's GE sync counts (`gesync=`).
@@ -1062,6 +1088,12 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
     // Recorded frames held back in a row because their list walk stopped
     // early (see MAX_HELD_BACK).
     let mut held_back = 0u32;
+    // Frames completed since the new session while the GE's state hadn't
+    // come (see MAX_GE_STATE_FRAMES).
+    let mut ge_state_frames = 0u32;
+    // How many such frames are held for the request waiting (session start
+    // or repair).
+    let mut ge_state_limit = MAX_GE_STATE_FRAMES;
     let mut timing = FrameTiming::default();
     let mut vertex_cache_tried = false;
     let mut ring_version_reported = false;
@@ -1151,7 +1183,13 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
             let length = title.iter().position(|&byte| byte == 0).unwrap_or(title.len());
             log::open(&title[..length], session);
             state.reader.restart();
-            state.capture.reset();
+            // Keeps the GE registers: a savestate load is a new session too
+            // (Capture::start_session); the GE's own come when the plugin
+            // answers.
+            state.capture.start_session();
+            ring.request_ge_state();
+            ge_state_frames = 0;
+            ge_state_limit = MAX_GE_STATE_FRAMES;
             timing = FrameTiming::default();
             if have_frames {
                 frames::building().clear();
@@ -1166,6 +1204,9 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
         let sync_wanted = GE_SYNC_WANTED.load(Ordering::Relaxed) != 0 && have_frames && renderer_enabled();
         ring.set_sync_wanted(sync_wanted);
         ring.request_sync_events();
+        if GE_STATE_CHECK.swap(false, Ordering::Relaxed) {
+            ring.request_ge_state();
+        }
         let lost = state.reader.catch_up(header.write_count);
         if lost > 0 {
             state.capture.note_dropped_events(lost);
@@ -1213,6 +1254,9 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
                 state.vram.add_stage_reads(stage_thread::vram_reads());
             }
             COMPLETED_FRAME_COUNT.store(state.capture.frames_completed(), Ordering::Relaxed);
+            if state.capture.waiting_for_ge_state() {
+                ge_state_frames += 1;
+            }
             let now = sys::now_us();
             timing.vita_time_us += now - start_time;
             start_time = now;
@@ -1235,7 +1279,10 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
                 // a row, so a game that always ends that way still shows.
                 let stopped_early = state.last_frame.bad_addresses > 0 || state.last_frame.endless_lists > 0;
                 let hold_back = stopped_early && held_back < MAX_HELD_BACK;
-                if state.last_frame.dropped_events == 0 && missing == 0 && !hold_back {
+                // After a savestate load: the registers of the time before
+                // until the GE's own come (the village's fog in MHF's field).
+                let without_ge_state = state.capture.waiting_for_ge_state() && ge_state_frames < ge_state_limit;
+                if state.last_frame.dropped_events == 0 && missing == 0 && !hold_back && !without_ge_state {
                     frames::publish();
                     held_back = 0;
                 } else {
@@ -1251,6 +1298,15 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
             } else {
                 state.vram.take_missing();
                 state.request_vram(None);
+            }
+            // The walk missed commands the GE ran: get the GE's registers.
+            // (Again if an earlier request went unanswered past its limit.)
+            let request_open = state.capture.waiting_for_ge_state() && ge_state_frames < ge_state_limit;
+            if state.last_frame.walk_stopped_early() && !request_open {
+                ring.request_ge_state();
+                state.capture.expect_ge_state();
+                ge_state_frames = 0;
+                ge_state_limit = MAX_REPAIR_FRAMES;
             }
             // Behind the game (recording took longer than its frame): walk
             // the frames that are already over without recording them, and
