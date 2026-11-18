@@ -729,6 +729,73 @@ impl CaptureState {
         self.send_vram_plan(&plan);
     }
 
+    /// After an event whose walk stopped at a VRAM block
+    /// (`Capture::waiting_for_vram`): requests the block's run right away
+    /// and waits for the plugin's copy (the game waits in its GE sync for
+    /// us meanwhile, where the plugin wakes its copy thread), then resumes
+    /// the walk; gives up when nothing new can be requested or after
+    /// `VRAM_WAIT_LIMIT_US` for the whole event, or as soon as the plugin
+    /// stopped holding the game (its sync wait timed out: the game may be
+    /// reusing the list memory, so the walk must not go on; resuming then
+    /// read half-rewritten lists as commands and MHF's intro fly-over stayed
+    /// black, 2026-11-18). `missing_before`: the frame's unready reads
+    /// before the event.
+    fn settle_vram_waits(&mut self, ring: &SharedRing, recording: bool, missing_before: u32) {
+        let mut missing = missing_before;
+        let first_stop = sys::now_us();
+        let timeouts = ring.header().sync_timeouts;
+        while self.capture.waiting_for_vram().is_some() {
+            let at_stop = self.vram.missing();
+            let started = sys::now_us();
+            let copied = self.wait_for_new_vram(ring, first_stop, timeouts);
+            let waited = (sys::now_us() - started) as u32;
+            // Safe: the capture thread, recording (frames allocated); used
+            // before the frame's publish.
+            let frame = if recording { Some(unsafe { frames::building() }) } else { None };
+            let CaptureState { capture, dump, vram, copies, .. } = self;
+            let mut memory = BlockCache::new(VitaBlocks { dump, vram, copies, check_vram: true });
+            memory.whole_blocks = COPY_LINES.load(Ordering::Relaxed) == 0;
+            if copied {
+                capture.resume_after_vram(&mut memory, frame, waited);
+                // The stop's failed read is made good; later ones count.
+                missing += self.vram.missing() - at_stop;
+                self.vram.set_missing(missing);
+            } else {
+                capture.give_up_vram(&mut memory, frame, waited);
+                missing = self.vram.missing();
+            }
+        }
+    }
+
+    /// Publishes the table with the blocks the walk just missed and waits
+    /// until the plugin has copied it. False if the table didn't change
+    /// (the block was requested already, e.g. distrusted after a pause) or
+    /// the copy didn't come in time.
+    fn wait_for_new_vram(&mut self, ring: &SharedRing, first_stop: u64, timeouts: u32) -> bool {
+        let table = vram_table();
+        // Safe: as in request_vram.
+        let copied = unsafe { read_volatile(addr_of!((*table).copied_generation)) };
+        let plan = self.vram.plan_mid_frame(copied);
+        // Safe: the table is mapped PSP memory the plugin also uses.
+        let Some(generation) = (unsafe { publish_vram_plan(table, &plan) }) else {
+            return false;
+        };
+        self.vram.published(generation);
+        loop {
+            // Safe: as above.
+            let copied = unsafe { read_volatile(addr_of!((*table).copied_generation)) };
+            let game_moved_on = ring.header().sync_timeouts != timeouts;
+            if game_moved_on || sys::now_us() - first_stop >= VRAM_WAIT_LIMIT_US {
+                return false;
+            }
+            if self.vram.note_copied(copied) {
+                return true;
+            }
+            // Safe: a plain kernel call.
+            unsafe { sys::sceKernelDelayThread(50) };
+        }
+    }
+
     fn send_vram_plan(&mut self, plan: &Plan) {
         let table = vram_table();
         // Safe: the table is mapped PSP memory the plugin also uses.
@@ -907,6 +974,18 @@ const MAX_GE_STATE_FRAMES: u32 = 30;
 /// whose walk stopped early (`FrameStats::walk_stopped_early`) hasn't come:
 /// the plugin answers at the next GE sync, within the next frame.
 const MAX_REPAIR_FRAMES: u32 = 3;
+
+/// How long the capture waits, in all, for the plugin to copy the VRAM
+/// blocks one event's walk stopped at (`CaptureState::settle_vram_waits`).
+/// The plugin holds the game in its GE sync for at most
+/// `event_ring::SYNC_TIMEOUT_US` (50 ms), counted from the sync, which comes
+/// after the stop: 30 ms leaves the resumed walk time before the game may
+/// reuse its list memory.
+const VRAM_WAIT_LIMIT_US: u64 = 30_000;
+
+/// Debug `vramwait 0|1`: walks wait for new VRAM blocks to be copied (1,
+/// default) or stop there as before (0).
+pub static VRAM_WAIT_WANTED: AtomicBool = AtomicBool::new(true);
 
 /// Debug `gestate`: asks the plugin for the GE's state in a running game
 /// (no new session). It replaces ours; the log line's `gestate_regdiff=` /
@@ -1204,6 +1283,12 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
         let sync_wanted = GE_SYNC_WANTED.load(Ordering::Relaxed) != 0 && have_frames && renderer_enabled();
         ring.set_sync_wanted(sync_wanted);
         ring.request_sync_events();
+        // Walks wait for new VRAM blocks only where the plugin copies them
+        // while the game waits for us (not a savestate's older plugin).
+        state.capture.vram_waits = sync_wanted
+            && ring.header().plugin_features == event_ring::COPIES_AT_SYNC
+            && VRAM_REQUESTS_WANTED.load(Ordering::Relaxed)
+            && VRAM_WAIT_WANTED.load(Ordering::Relaxed);
         if GE_STATE_CHECK.swap(false, Ordering::Relaxed) {
             ring.request_ge_state();
         }
@@ -1227,7 +1312,11 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
             timing.syncs.note(&event);
             let handle_start = sys::now_us();
             let stream_waited_before = recorder_thread::producer_waited_us();
+            let missing_before = state.vram.missing();
             let completed = state.handle(&event, frame);
+            if state.capture.waiting_for_vram().is_some() {
+                state.settle_vram_waits(&ring, recording, missing_before);
+            }
             // GE sync: the plugin may be waiting in the game's GE sync until
             // we have read (and copied) this far.
             if sync_wanted {

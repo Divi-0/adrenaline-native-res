@@ -35,7 +35,7 @@ use nativeres_core::event_ring::{
     Ring, CAPACITY, EVENT_FRAMEBUFFER_FLIP, EVENT_GE_RESTORE_CONTEXT, EVENT_GE_SAVE_CONTEXT, EVENT_GE_STATE, EVENT_GE_SYNC,
     EVENT_LIST_ENQUEUE, EVENT_LIST_ENQUEUE_HEAD, EVENT_STALL_UPDATE, GE_STATE_BONES, GE_STATE_PROJECTION,
     GE_STATE_REGISTERS, GE_STATE_TEXGEN, GE_STATE_VIEW, GE_STATE_WORDS, GE_STATE_WORLD, MAGIC, RING_ADDRESS,
-    SYNC_TIMEOUT_US, SYNC_WANTED, VERSION,
+    SYNC_TIMEOUT_US, SYNC_WANTED, VERSION, COPIES_AT_SYNC,
 };
 use nativeres_core::psp_copy::SyncStall;
 use nativeres_core::psp_link::{copy_method, VramRequestTable, VRAM_REQUESTS_ADDRESS};
@@ -267,6 +267,11 @@ static SYNC_STALL: Global<SyncStall> = Global::new(SyncStall::new());
 /// until it has handled every event written so far, at most
 /// SYNC_TIMEOUT_US (core `psp_copy::SyncStall`). Returns the microseconds
 /// waited (0 if it didn't).
+/// How long the GE sync wait goes on after a VRAM copy the Vita side
+/// requested was last outstanding (`wait_for_vita`): its walk resumes after
+/// the copy (it waits at most 30 ms itself).
+const VRAM_COPY_GRACE_US: u32 = 35_000;
+
 fn wait_for_vita() -> u32 {
     if header_get(header!(vita_sync_wanted)) != SYNC_WANTED {
         return 0;
@@ -278,7 +283,24 @@ fn wait_for_vita() -> u32 {
         return 0;
     }
     let start = now_us();
+    // The Vita side may be waiting for VRAM blocks it just requested (its
+    // walk stopped at new VRAM content). The copy thread copies them now, in
+    // the time the game waits here anyway, and the wait goes on while such a
+    // copy is outstanding or just done (the walk resumes after it): leaving
+    // earlier let the game reuse its list memory under the resumed walk
+    // (MHF's intro fly-over black, 2026-11-18). Bounded by VRAM_COPY_GRACE_US
+    // after the last outstanding copy and by SYNC_TIMEOUT_US + that in all.
+    let mut woken_for = get!(copied_generation);
+    let mut copy_seen = 0u32; // when a copy was last outstanding (0: never)
     loop {
+        let generation = get!(generation);
+        if generation != get!(copied_generation) {
+            copy_seen = now_us() | 1;
+            if generation != woken_for {
+                woken_for = generation;
+                wake_copier();
+            }
+        }
         // Safe: a plain kernel call.
         unsafe { sceKernelDelayThread(100) };
         if nativeres_core::psp_copy::reached(header_get(header!(vita_handled)), target) {
@@ -287,7 +309,10 @@ fn wait_for_vita() -> u32 {
         if header_get(header!(vita_sync_wanted)) != SYNC_WANTED {
             break;
         }
-        if now_us().wrapping_sub(start) >= SYNC_TIMEOUT_US {
+        let now = now_us();
+        let copying = copy_seen != 0 && now.wrapping_sub(copy_seen) < VRAM_COPY_GRACE_US;
+        let waited = now.wrapping_sub(start);
+        if (waited >= SYNC_TIMEOUT_US && !copying) || waited >= SYNC_TIMEOUT_US + VRAM_COPY_GRACE_US {
             header_set(header!(sync_timeouts), header_get(header!(sync_timeouts)).wrapping_add(1));
             stall.timed_out(header_get(header!(write_count)));
             break;
@@ -422,18 +447,26 @@ unsafe extern "C" fn display_set_frame_buf_hook(address: u32, width: i32, format
     let original: FrameBufFn = core::mem::transmute(original(&ORIGINAL_SET_FRAME_BUF));
     CHECK_AT_FLIP.store(!SYNCED_SINCE_FLIP.load(Relaxed), Relaxed);
     SYNCED_SINCE_FLIP.store(false, Relaxed);
-    let wakeup = COPY_WAKEUP.load(Relaxed);
-    if wakeup >= 0 {
-        // We run in the game's system call, where k1 still says "user-mode
-        // caller": the kernel would refuse our (kernel) semaphore.
-        let k1 = set_k1(0);
-        sceKernelSignalSema(wakeup, 1); // fails harmlessly if already signalled
-        set_k1(k1);
-    } else {
+    if !wake_copier() {
         copy::copy_requested_vram();
     }
     push_event(EVENT_FRAMEBUFFER_FLIP, [address, width as u32, format as u32, sync as u32]);
     original(address, width, format, sync)
+}
+
+/// Wakes the copy thread; false if there is none.
+fn wake_copier() -> bool {
+    let wakeup = COPY_WAKEUP.load(Relaxed);
+    if wakeup < 0 {
+        return false;
+    }
+    // We run in the game's system call, where k1 still says "user-mode
+    // caller": the kernel would refuse our (kernel) semaphore.
+    let k1 = set_k1(0);
+    // Safe: our semaphore; fails harmlessly if already signalled.
+    unsafe { sceKernelSignalSema(wakeup, 1) };
+    set_k1(k1);
+    true
 }
 
 /// Finds a kernel function by NID and routes its system call to `hook`;
@@ -460,6 +493,7 @@ fn init_ring() {
     header_set(header!(vita_sync_events), 0);
     header_set(header!(vita_state_request), 0);
     header_set(header!(state_answered), 0);
+    header_set(header!(plugin_features), 0); // until the copy thread runs
     header_set(header!(sync_waits), 0);
     header_set(header!(sync_wait_us), 0);
     header_set(header!(sync_timeouts), 0);
@@ -481,6 +515,9 @@ fn init_ring() {
 pub unsafe extern "C" fn module_start(_args: u32, _argp: *mut c_void) -> i32 {
     init_ring();
     copy::start_thread();
+    if COPY_WAKEUP.load(Relaxed) >= 0 {
+        header_set(header!(plugin_features), COPIES_AT_SYNC);
+    }
 
     const GE: &[u8] = b"sceGE_Manager\0";
     const GE_DRIVER: &[u8] = b"sceGe_driver\0";

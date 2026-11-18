@@ -27,6 +27,11 @@ const QUEUE_CAPACITY: usize = 64;
 /// Safety limit for one walk, to survive endless loops in a list.
 const MAX_COMMANDS_PER_WALK: u32 = 500_000;
 
+/// A physical address in VRAM or one of its mirrors.
+fn is_vram(address: u32) -> bool {
+    (0x0400_0000..0x0480_0000).contains(&physical(address))
+}
+
 /// What the game did, as recorded by the PSP plugin.
 /// The ring's event types (`event_ring::EVENT_*`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,6 +100,13 @@ pub struct Capture {
     /// A new session started and the GE's own state hasn't come yet
     /// (`start_session`, `Event::GeStateTaken`).
     waiting_for_ge_state: bool,
+    /// A walk stopping at a VRAM address keeps its list queued there
+    /// (`vram_wait`) instead of dropping it: the Vita side gets the block
+    /// copied and resumes the walk (`resume_after_vram`) or gives up
+    /// (`give_up_vram`). Off in the PC replay (nothing would copy).
+    pub vram_waits: bool,
+    /// The VRAM address the front list's walk stopped at, waiting.
+    vram_wait: Option<u32>,
     /// Only follow the lists, without statistics or recording draws. For
     /// timing the walk on its own (`bench`); wrong for anything else.
     pub walk_only: bool,
@@ -140,6 +152,8 @@ impl Capture {
             frames_completed: 0,
             last_screen_offset_x: 0,
             waiting_for_ge_state: false,
+            vram_waits: false,
+            vram_wait: None,
             walk_only: false,
             pipelined: false,
             walk_stream: WalkStream::new(),
@@ -240,6 +254,7 @@ impl Capture {
         self.stage_actions = None;
         self.contexts.clear();
         self.waiting_for_ge_state = false;
+        self.vram_wait = None;
     }
 
     /// The PSP put back the GE state saved at `address` (`ge_context`).
@@ -609,12 +624,47 @@ impl Capture {
                 }
                 WalkResult::TooManyCommands => self.current_frame.endless_lists += 1,
                 WalkResult::BadAddress(address) => {
+                    if self.vram_waits && !self.pipelined && !self.walk_only && is_vram(address) {
+                        // Maybe a block not copied yet: the list stays at
+                        // its pc (the command not read), see `vram_wait`.
+                        self.vram_wait = Some(address);
+                        return;
+                    }
                     self.current_frame.bad_addresses += 1;
                     self.current_frame.last_bad_address = address;
                 }
             }
             self.remove(0);
         }
+    }
+
+    /// The front list's walk stopped at this VRAM address and waits there
+    /// (`vram_waits`); no event may be handled until `resume_after_vram`
+    /// or `give_up_vram`.
+    pub fn waiting_for_vram(&self) -> Option<u32> {
+        self.vram_wait
+    }
+
+    /// The block the walk waited for is copied: the walk goes on from where
+    /// it stopped (it may stop at another one).
+    pub fn resume_after_vram(&mut self, memory: &mut impl PspMemory, frame: Option<&mut Frame>, waited_us: u32) {
+        self.vram_wait = None;
+        self.current_frame.vram_waits += 1;
+        self.current_frame.vram_wait_us += waited_us;
+        self.run_queue(memory, frame, &mut NoTrace);
+    }
+
+    /// No copy came (or none was possible): the list ends at the address,
+    /// as a bad address, and the next one is walked.
+    pub fn give_up_vram(&mut self, memory: &mut impl PspMemory, frame: Option<&mut Frame>, waited_us: u32) {
+        let Some(address) = self.vram_wait.take() else {
+            return;
+        };
+        self.current_frame.vram_wait_us += waited_us;
+        self.current_frame.bad_addresses += 1;
+        self.current_frame.last_bad_address = address;
+        self.remove(0);
+        self.run_queue(memory, frame, &mut NoTrace);
     }
 
     /// Stage B (single thread): works out the draws the stream holds,
@@ -684,6 +734,8 @@ impl Capture {
         finished.ge_state_register_differences = walk.ge_state_register_differences;
         finished.ge_state_matrix_differences = walk.ge_state_matrix_differences;
         finished.ge_state_psp_us = walk.ge_state_psp_us;
+        finished.vram_waits = walk.vram_waits;
+        finished.vram_wait_us = walk.vram_wait_us;
         self.note_screen_offset_x(&mut finished);
         finished.transfers_skipped = self.ge_writes.transfers_skipped;
         self.ge_writes.clear();
@@ -1137,6 +1189,64 @@ mod tests {
         assert_eq!(capture.ge.register(op::VIEWPORT_Y_SCALE), normal);
         assert_eq!(capture.current_frame.ge_state_register_differences, 1);
         assert_eq!(capture.current_frame.ge_state_psp_us, 40);
+    }
+
+    /// A list that CALLs a sublist in VRAM (as MHF's models do), which
+    /// sets FOG_COLOR; the sublist isn't in memory yet.
+    fn list_calling_into_vram(memory: &mut TestMemory) -> (u32, u32) {
+        let list = 0x0890_0000;
+        let sublist = 0x0410_0000;
+        memory.write(list, &[cmd(op::BASE, 0x04_0000), cmd(op::CALL, 0x10_0000), cmd(op::FINISH, 0), cmd(op::END, 0)]);
+        (list, sublist)
+    }
+
+    #[test]
+    fn a_walk_waits_at_a_vram_block_and_goes_on_once_it_is_copied() {
+        // MHF's field: new content CALLs a sublist in a VRAM block never
+        // requested; the walk stopped there (bad address) for this frame
+        // and the next, and missed the rest of the list (2026-11-18).
+        let mut memory = TestMemory::default();
+        let (list, sublist) = list_calling_into_vram(&mut memory);
+        let mut capture = Capture::new();
+        capture.vram_waits = true;
+        capture.handle(Event::ListEnqueued { list, stall: 0, id: 1, context: 0 }, &mut memory, None);
+        assert_eq!(capture.waiting_for_vram(), Some(sublist));
+        assert_eq!(capture.queue_len, 1, "the list stays queued where it stopped");
+
+        // The plugin copied the block.
+        memory.write(sublist, &[cmd(op::FOG_COLOR, 0x606050), cmd(op::RET, 0)]);
+        capture.resume_after_vram(&mut memory, None, 1200);
+        assert_eq!(capture.waiting_for_vram(), None);
+        assert_eq!(capture.ge.register(op::FOG_COLOR), 0x606050);
+        let stats = capture.handle(shown(), &mut memory, None).expect("a frame");
+        assert_eq!((stats.bad_addresses, stats.lists_finished), (0, 1));
+        assert_eq!((stats.vram_waits, stats.vram_wait_us), (1, 1200));
+    }
+
+    #[test]
+    fn a_walk_that_waited_in_vain_ends_at_the_block_as_before() {
+        let mut memory = TestMemory::default();
+        let (list, sublist) = list_calling_into_vram(&mut memory);
+        let mut capture = Capture::new();
+        capture.vram_waits = true;
+        capture.handle(Event::ListEnqueued { list, stall: 0, id: 1, context: 0 }, &mut memory, None);
+        capture.give_up_vram(&mut memory, None, 40_000);
+        assert_eq!(capture.queue_len, 0);
+        let stats = capture.handle(shown(), &mut memory, None).expect("a frame");
+        assert_eq!((stats.bad_addresses, stats.last_bad_address), (1, sublist));
+        assert_eq!((stats.vram_waits, stats.vram_wait_us), (0, 40_000));
+        assert!(stats.walk_stopped_early(), "the GE's state is asked for then");
+    }
+
+    #[test]
+    fn without_vram_waits_a_walk_stops_at_the_block() {
+        // The PC replay and plugins that can't copy at the GE sync.
+        let mut memory = TestMemory::default();
+        let (list, _) = list_calling_into_vram(&mut memory);
+        let mut capture = Capture::new();
+        capture.handle(Event::ListEnqueued { list, stall: 0, id: 1, context: 0 }, &mut memory, None);
+        assert_eq!(capture.waiting_for_vram(), None);
+        assert_eq!(capture.queue_len, 0);
     }
 
     #[test]

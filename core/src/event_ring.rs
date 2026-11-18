@@ -109,11 +109,17 @@ pub struct RingHeader {
     /// at its next GE sync and sets `state_answered` to it.
     pub vita_state_request: u32,
     pub state_answered: u32,
-    pub reserved: [u32; 3],
+    /// [`COPIES_AT_SYNC`] if this plugin copies a newly requested VRAM table
+    /// while the game waits for the Vita side in its GE sync (a savestate
+    /// brings back the plugin it was made with: older ones don't).
+    pub plugin_features: u32,
+    pub reserved: [u32; 2],
 }
 
 /// NATIVERES_SYNC_WANTED.
 pub const SYNC_WANTED: u32 = 0x434E_5953;
+/// `RingHeader::plugin_features`: "COPY".
+pub const COPIES_AT_SYNC: u32 = 0x5950_4F43;
 /// NATIVERES_SYNC_TIMEOUT_US.
 pub const SYNC_TIMEOUT_US: u32 = 50_000;
 

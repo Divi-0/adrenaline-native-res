@@ -267,6 +267,13 @@ impl VramRequests {
         self.missing
     }
 
+    /// Sets the count of unready reads: after a walk that stopped at a block
+    /// waited for its copy and went on, its failed read no longer leaves the
+    /// frame incomplete.
+    pub fn set_missing(&mut self, missing: u32) {
+        self.missing = missing;
+    }
+
     /// Blocks the last plan requested for the capture.
     pub fn capture_blocks(&self) -> u32 {
         self.capture_blocks
@@ -282,8 +289,28 @@ impl VramRequests {
             self.reset();
             return Plan { ranges: [VramRange::default(); MAX_RANGES], count: 0, recent_mask: 0 };
         };
+        self.build_plan(textures, copied_generation)
+    }
 
-        // A generation the plugin copied makes its blocks ready.
+    /// In the middle of a frame, when the walk stopped at a block never
+    /// requested (new VRAM content: MHF CALLs a model's sublist it hadn't
+    /// drawn for a while): the table with that block's run added, the
+    /// frame's texture ranges as they are. If it differs from the plugin's,
+    /// the capture publishes it and waits for the copy (the game waits in its
+    /// GE sync meanwhile, where the plugin copies), instead of losing the
+    /// rest of the list for this frame and the next.
+    pub fn plan_mid_frame(&mut self, copied_generation: u32) -> Plan {
+        // Seen from the frame's end, as `plan` will: this frame's reads are
+        // marked `frame + 1` (`block_ready`).
+        self.frame = self.frame.wrapping_add(1);
+        let plan = self.build_plan(&mut core::iter::empty(), copied_generation);
+        self.frame = self.frame.wrapping_sub(1);
+        plan
+    }
+
+    /// Takes the plugin's `copied_generation`: blocks of a published plan
+    /// it covers become ready. True if nothing published is still pending.
+    pub fn note_copied(&mut self, copied_generation: u32) -> bool {
         if self.any_pending && copied_generation.wrapping_sub(self.pending_generation) as i32 >= 0 {
             for block in 0..BLOCKS {
                 self.ready[block] |= self.pending[block];
@@ -291,6 +318,12 @@ impl VramRequests {
             }
             self.any_pending = false;
         }
+        !self.any_pending
+    }
+
+    fn build_plan(&mut self, textures: &mut dyn Iterator<Item = VramRange>, copied_generation: u32) -> Plan {
+        // A generation the plugin copied makes its blocks ready.
+        self.note_copied(copied_generation);
 
         for range in textures {
             if range.size > 0 && range.offset < VRAM_SIZE && range.size <= VRAM_SIZE - range.offset {
@@ -496,6 +529,33 @@ mod tests {
         assert!(requests.block_ready(list + 63 * BLOCK_SIZE), "the look-ahead blocks too");
         assert!(!requests.block_ready(list + 64 * BLOCK_SIZE));
         assert_eq!(requests.take_missing(), 1);
+    }
+
+    #[test]
+    fn a_block_missed_mid_frame_is_requested_and_ready_once_copied() {
+        // MHF's field (2026-11-18): new content CALLs a VRAM sublist never
+        // requested; the walk waits while the table goes out mid-frame.
+        let mut requests = Box::new(VramRequests::new());
+        let known = block_address(0x100);
+        assert!(!requests.block_ready(known));
+        frame(&mut requests, 0, 1);
+        frame(&mut requests, 1, 1);
+        assert!(requests.block_ready(known));
+        let frame_number = requests.frame;
+
+        let sublist = block_address(0x153);
+        assert!(!requests.block_ready(sublist));
+        let plan = requests.plan_mid_frame(1);
+        assert_eq!(requests.frame, frame_number, "the frame doesn't move on");
+        assert!(plan.ranges().iter().any(|range| range.offset == 0x153 * BLOCK_SIZE), "{:?}", plan.ranges());
+        assert!(plan.ranges().iter().any(|range| range.offset <= 0x100 * BLOCK_SIZE
+            && range.offset + range.size > 0x100 * BLOCK_SIZE), "the frame's other blocks stay requested");
+        requests.published(2);
+        assert!(!requests.note_copied(1), "generation 2 isn't copied yet");
+        assert!(!requests.block_ready(sublist));
+        assert!(requests.note_copied(2));
+        assert!(requests.block_ready(sublist), "ready within the same frame");
+        assert!(requests.block_ready(known));
     }
 
     #[test]

@@ -167,6 +167,8 @@ pub fn write_frame(out: &mut impl Write, stats: &FrameStats) -> fmt::Result {
         ("gestate_regdiff", stats.ge_state_register_differences),
         ("gestate_mtxdiff", stats.ge_state_matrix_differences),
         ("gestate_us", stats.ge_state_psp_us),
+        ("vramwait", stats.vram_waits),
+        ("vramwait_us", stats.vram_wait_us),
         ("offx", stats.screen_offset_x_changed >> 4),
         ("xfer_skipped", stats.transfers_skipped),
         ("skip3d", stats.skipped_3d_draws),

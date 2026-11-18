@@ -169,6 +169,11 @@ pub struct FrameStats {
     pub ge_state_matrix_differences: u32,
     /// Microseconds the plugin's reads took the game (`EVENT_GE_STATE`).
     pub ge_state_psp_us: u32,
+    /// Walks that stopped at a VRAM block not copied yet, waited for the
+    /// plugin's copy and went on (`Capture::resume_after_vram`), and the
+    /// microseconds all such waits took (given-up ones included).
+    pub vram_waits: u32,
+    pub vram_wait_us: u32,
     /// SCREEN_OFFSET_X (12.4 fixed point) at the frame's end, when it
     /// differs from the previous frame's (0 otherwise): MHF's house came out
     /// black with 404 where Sony's GE had 1808 (2026-11-18, under study).
@@ -269,6 +274,8 @@ impl FrameStats {
             ge_state_register_differences: 0,
             ge_state_matrix_differences: 0,
             ge_state_psp_us: 0,
+            vram_waits: 0,
+            vram_wait_us: 0,
             screen_offset_x_changed: 0,
             transfers_skipped: 0,
             cache: crate::vertex_cache::CacheStats { hits: 0, misses: 0, stored: 0, full: 0, cpu_only: 0, changing: 0, quick: 0, repeated: 0, raw_runs: 0, raw_bytes: 0, raw_full: 0, raw_lit: 0, raw_psp_ram: 0, raw_psp_ram_bytes: 0, raw_converted: 0, raw_gathered: 0, raw_full_at: [0; 4] },
