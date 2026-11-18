@@ -208,19 +208,28 @@ fn cut_uniforms(blend: u32, blending: bool, bits: [u32; 4], writes_color: bool, 
     ]
 }
 
-/// The alpha-test range that lets every fragment pass (the frame-read
-/// program always runs its alpha test).
-const ALPHA_ALL_PASS: [f32; 4] = [0.0, 255.0, 0.0, 0.0];
+/// The alpha-test uniform that lets every fragment pass (the frame-read
+/// program always runs its alpha test): 0..255 pass.
+const ALPHA_ALL_PASS: [f32; 4] = alpha_test_uniform(0.0, 255.0, false);
+
+/// The fragment programs' alpha-test uniform (uAlphaTest,
+/// nativeres_textured_test_f.cg) for alpha values `lo..=hi` passing, or with
+/// `outside` the ones outside: the bounds half a step out, z the sign that
+/// makes a passing alpha's (alpha - x)(y - alpha) z positive.
+const fn alpha_test_uniform(lo: f32, hi: f32, outside: bool) -> [f32; 4] {
+    [lo - 0.5, hi + 0.5, if outside { -1.0 } else { 1.0 }, 0.0]
+}
 
 /// The frame-read program for `draw` if it goes to a 16-bit PSP target
 /// whose colour is cut as the GE does (`TARGET_CUT`), else None (the 8-bit
 /// way); `keep_target_alpha` as `Draws::keep_target_alpha`.
-fn read_choice(draw: &Draw, keep_target_alpha: bool) -> Option<ReadVariant> {
+fn read_choice(frame: &Frame, draw: &Draw, keep_target_alpha: bool) -> Option<ReadVariant> {
     let mode = TARGET_CUT.load(Ordering::Relaxed);
     if draw.flags & draw_flags::TARGET_FORMAT_MASK == 0 || mode == 0 {
         return None;
     }
-    if mode == 2 || mode == 3 {
+    // The fast programs leave the separate specular colour out.
+    if mode == 2 || mode == 3 || separate_specular(frame, draw) {
         return Some(ReadVariant::Generic);
     }
     let variant = read_variant(draw.flags, draw.blend, keep_target_alpha, mode != 4);
@@ -230,6 +239,38 @@ fn read_choice(draw: &Draw, keep_target_alpha: bool) -> Option<ReadVariant> {
         6 if off => None,
         _ => Some(variant),
     }
+}
+
+/// The alpha values the PSP's alpha test `function` (its 3 bits) with
+/// `reference` (0..255) lets pass: `lo..=hi`, or with `outside` the ones
+/// outside that range; None for "always".
+fn alpha_test_bounds(function: u32, reference: u32) -> Option<(f32, f32, bool)> {
+    let reference = reference as f32;
+    Some(match function & 7 {
+        0 => (1.0, 0.0, false),               // never
+        1 => return None,                     // always
+        2 => (reference, reference, false),   // equal
+        3 => (reference, reference, true),    // not equal
+        4 => (0.0, reference - 1.0, false),   // less
+        5 => (0.0, reference, false),         // less or equal
+        6 => (reference + 1.0, 255.0, false), // greater
+        _ => (reference, 255.0, false),       // greater or equal
+    })
+}
+
+/// Whether `draw` is lit with a separate specular colour (LIGHTMODE 1):
+/// its vertex program then hands the fragment program a specular part
+/// (vSpecular), which the fast frame-read programs leave out (NO_SPECULAR,
+/// nativeres_textured_read_f.cg). Draws the GPU doesn't light have none.
+fn separate_specular(frame: &Frame, draw: &Draw) -> bool {
+    let lights = if draw.flags & draw_flags::RAW_VERTICES != 0 {
+        frame.raw_transform_of(draw).and_then(|(transform, _)| raw_light_set(frame, transform))
+    } else if draw.transform != 0 && draw.transform <= frame.transform_count {
+        frame.transforms.get(draw.transform as usize - 1).and_then(|transform| light_set(frame, transform))
+    } else {
+        None
+    };
+    lights.is_some_and(|lights| lights.material_specular[3] > 0.5)
 }
 
 /// Measuring only (0 = off): our scene draws only
@@ -243,6 +284,25 @@ pub static INDEX_TEST_FRAMES: AtomicI32 = AtomicI32::new(0);
 pub static MIP_TEST_FRAMES: AtomicI32 = AtomicI32::new(0);
 /// "shadetest <frames>": `draw_shade_test` after each of the next frames.
 pub static SHADE_TEST_FRAMES: AtomicI32 = AtomicI32::new(0);
+
+/// Which of our programs a shade-test quad goes through.
+#[derive(Clone, Copy)]
+enum ShadeProgram {
+    /// The 8-bit ones (nativeres_textured_f.cg, with the test _test_f).
+    EightBit,
+    /// The fast 5551 "off" ones (nativeres_textured_read_off_f.cg, with the
+    /// test _offtest_f): the colour cut to 5 bits per channel, widened.
+    Cut5551,
+}
+
+/// The shade test's alpha-test cases: PSP compare function and reference,
+/// over a quad of alpha 200 (`SHADE_ALPHA_CASE`). tools/shadetest.py knows
+/// which pass: greater or equal 200 yes, greater 200 no, not equal 200
+/// no, not equal 100 yes, equal 200 yes, less 200 no.
+const SHADE_ALPHA_TESTS: [(u32, u32); 6] = [(7, 200), (6, 200), (3, 200), (3, 100), (2, 200), (4, 200)];
+/// White at alpha 200: the texel's colour where it passes.
+const SHADE_ALPHA_CASE: ShadeCase =
+    ShadeCase { w: [1.0, 1.0], color: [0xC8FF_FFFF; 2], fog: 1.0, fog_and_scale: [0.0, 0.0, 0.0, 1.0], tested: true };
 
 /// One quad of the shade test: its left and right corners' w and colour
 /// (0xAABBGGRR), the fog factor at every corner, the fragment program's
@@ -649,9 +709,8 @@ impl Draws {
         self.alpha_log_kinds = 0;
     }
 
-    /// The PSP's alpha test of a textured draw as the alpha values that
-    /// pass: range[0] ..= range[1] (0..255), or outside it with range[2] = 1
-    /// (nativeres_textured_test_f.cg). None if the draw needs no test
+    /// The PSP's alpha test of a textured draw as the fragment programs'
+    /// uniform (`alpha_test_uniform`: the alpha values that pass, 0..255). None if the draw needs no test
     /// program: no test, "always", a mask other than 0xFF (blending stands in
     /// for those, blend.rs), no test program, a test every alpha passes, or
     /// one that only rejects alpha 0 where that changes nothing.
@@ -662,21 +721,12 @@ impl Draws {
         {
             return None;
         }
-        let reference = ((draw.tests >> test_flags::ALPHA_REFERENCE_SHIFT) & 0xFF) as f32;
-        let (lo, hi, outside) = match (draw.tests >> test_flags::ALPHA_FUNCTION_SHIFT) & 7 {
-            0 => (1.0, 0.0, 0.0),                // never
-            1 => return None,                    // always
-            2 => (reference, reference, 0.0),    // equal
-            3 => (reference, reference, 1.0),    // not equal
-            4 => (0.0, reference - 1.0, 0.0),    // less
-            5 => (0.0, reference, 0.0),          // less or equal
-            6 => (reference + 1.0, 255.0, 0.0),  // greater
-            _ => (reference, 255.0, 0.0),        // greater or equal
-        };
+        let reference = (draw.tests >> test_flags::ALPHA_REFERENCE_SHIFT) & 0xFF;
+        let (lo, hi, outside) = alpha_test_bounds(draw.tests >> test_flags::ALPHA_FUNCTION_SHIFT, reference)?;
         let stats = stats();
         stats.alpha_tested += 1;
-        let passes_all = outside == 0.0 && lo <= 0.0 && hi >= 255.0;
-        let rejects_only_zero = (outside == 0.0 && lo == 1.0 && hi >= 255.0) || (outside != 0.0 && lo == 0.0 && hi == 0.0);
+        let passes_all = !outside && lo <= 0.0 && hi >= 255.0;
+        let rejects_only_zero = (!outside && lo == 1.0 && hi >= 255.0) || (outside && lo == 0.0 && hi == 0.0);
         if passes_all || (rejects_only_zero && alpha_zero_changes_nothing(draw)) {
             stats.alpha_test_skipped += 1;
             return None;
@@ -684,7 +734,7 @@ impl Draws {
         if ALPHA_LOG.load(Ordering::Relaxed) != 0 {
             self.note_discard_draw(draw);
         }
-        Some([lo, hi, outside, 0.0])
+        Some(alpha_test_uniform(lo, hi, outside))
     }
 
     /// Our textured fragment program's uniforms: fog colour and colour
@@ -1068,7 +1118,7 @@ impl Draws {
         }
         let keep = self.keep_target_alpha;
         // A 16-bit PSP target: the frame-read program (alpha test included).
-        let choice = read_choice(draw, keep);
+        let choice = read_choice(frame, draw, keep);
         let read_variant = choice.unwrap_or(ReadVariant::Generic);
         let read_program = match choice {
             Some(variant) if programs_ready => self.programs.read_program(true, tested, variant).map(|program| program.program),
@@ -1359,7 +1409,7 @@ impl Draws {
             *out = basic_programs::ColorVertex { x: vertex.x * SCALE, y: vertex.y * SCALE, z: gpu_depth(vertex.z), color: vertex.color };
         }
         stats().convert_us += draw_clock().wrapping_sub(convert_start);
-        let choice = read_choice(draw, self.keep_target_alpha);
+        let choice = read_choice(frame, draw, self.keep_target_alpha);
         let read_variant = choice.unwrap_or(ReadVariant::Generic);
         let read_program = choice.and_then(|variant| self.programs.read_program(false, false, variant).map(|program| program.program));
         let read = read_program.is_some();
@@ -1481,21 +1531,17 @@ impl Draws {
         self.use_default_viewport();
     }
 
-    /// The memory layout GXM wants for a linear
-    /// texture's mip levels. A 64x64 texture with 7 levels, each level one
-    /// colour (0 red, 1 green, 2 blue, 3 yellow, 4 cyan, 5 magenta, 6
-    /// white), laid out as texture::mip_level_offset says. Row 1: ABGR8888;
-    /// row 2: P8 with a palette whose entry n is level n's colour. Seven
-    /// squares per row, the texture repeated 2, 4, ... 128 times across each,
-    /// so the GPU (point mip filter) samples level 0, 1, ... 6. A right
-    /// layout gives seven clean colours per row. In the test block.
-    /// The shade test (`SHADE_TESTS`): one 30x30 quad per case at PSP x
-    /// 20 + 40 i, y 100, through our textured programs exactly as a draw
-    /// goes (vertex program, fragment program for no blending, uniforms),
-    /// unblended over the frame. The PC tests never run the compiled
-    /// programs; tools/shadetest.py checks these pixels against the GE's
-    /// arithmetic (2026-11-18: a whole MHF scene came out black once while
-    /// the PC replay was right).
+    /// The shade test: 30x30 quads at PSP x 20 + 40 i through our textured
+    /// programs exactly as a draw goes (vertex program, fragment program for
+    /// no blending, uniforms), unblended over the frame:
+    /// - y 100: `SHADE_TESTS` through the 8-bit programs;
+    /// - y 140: the same through the 5551 "off" programs (cut to 5 bits);
+    /// - y 180 (8-bit) and y 220 (5551): the alpha test, `SHADE_ALPHA_TESTS`
+    ///   over a background quad (`SHADE_TESTS[0]`): where the test rejects,
+    ///   the background shows.
+    /// The PC tests never run the compiled programs; tools/shadetest.py
+    /// checks these pixels against the GE's arithmetic (2026-11-18: a whole
+    /// MHF scene came out black once while the PC replay was right).
     fn draw_shade_test(&mut self) {
         if !self.programs.textured_ready() {
             return;
@@ -1520,51 +1566,99 @@ impl Draws {
         }
         self.prepare_test();
         self.state.vertex_program = null(); // our matrix, set anew
-        let vertex = self.programs.textured.vertex as *const c_void;
-        let wvp = self.programs.textured.wvp;
-        let matrix = self.native_matrix();
         self.use_texture(&texture);
         for (i, case) in SHADE_TESTS.iter().enumerate() {
-            let tested = case.tested && self.programs.textured.have_test;
-            let kind = if tested { Kind::TexturedTest } else { Kind::Textured };
-            let fragment = self.programs.blend_program(kind, 0, self.keep_target_alpha);
-            if fragment.is_null() {
+            let left = 20.0 + 40.0 * i as f32;
+            self.shade_test_quad(left, 100.0, case, ShadeProgram::EightBit, ALPHA_ALL_PASS);
+            self.shade_test_quad(left, 140.0, case, ShadeProgram::Cut5551, ALPHA_ALL_PASS);
+        }
+        for (i, &(function, reference)) in SHADE_ALPHA_TESTS.iter().enumerate() {
+            let Some((lo, hi, outside)) = alpha_test_bounds(function, reference) else {
                 continue;
-            }
-            self.use_programs(vertex, wvp, matrix, fragment as *const c_void);
-            self.textured_fragment_uniforms(tested, case.fog_and_scale, ALPHA_ALL_PASS, 0);
-            let vertices = frame_pool_alloc(4 * core::mem::size_of::<FrameVertex>() as u32, 8) as *mut FrameVertex;
-            let indices = frame_pool_alloc(6 * 2, 2) as *mut u16;
-            if vertices.is_null() || indices.is_null() {
-                return;
-            }
-            let (left, top, size) = (20.0 + 40.0 * i as f32, 100.0, 30.0);
-            let corner = |x: f32, y: f32, side: usize, u: f32, v: f32| FrameVertex {
-                x,
-                y,
-                z: 0.5,
-                w: case.w[side],
-                u,
-                v,
-                color: case.color[side],
-                fog: case.fog,
             };
-            let quad = [
-                corner(left, top, 0, 0.0, 0.0),
-                corner(left + size, top, 1, 1.0, 0.0),
-                corner(left, top + size, 0, 0.0, 1.0),
-                corner(left + size, top + size, 1, 1.0, 1.0),
-            ];
-            // Safe: the pool gave room for 4 vertices and 6 indices.
-            unsafe {
-                core::ptr::copy_nonoverlapping(quad.as_ptr(), vertices, 4);
-                core::ptr::copy_nonoverlapping([0u16, 1, 2, 1, 3, 2].as_ptr(), indices, 6);
-                gxm::sceGxmSetVertexStream(context(), 0, vertices as *const c_void);
-                gxm::sceGxmDraw(context(), gxm::PRIMITIVE_TRIANGLES, gxm::INDEX_FORMAT_U16, indices as *const c_void, 6);
+            let left = 20.0 + 40.0 * i as f32;
+            for (top, program) in [(180.0, ShadeProgram::EightBit), (220.0, ShadeProgram::Cut5551)] {
+                self.shade_test_quad(left, top, &SHADE_TESTS[0], ShadeProgram::EightBit, ALPHA_ALL_PASS);
+                self.shade_test_quad(left, top, &SHADE_ALPHA_CASE, program, alpha_test_uniform(lo, hi, outside));
             }
         }
     }
 
+    /// One shade-test quad, 30x30 PSP pixels at (`left`, `top`): `case`'s
+    /// corners through `program`; `alpha_test` (`alpha_test_uniform`) for
+    /// the alpha-test program where `case.tested`.
+    fn shade_test_quad(&mut self, left: f32, top: f32, case: &ShadeCase, program: ShadeProgram, alpha_test: [f32; 4]) {
+        let tested = case.tested && self.programs.textured.have_test;
+        let off = ReadVariant::Fast { way: ReadWay::Off, keep_alpha: false };
+        let fragment = match program {
+            ShadeProgram::EightBit => {
+                let kind = if tested { Kind::TexturedTest } else { Kind::Textured };
+                self.programs.blend_program(kind, 0, self.keep_target_alpha)
+            }
+            ShadeProgram::Cut5551 => match self.programs.read_program(true, tested, off) {
+                Some(read) => read.program,
+                None => return,
+            },
+        };
+        if fragment.is_null() {
+            return;
+        }
+        let vertex = self.programs.textured.vertex as *const c_void;
+        let wvp = self.programs.textured.wvp;
+        let matrix = self.native_matrix();
+        self.use_programs(vertex, wvp, matrix, fragment as *const c_void);
+        match program {
+            ShadeProgram::EightBit => self.textured_fragment_uniforms(tested, case.fog_and_scale, alpha_test, 0),
+            ShadeProgram::Cut5551 => {
+                let read = self.programs.made_read_program(true, tested, off);
+                let (fog_and_scale, alpha) = (read.fog_and_scale, read.alpha_test);
+                let buffer = reserve_fragment_uniforms();
+                set_uniform(buffer, fog_and_scale, 4, case.fog_and_scale.as_ptr());
+                if !alpha.is_null() {
+                    set_uniform(buffer, alpha, 4, alpha_test.as_ptr());
+                }
+                self.state.tint = None; // the cached default buffer is no longer the one in use
+            }
+        }
+        let vertices = frame_pool_alloc(4 * core::mem::size_of::<FrameVertex>() as u32, 8) as *mut FrameVertex;
+        let indices = frame_pool_alloc(6 * 2, 2) as *mut u16;
+        if vertices.is_null() || indices.is_null() {
+            return;
+        }
+        let size = 30.0;
+        let corner = |x: f32, y: f32, side: usize, u: f32, v: f32| FrameVertex {
+            x,
+            y,
+            z: 0.5,
+            w: case.w[side],
+            u,
+            v,
+            color: case.color[side],
+            fog: case.fog,
+        };
+        let quad = [
+            corner(left, top, 0, 0.0, 0.0),
+            corner(left + size, top, 1, 1.0, 0.0),
+            corner(left, top + size, 0, 0.0, 1.0),
+            corner(left + size, top + size, 1, 1.0, 1.0),
+        ];
+        // Safe: the pool gave room for 4 vertices and 6 indices.
+        unsafe {
+            core::ptr::copy_nonoverlapping(quad.as_ptr(), vertices, 4);
+            core::ptr::copy_nonoverlapping([0u16, 1, 2, 1, 3, 2].as_ptr(), indices, 6);
+            gxm::sceGxmSetVertexStream(context(), 0, vertices as *const c_void);
+            gxm::sceGxmDraw(context(), gxm::PRIMITIVE_TRIANGLES, gxm::INDEX_FORMAT_U16, indices as *const c_void, 6);
+        }
+    }
+
+    /// The memory layout GXM wants for a linear
+    /// texture's mip levels. A 64x64 texture with 7 levels, each level one
+    /// colour (0 red, 1 green, 2 blue, 3 yellow, 4 cyan, 5 magenta, 6
+    /// white), laid out as texture::mip_level_offset says. Row 1: ABGR8888;
+    /// row 2: P8 with a palette whose entry n is level n's colour. Seven
+    /// squares per row, the texture repeated 2, 4, ... 128 times across each,
+    /// so the GPU (point mip filter) samples level 0, 1, ... 6. A right
+    /// layout gives seven clean colours per row. In the test block.
     fn draw_mip_test(&mut self) {
         const COLORS: [u32; 7] = [0xFF00_00FF, 0xFF00_FF00, 0xFFFF_0000, 0xFF00_FFFF, 0xFFFF_FF00, 0xFFFF_00FF, 0xFFFF_FFFF];
         let block = self.test_block();

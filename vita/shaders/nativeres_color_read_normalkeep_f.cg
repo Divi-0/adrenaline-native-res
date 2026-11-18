@@ -50,7 +50,7 @@
 //
 // Uniforms of the generic program:
 //   uFogAndScale  rgb = fog colour (0..255), a = colour scale (1 or 2)
-//   uAlphaTest    as nativeres_textured_test_f.cg (0, 255, 0: all pass)
+//   uAlphaTest    as nativeres_textured_test_f.cg (-0.5, 255.5, 1: all pass)
 //   uBlendFix     BLEND_FIX: rgb times x + y * source alpha (1, 0 without);
 //                 alpha = lerp(alpha, w, z) (z = 1: alpha = FIX B)
 //   uSource       a blend factor as k0 + k1 s + k2 s.a + k3 d + k4 d.a:
@@ -85,6 +85,11 @@
 #if defined(READ_NORMAL) || defined(READ_ADD) || defined(READ_OFF)
 #define READ_FAST 1
 #endif
+// The fast ones take no draws with a separate specular colour (draw.rs
+// `read_choice`: those go to the generic one).
+#ifdef READ_FAST
+#define NO_SPECULAR 1
+#endif
 
 // The GE's texture function (modulate) and fog in its integer arithmetic
 // (ppsspp-ref GPU/Software/Sampler.cpp GetTextureFunctionOutput and
@@ -97,16 +102,30 @@
 // as k / 255 (or k / 256) minus a rounding error at k. Without fog, f = 1
 // gives f8 = 255, which leaves the colour as it is.
 // fogAndScale: rgb the fog colour 0..255, a the colour scale (1 or 2).
-// Returns 0..1. tools/shadetest.py checks it on the Vita.
+// Returns the GE's whole values, 0..255 (alpha too: the alpha test and the
+// frame-read blends take them as they are). tools/shadetest.py checks it on
+// the Vita. NO_SPECULAR: the program is only used for draws without a
+// separate specular colour (4 instructions less).
+//
+// Cost (tools/gxpinfo.py, instructions per pixel): floor written as
+// x - frac(x) compiles shorter than floor(x); the fog is the dearest part
+// (~13 of a textured program's ~27); the specular 4. Keep this function the
+// same in nativeres_textured_f.cg, nativeres_textured_test_f.cg and
+// nativeres_textured_read_f.cg.
+#define FLOOR(x) ((x) - frac(x))
 float4 GeShade(float4 texel, float4 vertexColor, float3 specular, float fog, float4 fogAndScale)
 {
-	float4 t = floor(texel * 255.0f + 0.01f);
-	float4 p1 = floor(vertexColor * 255.0f + 1.01f); // p + 1
-	float4 c = floor(p1 * t * (float4(fogAndScale.aaa, 1.0f) * (1.0f / 256.0f)));
-	c.rgb = min(c.rgb + floor(specular * 255.0f + 0.5f) * fogAndScale.aaa, 255.0f);
-	float f = min(floor(saturate(fog) * 256.0f + 0.01f), 255.0f);
-	c.rgb = floor((f * (c.rgb - fogAndScale.rgb) + (fogAndScale.rgb * 255.0f + 255.0f)) * (1.0f / 256.0f));
-	return c * (1.0f / 255.0f);
+	float4 t = FLOOR(texel * 255.0f + 0.01f);
+	float4 p1 = FLOOR(vertexColor * 255.0f + 1.01f); // p + 1
+	float4 c = FLOOR(p1 * t * (float4(fogAndScale.aaa, 1.0f) * (1.0f / 256.0f)));
+#ifdef NO_SPECULAR
+	c.rgb = min(c.rgb, 255.0f);
+#else
+	c.rgb = min(c.rgb + FLOOR(specular * 255.0f + 0.5f) * fogAndScale.aaa, 255.0f);
+#endif
+	float f = min(FLOOR(saturate(fog) * 256.0f + 0.01f), 255.0f);
+	c.rgb = FLOOR((f * (c.rgb - fogAndScale.rgb) + (fogAndScale.rgb * 255.0f + 255.0f)) * (1.0f / 256.0f));
+	return c;
 }
 
 #ifdef READ_OFF
@@ -156,20 +175,24 @@ __nativecolor __regformat unsigned char4 main(
 	: COLOR
 #endif
 {
+	// c: the colour as whole values 0..255 (textured: the GE's own;
+	// untextured: rounded, as GXM writes a colour).
 #ifdef UNTEXTURED
 	float4 color = vColor;
+	float4 c = FLOOR(saturate(color) * 255.0f + 0.5f);
 #else
 	// Colour, specular and fog came times w (screen-linear, nativeres_3d_v.cg).
 	float overW = 1.0f / vFog.y;
 	// The separate specular colour after texturing, then the doubling (PPSSPP:
 	// v = p * t + s, then the colour doubling, clamped), then fog.
-	float4 color = GeShade(tex2D(tex, vTexcoord), vColor * overW, vSpecular * overW, vFog.x * overW, uFogAndScale);
+	float4 c = GeShade(tex2D(tex, vTexcoord), vColor * overW, vSpecular * overW, vFog.x * overW, uFogAndScale);
 #if !defined(READ_FAST) || defined(READ_TEST)
-	float alpha = floor(saturate(color.a) * 255.0f + 0.5f);
-	float inside = step(uAlphaTest.x - 0.5f, alpha) * step(alpha, uAlphaTest.y + 0.5f);
-	if (abs(inside - uAlphaTest.z) < 0.5f)
+	// The alpha test on the whole alpha, as nativeres_textured_test_f.cg
+	// (uAlphaTest: x = lo - 0.5, y = hi + 0.5, z = 1 or -1 for NOTEQUAL).
+	if ((c.a - uAlphaTest.x) * (uAlphaTest.y - c.a) * uAlphaTest.z < 0.0f)
 		discard;
 #endif
+	float4 color = c * (1.0f / 255.0f);
 #ifndef READ_FAST
 	float sourceAlpha = saturate(color.a);
 	color.rgb *= uBlendFix.x + uBlendFix.y * sourceAlpha;
@@ -177,35 +200,42 @@ __nativecolor __regformat unsigned char4 main(
 #endif
 #endif
 #ifdef READ_FAST
-	// The colour in 8 bits, rounded as GXM writes a colour, blended as the
-	// GE does (above), cut to 5 bits per channel and widened back. The
-	// rounding needs its floor: on the Vita a float -> unsigned char cast
-	// rounds instead of truncating (measured 2026-11-18: without the floor
-	// GeShade's whole values came out +1, every eighth pixel one 5-bit step
-	// too bright, MHF ~+1 level overall). An opaque source needs no terms:
+	// Blended as the GE does (above) from the whole values, cut to 5 bits
+	// per channel and widened back. An opaque source needs no terms:
 	// t(s, 255) = s, t(d, 0) = 0; most blended pixels in MHF are opaque
 	// texels of alpha-tested foliage, and the fp32 terms cost the GPU
 	// ~12 ms per intro frame when every pixel takes them.
-	unsigned char4 v = (unsigned char4)floor(saturate(color) * 255.0f + 0.5f);
 #if defined(READ_NORMAL)
-	if (v.a != 255) {
-		float4 s = (float4)v;
+	float4 value = c;
+	if (c.a != 255.0f) {
 		float4 d = (float4)target;
-		v = (unsigned char4)(floor((s * 2.0f + 1.0f) * ((s.a * 2.0f + 1.0f) * (1.0f / 1024.0f)))
-			+ floor((d * 2.0f + 1.0f) * ((511.0f - s.a * 2.0f) * (1.0f / 1024.0f))));
+		value = FLOOR((c * 2.0f + 1.0f) * ((c.a * 2.0f + 1.0f) * (1.0f / 1024.0f)))
+			+ FLOOR((d * 2.0f + 1.0f) * ((511.0f - c.a * 2.0f) * (1.0f / 1024.0f)));
 	}
 #elif defined(READ_ADD)
-	float4 s = (float4)v;
 	float4 d = (float4)target;
-	v = (unsigned char4)min(floor((s * 2.0f + 1.0f) * ((s.a * 2.0f + 1.0f) * (1.0f / 1024.0f))) + d, 255.0f);
+	float4 value = min(FLOOR((c * 2.0f + 1.0f) * ((c.a * 2.0f + 1.0f) * (1.0f / 1024.0f))) + d, 255.0f);
+#else
+	float4 value = c;
 #endif
-	unsigned char4 cut = (v & 0xF8) | (v >> 5);
 #ifdef READ_OFF
-	// The alpha as it is: GXM's blending uses it when the program draws a
-	// normal alpha blend (`ReadWay::Precut`).
-	cut.a = v.a;
-#elif defined(READ_KEEP_ALPHA)
+	// The cut in floats (2 instructions less than the bit operations
+	// below): 5 bits widened = 8 h + (h >> 2) with h = v >> 3, and
+	// h x 8.25 - 0.375 lies 0.125 .. 0.375 off that whole number; the cast
+	// to unsigned char rounds to the nearest (measured on the Vita,
+	// 2026-11-18). The alpha as it is: GXM's blending uses it when the
+	// program draws a normal alpha blend (`ReadWay::Precut`).
+	float4 h = FLOOR(value * 0.125f);
+	unsigned char4 cut = (unsigned char4)(h * 8.25f - 0.375f);
+	cut.a = (unsigned char)value.a;
+#else
+	// 5 bits widened = v & 0xF8 | v >> 5 (core frame.rs `cut_to_5_bits`,
+	// the same as `quantize_like_the_ge`); value is whole, the cast exact.
+	unsigned char4 v = (unsigned char4)value;
+	unsigned char4 cut = (v & 0xF8) | (v >> 5);
+#ifdef READ_KEEP_ALPHA
 	cut.a = target.a;
+#endif
 #endif
 	return cut;
 #else
