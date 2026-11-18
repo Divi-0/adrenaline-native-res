@@ -384,6 +384,9 @@ struct GxmState {
     /// The viewport's z offset and scale while raw draws set it; None: GXM's
     /// default.
     raw_viewport: Option<[f32; 2]>,
+    /// The dither matrix whose texture is on texture unit 1
+    /// (`use_dither_texture`).
+    dither_matrix: Option<u64>,
 }
 
 const FORGOTTEN: GxmState = GxmState {
@@ -400,6 +403,7 @@ const FORGOTTEN: GxmState = GxmState {
     raw_colors: null(),
     bones: 0,
     raw_viewport: None,
+    dither_matrix: None,
 };
 
 const ALPHA_LOG_KINDS: usize = 32;
@@ -692,6 +696,43 @@ impl Draws {
         self.state.texture = Some(*texture);
     }
 
+    /// Puts the GE's dither matrix `matrix` (`Frame::dither_matrix`) on
+    /// texture unit 1 for the fast dithered frame-read programs
+    /// (READ_DITHER, uDitherTexture): an 8x8 texture, texel (x, y) = the
+    /// matrix entry (x % 4, y % 4) + 8 in red, which they sample at WPOS / 16
+    /// (two of ours per PSP pixel), repeated, unfiltered. 8x8 rather than
+    /// 4x4: linear texture rows are at least 8 texels. From the frame pool,
+    /// once per scene and matrix; if the pool is full the draw reads what
+    /// the unit holds (the frame is late anyway).
+    fn use_dither_texture(&mut self, matrix: u64) {
+        if self.state.dither_matrix == Some(matrix) {
+            return;
+        }
+        let texels = frame_pool_alloc(64 * 4, 64) as *mut u32;
+        if texels.is_null() {
+            return;
+        }
+        for y in 0..8 {
+            for x in 0..8 {
+                let value = (nativeres_core::frame::dither_value(matrix, x % 4, y % 4) + 8) as u32;
+                // Safe: the pool gave room for 64 texels.
+                unsafe { texels.add(y * 8 + x).write(0xFF00_0000 | value) };
+            }
+        }
+        let mut texture = gxm::Texture { control_words: [0; 4] };
+        // Safe: our texture struct over the pool's block; GXM copies the
+        // texture state.
+        unsafe {
+            gxm::sceGxmTextureInitLinear(&mut texture, texels as *const c_void, gxm::TEXTURE_FORMAT_U8U8U8U8_ABGR, 8, 8, 0);
+            gxm::sceGxmTextureSetMinFilter(&mut texture, gxm::TEXTURE_FILTER_POINT);
+            gxm::sceGxmTextureSetMagFilter(&mut texture, gxm::TEXTURE_FILTER_POINT);
+            gxm::sceGxmTextureSetUAddrMode(&mut texture, gxm::TEXTURE_ADDR_REPEAT);
+            gxm::sceGxmTextureSetVAddrMode(&mut texture, gxm::TEXTURE_ADDR_REPEAT);
+            gxm::sceGxmSetFragmentTexture(context(), 1, &texture);
+        }
+        self.state.dither_matrix = Some(matrix);
+    }
+
     fn note_discard_draw(&mut self, draw: &Draw) {
         if let Some(kind) = self.alpha_log[..self.alpha_log_kinds].iter_mut().find(|kind| kind.0 == draw.tests && kind.1 == draw.blend) {
             kind.2 += 1;
@@ -790,10 +831,13 @@ impl Draws {
         };
         stats().cut_draws += 1;
         let generic = variant == ReadVariant::Generic;
-        if let ReadVariant::Fast { way, .. } = variant {
+        if let ReadVariant::Fast { way, dither, .. } = variant {
             stats().cut_fast_draws += 1;
             if matches!(way, ReadWay::Off | ReadWay::Precut) {
                 stats().cut_off_draws += 1;
+            }
+            if dither {
+                self.use_dither_texture(frame.dither_matrix);
             }
             if textured.is_none() {
                 return;
@@ -807,16 +851,17 @@ impl Draws {
         let enabled = blend & BLEND_ENABLED != 0;
         let writes_alpha = blend & BLEND_WRITES_ALPHA != 0;
         let alpha_only = writes_alpha && blend & BLEND_ALPHA_ONLY != 0;
-        let dithered = draw.flags & draw_flags::DITHER != 0;
+        let dither_flag = draw.flags & draw_flags::DITHER != 0;
         let buffer = reserve_fragment_uniforms();
         if generic {
-            let cut = cut_uniforms(blend, enabled && !alpha_only, bits, !alpha_only, writes_alpha, dithered);
-            let rows: [[f32; 4]; 4] = core::array::from_fn(|y| {
-                core::array::from_fn(|x| if dithered { nativeres_core::frame::dither_value(frame.dither_matrix, x, y) as f32 } else { 0.0 })
-            });
+            let cut = cut_uniforms(blend, enabled && !alpha_only, bits, !alpha_only, writes_alpha, dither_flag);
             for (parameter, values) in program.cut.iter().zip(&cut) {
                 set_uniform(buffer, *parameter, 4, values.as_ptr());
             }
+            // The GE's matrix (zeros for an undithered draw).
+            let rows: [[f32; 4]; 4] = core::array::from_fn(|y| {
+                core::array::from_fn(|x| if dither_flag { nativeres_core::frame::dither_value(frame.dither_matrix, x, y) as f32 } else { 0.0 })
+            });
             for (parameter, row) in program.dither.iter().zip(&rows) {
                 set_uniform(buffer, *parameter, 4, row.as_ptr());
             }
@@ -1589,7 +1634,7 @@ impl Draws {
     /// the alpha-test program where `case.tested`.
     fn shade_test_quad(&mut self, left: f32, top: f32, case: &ShadeCase, program: ShadeProgram, alpha_test: [f32; 4]) {
         let tested = case.tested && self.programs.textured.have_test;
-        let off = ReadVariant::Fast { way: ReadWay::Off, keep_alpha: false };
+        let off = ReadVariant::Fast { way: ReadWay::Off, keep_alpha: false, dither: false };
         let fragment = match program {
             ShadeProgram::EightBit => {
                 let kind = if tested { Kind::TexturedTest } else { Kind::Textured };

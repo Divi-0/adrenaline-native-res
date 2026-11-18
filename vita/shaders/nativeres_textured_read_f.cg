@@ -24,15 +24,18 @@
 // colour itself.
 //
 // Fast variants (scripts/shader-variants.sh, programs.rs `ReadVariant`):
-// for 5551 targets without dithering and the common blends, one per
-// way: READ_NORMAL (source alpha, one minus source alpha, add), READ_ADD
+// for 5551 targets and the common blends, one per way: READ_NORMAL (source alpha, one minus source alpha, add), READ_ADD
 // (source alpha, one, add), READ_OFF (no blending: no frame read, see
 // there); READ_KEEP_ALPHA: the target's alpha (the PSP's stencil, while a
 // game reads it) stays, else the alpha is written as blended (nobody
 // reads it then); READ_TEST (textured only): with the alpha test, whose
 // `discard` costs the GPU even where it passes (the 8-bit path's
-// nativeres_textured_test_f.cg likewise). No BLEND_FIX (those draws take
-// the generic program). They blend as above with their factors built in
+// nativeres_textured_test_f.cg likewise); READ_DITHER: the GE's dither
+// value added after the blend, read from uDitherTexture (texture unit 1:
+// the matrix as an 8x8 texture, value + 8 in red, sampled at WPOS / 16:
+// draw.rs `use_dither_texture`; 13 instructions less than `DitherValue`'s
+// one-hot weights). No BLEND_FIX (those draws
+// take the generic program). They blend as above with their factors built in
 // and cut with bit operations: 5 bits widened = v & 0xF8 | v >> 5 (core
 // frame.rs `cut_to_5_bits`, the same as `quantize_like_the_ge`). No
 // uniforms besides the colour's.
@@ -86,6 +89,10 @@
 #ifdef READ_FAST
 #define NO_SPECULAR 1
 #endif
+// The "off" ones floor the colour with their cut.
+#ifdef READ_OFF
+#define FOG_UNFLOORED 1
+#endif
 
 // The GE's texture function (modulate) and fog in its integer arithmetic
 // (ppsspp-ref GPU/Software/Sampler.cpp GetTextureFunctionOutput and
@@ -101,7 +108,8 @@
 // Returns the GE's whole values, 0..255 (alpha too: the alpha test and the
 // frame-read blends take them as they are). tools/shadetest.py checks it on
 // the Vita. NO_SPECULAR: the program is only used for draws without a
-// separate specular colour (4 instructions less).
+// separate specular colour (4 instructions less). FOG_UNFLOORED: the rgb
+// comes back unfloored, for a caller that floors anyway (3 less).
 //
 // Cost (tools/gxpinfo.py, instructions per pixel): floor written as
 // x - frac(x) compiles shorter than floor(x); the fog is the dearest part
@@ -120,8 +128,27 @@ float4 GeShade(float4 texel, float4 vertexColor, float3 specular, float fog, flo
 	c.rgb = min(c.rgb + FLOOR(specular * 255.0f + 0.5f) * fogAndScale.aaa, 255.0f);
 #endif
 	float f = min(FLOOR(saturate(fog) * 256.0f + 0.01f), 255.0f);
+#ifdef FOG_UNFLOORED
+	// The caller floors it with its cut (floor(floor(x) / 8) = floor(x / 8)).
+	c.rgb = (f * (c.rgb - fogAndScale.rgb) + (fogAndScale.rgb * 255.0f + 255.0f)) * (1.0f / 256.0f);
+#else
 	c.rgb = FLOOR((f * (c.rgb - fogAndScale.rgb) + (fogAndScale.rgb * 255.0f + 255.0f)) * (1.0f / 256.0f));
+#endif
 	return c;
+}
+
+// The dither value (-8..7) of the PSP pixel under `position` (WPOS: two of
+// ours per PSP pixel), from the GE's 4x4 dither matrix `row0..3` (core
+// frame.rs `dither_value`): its row and column picked by one-hot weights.
+float DitherValue(float2 position, float4 row0, float4 row1, float4 row2, float4 row3)
+{
+	float2 psp = floor(position * 0.5f);
+	float2 cell = psp - 4.0f * floor(psp * 0.25f);
+	const float4 columns = float4(0.0f, 1.0f, 2.0f, 3.0f);
+	float4 rowWeights = saturate(1.0f - abs(cell.y - columns));
+	float4 columnWeights = saturate(1.0f - abs(cell.x - columns));
+	float4 matrixRow = rowWeights.x * row0 + rowWeights.y * row1 + rowWeights.z * row2 + rowWeights.w * row3;
+	return dot(matrixRow, columnWeights);
 }
 
 #ifdef READ_OFF
@@ -135,8 +162,14 @@ __regformat unsigned char4 main(
 __nativecolor __regformat unsigned char4 main(
 	__regformat unsigned char4 target : FRAGCOLOR,
 #endif
-#ifndef READ_FAST
+#if !defined(READ_FAST) || defined(READ_DITHER)
 	float4 vPosition : WPOS,
+#endif
+#ifndef READ_FAST
+	uniform float4 uDither0,
+	uniform float4 uDither1,
+	uniform float4 uDither2,
+	uniform float4 uDither3,
 	uniform float4 uSource,
 	uniform float4 uDestination,
 	uniform float4 uBlend,
@@ -146,13 +179,9 @@ __nativecolor __regformat unsigned char4 main(
 	uniform float4 uWiden,
 	uniform float4 uWidenLow,
 	uniform float4 uWrite,
-	uniform float4 uDither0,
-	uniform float4 uDither1,
-	uniform float4 uDither2,
-	uniform float4 uDither3,
 #endif
 #ifdef UNTEXTURED
-	float4 vColor : COLOR)
+	float4 vColor : COLOR
 #else
 	float2 vTexcoord : TEXCOORD0,
 	float4 vColor : TEXCOORD1,
@@ -165,8 +194,12 @@ __nativecolor __regformat unsigned char4 main(
 #if !defined(READ_FAST) || defined(READ_TEST)
 	uniform float4 uAlphaTest,
 #endif
-	uniform float4 uFogAndScale)
+	uniform float4 uFogAndScale
 #endif
+#ifdef READ_DITHER
+	, uniform sampler2D uDitherTexture : TEXUNIT1
+#endif
+	)
 #ifdef READ_OFF
 	: COLOR
 #endif
@@ -214,6 +247,11 @@ __nativecolor __regformat unsigned char4 main(
 #else
 	float4 value = c;
 #endif
+#ifdef READ_DITHER
+	// The dither after the blend, clamped (alpha not dithered).
+	float dither = FLOOR(tex2D(uDitherTexture, vPosition.xy * (1.0f / 16.0f)).x * 255.0f + 0.5f) - 8.0f;
+	value.rgb = clamp(value.rgb + dither, 0.0f, 255.0f);
+#endif
 #ifdef READ_OFF
 	// The cut in floats (2 instructions less than the bit operations
 	// below): 5 bits widened = 8 h + (h >> 2) with h = v >> 3, and
@@ -221,6 +259,7 @@ __nativecolor __regformat unsigned char4 main(
 	// to unsigned char rounds to the nearest (measured on the Vita,
 	// 2026-11-18). The alpha as it is: GXM's blending uses it when the
 	// program draws a normal alpha blend (`ReadWay::Precut`).
+	// (value's rgb comes unfloored here: FOG_UNFLOORED, floored by h.)
 	float4 h = FLOOR(value * 0.125f);
 	unsigned char4 cut = (unsigned char4)(h * 8.25f - 0.375f);
 	cut.a = (unsigned char)value.a;
@@ -264,16 +303,9 @@ __nativecolor __regformat unsigned char4 main(
 			value = uMinMax.y > 0.5f ? max(s, d) : min(s, d);
 	}
 
-	// The dither value of this PSP pixel: its row and column picked by
-	// one-hot weights (alpha not dithered).
+	// The dither value of this PSP pixel (alpha not dithered).
 	if (uPath.y > 0.5f) {
-		float2 psp = floor(vPosition.xy * 0.5f);
-		float2 cell = psp - 4.0f * floor(psp * 0.25f);
-		const float4 columns = float4(0.0f, 1.0f, 2.0f, 3.0f);
-		float4 rowWeights = saturate(1.0f - abs(cell.y - columns));
-		float4 columnWeights = saturate(1.0f - abs(cell.x - columns));
-		float4 matrixRow = rowWeights.x * uDither0 + rowWeights.y * uDither1 + rowWeights.z * uDither2 + rowWeights.w * uDither3;
-		float dither = dot(matrixRow, columnWeights);
+		float dither = DitherValue(vPosition.xy, uDither0, uDither1, uDither2, uDither3);
 		value = clamp(value + float4(dither, dither, dither, 0.0f), 0.0f, 255.0f);
 	}
 

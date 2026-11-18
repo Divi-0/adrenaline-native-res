@@ -246,9 +246,10 @@ pub enum ReadVariant {
     /// The generic program: any format, blend and dithering, in floating
     /// point (uniforms).
     Generic,
-    /// A fast one (5551, no dithering): its blend; `keep_alpha` = the
-    /// target's alpha stays (else the alpha is written, as blended).
-    Fast { way: ReadWay, keep_alpha: bool },
+    /// A fast one (5551): its blend; `keep_alpha` = the target's alpha
+    /// stays (else the alpha is written, as blended); `dither` = the GE's
+    /// dither value is added after the blend (`draw_flags::DITHER`).
+    Fast { way: ReadWay, keep_alpha: bool, dither: bool },
 }
 
 /// The frame-read program for a draw into a 16-bit target with `flags`
@@ -259,15 +260,19 @@ pub enum ReadVariant {
 /// bits: a draw that writes an alpha that is read (5551's one bit) gets
 /// the generic one; so do BLEND_FIX draws (FIX B through the alpha: the
 /// generic program's premultiply). `exact_normal`: normal alpha blends
-/// read the frame and blend as the GE does, else `ReadWay::Precut`.
+/// read the frame and blend as the GE does, else `ReadWay::Precut`
+/// (dithered ones always read: the dither comes after the blend, which
+/// GXM would do). Dithered draws took the generic program until
+/// 2026-11-18: MHF's full-screen fade quad cost ~9.6 ms of GPU time there.
 pub fn read_variant(flags: u32, blend: u32, keep_target_alpha: bool, exact_normal: bool) -> ReadVariant {
     use crate::blend::{BLEND_ALPHA_ONLY, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_WRITES_ALPHA};
     let format = (flags & draw_flags::TARGET_FORMAT_MASK) >> draw_flags::TARGET_FORMAT_SHIFT;
     let alpha_only = blend & BLEND_WRITES_ALPHA != 0 && blend & BLEND_ALPHA_ONLY != 0;
     let fix = blend & BLEND_ENABLED != 0 && blend & BLEND_FIX_B_ALPHA != 0;
-    if format != draw_flags::TARGET_5551 || flags & draw_flags::DITHER != 0 || alpha_only || fix {
+    if format != draw_flags::TARGET_5551 || alpha_only || fix {
         return ReadVariant::Generic;
     }
+    let dither = flags & draw_flags::DITHER != 0;
     let writes_alpha = !keep_target_alpha || blend & BLEND_WRITES_ALPHA != 0;
     if writes_alpha && keep_target_alpha {
         return ReadVariant::Generic;
@@ -276,13 +281,13 @@ pub fn read_variant(flags: u32, blend: u32, keep_target_alpha: bool, exact_norma
         ReadWay::Off
     } else {
         match (blend & 0xF, (blend >> 4) & 0xF, (blend >> 8) & 7) {
-            (4, 5, 0) if exact_normal => ReadWay::Normal,
+            (4, 5, 0) if exact_normal || dither => ReadWay::Normal,
             (4, 5, 0) => ReadWay::Precut,
             (4, 1, 0) => ReadWay::Add,
             _ => return ReadVariant::Generic,
         }
     };
-    ReadVariant::Fast { way, keep_alpha: !writes_alpha }
+    ReadVariant::Fast { way, keep_alpha: !writes_alpha, dither }
 }
 
 /// The corners of triangle `t` of a strip, counted from its first vertex:
@@ -2336,7 +2341,8 @@ mod tests {
         let target = |format: u32| format << draw_flags::TARGET_FORMAT_SHIFT;
         let normal = BLEND_ENABLED | 4 | 5 << 4;
         let add = BLEND_ENABLED | 4 | 1 << 4;
-        let fast = |way, keep_alpha| ReadVariant::Fast { way, keep_alpha };
+        let fast = |way, keep_alpha| ReadVariant::Fast { way, keep_alpha, dither: false };
+        let dithered = |way, keep_alpha| ReadVariant::Fast { way, keep_alpha, dither: true };
         let f5551 = target(draw_flags::TARGET_5551);
         // Nobody reads the alpha: every draw writes it.
         assert_eq!(read_variant(f5551, normal, false, true), fast(ReadWay::Normal, false));
@@ -2350,12 +2356,18 @@ mod tests {
         assert_eq!(read_variant(f5551, 0, true, true), fast(ReadWay::Off, true));
         // ...and cut to one bit by the generic program where they do.
         assert_eq!(read_variant(f5551, normal | BLEND_WRITES_ALPHA, true, true), ReadVariant::Generic);
-        // Stencil-only clears, other factors and equations, dithering,
-        // BLEND_FIX and other formats: generic.
+        // Dithered: the fast ones with the dither; normal blends read the
+        // frame even without `exact_normal` (the dither follows the blend).
+        let f5551_dither = f5551 | draw_flags::DITHER;
+        assert_eq!(read_variant(f5551_dither, normal, false, true), dithered(ReadWay::Normal, false));
+        assert_eq!(read_variant(f5551_dither, normal, false, false), dithered(ReadWay::Normal, false));
+        assert_eq!(read_variant(f5551_dither, add, true, true), dithered(ReadWay::Add, true));
+        assert_eq!(read_variant(f5551_dither, 0, false, true), dithered(ReadWay::Off, false));
+        // Stencil-only clears, other factors and equations, BLEND_FIX and
+        // other formats: generic.
         assert_eq!(read_variant(f5551, BLEND_WRITES_ALPHA | BLEND_ALPHA_ONLY, false, true), ReadVariant::Generic);
         assert_eq!(read_variant(f5551, BLEND_ENABLED | 1 | 1 << 4, false, true), ReadVariant::Generic);
         assert_eq!(read_variant(f5551, normal | 1 << 8, false, true), ReadVariant::Generic);
-        assert_eq!(read_variant(f5551 | draw_flags::DITHER, normal, false, true), ReadVariant::Generic);
         assert_eq!(read_variant(f5551, normal | BLEND_FIX_B_ALPHA, false, true), ReadVariant::Generic);
         // Without blending the FIX bit means nothing.
         assert_eq!(read_variant(f5551, BLEND_FIX_B_ALPHA, false, true), fast(ReadWay::Off, false));

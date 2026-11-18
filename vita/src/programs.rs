@@ -324,22 +324,25 @@ pub struct ReadProgram {
     /// uDestination, uBlend, uMinMax, uStep, uWiden, uWidenLow, uWrite,
     /// uPath (the shader's comment), in this order.
     pub cut: [*const ProgramParameter; 9],
+    /// The generic one only (else null; the fast dithered ones read the
+    /// matrix from a texture, draw.rs `use_dither_texture`).
     pub dither: [*const ProgramParameter; 4],
 }
 
 /// Frame-read programs (`read_index`): untextured generic + four ways x
-/// alpha kept or not; textured the same, the fast ones also with and
-/// without the alpha test.
-const READ_PROGRAMS: usize = 26;
+/// alpha kept or not x dithered or not; textured the same, the fast ones
+/// also with and without the alpha test.
+const READ_PROGRAMS: usize = 50;
 
 /// The place of a frame-read program in `Programs::read`; `tested`: with
 /// the alpha test (textured only; the generic one always has it).
 fn read_index(textured: bool, tested: bool, variant: ReadVariant) -> usize {
+    let fast = |way: ReadWay, keep_alpha: bool, dither: bool| (2 * way as usize + keep_alpha as usize) * 2 + dither as usize;
     match (textured, variant) {
         (false, ReadVariant::Generic) => 0,
-        (false, ReadVariant::Fast { way, keep_alpha }) => 1 + 2 * way as usize + keep_alpha as usize,
-        (true, ReadVariant::Generic) => 9,
-        (true, ReadVariant::Fast { way, keep_alpha }) => 10 + 2 * (2 * way as usize + keep_alpha as usize) + tested as usize,
+        (false, ReadVariant::Fast { way, keep_alpha, dither }) => 1 + fast(way, keep_alpha, dither),
+        (true, ReadVariant::Generic) => 17,
+        (true, ReadVariant::Fast { way, keep_alpha, dither }) => 18 + 2 * fast(way, keep_alpha, dither) + tested as usize,
     }
 }
 
@@ -348,29 +351,45 @@ fn read_index(textured: bool, tested: bool, variant: ReadVariant) -> usize {
 /// and for `ReadWay::Precut` (GXM blends).
 fn read_gxp(textured: bool, tested: bool, variant: ReadVariant) -> *const gxm::Program {
     use ReadWay::{Add, Normal, Off, Precut};
-    let ReadVariant::Fast { way, keep_alpha } = variant else {
-        return if textured { gxp(&shaders::nativeres_textured_read_f) } else { gxp(&shaders::nativeres_color_read_f) };
+    use shaders::*;
+    let ReadVariant::Fast { way, keep_alpha, dither } = variant else {
+        return if textured { gxp(&nativeres_textured_read_f) } else { gxp(&nativeres_color_read_f) };
     };
     if !textured {
-        return match (way, keep_alpha) {
-            (Normal, false) => gxp(&shaders::nativeres_color_read_normal_f),
-            (Normal, true) => gxp(&shaders::nativeres_color_read_normalkeep_f),
-            (Add, false) => gxp(&shaders::nativeres_color_read_add_f),
-            (Add, true) => gxp(&shaders::nativeres_color_read_addkeep_f),
-            (Off | Precut, _) => gxp(&shaders::nativeres_color_read_off_f),
+        return match (way, keep_alpha, dither) {
+            (Normal, false, false) => gxp(&nativeres_color_read_normal_f),
+            (Normal, true, false) => gxp(&nativeres_color_read_normalkeep_f),
+            (Add, false, false) => gxp(&nativeres_color_read_add_f),
+            (Add, true, false) => gxp(&nativeres_color_read_addkeep_f),
+            (Off | Precut, _, false) => gxp(&nativeres_color_read_off_f),
+            (Normal, false, true) => gxp(&nativeres_color_read_normaldither_f),
+            (Normal, true, true) => gxp(&nativeres_color_read_normalkeepdither_f),
+            (Add, false, true) => gxp(&nativeres_color_read_adddither_f),
+            (Add, true, true) => gxp(&nativeres_color_read_addkeepdither_f),
+            (Off | Precut, _, true) => gxp(&nativeres_color_read_offdither_f),
         };
     }
-    match (way, keep_alpha, tested) {
-        (Normal, false, false) => gxp(&shaders::nativeres_textured_read_normal_f),
-        (Normal, false, true) => gxp(&shaders::nativeres_textured_read_normaltest_f),
-        (Normal, true, false) => gxp(&shaders::nativeres_textured_read_normalkeep_f),
-        (Normal, true, true) => gxp(&shaders::nativeres_textured_read_normalkeeptest_f),
-        (Add, false, false) => gxp(&shaders::nativeres_textured_read_add_f),
-        (Add, false, true) => gxp(&shaders::nativeres_textured_read_addtest_f),
-        (Add, true, false) => gxp(&shaders::nativeres_textured_read_addkeep_f),
-        (Add, true, true) => gxp(&shaders::nativeres_textured_read_addkeeptest_f),
-        (Off | Precut, _, false) => gxp(&shaders::nativeres_textured_read_off_f),
-        (Off | Precut, _, true) => gxp(&shaders::nativeres_textured_read_offtest_f),
+    match (way, keep_alpha, tested, dither) {
+        (Normal, false, false, false) => gxp(&nativeres_textured_read_normal_f),
+        (Normal, false, true, false) => gxp(&nativeres_textured_read_normaltest_f),
+        (Normal, true, false, false) => gxp(&nativeres_textured_read_normalkeep_f),
+        (Normal, true, true, false) => gxp(&nativeres_textured_read_normalkeeptest_f),
+        (Add, false, false, false) => gxp(&nativeres_textured_read_add_f),
+        (Add, false, true, false) => gxp(&nativeres_textured_read_addtest_f),
+        (Add, true, false, false) => gxp(&nativeres_textured_read_addkeep_f),
+        (Add, true, true, false) => gxp(&nativeres_textured_read_addkeeptest_f),
+        (Off | Precut, _, false, false) => gxp(&nativeres_textured_read_off_f),
+        (Off | Precut, _, true, false) => gxp(&nativeres_textured_read_offtest_f),
+        (Normal, false, false, true) => gxp(&nativeres_textured_read_normaldither_f),
+        (Normal, false, true, true) => gxp(&nativeres_textured_read_normaltestdither_f),
+        (Normal, true, false, true) => gxp(&nativeres_textured_read_normalkeepdither_f),
+        (Normal, true, true, true) => gxp(&nativeres_textured_read_normalkeeptestdither_f),
+        (Add, false, false, true) => gxp(&nativeres_textured_read_adddither_f),
+        (Add, false, true, true) => gxp(&nativeres_textured_read_addtestdither_f),
+        (Add, true, false, true) => gxp(&nativeres_textured_read_addkeepdither_f),
+        (Add, true, true, true) => gxp(&nativeres_textured_read_addkeeptestdither_f),
+        (Off | Precut, _, false, true) => gxp(&nativeres_textured_read_offdither_f),
+        (Off | Precut, _, true, true) => gxp(&nativeres_textured_read_offtestdither_f),
     }
 }
 
@@ -453,9 +472,9 @@ impl ReadProgram {
         let precut_keep = normal(rgb);
         let precut = normal(gxm::COLOR_MASK_ALL);
         let info = match variant {
-            ReadVariant::Fast { way: ReadWay::Off, keep_alpha: true } => &keep_rgb as *const gxm::BlendInfo,
-            ReadVariant::Fast { way: ReadWay::Precut, keep_alpha: true } => &precut_keep as *const gxm::BlendInfo,
-            ReadVariant::Fast { way: ReadWay::Precut, keep_alpha: false } => &precut as *const gxm::BlendInfo,
+            ReadVariant::Fast { way: ReadWay::Off, keep_alpha: true, .. } => &keep_rgb as *const gxm::BlendInfo,
+            ReadVariant::Fast { way: ReadWay::Precut, keep_alpha: true, .. } => &precut_keep as *const gxm::BlendInfo,
+            ReadVariant::Fast { way: ReadWay::Precut, keep_alpha: false, .. } => &precut as *const gxm::BlendInfo,
             _ => null(),
         };
         self.program = basic_programs::fragment_program(id, info, vertex_gxp);

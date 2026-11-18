@@ -30,7 +30,8 @@
 // Returns the GE's whole values, 0..255 (alpha too: the alpha test and the
 // frame-read blends take them as they are). tools/shadetest.py checks it on
 // the Vita. NO_SPECULAR: the program is only used for draws without a
-// separate specular colour (4 instructions less).
+// separate specular colour (4 instructions less). FOG_UNFLOORED: the rgb
+// comes back unfloored, for a caller that floors anyway (3 less).
 //
 // Cost (tools/gxpinfo.py, instructions per pixel): floor written as
 // x - frac(x) compiles shorter than floor(x); the fog is the dearest part
@@ -49,7 +50,12 @@ float4 GeShade(float4 texel, float4 vertexColor, float3 specular, float fog, flo
 	c.rgb = min(c.rgb + FLOOR(specular * 255.0f + 0.5f) * fogAndScale.aaa, 255.0f);
 #endif
 	float f = min(FLOOR(saturate(fog) * 256.0f + 0.01f), 255.0f);
+#ifdef FOG_UNFLOORED
+	// The caller floors it with its cut (floor(floor(x) / 8) = floor(x / 8)).
+	c.rgb = (f * (c.rgb - fogAndScale.rgb) + (fogAndScale.rgb * 255.0f + 255.0f)) * (1.0f / 256.0f);
+#else
 	c.rgb = FLOOR((f * (c.rgb - fogAndScale.rgb) + (fogAndScale.rgb * 255.0f + 255.0f)) * (1.0f / 256.0f));
+#endif
 	return c;
 }
 

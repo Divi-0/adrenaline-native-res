@@ -51,6 +51,22 @@ embed_gxp!(nativeres_color_read_normalkeep_f);
 embed_gxp!(nativeres_color_read_add_f);
 embed_gxp!(nativeres_color_read_addkeep_f);
 embed_gxp!(nativeres_color_read_off_f);
+// With the GE's dither (READ_DITHER).
+embed_gxp!(nativeres_textured_read_normaldither_f);
+embed_gxp!(nativeres_textured_read_normalkeepdither_f);
+embed_gxp!(nativeres_textured_read_adddither_f);
+embed_gxp!(nativeres_textured_read_addkeepdither_f);
+embed_gxp!(nativeres_textured_read_offdither_f);
+embed_gxp!(nativeres_textured_read_normaltestdither_f);
+embed_gxp!(nativeres_textured_read_normalkeeptestdither_f);
+embed_gxp!(nativeres_textured_read_addtestdither_f);
+embed_gxp!(nativeres_textured_read_addkeeptestdither_f);
+embed_gxp!(nativeres_textured_read_offtestdither_f);
+embed_gxp!(nativeres_color_read_normaldither_f);
+embed_gxp!(nativeres_color_read_normalkeepdither_f);
+embed_gxp!(nativeres_color_read_adddither_f);
+embed_gxp!(nativeres_color_read_addkeepdither_f);
+embed_gxp!(nativeres_color_read_offdither_f);
 // Decoded vertices in model space: the GPU transforms and lights them.
 embed_gxp!(nativeres_3d_v);
 // Raw PSP vertices, read by the GPU as the game wrote them: with up to

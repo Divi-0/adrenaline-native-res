@@ -12,7 +12,8 @@
 #   nativeres_textured_read_<way>_f.cg, nativeres_color_read_<way>_f.cg
 #                                   the same + READ_NORMAL / READ_ADD / READ_OFF, the normalkeep and
 #                                   addkeep ones also READ_KEEP_ALPHA, the textured ...test ones also
-#                                   READ_TEST (fast 5551 variants, programs.rs read_gxp)
+#                                   READ_TEST (fast 5551 variants, programs.rs read_gxp); each
+#                                   of these also as ...dither_f with READ_DITHER
 # Run after changing a source, then compile the shaders on the Vita
 # (README.md "Shaders").
 cd "$(dirname "$0")/../vita/shaders"
@@ -32,15 +33,18 @@ variant nativeres_raw_v RAW_LIT4_FLAT nativeres_raw_lit4flat_v
 variant nativeres_textured_f BLEND_FIX nativeres_textured_fix_f
 variant nativeres_textured_test_f BLEND_FIX nativeres_textured_test_fix_f
 variant nativeres_textured_read_f UNTEXTURED nativeres_color_read_f
-for way in normal add off; do
-  WAY=READ_$(echo $way | tr a-z A-Z)
-  variant nativeres_textured_read_f "$WAY" nativeres_textured_read_${way}_f
-  variant nativeres_textured_read_f "$WAY READ_TEST" nativeres_textured_read_${way}test_f
-  variant nativeres_textured_read_f "UNTEXTURED $WAY" nativeres_color_read_${way}_f
-  # READ_OFF keeps the alpha by GXM's colour mask: no keep variant.
-  if [ $way != off ]; then
-    variant nativeres_textured_read_f "$WAY READ_KEEP_ALPHA" nativeres_textured_read_${way}keep_f
-    variant nativeres_textured_read_f "$WAY READ_KEEP_ALPHA READ_TEST" nativeres_textured_read_${way}keeptest_f
-    variant nativeres_textured_read_f "UNTEXTURED $WAY READ_KEEP_ALPHA" nativeres_color_read_${way}keep_f
-  fi
+for dither in "" dither; do
+  DITHER=$([ -n "$dither" ] && echo READ_DITHER)
+  for way in normal add off; do
+    WAY=READ_$(echo $way | tr a-z A-Z)
+    variant nativeres_textured_read_f "$WAY $DITHER" nativeres_textured_read_${way}${dither}_f
+    variant nativeres_textured_read_f "$WAY READ_TEST $DITHER" nativeres_textured_read_${way}test${dither}_f
+    variant nativeres_textured_read_f "UNTEXTURED $WAY $DITHER" nativeres_color_read_${way}${dither}_f
+    # READ_OFF keeps the alpha by GXM's colour mask: no keep variant.
+    if [ $way != off ]; then
+      variant nativeres_textured_read_f "$WAY READ_KEEP_ALPHA $DITHER" nativeres_textured_read_${way}keep${dither}_f
+      variant nativeres_textured_read_f "$WAY READ_KEEP_ALPHA READ_TEST $DITHER" nativeres_textured_read_${way}keeptest${dither}_f
+      variant nativeres_textured_read_f "UNTEXTURED $WAY READ_KEEP_ALPHA $DITHER" nativeres_color_read_${way}keep${dither}_f
+    fi
+  done
 done
