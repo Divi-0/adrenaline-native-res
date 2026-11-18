@@ -35,6 +35,7 @@ use core::ffi::c_void;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
+use nativeres_core::display_loop;
 use nativeres_core::game_fps::{self, GameFps, LABEL_HEIGHT, LABEL_WIDTH};
 
 use crate::basic_programs::TextureVertex;
@@ -138,11 +139,17 @@ fn on_display_thread() -> bool {
     thread == DISPLAY_THREAD.load(Relaxed)
 }
 
-/// A PS1 game, homebrew drawing at the Vita's resolution, or a savestate
-/// being taken or loaded (the loop draws "Please wait..." then): none of it
-/// is ours to draw.
+/// A PS1 game, homebrew drawing at the Vita's resolution, a savestate
+/// being taken or loaded (the loop draws "Please wait..." then), or the
+/// PSP's HOME menu (drawn by the PSP's kernel, not in the lists we
+/// capture): none of it is ours to draw.
 fn not_ours_to_draw() -> bool {
-    adrenaline::pops_mode() || adrenaline::draw_native() || adrenaline::savestate_screen()
+    !display_loop::ours_to_draw(display_loop::AdrenalineScreen {
+        pops_mode: adrenaline::pops_mode(),
+        draw_native: adrenaline::draw_native(),
+        savestate_screen: adrenaline::savestate_screen(),
+        home_menu: adrenaline::home_menu(),
+    })
 }
 
 // ------------------------------------------------------------ the loop's timings

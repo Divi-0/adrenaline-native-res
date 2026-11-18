@@ -72,6 +72,8 @@ const TITLE_ID_BYTES: usize = 12;
 /// `SceAdrenaline::pops_mode` (a PS1 game runs) as a PSP address, read
 /// through CONVERT_ADDRESS as menu.c does.
 pub const POPS_MODE_ADDRESS: u32 = ADRENALINE_ADDRESS + 16;
+/// `SceAdrenaline::draw_psp_screen_in_pops` (right after pops_mode).
+const HOME_MENU_OFFSET: usize = 20;
 /// DRAW_NATIVE (adrenaline_vita.h): homebrew drawing at the Vita's
 /// resolution itself.
 pub const DRAW_NATIVE_ADDRESS: u32 = 0xABCD_EF00;
@@ -386,6 +388,14 @@ pub fn pops_mode() -> bool {
 pub fn savestate_screen() -> bool {
     // Safe: as `pops_mode`.
     unsafe { read_volatile(sys::psp_to_vita(ADRENALINE_ADDRESS + SAVESTATE_MODE_OFFSET as u32) as *const i32) != 0 }
+}
+
+/// The PSP's HOME menu is open (`draw_psp_screen_in_pops`: Adrenaline's
+/// Vita side sets it on PAUSE_POPS, which its impose patch sends for every
+/// game when the popup opens, and clears it on RESUME_POPS).
+pub fn home_menu() -> bool {
+    // Safe: as `pops_mode`.
+    unsafe { read_volatile(sys::psp_to_vita(ADRENALINE_ADDRESS + HOME_MENU_OFFSET as u32) as *const i32) != 0 }
 }
 
 /// Homebrew draws at the Vita's resolution itself (DRAW_NATIVE).

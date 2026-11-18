@@ -77,6 +77,31 @@ pub fn copy_time_us(point: CopyPoint, render_end_us: u32) -> u32 {
     }
 }
 
+/// What Adrenaline's shared words say about the PSP screen, read every pass
+/// of the display loop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AdrenalineScreen {
+    /// A PS1 game runs (`SceAdrenaline::pops_mode`).
+    pub pops_mode: bool,
+    /// Homebrew draws at the Vita's resolution itself (DRAW_NATIVE).
+    pub draw_native: bool,
+    /// A savestate is taken or loaded ("Please wait...").
+    pub savestate_screen: bool,
+    /// The PSP's HOME menu ("Quit the game?") is open
+    /// (`SceAdrenaline::draw_psp_screen_in_pops`: set by Adrenaline's
+    /// PAUSE_POPS, which its impose patch sends for every game when the
+    /// popup opens, cleared by RESUME_POPS when it closes).
+    pub home_menu: bool,
+}
+
+/// Whether the loop may show our picture: none of the above. The HOME menu
+/// is drawn by the PSP's kernel (impose), never through the game's display
+/// lists we capture: with our picture shown it stayed invisible (user,
+/// 2026-11-18), so Sony's picture is shown while it is open.
+pub fn ours_to_draw(screen: AdrenalineScreen) -> bool {
+    !(screen.pops_mode || screen.draw_native || screen.savestate_screen || screen.home_menu)
+}
+
 /// A sample of the CPU-picture check differs when its R + G + B differ by
 /// more than this (0..765): far above what upscaling and filtering change.
 pub const CPU_PICTURE_DIFFERENCE: u32 = 96;
@@ -121,6 +146,19 @@ mod tests {
     }
 
     use super::*;
+
+    /// PS button in a PSP game, renderer on (2026-11-18): the HOME menu
+    /// didn't show, our picture covered Sony's. With the menu open only
+    /// Sony's picture is shown; closed, ours again.
+    #[test]
+    fn the_home_menu_shows_sonys_picture() {
+        let game = AdrenalineScreen::default();
+        assert!(ours_to_draw(game));
+        assert!(!ours_to_draw(AdrenalineScreen { home_menu: true, ..game }));
+        assert!(!ours_to_draw(AdrenalineScreen { pops_mode: true, ..game }));
+        assert!(!ours_to_draw(AdrenalineScreen { draw_native: true, ..game }));
+        assert!(!ours_to_draw(AdrenalineScreen { savestate_screen: true, ..game }));
+    }
 
     /// Measured during MTX's intro movie, renderer on (2026-11-10): how
     /// long after the LCD sync `NativeResRenderFrame` returned in loops that
