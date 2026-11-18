@@ -112,6 +112,16 @@ pub fn for_opaque_source(variant: ReadVariant) -> ReadVariant {
     }
 }
 
+/// True if an alpha test with fragment-program uniform `uniform` (x, y, z:
+/// a fragment passes when (alpha - x)(y - alpha) z > 0, draw.rs
+/// `alpha_test_uniform`) lets alpha 255 through. A draw whose every
+/// fragment has alpha 255 then passes it everywhere and can drop it: no
+/// `discard` (the GPU pays for it even where it passes), the same picture
+/// and depth.
+pub fn alpha_test_lets_255_pass(uniform: [f32; 4]) -> bool {
+    (255.0 - uniform[0]) * (uniform[1] - 255.0) * uniform[2] > 0.0
+}
+
 /// The vertex numbers a raw draw (`draw_flags::RAW_VERTICES`) uses, as
 /// `first..end` counted from its window (`Draw::first_vertex`): from its
 /// index runs or its triangle list. None without any.
@@ -164,6 +174,22 @@ mod tests {
             }
         }
         assert_eq!(for_opaque_source(ReadVariant::Generic), ReadVariant::Generic);
+    }
+
+    #[test]
+    fn alpha_tests_that_let_255_pass() {
+        // As draw.rs `alpha_test_uniform(lo, hi, outside)` builds them.
+        let uniform = |lo: f32, hi: f32, outside: bool| [lo - 0.5, hi + 0.5, if outside { -1.0 } else { 1.0 }, 0.0];
+        for reference in 0..=255 {
+            let r = reference as f32;
+            assert!(alpha_test_lets_255_pass(uniform(r, 255.0, false)), "greater or equal {reference}");
+            assert_eq!(alpha_test_lets_255_pass(uniform(r + 1.0, 255.0, false)), reference < 255, "greater {reference}");
+            assert_eq!(alpha_test_lets_255_pass(uniform(r, r, false)), reference == 255, "equal {reference}");
+            assert_eq!(alpha_test_lets_255_pass(uniform(r, r, true)), reference != 255, "not equal {reference}");
+            assert_eq!(alpha_test_lets_255_pass(uniform(0.0, r, false)), reference == 255, "less or equal {reference}");
+            assert!(!alpha_test_lets_255_pass(uniform(0.0, r - 1.0, false)), "less {reference}");
+        }
+        assert!(!alpha_test_lets_255_pass(uniform(1.0, 0.0, false)), "never");
     }
 
     #[test]

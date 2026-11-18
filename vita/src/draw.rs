@@ -28,7 +28,7 @@ use nativeres_core::frame::{
     ReadWay, NO_RING_INDICES,
 };
 use nativeres_core::texture;
-use nativeres_core::opaque_source::{for_opaque_source, lowest_vertex_alpha, raw_vertex_span};
+use nativeres_core::opaque_source::{alpha_test_lets_255_pass, for_opaque_source, lowest_vertex_alpha, raw_vertex_span};
 use nativeres_core::vertex::VertexFormat;
 
 use crate::arenas;
@@ -145,6 +145,13 @@ pub static TARGET_CUT: AtomicI32 = AtomicI32::new(1);
 /// with the unblended frame-read program (no frame read; the same
 /// picture). 1 = on (default), 0 = the normal one.
 pub static OPAQUE_SOURCES: AtomicI32 = AtomicI32::new(1);
+
+/// Alpha-tested textured draws whose every fragment is opaque (as for
+/// `OPAQUE_SOURCES`, any target) drop a test that lets alpha 255 pass:
+/// the program without `discard`, the same picture (core
+/// `alpha_test_lets_255_pass`; MHF's ground, alpha test >= 128).
+/// 1 = on (default), 0 = the tested program.
+pub static OPAQUE_UNTESTED: AtomicI32 = AtomicI32::new(1);
 
 /// True if every vertex of textured `draw` ends up with alpha 255: raw
 /// vertices by their lowest alpha and colour rules, screen-space ones as
@@ -1241,18 +1248,26 @@ impl Draws {
         let keep = self.keep_target_alpha;
         // A 16-bit PSP target: the frame-read program (alpha test included).
         let mut choice = read_choice(frame, draw, keep);
-        // A normal blend of an opaque texture and vertices of alpha 255 is
-        // the source itself: drawn unblended, no frame read (core
-        // `opaque_source`; MHF's ground).
-        if let Some(variant) = choice {
-            if opaque_texture && for_opaque_source(variant) != variant && OPAQUE_SOURCES.load(Ordering::Relaxed) != 0 {
-                let start = draw_clock();
-                if vertices_opaque(frame, draw) {
-                    choice = Some(for_opaque_source(variant));
+        // An opaque texture and vertices of alpha 255: every fragment has
+        // alpha 255 (core `opaque_source`; MHF's ground). A normal blend of
+        // it is the source itself: drawn unblended, no frame read. An alpha
+        // test that lets 255 pass passes everywhere: dropped (no discard).
+        let unblend = choice.is_some_and(|variant| for_opaque_source(variant) != variant)
+            && OPAQUE_SOURCES.load(Ordering::Relaxed) != 0;
+        let untest = tested && alpha_test_lets_255_pass(alpha_range) && OPAQUE_UNTESTED.load(Ordering::Relaxed) != 0;
+        if opaque_texture && (unblend || untest) {
+            let start = draw_clock();
+            if vertices_opaque(frame, draw) {
+                if unblend {
+                    choice = choice.map(for_opaque_source);
                     stats().opaque_draws += 1;
                 }
-                stats().opaque_us += draw_clock().wrapping_sub(start);
+                if untest {
+                    tested = false;
+                    stats().opaque_untested_draws += 1;
+                }
             }
+            stats().opaque_us += draw_clock().wrapping_sub(start);
         }
         let read_variant = choice.unwrap_or(ReadVariant::Generic);
         let read_program = match choice {
