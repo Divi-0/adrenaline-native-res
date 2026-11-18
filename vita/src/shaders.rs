@@ -88,6 +88,38 @@ embed_gxp!(nativeres_raw_lit1_v);
 embed_gxp!(nativeres_raw_lit4_v);
 embed_gxp!(nativeres_raw_lit1flat_v);
 embed_gxp!(nativeres_raw_lit4flat_v);
+// Each of those six with the vertex colour format fixed (programs.rs
+// `RawColor`): without colour (the material), 5650, 5551, 4444, 8888.
+embed_gxp!(nativeres_raw_plain_none_v);
+embed_gxp!(nativeres_raw_plain_5650_v);
+embed_gxp!(nativeres_raw_plain_5551_v);
+embed_gxp!(nativeres_raw_plain_4444_v);
+embed_gxp!(nativeres_raw_plain_8888_v);
+embed_gxp!(nativeres_raw_plain4_none_v);
+embed_gxp!(nativeres_raw_plain4_5650_v);
+embed_gxp!(nativeres_raw_plain4_5551_v);
+embed_gxp!(nativeres_raw_plain4_4444_v);
+embed_gxp!(nativeres_raw_plain4_8888_v);
+embed_gxp!(nativeres_raw_lit1_none_v);
+embed_gxp!(nativeres_raw_lit1_5650_v);
+embed_gxp!(nativeres_raw_lit1_5551_v);
+embed_gxp!(nativeres_raw_lit1_4444_v);
+embed_gxp!(nativeres_raw_lit1_8888_v);
+embed_gxp!(nativeres_raw_lit4_none_v);
+embed_gxp!(nativeres_raw_lit4_5650_v);
+embed_gxp!(nativeres_raw_lit4_5551_v);
+embed_gxp!(nativeres_raw_lit4_4444_v);
+embed_gxp!(nativeres_raw_lit4_8888_v);
+embed_gxp!(nativeres_raw_lit1flat_none_v);
+embed_gxp!(nativeres_raw_lit1flat_5650_v);
+embed_gxp!(nativeres_raw_lit1flat_5551_v);
+embed_gxp!(nativeres_raw_lit1flat_4444_v);
+embed_gxp!(nativeres_raw_lit1flat_8888_v);
+embed_gxp!(nativeres_raw_lit4flat_none_v);
+embed_gxp!(nativeres_raw_lit4flat_5650_v);
+embed_gxp!(nativeres_raw_lit4flat_5551_v);
+embed_gxp!(nativeres_raw_lit4flat_4444_v);
+embed_gxp!(nativeres_raw_lit4flat_8888_v);
 embed_gxp!(nativeres_raw_sprite_v);
 // The basic programs (basic_programs.rs): untextured draws and clears;
 // full-screen quads and textured draws without our textured program.

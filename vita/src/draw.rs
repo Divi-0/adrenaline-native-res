@@ -36,7 +36,7 @@ use crate::capture::{RAW_ARENA, RAW_ARENA_BYTES, VERTEX_ARENA, VERTEX_ARENA_VERT
 use crate::frame_pool::alloc as frame_pool_alloc;
 use crate::gpu_textures::TextureObject;
 use crate::gxm::{self, ProgramParameter};
-use crate::programs::{Kind, Programs, RawUniforms, RawVariant, SPRITE_CORNERS};
+use crate::programs::{Kind, Programs, RawColor, RawUniforms, RawVariant, SPRITE_CORNERS};
 use crate::render_stats::stats;
 use crate::{basic_programs, render_log, sys, SingleThreaded};
 
@@ -131,6 +131,11 @@ pub static RAW_VARIANTS: AtomicI32 = AtomicI32::new(1);
 /// the flat programs (`RawVariant::Lit1Flat` / `Lit4Flat`: no pow, three
 /// lights; the same picture). 1 = on (default), 0 = the general ones.
 pub static RAW_FLAT_LIGHTS: AtomicI32 = AtomicI32::new(1);
+
+/// Raw draws but the full program's get the program for their vertex colour
+/// format (programs.rs `RawColor`: one decode, 50-70 fewer instructions per
+/// vertex; the same picture). 1 = on (default), 0 = the generic ones.
+pub static RAW_FIXED_COLOR: AtomicI32 = AtomicI32::new(1);
 
 /// Draws into the PSP's 16-bit framebuffers (`draw_flags::
 /// TARGET_FORMAT_SHIFT`, Monster Hunter Freedom) get the frame-read
@@ -1048,8 +1053,8 @@ impl Draws {
         fragment: *const c_void,
     ) {
         let (uniforms, skinning) = match set {
-            RawSetChoice::Raw(variant) => {
-                let raw = self.programs.raw_set(variant);
+            RawSetChoice::Raw(variant, color) => {
+                let raw = self.programs.raw_set(variant, color);
                 (raw.uniforms, Some(raw_skinning(raw)))
             }
             RawSetChoice::Sprites => (self.programs.sprites.uniforms, None),
@@ -1338,12 +1343,21 @@ impl Draws {
                 let mut variant = raw_variant(weights, lit_with_lights, plain, variants);
                 if variant != variant.flat() && RAW_FLAT_LIGHTS.load(Ordering::Relaxed) != 0 {
                     let flat = frame.raw_transform_of(draw).and_then(|(transform, _)| raw_light_set(frame, transform)).is_some_and(flat_lights);
-                    if flat && self.programs.raw_set(variant.flat()).ready() {
+                    if flat && self.programs.raw_set(variant.flat(), RawColor::Any).ready() {
                         variant = variant.flat();
                     }
                 }
-                if !self.programs.raw_set(variant).ready() {
+                if !self.programs.raw_set(variant, RawColor::Any).ready() {
                     variant = RawVariant::Full;
+                }
+                // The program for the draw's colour format, if there is one.
+                let mut color = RawColor::Any;
+                if variant != RawVariant::Full && RAW_FIXED_COLOR.load(Ordering::Relaxed) != 0 {
+                    let fixed = RawColor::of_format(draw.vertex_format);
+                    if self.programs.raw_set(variant, fixed).ready() {
+                        color = fixed;
+                        stats().fixed_color_draws += 1;
+                    }
                 }
                 match variant {
                     RawVariant::Plain | RawVariant::Plain4 => stats().plain_draws += 1,
@@ -1354,11 +1368,11 @@ impl Draws {
                     }
                     RawVariant::Full => {}
                 }
-                RawSetChoice::Raw(variant)
+                RawSetChoice::Raw(variant, color)
             };
             let program = match set {
                 RawSetChoice::Sprites => self.programs.sprites.program_for(draw.vertex_format),
-                RawSetChoice::Raw(variant) => self.programs.raw_set(variant).program_for(draw.vertex_format),
+                RawSetChoice::Raw(variant, color) => self.programs.raw_set(variant, color).program_for(draw.vertex_format),
             };
             let in_psp_ram = draw.flags & draw_flags::RAW_PSP_RAM != 0;
             let (Some(blocks), Some(colors)) = (frame.raw_transform_of(draw), colors) else {
@@ -1916,8 +1930,8 @@ pub static nativeres_plan_phycont_test_block: u32 = sys::pages(TEST_BLOCK_BYTES)
 /// Which raw program set a raw draw uses.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RawSetChoice {
-    /// nativeres_raw_v.cg or one of its variants.
-    Raw(RawVariant),
+    /// nativeres_raw_v.cg or one of its variants, generic or for one colour format.
+    Raw(RawVariant, RawColor),
     /// nativeres_raw_sprite_v.cg.
     Sprites,
 }

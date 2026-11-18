@@ -7,6 +7,8 @@
 #   nativeres_raw_lit4_v.cg         nativeres_raw_v.cg + RAW_LIT4 (up to four bones, lights)
 #   nativeres_raw_lit1flat_v.cg     nativeres_raw_v.cg + RAW_LIT1_FLAT (RAW_LIT1, coefficient <= 0, 3 lights)
 #   nativeres_raw_lit4flat_v.cg     nativeres_raw_v.cg + RAW_LIT4_FLAT (RAW_LIT4, coefficient <= 0, 3 lights)
+#   nativeres_raw_<variant>_<colour>_v.cg  each of these six + RAW_COLOR_<colour> (none, 5650,
+#                                   5551, 4444, 8888: the vertex colour format fixed)
 #   nativeres_textured_fix_f.cg     nativeres_textured_f.cg + BLEND_FIX (grey FIX B blending)
 #   nativeres_textured_test_fix_f.cg nativeres_textured_test_f.cg + BLEND_FIX
 #   nativeres_color_read_f.cg       nativeres_textured_read_f.cg + UNTEXTURED (16-bit targets, untextured)
@@ -34,6 +36,13 @@ variant nativeres_raw_v RAW_LIT1 nativeres_raw_lit1_v
 variant nativeres_raw_v RAW_LIT4 nativeres_raw_lit4_v
 variant nativeres_raw_v RAW_LIT1_FLAT nativeres_raw_lit1flat_v
 variant nativeres_raw_v RAW_LIT4_FLAT nativeres_raw_lit4flat_v
+# Each of them with a fixed vertex colour format (RAW_COLOR_*).
+for v in PLAIN:plain PLAIN4:plain4 LIT1:lit1 LIT4:lit4 LIT1_FLAT:lit1flat LIT4_FLAT:lit4flat; do
+  for color in NONE 5650 5551 4444 8888; do
+    lower=$(echo $color | tr A-Z a-z)
+    variant nativeres_raw_v "RAW_${v%%:*} RAW_COLOR_$color" nativeres_raw_${v#*:}_${lower}_v
+  done
+done
 variant nativeres_textured_f BLEND_FIX nativeres_textured_fix_f
 variant nativeres_textured_test_f BLEND_FIX nativeres_textured_test_fix_f
 variant nativeres_textured_read_f UNTEXTURED nativeres_color_read_f

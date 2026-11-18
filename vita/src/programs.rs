@@ -175,6 +175,20 @@ impl RawVariant {
         }
     }
 
+    /// The place among the variants with fixed-colour programs
+    /// (`fixed_raw_sets`); None for the full program.
+    fn fixed_index(self) -> Option<usize> {
+        match self {
+            RawVariant::Full => None,
+            RawVariant::Plain => Some(0),
+            RawVariant::Plain4 => Some(1),
+            RawVariant::Lit1 => Some(2),
+            RawVariant::Lit4 => Some(3),
+            RawVariant::Lit1Flat => Some(4),
+            RawVariant::Lit4Flat => Some(5),
+        }
+    }
+
     /// The same program for a flat light set (`Lit1Flat` / `Lit4Flat`);
     /// the others as they are.
     pub fn flat(self) -> RawVariant {
@@ -186,10 +200,162 @@ impl RawVariant {
     }
 }
 
+/// A raw program's vertex colour format (VERTEX_TYPE bits 2-4): any (the
+/// program decodes all, by uFormat.y) or one fixed (nativeres_raw_v.cg
+/// RAW_COLOR_*: only that format's decode and attribute, 50-70 fewer
+/// instructions per vertex, 2026-11-18). The full program is always `Any`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RawColor {
+    Any,
+    /// No vertex colour (the material colour; also the unused field values 1-3).
+    Material,
+    Bits5650,
+    Bits5551,
+    Bits4444,
+    Bits8888,
+}
+
+/// The fixed colour formats per variant (`Programs::raw_fixed`).
+const FIXED_COLORS: usize = 5;
+/// The variants with fixed-colour programs (all but the full one).
+const FIXED_VARIANTS: usize = 6;
+
+impl RawColor {
+    /// The fixed colour format of VERTEX_TYPE `format`.
+    pub fn of_format(format: u32) -> RawColor {
+        match (format >> 2) & 7 {
+            4 => RawColor::Bits5650,
+            5 => RawColor::Bits5551,
+            6 => RawColor::Bits4444,
+            7 => RawColor::Bits8888,
+            _ => RawColor::Material,
+        }
+    }
+
+    /// Whether a program of `variant` with this colour format reads
+    /// uMaterial: not a lit-only one for a vertex colour format (its
+    /// lighting takes the vertex colour, and it has no unlit rules).
+    fn uses_material(self, variant: RawVariant) -> bool {
+        !variant.lights_only() || matches!(self, RawColor::Any | RawColor::Material)
+    }
+
+    /// Whether the program reads the two bytes of a 16-bit colour (aColorBytes).
+    fn reads_bytes(self) -> bool {
+        matches!(self, RawColor::Any | RawColor::Bits5650 | RawColor::Bits5551 | RawColor::Bits4444)
+    }
+
+    /// Whether the program reads an 8888 colour (aColor32).
+    fn reads_32(self) -> bool {
+        matches!(self, RawColor::Any | RawColor::Bits8888)
+    }
+
+    /// The place among the fixed formats (`FIXED_COLORS`); None for `Any`.
+    fn fixed_index(self) -> Option<usize> {
+        match self {
+            RawColor::Any => None,
+            RawColor::Material => Some(0),
+            RawColor::Bits5650 => Some(1),
+            RawColor::Bits5551 => Some(2),
+            RawColor::Bits4444 => Some(3),
+            RawColor::Bits8888 => Some(4),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            RawColor::Any => "",
+            RawColor::Material => " [no colour]",
+            RawColor::Bits5650 => " [5650]",
+            RawColor::Bits5551 => " [5551]",
+            RawColor::Bits4444 => " [4444]",
+            RawColor::Bits8888 => " [8888]",
+        }
+    }
+}
+
+/// The compiled program of `variant` with colour format `color` (the full
+/// program has only the generic one).
+fn raw_gxp(variant: RawVariant, color: RawColor) -> *const gxm::Program {
+    use RawColor::*;
+    use RawVariant::*;
+    match (variant, color) {
+        (Full, _) => gxp(&shaders::nativeres_raw_v),
+        (Plain, Any) => gxp(&shaders::nativeres_raw_plain_v),
+        (Plain, Material) => gxp(&shaders::nativeres_raw_plain_none_v),
+        (Plain, Bits5650) => gxp(&shaders::nativeres_raw_plain_5650_v),
+        (Plain, Bits5551) => gxp(&shaders::nativeres_raw_plain_5551_v),
+        (Plain, Bits4444) => gxp(&shaders::nativeres_raw_plain_4444_v),
+        (Plain, Bits8888) => gxp(&shaders::nativeres_raw_plain_8888_v),
+        (Plain4, Any) => gxp(&shaders::nativeres_raw_plain4_v),
+        (Plain4, Material) => gxp(&shaders::nativeres_raw_plain4_none_v),
+        (Plain4, Bits5650) => gxp(&shaders::nativeres_raw_plain4_5650_v),
+        (Plain4, Bits5551) => gxp(&shaders::nativeres_raw_plain4_5551_v),
+        (Plain4, Bits4444) => gxp(&shaders::nativeres_raw_plain4_4444_v),
+        (Plain4, Bits8888) => gxp(&shaders::nativeres_raw_plain4_8888_v),
+        (Lit1, Any) => gxp(&shaders::nativeres_raw_lit1_v),
+        (Lit1, Material) => gxp(&shaders::nativeres_raw_lit1_none_v),
+        (Lit1, Bits5650) => gxp(&shaders::nativeres_raw_lit1_5650_v),
+        (Lit1, Bits5551) => gxp(&shaders::nativeres_raw_lit1_5551_v),
+        (Lit1, Bits4444) => gxp(&shaders::nativeres_raw_lit1_4444_v),
+        (Lit1, Bits8888) => gxp(&shaders::nativeres_raw_lit1_8888_v),
+        (Lit4, Any) => gxp(&shaders::nativeres_raw_lit4_v),
+        (Lit4, Material) => gxp(&shaders::nativeres_raw_lit4_none_v),
+        (Lit4, Bits5650) => gxp(&shaders::nativeres_raw_lit4_5650_v),
+        (Lit4, Bits5551) => gxp(&shaders::nativeres_raw_lit4_5551_v),
+        (Lit4, Bits4444) => gxp(&shaders::nativeres_raw_lit4_4444_v),
+        (Lit4, Bits8888) => gxp(&shaders::nativeres_raw_lit4_8888_v),
+        (Lit1Flat, Any) => gxp(&shaders::nativeres_raw_lit1flat_v),
+        (Lit1Flat, Material) => gxp(&shaders::nativeres_raw_lit1flat_none_v),
+        (Lit1Flat, Bits5650) => gxp(&shaders::nativeres_raw_lit1flat_5650_v),
+        (Lit1Flat, Bits5551) => gxp(&shaders::nativeres_raw_lit1flat_5551_v),
+        (Lit1Flat, Bits4444) => gxp(&shaders::nativeres_raw_lit1flat_4444_v),
+        (Lit1Flat, Bits8888) => gxp(&shaders::nativeres_raw_lit1flat_8888_v),
+        (Lit4Flat, Any) => gxp(&shaders::nativeres_raw_lit4flat_v),
+        (Lit4Flat, Material) => gxp(&shaders::nativeres_raw_lit4flat_none_v),
+        (Lit4Flat, Bits5650) => gxp(&shaders::nativeres_raw_lit4flat_5650_v),
+        (Lit4Flat, Bits5551) => gxp(&shaders::nativeres_raw_lit4flat_5551_v),
+        (Lit4Flat, Bits4444) => gxp(&shaders::nativeres_raw_lit4flat_4444_v),
+        (Lit4Flat, Bits8888) => gxp(&shaders::nativeres_raw_lit4flat_8888_v),
+    }
+}
+
+/// The fixed-colour raw sets in `Programs::raw_fixed`'s order: per variant
+/// (`RawVariant::fixed_index`) its five colour formats.
+const fn fixed_raw_sets() -> [RawSet; FIXED_VARIANTS * FIXED_COLORS] {
+    const VARIANTS: [RawVariant; FIXED_VARIANTS] = [
+        RawVariant::Plain,
+        RawVariant::Plain4,
+        RawVariant::Lit1,
+        RawVariant::Lit4,
+        RawVariant::Lit1Flat,
+        RawVariant::Lit4Flat,
+    ];
+    const COLORS: [RawColor; FIXED_COLORS] =
+        [RawColor::Material, RawColor::Bits5650, RawColor::Bits5551, RawColor::Bits4444, RawColor::Bits8888];
+    let mut sets = [const { RawSet::new(RawVariant::Full, RawColor::Any) }; FIXED_VARIANTS * FIXED_COLORS];
+    let mut i = 0;
+    while i < sets.len() {
+        sets[i] = RawSet::new(VARIANTS[i / FIXED_COLORS], COLORS[i % FIXED_COLORS]);
+        i += 1;
+    }
+    sets
+}
+
+/// A raw program's name in the log: variant and colour format.
+struct Label(RawVariant, RawColor);
+
+impl core::fmt::Display for Label {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        f.write_str(self.0.label())?;
+        f.write_str(self.1.label())
+    }
+}
+
 /// A raw program (nativeres_raw_v.cg or a variant) and its programs per PSP
 /// vertex format.
 pub struct RawSet {
     pub variant: RawVariant,
+    pub color: RawColor,
     tried: bool,
     ready: bool,
     id: PatcherId,
@@ -266,7 +432,8 @@ impl RawUniforms {
     }
 
     /// All found but the unlit colour rules' uAmbient and uEmissive (the
-    /// lit-only raw programs have none: `unlit_rules_found`).
+    /// lit-only raw programs have none: `unlit_rules_found`) and uMaterial
+    /// (not in lit-only programs for a vertex colour format: `RawColor::uses_material`).
     fn all_found(&self) -> bool {
         [
             self.wvp,
@@ -278,7 +445,6 @@ impl RawUniforms {
             self.uv_scale,
             self.format,
             self.raw_uv,
-            self.material,
             self.colors,
         ]
         .iter()
@@ -530,6 +696,8 @@ pub struct Programs {
     pub raw_lit4: RawSet,
     pub raw_lit1_flat: RawSet,
     pub raw_lit4_flat: RawSet,
+    /// The variants with a fixed colour format (`fixed_raw_sets`).
+    raw_fixed: [RawSet; FIXED_VARIANTS * FIXED_COLORS],
     pub sprites: SpriteSet,
     blend: [BlendProgram; MAX_BLEND_PROGRAMS],
     blend_count: usize,
@@ -540,9 +708,10 @@ pub struct Programs {
 const NO_BLEND_PROGRAM: BlendProgram = BlendProgram { kind: Kind::Color, blend: 0, program: null_mut() };
 
 impl RawSet {
-    const fn new(variant: RawVariant) -> RawSet {
+    const fn new(variant: RawVariant, color: RawColor) -> RawSet {
         RawSet {
             variant,
+            color,
             tried: false,
             ready: false,
             id: null_mut(),
@@ -565,8 +734,8 @@ impl RawSet {
         }
     }
 
-    fn label(&self) -> &'static str {
-        self.variant.label()
+    fn label(&self) -> Label {
+        Label(self.variant, self.color)
     }
 
     /// Registers the program and finds its parameters (once).
@@ -575,15 +744,7 @@ impl RawSet {
             return self.ready;
         }
         self.tried = true;
-        let program = match self.variant {
-            RawVariant::Full => gxp(&shaders::nativeres_raw_v),
-            RawVariant::Plain => gxp(&shaders::nativeres_raw_plain_v),
-            RawVariant::Plain4 => gxp(&shaders::nativeres_raw_plain4_v),
-            RawVariant::Lit1 => gxp(&shaders::nativeres_raw_lit1_v),
-            RawVariant::Lit4 => gxp(&shaders::nativeres_raw_lit4_v),
-            RawVariant::Lit1Flat => gxp(&shaders::nativeres_raw_lit1flat_v),
-            RawVariant::Lit4Flat => gxp(&shaders::nativeres_raw_lit4flat_v),
-        };
+        let program = raw_gxp(self.variant, self.color);
         let Some(id) = register(program) else {
             render_log::line(format_args!("raw program{}: invalid or not registered\n", self.label()));
             return false;
@@ -606,14 +767,16 @@ impl RawSet {
         // The lit-only programs have no unlit colour rules: no uAmbient,
         // uEmissive, uScale (left null; `set_uniform` skips null ones).
         let unlit_rules = !self.variant.lights_only();
+        // A fixed colour format reads only its own attribute (none without colour).
         if self.position.is_null()
             || self.texcoord.is_null()
-            || self.color_bytes.is_null()
-            || self.color32.is_null()
+            || (self.color.reads_bytes() && self.color_bytes.is_null())
+            || (self.color.reads_32() && self.color32.is_null())
             || (unlit_rules && (self.scale.is_null() || !self.uniforms.unlit_rules_found()))
             || self.skin.is_null()
             || self.bones.is_null()
             || !self.uniforms.all_found()
+            || (self.color.uses_material(self.variant) && self.uniforms.material.is_null())
             || (bones == 1 && self.weight.is_null())
             || (bones > 1 && self.weights0.is_null())
             || (bones > 4 && self.weights1.is_null())
@@ -645,6 +808,7 @@ impl RawSet {
         let texcoord_offset = layout.texcoord_offset.unwrap_or(0);
         let color_offset = layout.color_offset.unwrap_or(0);
         let normal_offset = layout.normal_offset.unwrap_or(0);
+        debug_assert!(self.color == RawColor::Any || self.color == RawColor::of_format(format));
         // Weights 1-4 and 5-8 (aWeights0, aWeights1); without (more) weights
         // one byte from byte 0, unused (the bones beyond the format's are zero).
         let weight_type = ((format >> 9) & 3) as usize;
@@ -656,9 +820,15 @@ impl RawSet {
         let position = attribute(0, layout.position_offset, POSITION_FORMATS[((format >> 7) & 3) as usize], 3, self.position);
         let mut attributes = [position; 7];
         attributes[1] = attribute(0, texcoord_offset, TEXCOORD_FORMATS[(format & 3) as usize], 2, self.texcoord);
-        attributes[2] = attribute(0, color_offset, gxm::ATTRIBUTE_FORMAT_U8, 2, self.color_bytes);
-        attributes[3] = attribute(0, color_offset, gxm::ATTRIBUTE_FORMAT_U8N, 4, self.color32);
-        let mut used = 4;
+        let mut used = 2;
+        if self.color.reads_bytes() {
+            attributes[used] = attribute(0, color_offset, gxm::ATTRIBUTE_FORMAT_U8, 2, self.color_bytes);
+            used += 1;
+        }
+        if self.color.reads_32() {
+            attributes[used] = attribute(0, color_offset, gxm::ATTRIBUTE_FORMAT_U8N, 4, self.color32);
+            used += 1;
+        }
         let bones = self.variant.bones();
         if bones == 1 {
             // The first weight (one byte from byte 0 without weights: the
@@ -744,7 +914,7 @@ impl SpriteSet {
         self.corner = parameter(program, b"aCorner\0");
         self.uniforms = RawUniforms::find(program);
         let inputs = [self.position, self.texcoord, self.position_b, self.texcoord_b, self.color_bytes_b, self.color32_b, self.corner];
-        if inputs.iter().any(|parameter| parameter.is_null()) || !self.uniforms.all_found() || !self.uniforms.unlit_rules_found() {
+        if inputs.iter().any(|parameter| parameter.is_null()) || !self.uniforms.all_found() || self.uniforms.material.is_null() || !self.uniforms.unlit_rules_found() {
             render_log::line(format_args!("sprite program: parameters missing\n"));
             return false;
         }
@@ -833,13 +1003,14 @@ impl Programs {
                 normal_rows_3d: null(),
                 lights_3d: null(),
             },
-            raw: RawSet::new(RawVariant::Full),
-            raw_plain: RawSet::new(RawVariant::Plain),
-            raw_plain4: RawSet::new(RawVariant::Plain4),
-            raw_lit1: RawSet::new(RawVariant::Lit1),
-            raw_lit4: RawSet::new(RawVariant::Lit4),
-            raw_lit1_flat: RawSet::new(RawVariant::Lit1Flat),
-            raw_lit4_flat: RawSet::new(RawVariant::Lit4Flat),
+            raw: RawSet::new(RawVariant::Full, RawColor::Any),
+            raw_plain: RawSet::new(RawVariant::Plain, RawColor::Any),
+            raw_plain4: RawSet::new(RawVariant::Plain4, RawColor::Any),
+            raw_lit1: RawSet::new(RawVariant::Lit1, RawColor::Any),
+            raw_lit4: RawSet::new(RawVariant::Lit4, RawColor::Any),
+            raw_lit1_flat: RawSet::new(RawVariant::Lit1Flat, RawColor::Any),
+            raw_lit4_flat: RawSet::new(RawVariant::Lit4Flat, RawColor::Any),
+            raw_fixed: fixed_raw_sets(),
             sprites: SpriteSet::new(),
             blend: [NO_BLEND_PROGRAM; MAX_BLEND_PROGRAMS],
             blend_count: 0,
@@ -860,8 +1031,12 @@ impl Programs {
         &self.read[read_index(textured, tested, variant)]
     }
 
-    /// The raw program set of `variant`.
-    pub fn raw_set(&mut self, variant: RawVariant) -> &mut RawSet {
+    /// The raw program set of `variant` with colour format `color` (the
+    /// full program only as `RawColor::Any`, whatever `color` says).
+    pub fn raw_set(&mut self, variant: RawVariant, color: RawColor) -> &mut RawSet {
+        if let (Some(place), Some(color)) = (variant.fixed_index(), color.fixed_index()) {
+            return &mut self.raw_fixed[place * FIXED_COLORS + color];
+        }
         match variant {
             RawVariant::Full => &mut self.raw,
             RawVariant::Plain => &mut self.raw_plain,

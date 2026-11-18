@@ -84,6 +84,14 @@
 //   fourth light, which adds exactly 0, is left out: the same sums, bit for
 //   bit. MTX's riders: three lights with specular, coefficient 0 (2026-11-17,
 //   every lit draw of the four dumps).
+// - RAW_COLOR_NONE, _5650, _5551, _4444, _8888 (nativeres_raw_<variant>_<colour>_v.cg,
+//   with each of the variants above): the vertex colour format fixed
+//   (VERTEX_TYPE bits 2-4; none = the material colour), so the program
+//   decodes that one format and reads only its attribute (aColorBytes for
+//   the 16-bit ones, aColor32 for 8888, none without colour); uFormat.y is
+//   unused then. The generic decode runs every format's branch on the GPU
+//   (2026-11-18: lit1flat 209 -> ~149 instructions with 4444). programs.rs
+//   `RawColor`; the full program stays generic.
 // One bone (RAW_ONE_BONE) is skinned without a branch: aWeight is the first
 // weight, uSkin y its scale, z added to it: formats without weights get
 // weight 0 x 0 + 1 and the identity as bone 0, which leaves position and
@@ -113,6 +121,31 @@
 #define RAW_FOUR_BONES 1
 #define RAW_FLAT_LIGHTS 1
 #define RAW_LIGHTS_ONLY 1
+#endif
+// The fixed colour format: RAW_MODE the colour field's value (uFormat.y of
+// the generic program), RAW_COLOR_BYTES / RAW_COLOR_32 the attributes read.
+#ifdef RAW_COLOR_NONE
+#define RAW_MODE 0.0f
+#endif
+#ifdef RAW_COLOR_5650
+#define RAW_MODE 4.0f
+#define RAW_COLOR_BYTES 1
+#endif
+#ifdef RAW_COLOR_5551
+#define RAW_MODE 5.0f
+#define RAW_COLOR_BYTES 1
+#endif
+#ifdef RAW_COLOR_4444
+#define RAW_MODE 6.0f
+#define RAW_COLOR_BYTES 1
+#endif
+#ifdef RAW_COLOR_8888
+#define RAW_MODE 7.0f
+#define RAW_COLOR_32 1
+#endif
+#ifndef RAW_MODE
+#define RAW_COLOR_BYTES 1
+#define RAW_COLOR_32 1
 #endif
 
 // The number above the low bits of a whole number v (1 / 2^low = inverse):
@@ -169,8 +202,12 @@ float4 VertexColor(float mode, float2 bytes, float4 color32, float4 material)
 void main(
 	float3 aPosition,
 	float2 aTexcoord,
+#ifdef RAW_COLOR_BYTES
 	float2 aColorBytes,
+#endif
+#ifdef RAW_COLOR_32
 	float4 aColor32,
+#endif
 #ifdef RAW_ONE_BONE
 	float aWeight,
 #else
@@ -265,8 +302,22 @@ void main(
 	vFog = float2((view.z * uFog.x + uFog.y) * uFog.z, 1.0f) * clip.w;
 
 	// The colour: raw_vertex.rs RawColors::color.
+#ifdef RAW_MODE
+	float mode = RAW_MODE;  // constant: VertexColor keeps one branch
+#else
 	float mode = uFormat.y;
-	float4 color = VertexColor(mode, aColorBytes, aColor32, uMaterial);
+#endif
+#ifdef RAW_COLOR_BYTES
+	float2 colorBytes = aColorBytes;
+#else
+	float2 colorBytes = float2(0.0f, 0.0f);
+#endif
+#ifdef RAW_COLOR_32
+	float4 color32 = aColor32;
+#else
+	float4 color32 = float4(0.0f, 0.0f, 0.0f, 0.0f);
+#endif
+	float4 color = VertexColor(mode, colorBytes, color32, uMaterial);
 #ifndef RAW_NO_LIGHTS
 #ifdef RAW_LIGHTS_ONLY
 	{
