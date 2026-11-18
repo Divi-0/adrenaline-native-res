@@ -2,6 +2,7 @@
 # Makes the generated shader variants in vita/shaders from their
 # sources (one source of truth each, a #define selecting the variant):
 #   nativeres_raw_plain_v.cg        nativeres_raw_v.cg + RAW_PLAIN (one bone, no lights)
+#   nativeres_raw_plain4_v.cg       nativeres_raw_v.cg + RAW_PLAIN4 (up to four bones, no lights)
 #   nativeres_raw_lit1_v.cg         nativeres_raw_v.cg + RAW_LIT1 (one bone, lights)
 #   nativeres_raw_lit4_v.cg         nativeres_raw_v.cg + RAW_LIT4 (up to four bones, lights)
 #   nativeres_raw_lit1flat_v.cg     nativeres_raw_v.cg + RAW_LIT1_FLAT (RAW_LIT1, coefficient <= 0, 3 lights)
@@ -28,6 +29,7 @@ variant() {  # <source stem> "<define> ..." <output stem>
   echo "wrote $3.cg"
 }
 variant nativeres_raw_v RAW_PLAIN nativeres_raw_plain_v
+variant nativeres_raw_v RAW_PLAIN4 nativeres_raw_plain4_v
 variant nativeres_raw_v RAW_LIT1 nativeres_raw_lit1_v
 variant nativeres_raw_v RAW_LIT4 nativeres_raw_lit4_v
 variant nativeres_raw_v RAW_LIT1_FLAT nativeres_raw_lit1flat_v

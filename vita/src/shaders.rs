@@ -77,12 +77,13 @@ embed_gxp!(nativeres_color_read_invisiblekeepdither_f);
 // Decoded vertices in model space: the GPU transforms and lights them.
 embed_gxp!(nativeres_3d_v);
 // Raw PSP vertices, read by the GPU as the game wrote them: with up to
-// eight bones and lights, one bone without lights, one bone with lights, up
-// to four bones with lights, the last two for flat light sets
-// (programs.rs `RawVariant::Lit1Flat`), and sprites (two corners per
+// eight bones and lights, one and up to four bones without lights, one bone
+// with lights, up to four bones with lights, the last two for flat light
+// sets (programs.rs `RawVariant::Lit1Flat`), and sprites (two corners per
 // rectangle).
 embed_gxp!(nativeres_raw_v);
 embed_gxp!(nativeres_raw_plain_v);
+embed_gxp!(nativeres_raw_plain4_v);
 embed_gxp!(nativeres_raw_lit1_v);
 embed_gxp!(nativeres_raw_lit4_v);
 embed_gxp!(nativeres_raw_lit1flat_v);

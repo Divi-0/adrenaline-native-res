@@ -127,7 +127,10 @@ pub enum RawVariant {
     Full,
     /// One bone, no directional lights (nativeres_raw_plain_v.cg).
     Plain,
-    /// One bone, lights (nativeres_raw_lit1_v.cg).
+    /// Up to four bones, no directional lights (nativeres_raw_plain4_v.cg).
+    Plain4,
+    /// One bone, lights (nativeres_raw_lit1_v.cg). The lit variants take
+    /// only draws lit with directional lights (`lights_only`).
     Lit1,
     /// Up to four bones, lights (nativeres_raw_lit4_v.cg).
     Lit4,
@@ -143,20 +146,28 @@ impl RawVariant {
     pub fn bones(self) -> u32 {
         match self {
             RawVariant::Full => 8,
-            RawVariant::Lit4 | RawVariant::Lit4Flat => 4,
+            RawVariant::Plain4 | RawVariant::Lit4 | RawVariant::Lit4Flat => 4,
             RawVariant::Plain | RawVariant::Lit1 | RawVariant::Lit1Flat => 1,
         }
     }
 
     /// Whether the program lights with directional lights (uLights, aNormal).
     pub fn lights(self) -> bool {
-        self != RawVariant::Plain
+        !matches!(self, RawVariant::Plain | RawVariant::Plain4)
+    }
+
+    /// Whether the program takes only draws lit with directional lights
+    /// (nativeres_raw_v.cg RAW_LIGHTS_ONLY: without the unlit colour rules,
+    /// so without uAmbient, uEmissive, uScale).
+    pub fn lights_only(self) -> bool {
+        self.lights() && self != RawVariant::Full
     }
 
     fn label(self) -> &'static str {
         match self {
             RawVariant::Full => "",
             RawVariant::Plain => " (plain)",
+            RawVariant::Plain4 => " (plain, four bones)",
             RawVariant::Lit1 => " (lit, one bone)",
             RawVariant::Lit4 => " (lit, four bones)",
             RawVariant::Lit1Flat => " (flat lights, one bone)",
@@ -254,6 +265,8 @@ impl RawUniforms {
         }
     }
 
+    /// All found but the unlit colour rules' uAmbient and uEmissive (the
+    /// lit-only raw programs have none: `unlit_rules_found`).
     fn all_found(&self) -> bool {
         [
             self.wvp,
@@ -266,12 +279,15 @@ impl RawUniforms {
             self.format,
             self.raw_uv,
             self.material,
-            self.ambient,
-            self.emissive,
             self.colors,
         ]
         .iter()
         .all(|parameter| !parameter.is_null())
+    }
+
+    /// uAmbient and uEmissive found (programs with the unlit colour rules).
+    fn unlit_rules_found(&self) -> bool {
+        !self.ambient.is_null() && !self.emissive.is_null()
     }
 }
 
@@ -509,6 +525,7 @@ pub struct Programs {
     pub textured: Textured,
     pub raw: RawSet,
     pub raw_plain: RawSet,
+    pub raw_plain4: RawSet,
     pub raw_lit1: RawSet,
     pub raw_lit4: RawSet,
     pub raw_lit1_flat: RawSet,
@@ -561,6 +578,7 @@ impl RawSet {
         let program = match self.variant {
             RawVariant::Full => gxp(&shaders::nativeres_raw_v),
             RawVariant::Plain => gxp(&shaders::nativeres_raw_plain_v),
+            RawVariant::Plain4 => gxp(&shaders::nativeres_raw_plain4_v),
             RawVariant::Lit1 => gxp(&shaders::nativeres_raw_lit1_v),
             RawVariant::Lit4 => gxp(&shaders::nativeres_raw_lit4_v),
             RawVariant::Lit1Flat => gxp(&shaders::nativeres_raw_lit1flat_v),
@@ -585,11 +603,14 @@ impl RawSet {
         self.scale = parameter(program, b"uScale\0");
         self.uniforms = RawUniforms::find(program);
         let bones = self.variant.bones();
+        // The lit-only programs have no unlit colour rules: no uAmbient,
+        // uEmissive, uScale (left null; `set_uniform` skips null ones).
+        let unlit_rules = !self.variant.lights_only();
         if self.position.is_null()
             || self.texcoord.is_null()
             || self.color_bytes.is_null()
             || self.color32.is_null()
-            || self.scale.is_null()
+            || (unlit_rules && (self.scale.is_null() || !self.uniforms.unlit_rules_found()))
             || self.skin.is_null()
             || self.bones.is_null()
             || !self.uniforms.all_found()
@@ -723,7 +744,7 @@ impl SpriteSet {
         self.corner = parameter(program, b"aCorner\0");
         self.uniforms = RawUniforms::find(program);
         let inputs = [self.position, self.texcoord, self.position_b, self.texcoord_b, self.color_bytes_b, self.color32_b, self.corner];
-        if inputs.iter().any(|parameter| parameter.is_null()) || !self.uniforms.all_found() {
+        if inputs.iter().any(|parameter| parameter.is_null()) || !self.uniforms.all_found() || !self.uniforms.unlit_rules_found() {
             render_log::line(format_args!("sprite program: parameters missing\n"));
             return false;
         }
@@ -814,6 +835,7 @@ impl Programs {
             },
             raw: RawSet::new(RawVariant::Full),
             raw_plain: RawSet::new(RawVariant::Plain),
+            raw_plain4: RawSet::new(RawVariant::Plain4),
             raw_lit1: RawSet::new(RawVariant::Lit1),
             raw_lit4: RawSet::new(RawVariant::Lit4),
             raw_lit1_flat: RawSet::new(RawVariant::Lit1Flat),
@@ -843,6 +865,7 @@ impl Programs {
         match variant {
             RawVariant::Full => &mut self.raw,
             RawVariant::Plain => &mut self.raw_plain,
+            RawVariant::Plain4 => &mut self.raw_plain4,
             RawVariant::Lit1 => &mut self.raw_lit1,
             RawVariant::Lit4 => &mut self.raw_lit4,
             RawVariant::Lit1Flat => &mut self.raw_lit1_flat,

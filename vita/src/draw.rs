@@ -59,6 +59,11 @@ const PRIM_SPRITES: u16 = 6;
 /// nothing per draw (the last two in frame_loop.rs). Only set while the
 /// bench runs (pictures are wrong then).
 pub static REDRAW_SKIP: AtomicU32 = AtomicU32::new(0);
+
+/// Measuring only (0 = off): each textured draw is issued this many times
+/// more (pictures are wrong then), to see what the GPU's geometry work
+/// costs (with `GPU_CLIP_ROWS` 1: hardly any pixels).
+pub static DRAW_REPEAT: AtomicI32 = AtomicI32::new(0);
 /// Frame draws GXM refused (sceGxmDraw < 0) and the last refusal's code
 /// (debug "drawerrors"; the first few are also logged).
 pub static DRAW_ERRORS: AtomicU32 = AtomicU32::new(0);
@@ -557,6 +562,9 @@ fn floats<T>(value: &T) -> *const f32 {
 
 /// Sets `count` floats from `data` into uniform buffer `buffer`.
 pub fn set_uniform(buffer: *mut c_void, parameter: *const ProgramParameter, count: u32, data: *const f32) {
+    if parameter.is_null() {
+        return; // a uniform this program doesn't have (the compiler dropped it)
+    }
     // Safe: a reserved buffer, a parameter of the program in use, `count`
     // floats readable at `data`.
     unsafe { gxm::sceGxmSetUniformDataF(buffer, parameter, 0, count, data) };
@@ -1338,7 +1346,7 @@ impl Draws {
                     variant = RawVariant::Full;
                 }
                 match variant {
-                    RawVariant::Plain => stats().plain_draws += 1,
+                    RawVariant::Plain | RawVariant::Plain4 => stats().plain_draws += 1,
                     RawVariant::Lit1 | RawVariant::Lit4 => stats().lit_variant_draws += 1,
                     RawVariant::Lit1Flat | RawVariant::Lit4Flat => {
                         stats().lit_variant_draws += 1;
@@ -1531,6 +1539,9 @@ impl Draws {
                 gxm::sceGxmSetVertexStream(context(), 2, self.programs.sprites.corners as *const c_void);
             }
             note_draw_result(gxm::sceGxmDraw(context(), gxm::PRIMITIVE_TRIANGLES, gxm::INDEX_FORMAT_U16, indices as *const c_void, index_count));
+            for _ in 0..DRAW_REPEAT.load(Ordering::Relaxed).clamp(0, 8) {
+                gxm::sceGxmDraw(context(), gxm::PRIMITIVE_TRIANGLES, gxm::INDEX_FORMAT_U16, indices as *const c_void, index_count);
+            }
         }
     }
 
@@ -1913,17 +1924,23 @@ enum RawSetChoice {
 
 /// The raw program for a draw with `weights` skinning weights (0 without),
 /// lit with directional lights or not: the smallest that takes it
-/// (nativeres_raw_v.cg's variants). `variants` off (debug `rawvariants 0`):
-/// only the plain and the full program, as before 2026-11-17.
+/// (nativeres_raw_v.cg's variants; the lit ones take only draws lit with
+/// lights, the plain ones only the others). `variants` off (debug
+/// `rawvariants 0`): only the plain and the full program, as before
+/// 2026-11-17.
 fn raw_variant(weights: u32, lit_with_lights: bool, plain: bool, variants: bool) -> RawVariant {
-    if plain && weights <= 1 && !lit_with_lights {
-        RawVariant::Plain
-    } else if variants && weights <= 1 {
-        RawVariant::Lit1
-    } else if variants && weights <= 4 {
-        RawVariant::Lit4
+    if lit_with_lights {
+        match weights {
+            0..=1 if variants => RawVariant::Lit1,
+            2..=4 if variants => RawVariant::Lit4,
+            _ => RawVariant::Full,
+        }
     } else {
-        RawVariant::Full
+        match weights {
+            0..=1 if plain => RawVariant::Plain,
+            0..=4 if variants => RawVariant::Plain4,
+            _ => RawVariant::Full,
+        }
     }
 }
 
