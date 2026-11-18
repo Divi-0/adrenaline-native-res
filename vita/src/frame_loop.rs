@@ -196,6 +196,16 @@ pub fn render_frame() -> bool {
     state.render_frame(targets)
 }
 
+/// Display thread, while the PSP runs its XMB (the game was quit): what
+/// the targets hold is the quit game's, never to be shown again (the next
+/// game's start showed it until its first frame of ours).
+pub fn leave_game() {
+    // Safe: the display thread, as `render_frame`.
+    let (state, targets) = unsafe { (FRAME_LOOP.get(), targets::targets()) };
+    targets.forget();
+    state.frame_pending = false;
+}
+
 impl FrameLoop {
     fn render_frame(&mut self, targets: &mut Targets) -> bool {
 

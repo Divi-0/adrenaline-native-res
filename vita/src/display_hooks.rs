@@ -139,17 +139,23 @@ fn on_display_thread() -> bool {
     thread == DISPLAY_THREAD.load(Relaxed)
 }
 
-/// A PS1 game, homebrew drawing at the Vita's resolution, a savestate
-/// being taken or loaded (the loop draws "Please wait..." then), or the
-/// PSP's HOME menu (drawn by the PSP's kernel, not in the lists we
-/// capture): none of it is ours to draw.
-fn not_ours_to_draw() -> bool {
-    !display_loop::ours_to_draw(display_loop::AdrenalineScreen {
+/// What Adrenaline's shared words say about the PSP screen this pass.
+fn adrenaline_screen() -> display_loop::AdrenalineScreen {
+    display_loop::AdrenalineScreen {
         pops_mode: adrenaline::pops_mode(),
         draw_native: adrenaline::draw_native(),
         savestate_screen: adrenaline::savestate_screen(),
         home_menu: adrenaline::home_menu(),
-    })
+        xmb: adrenaline::xmb(),
+    }
+}
+
+/// A PS1 game, homebrew drawing at the Vita's resolution, a savestate
+/// being taken or loaded (the loop draws "Please wait..." then), the
+/// PSP's HOME menu (drawn by the PSP's kernel, not in the lists we
+/// capture) or the XMB: none of it is ours to draw.
+fn not_ours_to_draw() -> bool {
+    !display_loop::ours_to_draw(adrenaline_screen())
 }
 
 // ------------------------------------------------------------ the loop's timings
@@ -271,7 +277,12 @@ unsafe extern "C" fn begin_scene_hooked(
     if DISPLAY_THREAD.swap(thread, Relaxed) != thread {
         ext::note_thread(thread);
     }
-    let ours = if not_ours_to_draw() {
+    let screen = adrenaline_screen();
+    if screen.xmb {
+        // The game was quit: its last frame is never shown again.
+        frame_loop::leave_game();
+    }
+    let ours = if !display_loop::ours_to_draw(screen) {
         false
     } else {
         let ours = frame_loop::render_frame();

@@ -92,14 +92,20 @@ pub struct AdrenalineScreen {
     /// PAUSE_POPS, which its impose patch sends for every game when the
     /// popup opens, cleared by RESUME_POPS when it closes).
     pub home_menu: bool,
+    /// The PSP runs its XMB, no game (`SceAdrenaline::app_type` is
+    /// PSP_INIT_KEYCONFIG_VSH: set at every PSP boot, so after "Quit the
+    /// game?" > Yes).
+    pub xmb: bool,
 }
 
 /// Whether the loop may show our picture: none of the above. The HOME menu
 /// is drawn by the PSP's kernel (impose), never through the game's display
 /// lists we capture: with our picture shown it stayed invisible (user,
-/// 2026-11-18), so Sony's picture is shown while it is open.
+/// 2026-11-18), so Sony's picture is shown while it is open. In the XMB
+/// no game draws: our last frame of the quit game stayed frozen on the
+/// screen (user, 2026-11-18).
 pub fn ours_to_draw(screen: AdrenalineScreen) -> bool {
-    !(screen.pops_mode || screen.draw_native || screen.savestate_screen || screen.home_menu)
+    !(screen.pops_mode || screen.draw_native || screen.savestate_screen || screen.home_menu || screen.xmb)
 }
 
 /// A sample of the CPU-picture check differs when its R + G + B differ by
@@ -158,6 +164,14 @@ mod tests {
         assert!(!ours_to_draw(AdrenalineScreen { pops_mode: true, ..game }));
         assert!(!ours_to_draw(AdrenalineScreen { draw_native: true, ..game }));
         assert!(!ours_to_draw(AdrenalineScreen { savestate_screen: true, ..game }));
+    }
+
+    /// "Quit the game?" > Yes, renderer on (2026-11-18): the PSP went back
+    /// to the XMB, no more frames came, and our last one stayed on the
+    /// screen. In the XMB, Sony's picture.
+    #[test]
+    fn the_xmb_after_quitting_shows_sonys_picture() {
+        assert!(!ours_to_draw(AdrenalineScreen { xmb: true, ..AdrenalineScreen::default() }));
     }
 
     /// Measured during MTX's intro movie, renderer on (2026-11-10): how

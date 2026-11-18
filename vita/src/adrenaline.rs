@@ -74,6 +74,11 @@ const TITLE_ID_BYTES: usize = 12;
 pub const POPS_MODE_ADDRESS: u32 = ADRENALINE_ADDRESS + 16;
 /// `SceAdrenaline::draw_psp_screen_in_pops` (right after pops_mode).
 const HOME_MENU_OFFSET: usize = 20;
+/// `SceAdrenaline::app_type` (after vita_response and the 1024-byte
+/// printbuf): sceKernelApplicationType, written at every PSP boot.
+const APP_TYPE_OFFSET: usize = 436 + 1024;
+/// PSP_INIT_KEYCONFIG_VSH: the XMB.
+const APP_TYPE_VSH: i32 = 0x100;
 /// DRAW_NATIVE (adrenaline_vita.h): homebrew drawing at the Vita's
 /// resolution itself.
 pub const DRAW_NATIVE_ADDRESS: u32 = 0xABCD_EF00;
@@ -396,6 +401,12 @@ pub fn savestate_screen() -> bool {
 pub fn home_menu() -> bool {
     // Safe: as `pops_mode`.
     unsafe { read_volatile(sys::psp_to_vita(ADRENALINE_ADDRESS + HOME_MENU_OFFSET as u32) as *const i32) != 0 }
+}
+
+/// The PSP runs its XMB, no game (`app_type`).
+pub fn xmb() -> bool {
+    // Safe: as `pops_mode`.
+    unsafe { read_volatile(sys::psp_to_vita(ADRENALINE_ADDRESS + APP_TYPE_OFFSET as u32) as *const i32) == APP_TYPE_VSH }
 }
 
 /// Homebrew draws at the Vita's resolution itself (DRAW_NATIVE).
