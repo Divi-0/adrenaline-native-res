@@ -67,6 +67,13 @@ embed_gxp!(nativeres_color_read_normalkeepdither_f);
 embed_gxp!(nativeres_color_read_adddither_f);
 embed_gxp!(nativeres_color_read_addkeepdither_f);
 embed_gxp!(nativeres_color_read_offdither_f);
+// Untextured normal blends of alpha 0 (core frame.rs `ReadWay::Invisible`):
+// the target dithered and cut again, alpha written or kept, undithered and
+// dithered.
+embed_gxp!(nativeres_color_read_invisible_f);
+embed_gxp!(nativeres_color_read_invisiblekeep_f);
+embed_gxp!(nativeres_color_read_invisibledither_f);
+embed_gxp!(nativeres_color_read_invisiblekeepdither_f);
 // Decoded vertices in model space: the GPU transforms and lights them.
 embed_gxp!(nativeres_3d_v);
 // Raw PSP vertices, read by the GPU as the game wrote them: with up to

@@ -14,6 +14,8 @@
 #                                   addkeep ones also READ_KEEP_ALPHA, the textured ...test ones also
 #                                   READ_TEST (fast 5551 variants, programs.rs read_gxp); each
 #                                   of these also as ...dither_f with READ_DITHER
+#   nativeres_color_read_invisible[keep][dither]_f.cg
+#                                   UNTEXTURED READ_INVISIBLE (normal blends of alpha 0)
 # Run after changing a source, then compile the shaders on the Vita
 # (README.md "Shaders").
 cd "$(dirname "$0")/../vita/shaders"
@@ -47,4 +49,7 @@ for dither in "" dither; do
       variant nativeres_textured_read_f "UNTEXTURED $WAY READ_KEEP_ALPHA $DITHER" nativeres_color_read_${way}keep${dither}_f
     fi
   done
+  # Untextured only: normal blending of alpha 0 (ReadWay::Invisible).
+  variant nativeres_textured_read_f "UNTEXTURED READ_INVISIBLE $DITHER" nativeres_color_read_invisible${dither}_f
+  variant nativeres_textured_read_f "UNTEXTURED READ_INVISIBLE READ_KEEP_ALPHA $DITHER" nativeres_color_read_invisiblekeep${dither}_f
 done

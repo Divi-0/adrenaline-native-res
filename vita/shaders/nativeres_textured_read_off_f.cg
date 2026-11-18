@@ -28,7 +28,8 @@
 // Fast variants (scripts/shader-variants.sh, programs.rs `ReadVariant`):
 // for 5551 targets and the common blends, one per way: READ_NORMAL (source alpha, one minus source alpha, add), READ_ADD
 // (source alpha, one, add), READ_OFF (no blending: no frame read, see
-// there); READ_KEEP_ALPHA: the target's alpha (the PSP's stencil, while a
+// there), READ_INVISIBLE (untextured only: normal blending of a source
+// whose alpha is 0, the target dithered and cut again); READ_KEEP_ALPHA: the target's alpha (the PSP's stencil, while a
 // game reads it) stays, else the alpha is written as blended (nobody
 // reads it then); READ_TEST (textured only): with the alpha test, whose
 // `discard` costs the GPU even where it passes (the 8-bit path's
@@ -83,7 +84,7 @@
 // Needs the compiler's Vita extensions (shadercompiler: on by a hook).
 // Compiled on the Vita with the shader compiler app (README.md "Shaders").
 
-#if defined(READ_NORMAL) || defined(READ_ADD) || defined(READ_OFF)
+#if defined(READ_NORMAL) || defined(READ_ADD) || defined(READ_OFF) || defined(READ_INVISIBLE)
 #define READ_FAST 1
 #endif
 // The fast ones take no draws with a separate specular colour (draw.rs
@@ -243,6 +244,11 @@ __nativecolor __regformat unsigned char4 main(
 		value = FLOOR((c * 2.0f + 1.0f) * ((c.a * 2.0f + 1.0f) * (1.0f / 1024.0f)))
 			+ FLOOR((d * 2.0f + 1.0f) * ((511.0f - c.a * 2.0f) * (1.0f / 1024.0f)));
 	}
+#elif defined(READ_INVISIBLE)
+	// A normal blend of alpha 0 (untextured only: every vertex alpha 0,
+	// core frame.rs `ReadWay::Invisible`): t(c, 0) = 0, t(d, 255) = d,
+	// so the blend is the target; the colour isn't read at all.
+	float4 value = (float4)target;
 #elif defined(READ_ADD)
 	float4 d = (float4)target;
 	float4 value = min(FLOOR((c * 2.0f + 1.0f) * ((c.a * 2.0f + 1.0f) * (1.0f / 1024.0f))) + d, 255.0f);

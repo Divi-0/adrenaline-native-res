@@ -329,10 +329,17 @@ pub struct ReadProgram {
     pub dither: [*const ProgramParameter; 4],
 }
 
-/// Frame-read programs (`read_index`): untextured generic + four ways x
+/// Fast frame-read ways (`ReadWay`, all five).
+const READ_WAYS: usize = 5;
+
+/// Frame-read programs (`read_index`): untextured generic + the ways x
 /// alpha kept or not x dithered or not; textured the same, the fast ones
-/// also with and without the alpha test.
-const READ_PROGRAMS: usize = 50;
+/// also with and without the alpha test (`ReadWay::Invisible` is
+/// untextured only, its textured slots stay unused).
+const READ_PROGRAMS: usize = READ_TEXTURED + 1 + 2 * READ_WAYS * 4;
+
+/// The first textured one in `read_index` (the textured generic program).
+const READ_TEXTURED: usize = 1 + READ_WAYS * 4;
 
 /// The place of a frame-read program in `Programs::read`; `tested`: with
 /// the alpha test (textured only; the generic one always has it).
@@ -341,8 +348,8 @@ fn read_index(textured: bool, tested: bool, variant: ReadVariant) -> usize {
     match (textured, variant) {
         (false, ReadVariant::Generic) => 0,
         (false, ReadVariant::Fast { way, keep_alpha, dither }) => 1 + fast(way, keep_alpha, dither),
-        (true, ReadVariant::Generic) => 17,
-        (true, ReadVariant::Fast { way, keep_alpha, dither }) => 18 + 2 * fast(way, keep_alpha, dither) + tested as usize,
+        (true, ReadVariant::Generic) => READ_TEXTURED,
+        (true, ReadVariant::Fast { way, keep_alpha, dither }) => READ_TEXTURED + 1 + 2 * fast(way, keep_alpha, dither) + tested as usize,
     }
 }
 
@@ -350,7 +357,7 @@ fn read_index(textured: bool, tested: bool, variant: ReadVariant) -> usize {
 /// "off" ones keep the alpha by GXM's colour mask: one program for both,
 /// and for `ReadWay::Precut` (GXM blends).
 fn read_gxp(textured: bool, tested: bool, variant: ReadVariant) -> *const gxm::Program {
-    use ReadWay::{Add, Normal, Off, Precut};
+    use ReadWay::{Add, Invisible, Normal, Off, Precut};
     use shaders::*;
     let ReadVariant::Fast { way, keep_alpha, dither } = variant else {
         return if textured { gxp(&nativeres_textured_read_f) } else { gxp(&nativeres_color_read_f) };
@@ -367,23 +374,29 @@ fn read_gxp(textured: bool, tested: bool, variant: ReadVariant) -> *const gxm::P
             (Add, false, true) => gxp(&nativeres_color_read_adddither_f),
             (Add, true, true) => gxp(&nativeres_color_read_addkeepdither_f),
             (Off | Precut, _, true) => gxp(&nativeres_color_read_offdither_f),
+            (Invisible, false, false) => gxp(&nativeres_color_read_invisible_f),
+            (Invisible, true, false) => gxp(&nativeres_color_read_invisiblekeep_f),
+            (Invisible, false, true) => gxp(&nativeres_color_read_invisibledither_f),
+            (Invisible, true, true) => gxp(&nativeres_color_read_invisiblekeepdither_f),
         };
     }
+    // `ReadWay::Invisible` is untextured only (a textured draw never gets
+    // it); should one come, the normal blend gives the same picture.
     match (way, keep_alpha, tested, dither) {
-        (Normal, false, false, false) => gxp(&nativeres_textured_read_normal_f),
-        (Normal, false, true, false) => gxp(&nativeres_textured_read_normaltest_f),
-        (Normal, true, false, false) => gxp(&nativeres_textured_read_normalkeep_f),
-        (Normal, true, true, false) => gxp(&nativeres_textured_read_normalkeeptest_f),
+        (Normal | Invisible, false, false, false) => gxp(&nativeres_textured_read_normal_f),
+        (Normal | Invisible, false, true, false) => gxp(&nativeres_textured_read_normaltest_f),
+        (Normal | Invisible, true, false, false) => gxp(&nativeres_textured_read_normalkeep_f),
+        (Normal | Invisible, true, true, false) => gxp(&nativeres_textured_read_normalkeeptest_f),
         (Add, false, false, false) => gxp(&nativeres_textured_read_add_f),
         (Add, false, true, false) => gxp(&nativeres_textured_read_addtest_f),
         (Add, true, false, false) => gxp(&nativeres_textured_read_addkeep_f),
         (Add, true, true, false) => gxp(&nativeres_textured_read_addkeeptest_f),
         (Off | Precut, _, false, false) => gxp(&nativeres_textured_read_off_f),
         (Off | Precut, _, true, false) => gxp(&nativeres_textured_read_offtest_f),
-        (Normal, false, false, true) => gxp(&nativeres_textured_read_normaldither_f),
-        (Normal, false, true, true) => gxp(&nativeres_textured_read_normaltestdither_f),
-        (Normal, true, false, true) => gxp(&nativeres_textured_read_normalkeepdither_f),
-        (Normal, true, true, true) => gxp(&nativeres_textured_read_normalkeeptestdither_f),
+        (Normal | Invisible, false, false, true) => gxp(&nativeres_textured_read_normaldither_f),
+        (Normal | Invisible, false, true, true) => gxp(&nativeres_textured_read_normaltestdither_f),
+        (Normal | Invisible, true, false, true) => gxp(&nativeres_textured_read_normalkeepdither_f),
+        (Normal | Invisible, true, true, true) => gxp(&nativeres_textured_read_normalkeeptestdither_f),
         (Add, false, false, true) => gxp(&nativeres_textured_read_adddither_f),
         (Add, false, true, true) => gxp(&nativeres_textured_read_addtestdither_f),
         (Add, true, false, true) => gxp(&nativeres_textured_read_addkeepdither_f),

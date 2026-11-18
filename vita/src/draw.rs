@@ -139,6 +139,12 @@ pub static RAW_FLAT_LIGHTS: AtomicI32 = AtomicI32::new(1);
 /// measuring: 5 = only unblended draws cut, 6 = only blended ones.
 pub static TARGET_CUT: AtomicI32 = AtomicI32::new(1);
 
+/// Untextured normal alpha blends into 5551 whose vertex alphas are all 0
+/// get the "invisible" frame-read program (core frame.rs
+/// `ReadWay::Invisible`: the target dithered and cut again, no colour
+/// maths; the same picture). 1 = on (default), 0 = the normal one.
+pub static INVISIBLE_SOURCES: AtomicI32 = AtomicI32::new(1);
+
 /// A GXM blend factor (core blend.rs `Factor` numbers) as the frame-read
 /// program's coefficients: k0 + k1 s + k2 s.a + k3 d + k4 d.a, returned as
 /// (k0, [k1, k2, k3, k4]).
@@ -1454,7 +1460,12 @@ impl Draws {
             *out = basic_programs::ColorVertex { x: vertex.x * SCALE, y: vertex.y * SCALE, z: gpu_depth(vertex.z), color: vertex.color };
         }
         stats().convert_us += draw_clock().wrapping_sub(convert_start);
-        let choice = read_choice(frame, draw, self.keep_target_alpha);
+        let mut choice = read_choice(frame, draw, self.keep_target_alpha);
+        // Alpha 0 at every vertex: a normal blend leaves the target as it
+        // is (`ReadWay::Invisible`, MHF's full-screen fade quad).
+        if INVISIBLE_SOURCES.load(Ordering::Relaxed) != 0 && vertices.iter().all(|vertex| vertex.color >> 24 == 0) {
+            choice = choice.map(ReadVariant::for_invisible_source);
+        }
         let read_variant = choice.unwrap_or(ReadVariant::Generic);
         let read_program = choice.and_then(|variant| self.programs.read_program(false, false, variant).map(|program| program.program));
         let read = read_program.is_some();

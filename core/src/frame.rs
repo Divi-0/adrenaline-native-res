@@ -238,6 +238,21 @@ pub enum ReadWay {
     /// the blend (one 5-bit step at most). Frame-read draws cost MHF's
     /// intro ~12-16 ms of GPU time (`read_variant`'s `exact_normal`).
     Precut,
+    /// Normal alpha blending of an untextured source whose alpha is 0 at
+    /// every vertex (`ReadVariant::for_invisible_source`): the GE's blend
+    /// gives the target back unchanged (`ge_blend_term`), so the program
+    /// only adds the dither to the target and cuts it again. Exact, and
+    /// no colour maths: Monster Hunter Freedom draws a full-screen quad of
+    /// alpha 0, dithered, every frame in the field (~6.5 ms of GPU time
+    /// with the normal program).
+    Invisible,
+}
+
+/// One term of the GE's blend: colour `c` times factor `f` (both 0..255)
+/// as ((2c + 1)(2f + 1)) >> 10 (PPSSPP GPU/Software/DrawPixel.cpp, probed
+/// on hardware; nativeres_textured_read_f.cg does the same in floats).
+pub fn ge_blend_term(c: u32, f: u32) -> u32 {
+    ((2 * c + 1) * (2 * f + 1)) >> 10
 }
 
 /// The frame-read program a draw into a 16-bit target gets.
@@ -250,6 +265,19 @@ pub enum ReadVariant {
     /// stays (else the alpha is written, as blended); `dither` = the GE's
     /// dither value is added after the blend (`draw_flags::DITHER`).
     Fast { way: ReadWay, keep_alpha: bool, dither: bool },
+}
+
+impl ReadVariant {
+    /// The variant for an untextured draw whose vertex alphas are all 0
+    /// (so is every fragment's alpha: interpolated zeros): a normal alpha
+    /// blend becomes `ReadWay::Invisible` (the same picture), anything
+    /// else stays as it is.
+    pub fn for_invisible_source(self) -> ReadVariant {
+        match self {
+            ReadVariant::Fast { way: ReadWay::Normal, keep_alpha, dither } => ReadVariant::Fast { way: ReadWay::Invisible, keep_alpha, dither },
+            other => other,
+        }
+    }
 }
 
 /// The frame-read program for a draw into a 16-bit target with `flags`
@@ -2373,6 +2401,34 @@ mod tests {
         assert_eq!(read_variant(f5551, BLEND_FIX_B_ALPHA, false, true), fast(ReadWay::Off, false));
         assert_eq!(read_variant(target(draw_flags::TARGET_565), normal, false, true), ReadVariant::Generic);
         assert_eq!(read_variant(target(draw_flags::TARGET_4444), normal, false, true), ReadVariant::Generic);
+    }
+
+    #[test]
+    fn a_normal_blend_of_alpha_0_leaves_the_target_as_it_is() {
+        // ReadWay::Invisible's reason: source term 0 for every colour, the
+        // destination term (factor 255 - 0) the target itself.
+        for target in 0..=255 {
+            for color in 0..=255 {
+                assert_eq!(ge_blend_term(color, 0) + ge_blend_term(target, 255), target, "colour {color}, target {target}");
+            }
+        }
+        // Not so for alpha 1: a target of 255 comes back as 254.
+        assert_eq!(ge_blend_term(0, 1) + ge_blend_term(255, 254), 254);
+    }
+
+    #[test]
+    fn only_normal_blends_become_invisible() {
+        let fast = |way, keep_alpha, dither| ReadVariant::Fast { way, keep_alpha, dither };
+        for keep_alpha in [false, true] {
+            for dither in [false, true] {
+                let normal = fast(ReadWay::Normal, keep_alpha, dither);
+                assert_eq!(normal.for_invisible_source(), fast(ReadWay::Invisible, keep_alpha, dither));
+                for way in [ReadWay::Add, ReadWay::Off, ReadWay::Precut] {
+                    assert_eq!(fast(way, keep_alpha, dither).for_invisible_source(), fast(way, keep_alpha, dither));
+                }
+            }
+        }
+        assert_eq!(ReadVariant::Generic.for_invisible_source(), ReadVariant::Generic);
     }
 
     #[test]
