@@ -112,6 +112,16 @@ pub fn ours_to_draw(screen: AdrenalineScreen) -> bool {
 /// more than this (0..765): far above what upscaling and filtering change.
 pub const CPU_PICTURE_DIFFERENCE: u32 = 96;
 
+/// A sample also differs when ours is black (R + G + B below
+/// `CPU_PICTURE_OURS_BLACK`) and Sony's is not (at least
+/// `CPU_PICTURE_SONY_LIT`): a dark picture missing from our target. MTX's
+/// boot loading screen is dimmed art (R + G + B ~25..120) that stays under
+/// CPU_PICTURE_DIFFERENCE against black in most cells. Above dithered black
+/// (a few levels per channel), and only against our black: dark against our
+/// own dark picture is still judged by CPU_PICTURE_DIFFERENCE.
+pub const CPU_PICTURE_OURS_BLACK: u32 = 16;
+pub const CPU_PICTURE_SONY_LIT: u32 = 32;
+
 /// Whether a frame with few draws shows a picture the CPU wrote (loading
 /// screens, movies): the screen cells no draw touches, Sony's picture
 /// (`sony`) against ours (`ours`; `None` when our target holds nothing yet,
@@ -124,13 +134,20 @@ pub const CPU_PICTURE_DIFFERENCE: u32 = 96;
 /// every frame into the still empty target was drawn by us: black with the
 /// bar, every other frame (flicker). An empty target is black, which is
 /// what we would show.
+///
+/// 2026-11-18: that picture is dark, so a dark sample over our black counts
+/// as different too (`CPU_PICTURE_OURS_BLACK`).
 pub fn shows_cpu_written_picture(sony: &[u32], ours: Option<&[u32]>) -> bool {
     const BLACK: u32 = 0xFF00_0000;
     let difference = |a: u32, b: u32| (0..3).map(|channel| ((a >> (8 * channel)) & 0xFF).abs_diff((b >> (8 * channel)) & 0xFF)).sum::<u32>();
+    let differs = |sony: u32, ours: u32| {
+        difference(sony, ours) > CPU_PICTURE_DIFFERENCE
+            || (difference(ours, BLACK) < CPU_PICTURE_OURS_BLACK && difference(sony, BLACK) >= CPU_PICTURE_SONY_LIT)
+    };
     let differing = sony
         .iter()
         .enumerate()
-        .filter(|&(index, &pixel)| difference(pixel, ours.map_or(BLACK, |ours| ours.get(index).copied().unwrap_or(BLACK))) > CPU_PICTURE_DIFFERENCE)
+        .filter(|&(index, &pixel)| differs(pixel, ours.map_or(BLACK, |ours| ours.get(index).copied().unwrap_or(BLACK))))
         .count();
     sony.len() >= 8 && 2 * differing >= sony.len()
 }
@@ -149,6 +166,35 @@ mod tests {
         assert!(!shows_cpu_written_picture(&sony, Some(&[0xFF80_8080; 100])), "ours shows the same");
         assert!(!shows_cpu_written_picture(&[0xFF00_0000; 100], None), "Sony's is black too");
         assert!(!shows_cpu_written_picture(&sony[..4], None), "too few samples");
+    }
+
+    /// MTX's boot loading screen (2026-11-18): the game draws the picture
+    /// (dimmed art + white text) once, while our renderer was still starting
+    /// (its texture waited a frame, then the bar-only frames superseded it),
+    /// so our targets hold only the bar. In Sony's picture 75 of the 120
+    /// free cells were dark (R + G + B 2..96, the art dimmed), 45 brighter:
+    /// against black, under half differed by more than CPU_PICTURE_DIFFERENCE
+    /// and the screen stayed black with the bar. Dark against our black
+    /// counts as different; dark against our own dark picture doesn't.
+    #[test]
+    fn a_dark_cpu_picture_is_found_over_an_empty_target() {
+        use super::shows_cpu_written_picture;
+        // 75 dimmed-art cells (R + G + B = 34 .. 92), 45 bright text cells.
+        let mut sony = [0u32; 120];
+        for (index, pixel) in sony.iter_mut().enumerate() {
+            let level = if index < 75 { 12 + (index as u32 % 20) } else { 110 };
+            *pixel = 0xFF00_0000 | (level - 4) << 16 | level << 8 | (level + 4);
+        }
+        assert!(shows_cpu_written_picture(&sony, None), "empty target: the dark picture is missing from ours");
+        assert!(shows_cpu_written_picture(&sony, Some(&[0xFF00_0000; 120])), "ours black with the bar");
+        assert!(!shows_cpu_written_picture(&sony, Some(&sony)), "ours shows the same dark picture");
+        let ours_slightly_darker: [u32; 120] = core::array::from_fn(|index| {
+            let level = (sony[index] >> 8 & 0xFF) * 3 / 4;
+            0xFF00_0000 | level << 16 | level << 8 | level
+        });
+        assert!(!shows_cpu_written_picture(&sony, Some(&ours_slightly_darker)), "filtering differences, not a missing picture");
+        let near_black = [0xFF03_0303u32; 120];
+        assert!(!shows_cpu_written_picture(&near_black, None), "Sony's near black (dither) over our black");
     }
 
     use super::*;
