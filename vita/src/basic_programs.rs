@@ -263,6 +263,10 @@ pub fn fragment_program(id: PatcherId, blend: *const gxm::BlendInfo, vertex_gxp:
         )
     };
     if result < 0 {
+        // Was silent: a missing program skips its draws (2026-11-18, an MHF
+        // scene went black; is the patcher's USSE memory full?).
+        render_log::line(format_args!("fragment program not made: {:08x}
+", result));
         null_mut()
     } else {
         program

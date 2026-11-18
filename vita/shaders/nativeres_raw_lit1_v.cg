@@ -199,7 +199,7 @@ void main(
 	out float4 vPosition : POSITION,
 	out float2 vTexcoord : TEXCOORD0,
 	out float4 vColor : TEXCOORD1,
-	out float vFog : TEXCOORD2,
+	out float2 vFog : TEXCOORD2,
 	out float3 vSpecular : TEXCOORD3)
 {
 	// The separate specular colour (LIGHTMODE 1), added after texturing by
@@ -243,7 +243,8 @@ void main(
 	vPosition = mul(float4(screenTimesW, 0.0f, clip.w), wvp);
 	vPosition.z = 0.5f * (clip.z - clip.w);
 	vTexcoord = (aTexcoord * uRawUv.xy + uRawUv.zw) * uUvScale;
-	vFog = (view.z * uFog.x + uFog.y) * uFog.z;
+	// Colour, specular and fog times w (screen-linear, see nativeres_3d_v.cg).
+	vFog = float2((view.z * uFog.x + uFog.y) * uFog.z, 1.0f) * clip.w;
 
 	// The colour: raw_vertex.rs RawColors::color.
 	float mode = uFormat.y;
@@ -288,14 +289,14 @@ void main(
 		float3 specularPart = specular * specularColor;
 		if (uLights[20].a > 0.5f) {
 			// Separate specular: after texturing (vSpecular).
-			vSpecular = saturate(specularPart);
+			vSpecular = saturate(specularPart) * clip.w;
 			specularPart = float3(0.0f, 0.0f, 0.0f);
 		}
 		lit.rgb = saturate(uLights[17].rgb + uLights[16].rgb * ambientColor.rgb + diffuse * diffuseColor + specularPart);
 		lit.a = uLights[19].a > 0.5f ? 1.0f : saturate(uLights[16].a * ambientColor.a);
 		if (uColors.y > 0.5f)
 			lit.a = 1.0f;
-		vColor = lit;
+		vColor = lit * clip.w;
 		return;
 	}
 #endif
@@ -316,5 +317,5 @@ void main(
 		color.rgb = float3(255.0f, 255.0f, 255.0f);
 	if (uScale.w > 0.5f)
 		color.rgb = floor((color.rgb * uScale.rgb + 0.5f) * (1.0f / 255.0f));
-	vColor = color * (1.0f / 255.0f);
+	vColor = color * (clip.w * (1.0f / 255.0f));
 }

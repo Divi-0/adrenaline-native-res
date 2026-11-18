@@ -23,7 +23,7 @@ arm-vita-eabi-gcc -Wl,-q -nostartfiles -nostdlib \
   -o "$OUT/nativeres_shadercompiler.elf" \
   target/$VITA_TARGET/release/libnativeres_shadercompiler.a \
   -Wl,--start-group \
-  -lSceShaccCg_stub -lSceLibKernel_stub -lSceIofilemgr_stub -lSceKernelModulemgr_stub -lSceSysmem_stub \
+  -lSceShaccCg_stub -ltaihen_stub -lSceLibKernel_stub -lSceIofilemgr_stub -lSceKernelModulemgr_stub -lSceSysmem_stub \
   -Wl,--end-group
 vita-elf-create "$OUT/nativeres_shadercompiler.elf" "$OUT/nativeres_shadercompiler.velf"
 # Unsafe (no -s): it loads a module from ur0:data.

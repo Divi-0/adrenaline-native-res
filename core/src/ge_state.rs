@@ -325,7 +325,7 @@ pub fn float24(data: u32) -> f32 {
 /// listed. The loaded palette is checked apart (`DrawStateCache::fits`).
 /// The test `registers_left_out_of_the_draw_state_do_not_change_it` (in
 /// recorder.rs) checks that the list is complete.
-pub const DRAW_STATE_REGISTERS: [u8; 55] = [
+pub const DRAW_STATE_REGISTERS: [u8; 60] = [
     // Render target.
     op::FRAMEBUFFER_POINTER,
     op::FRAMEBUFFER_WIDTH,
@@ -335,6 +335,12 @@ pub const DRAW_STATE_REGISTERS: [u8; 55] = [
     // (`blend::alpha_write`).
     op::FRAMEBUFFER_PIXEL_FORMAT,
     op::ALPHA_MASK,
+    // 16-bit targets: dithering and its matrix (`draw_flags::DITHER`).
+    op::DITHER_ENABLE,
+    op::DITHER_ROW_0,
+    op::DITHER_ROW_0 + 1,
+    op::DITHER_ROW_0 + 2,
+    op::DITHER_ROW_0 + 3,
     op::STENCIL_OP,
     // Per-pixel tests and scissor.
     op::ALPHA_TEST_ENABLE,

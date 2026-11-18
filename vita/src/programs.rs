@@ -28,7 +28,7 @@ use core::mem::offset_of;
 use core::ptr::{null, null_mut};
 
 use nativeres_core::blend::{BLEND_ALPHA_ONLY, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_WRITES_ALPHA};
-use nativeres_core::frame::FrameVertex;
+use nativeres_core::frame::{FrameVertex, ReadVariant, ReadWay};
 use nativeres_core::vertex::VertexFormat;
 
 use crate::gxm::{self, PatcherId, ProgramParameter, VertexAttribute, VertexStream};
@@ -304,6 +304,169 @@ pub const SPRITE_CORNERS: usize = 32768;
 #[allow(non_upper_case_globals)]
 pub static nativeres_plan_fixed_sprite_corners: u32 = crate::sys::pages(SPRITE_CORNERS);
 
+/// A frame-read fragment program for draws into the PSP's 16-bit
+/// framebuffers (nativeres_textured_read*_f.cg, the untextured
+/// nativeres_color_read*_f.cg): it reads the pixel under it, blends itself
+/// and cuts the result to the target's bits as the GE does. Made without
+/// GXM blending. The generic one does every blend mode (uniforms); the fast
+/// ones one blend each, 5551 only (core frame.rs `read_variant`); the fast
+/// "off" ones (no blending) read no frame.
+pub struct ReadProgram {
+    tried: bool,
+    pub program: *mut gxm::FragmentProgram,
+    /// Textured only (null for the untextured ones).
+    pub fog_and_scale: *const ProgramParameter,
+    /// The generic one and the fast tested ones only (else null).
+    pub alpha_test: *const ProgramParameter,
+    /// The generic one only (else null).
+    pub blend_fix: *const ProgramParameter,
+    /// The generic one only (null for the fast ones): uSource,
+    /// uDestination, uBlend, uMinMax, uStep, uWiden, uWidenLow, uWrite,
+    /// uPath (the shader's comment), in this order.
+    pub cut: [*const ProgramParameter; 9],
+    pub dither: [*const ProgramParameter; 4],
+}
+
+/// Frame-read programs (`read_index`): untextured generic + four ways x
+/// alpha kept or not; textured the same, the fast ones also with and
+/// without the alpha test.
+const READ_PROGRAMS: usize = 26;
+
+/// The place of a frame-read program in `Programs::read`; `tested`: with
+/// the alpha test (textured only; the generic one always has it).
+fn read_index(textured: bool, tested: bool, variant: ReadVariant) -> usize {
+    match (textured, variant) {
+        (false, ReadVariant::Generic) => 0,
+        (false, ReadVariant::Fast { way, keep_alpha }) => 1 + 2 * way as usize + keep_alpha as usize,
+        (true, ReadVariant::Generic) => 9,
+        (true, ReadVariant::Fast { way, keep_alpha }) => 10 + 2 * (2 * way as usize + keep_alpha as usize) + tested as usize,
+    }
+}
+
+/// The compiled frame-read program of `variant` (as `read_index`). The
+/// "off" ones keep the alpha by GXM's colour mask: one program for both,
+/// and for `ReadWay::Precut` (GXM blends).
+fn read_gxp(textured: bool, tested: bool, variant: ReadVariant) -> *const gxm::Program {
+    use ReadWay::{Add, Normal, Off, Precut};
+    let ReadVariant::Fast { way, keep_alpha } = variant else {
+        return if textured { gxp(&shaders::nativeres_textured_read_f) } else { gxp(&shaders::nativeres_color_read_f) };
+    };
+    if !textured {
+        return match (way, keep_alpha) {
+            (Normal, false) => gxp(&shaders::nativeres_color_read_normal_f),
+            (Normal, true) => gxp(&shaders::nativeres_color_read_normalkeep_f),
+            (Add, false) => gxp(&shaders::nativeres_color_read_add_f),
+            (Add, true) => gxp(&shaders::nativeres_color_read_addkeep_f),
+            (Off | Precut, _) => gxp(&shaders::nativeres_color_read_off_f),
+        };
+    }
+    match (way, keep_alpha, tested) {
+        (Normal, false, false) => gxp(&shaders::nativeres_textured_read_normal_f),
+        (Normal, false, true) => gxp(&shaders::nativeres_textured_read_normaltest_f),
+        (Normal, true, false) => gxp(&shaders::nativeres_textured_read_normalkeep_f),
+        (Normal, true, true) => gxp(&shaders::nativeres_textured_read_normalkeeptest_f),
+        (Add, false, false) => gxp(&shaders::nativeres_textured_read_add_f),
+        (Add, false, true) => gxp(&shaders::nativeres_textured_read_addtest_f),
+        (Add, true, false) => gxp(&shaders::nativeres_textured_read_addkeep_f),
+        (Add, true, true) => gxp(&shaders::nativeres_textured_read_addkeeptest_f),
+        (Off | Precut, _, false) => gxp(&shaders::nativeres_textured_read_off_f),
+        (Off | Precut, _, true) => gxp(&shaders::nativeres_textured_read_offtest_f),
+    }
+}
+
+impl ReadProgram {
+    const fn new() -> ReadProgram {
+        ReadProgram {
+            tried: false,
+            program: null_mut(),
+            fog_and_scale: null(),
+            alpha_test: null(),
+            blend_fix: null(),
+            cut: [null(); 9],
+            dither: [null(); 4],
+        }
+    }
+
+    /// Makes the program on first use: `textured` a textured one (linked
+    /// to nativeres_textured_v), else an untextured one (nativeres_color_v).
+    /// False if it can't be made (the draw then goes the 8-bit way).
+    fn ready(&mut self, textured: bool, tested: bool, variant: ReadVariant) -> bool {
+        if self.tried {
+            return !self.program.is_null();
+        }
+        self.tried = true;
+        let fragment_gxp = read_gxp(textured, tested, variant);
+        let (vertex_gxp, label) = if textured {
+            (gxp(&shaders::nativeres_textured_v), "textured")
+        } else {
+            (gxp(&shaders::nativeres_color_v), "untextured")
+        };
+        let Some(id) = register(fragment_gxp) else {
+            render_log::line(format_args!("16-bit target program ({label}, {variant:?}): invalid GXP\n"));
+            return false;
+        };
+        let generic = variant == ReadVariant::Generic;
+        if generic {
+            self.cut = [
+                parameter(fragment_gxp, b"uSource\0"),
+                parameter(fragment_gxp, b"uDestination\0"),
+                parameter(fragment_gxp, b"uBlend\0"),
+                parameter(fragment_gxp, b"uMinMax\0"),
+                parameter(fragment_gxp, b"uStep\0"),
+                parameter(fragment_gxp, b"uWiden\0"),
+                parameter(fragment_gxp, b"uWidenLow\0"),
+                parameter(fragment_gxp, b"uWrite\0"),
+                parameter(fragment_gxp, b"uPath\0"),
+            ];
+            self.dither = [
+                parameter(fragment_gxp, b"uDither0\0"),
+                parameter(fragment_gxp, b"uDither1\0"),
+                parameter(fragment_gxp, b"uDither2\0"),
+                parameter(fragment_gxp, b"uDither3\0"),
+            ];
+        }
+        let mut missing = generic && self.cut.iter().chain(&self.dither).any(|parameter| parameter.is_null());
+        if textured {
+            self.fog_and_scale = parameter(fragment_gxp, b"uFogAndScale\0");
+            missing |= self.fog_and_scale.is_null();
+            if generic || tested {
+                self.alpha_test = parameter(fragment_gxp, b"uAlphaTest\0");
+                missing |= self.alpha_test.is_null();
+            }
+            if generic {
+                self.blend_fix = parameter(fragment_gxp, b"uBlendFix\0");
+                missing |= self.blend_fix.is_null();
+            }
+        }
+        if missing {
+            render_log::line(format_args!("16-bit target program ({label}, {variant:?}): parameters missing\n"));
+            return false;
+        }
+        // The "off" ones read no frame: GXM keeps the alpha by its colour
+        // mask; the precut ones get GXM's normal alpha blending (the others
+        // are made without GXM blending).
+        let rgb = gxm::COLOR_MASK_R | gxm::COLOR_MASK_G | gxm::COLOR_MASK_B;
+        let keep_rgb = gxm::BlendInfo::new(rgb, gxm::BLEND_FUNC_NONE, gxm::BLEND_FACTOR_ONE, gxm::BLEND_FACTOR_ZERO);
+        // GXM's factors and functions as in `blend_program` (source alpha
+        // 4, one minus source alpha 5, add 0 + 1).
+        let normal = |mask| gxm::BlendInfo::new(mask, 1, 4, 5);
+        let precut_keep = normal(rgb);
+        let precut = normal(gxm::COLOR_MASK_ALL);
+        let info = match variant {
+            ReadVariant::Fast { way: ReadWay::Off, keep_alpha: true } => &keep_rgb as *const gxm::BlendInfo,
+            ReadVariant::Fast { way: ReadWay::Precut, keep_alpha: true } => &precut_keep as *const gxm::BlendInfo,
+            ReadVariant::Fast { way: ReadWay::Precut, keep_alpha: false } => &precut as *const gxm::BlendInfo,
+            _ => null(),
+        };
+        self.program = basic_programs::fragment_program(id, info, vertex_gxp);
+        render_log::line(format_args!(
+            "16-bit target program ({label}, {variant:?}) {}\n",
+            if self.program.is_null() { "failed" } else { "ready" }
+        ));
+        !self.program.is_null()
+    }
+}
+
 struct BlendProgram {
     kind: Kind,
     blend: u32,
@@ -321,6 +484,8 @@ pub struct Programs {
     pub sprites: SpriteSet,
     blend: [BlendProgram; MAX_BLEND_PROGRAMS],
     blend_count: usize,
+    /// Draws into 16-bit PSP targets (`read_index`).
+    read: [ReadProgram; READ_PROGRAMS],
 }
 
 const NO_BLEND_PROGRAM: BlendProgram = BlendProgram { kind: Kind::Color, blend: 0, program: null_mut() };
@@ -624,7 +789,21 @@ impl Programs {
             sprites: SpriteSet::new(),
             blend: [NO_BLEND_PROGRAM; MAX_BLEND_PROGRAMS],
             blend_count: 0,
+            read: [const { ReadProgram::new() }; READ_PROGRAMS],
         }
+    }
+
+    /// The frame-read program `variant` for a draw into a 16-bit PSP
+    /// target (`textured` or not, `tested`: with the alpha test), or None
+    /// if it can't be made.
+    pub fn read_program(&mut self, textured: bool, tested: bool, variant: ReadVariant) -> Option<&ReadProgram> {
+        let program = &mut self.read[read_index(textured, tested, variant)];
+        program.ready(textured, tested, variant).then_some(&*program)
+    }
+
+    /// The frame-read program made before (`read_program`).
+    pub fn made_read_program(&self, textured: bool, tested: bool, variant: ReadVariant) -> &ReadProgram {
+        &self.read[read_index(textured, tested, variant)]
     }
 
     /// The raw program set of `variant`.

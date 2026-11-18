@@ -3197,6 +3197,21 @@ fn work_out_draw_state(catalog: &mut Catalog, stats: &mut FrameStats, palette: &
         ..Draw::default()
     };
     (draw.scissor_left, draw.scissor_top, draw.scissor_right, draw.scissor_bottom) = ge.scissor();
+    // 16-bit targets: the display cuts colours as the GE does
+    // (`draw_flags::TARGET_FORMAT_SHIFT`); dithering not in clear mode
+    // (PPSSPP neither).
+    let target = match ge.register(op::FRAMEBUFFER_PIXEL_FORMAT) & 3 {
+        0 => draw_flags::TARGET_565,
+        1 => draw_flags::TARGET_5551,
+        2 => draw_flags::TARGET_4444,
+        _ => 0,
+    };
+    draw.flags |= target << draw_flags::TARGET_FORMAT_SHIFT;
+    if target != 0 && ge.register(op::DITHER_ENABLE) & 1 != 0 && !ge.is_clear_mode() {
+        draw.flags |= draw_flags::DITHER;
+        let row = |index: u8| (ge.register(op::DITHER_ROW_0 + index) & 0xFFFF) as u64;
+        catalog.set_dither_matrix(row(0) | row(1) << 16 | row(2) << 32 | row(3) << 48);
+    }
     // Back-face culling; never in clear mode (`draw_flags::CULL`).
     if ge.register(op::CULL_FACE_ENABLE) & 1 != 0 && !ge.is_clear_mode() {
         draw.flags |= draw_flags::CULL | if ge.register(op::CULL) & 1 != 0 { draw_flags::CULL_CCW } else { 0 };
@@ -3529,6 +3544,50 @@ mod tests {
     /// (random register values, so enables, texture formats with and
     /// without palettes, clear mode and blend modes all come up), changing
     /// any register not listed leaves the worked-out draw state the same.
+    #[test]
+    fn draws_into_16_bit_targets_say_so_with_their_dithering() {
+        // MHF draws into a 5551 framebuffer with dithering on (guild hall,
+        // 2026-11-17); FF1 and MTX into 8888 ones.
+        let mut frame = new_boxed_frame();
+        let mut stats = FrameStats::new();
+        let mut palette = LoadedPalette::new();
+        let frame_pointer: *mut Frame = &mut *frame;
+        // Safe: one thread; the catalog is only used here.
+        let mut catalog = unsafe { Frame::catalog_raw(frame_pointer) };
+        let mut ge = GeState::new();
+        ge.set_register(cmd(op::FRAMEBUFFER_PIXEL_FORMAT, 1));
+        ge.set_register(cmd(op::DITHER_ENABLE, 1));
+        for (row, value) in [0x000f0f, 0x00f0f1, 0x000f0f, 0x0000f1].into_iter().enumerate() {
+            ge.set_register(cmd(op::DITHER_ROW_0 + row as u8, value));
+        }
+        let state = work_out_draw_state(&mut catalog, &mut stats, &mut palette, &ge).unwrap();
+        assert_eq!(crate::frame::target_channel_bits(state.draw.flags), Some([5, 5, 5, 1]));
+        assert_ne!(state.draw.flags & draw_flags::DITHER, 0);
+        drop(catalog);
+        assert_eq!(frame.dither_matrix, 0x000f0f | 0x00f0f1 << 16 | 0x000f0f << 32 | 0x0000f1 << 48);
+
+        let frame_pointer: *mut Frame = &mut *frame;
+        // Safe: as above.
+        let mut catalog = unsafe { Frame::catalog_raw(frame_pointer) };
+        let formats = [(0, Some([5, 6, 5, 0])), (2, Some([4, 4, 4, 4])), (3, None)];
+        for (format, bits) in formats {
+            ge.set_register(cmd(op::FRAMEBUFFER_PIXEL_FORMAT, format));
+            let state = work_out_draw_state(&mut catalog, &mut stats, &mut palette, &ge).unwrap();
+            assert_eq!(crate::frame::target_channel_bits(state.draw.flags), bits, "format {format}");
+            assert_eq!(state.draw.flags & draw_flags::DITHER != 0, bits.is_some(), "format {format}");
+        }
+        // No dithering when it is off, nor in clear mode.
+        ge.set_register(cmd(op::FRAMEBUFFER_PIXEL_FORMAT, 1));
+        ge.set_register(cmd(op::DITHER_ENABLE, 0));
+        let state = work_out_draw_state(&mut catalog, &mut stats, &mut palette, &ge).unwrap();
+        assert_eq!(state.draw.flags & draw_flags::DITHER, 0);
+        ge.set_register(cmd(op::DITHER_ENABLE, 1));
+        ge.set_register(cmd(op::CLEAR_MODE, 1));
+        let state = work_out_draw_state(&mut catalog, &mut stats, &mut palette, &ge).unwrap();
+        assert_eq!(state.draw.flags & draw_flags::DITHER, 0);
+        assert_ne!(state.draw.flags & draw_flags::TARGET_FORMAT_MASK, 0, "clears are still cut");
+    }
+
     #[test]
     fn registers_left_out_of_the_draw_state_do_not_change_it() {
         use crate::ge_state::DRAW_STATE_REGISTERS;

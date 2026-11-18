@@ -2,8 +2,10 @@
 //
 // aPosition: x, y in vita2d's 960x544 units, z, and w. The position is
 // multiplied by w after the projection, so the GPU divides by it again:
-// the picture is unchanged, but texture coordinates, colours and fog are
-// then interpolated with perspective (w = 1 for 2D draws).
+// the picture is unchanged, but texture coordinates are then interpolated
+// with perspective (w = 1 for 2D draws). Colour and fog leave times w, with
+// w in vFog.y, so the fragment program gets them linear on the screen, as
+// the PSP shades (see nativeres_3d_v.cg).
 // aColor: per-vertex colour (PSP vertex colour or material colour, with the
 // texture function applied), RGBA bytes read as 0..1.
 // aFog: PSP fog factor, 1 = no fog, 0 = fog colour (see nativeres_textured_f.cg).
@@ -19,7 +21,7 @@ void main(
 	out float4 vPosition : POSITION,
 	out float2 vTexcoord : TEXCOORD0,
 	out float4 vColor : TEXCOORD1,
-	out float vFog : TEXCOORD2,
+	out float2 vFog : TEXCOORD2,
 	out float3 vSpecular : TEXCOORD3)
 {
 	// The separate specular colour (LIGHTMODE 1), added after texturing by
@@ -27,6 +29,7 @@ void main(
 	vSpecular = float3(0.0f, 0.0f, 0.0f);
 	vPosition = mul(float4(aPosition.xyz, 1.0f), wvp) * aPosition.w;
 	vTexcoord = aTexcoord;
-	vColor = aColor;
-	vFog = aFog;
+	// Times w, see nativeres_3d_v.cg (screen-linear colour and fog).
+	vColor = aColor * aPosition.w;
+	vFog = float2(aFog, 1.0f) * aPosition.w;
 }

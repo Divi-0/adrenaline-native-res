@@ -31,6 +31,13 @@
 // Only vertices in front of the PSP's near plane come here (the capture
 // clips the others), so clip.w > 0.
 //
+// Screen-linear colour and fog (the PSP's Gouraud shading and fog are not
+// perspective corrected, ppsspp-ref GPU/Software/Rasterizer.cpp "Color
+// interpolation is not perspective corrected on the PSP"): the GPU
+// interpolates every varying with perspective, so colour, specular and fog
+// leave here times w, with w itself in vFog.y; the fragment program divides
+// by the interpolated w, which leaves the screen-linear value.
+//
 // Compiled on the Vita with the shader compiler app (README.md "Shaders").
 
 // The GE's pow for lighting, as PPSSPP's shader without bit operations:
@@ -59,7 +66,7 @@ void main(
 	out float4 vPosition : POSITION,
 	out float2 vTexcoord : TEXCOORD0,
 	out float4 vColor : TEXCOORD1,
-	out float vFog : TEXCOORD2,
+	out float2 vFog : TEXCOORD2,
 	out float3 vSpecular : TEXCOORD3)
 {
 	// The separate specular colour (LIGHTMODE 1), added after texturing by
@@ -72,7 +79,7 @@ void main(
 	// As nativeres_textured_v.cg: times w, so the GPU interpolates with perspective.
 	vPosition = mul(float4(screen, 1.0f), wvp) * clip.w;
 	vTexcoord = aTexcoord * uUvScale;
-	vFog = dot(uFogRow, p);
+	vFog = float2(dot(uFogRow, p), 1.0f) * clip.w;
 
 	float4 color = aColor;
 	if (uNormalRows[3].x > 0.5f) {
@@ -98,11 +105,11 @@ void main(
 		float3 specularPart = specular * specularColor;
 		if (uLights[20].a > 0.5f) {
 			// Separate specular: after texturing (vSpecular).
-			vSpecular = saturate(specularPart);
+			vSpecular = saturate(specularPart) * clip.w;
 			specularPart = float3(0.0f, 0.0f, 0.0f);
 		}
 		color.rgb = saturate(uLights[17].rgb + uLights[16].rgb * ambientColor.rgb + diffuse * diffuseColor + specularPart);
 		color.a = uLights[19].a > 0.5f ? 1.0f : saturate(uLights[16].a * ambientColor.a);
 	}
-	vColor = color;
+	vColor = color * clip.w;
 }

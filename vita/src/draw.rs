@@ -22,9 +22,10 @@ use core::ffi::c_void;
 use core::ptr::{null, null_mut};
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, Ordering};
 
-use nativeres_core::blend::{BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_WRITES_ALPHA};
+use nativeres_core::blend::{BLEND_ALPHA_ONLY, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_WRITES_ALPHA};
 use nativeres_core::frame::{
-    draw_flags, test_flags, Draw, Frame, FrameVertex, GpuLights, GpuTransform, RawCamera, RawColors, RawTransform, NO_RING_INDICES,
+    draw_flags, read_variant, test_flags, Draw, Frame, FrameVertex, GpuLights, GpuTransform, RawCamera, RawColors, RawTransform, ReadVariant,
+    ReadWay, NO_RING_INDICES,
 };
 use nativeres_core::texture;
 use nativeres_core::vertex::VertexFormat;
@@ -57,6 +58,25 @@ const PRIM_SPRITES: u16 = 6;
 /// nothing per draw (the last two in frame_loop.rs). Only set while the
 /// bench runs (pictures are wrong then).
 pub static REDRAW_SKIP: AtomicU32 = AtomicU32::new(0);
+/// Frame draws GXM refused (sceGxmDraw < 0) and the last refusal's code
+/// (debug "drawerrors"; the first few are also logged).
+pub static DRAW_ERRORS: AtomicU32 = AtomicU32::new(0);
+pub static LAST_DRAW_ERROR: AtomicU32 = AtomicU32::new(0);
+/// Debug "nodepth 1": every draw without the depth test (diagnosis).
+pub static NO_DEPTH: AtomicI32 = AtomicI32::new(0);
+
+/// Counts and logs a refused frame draw.
+fn note_draw_result(result: i32) {
+    if result >= 0 {
+        return;
+    }
+    let count = DRAW_ERRORS.fetch_add(1, Ordering::Relaxed);
+    LAST_DRAW_ERROR.store(result as u32, Ordering::Relaxed);
+    if count < 8 {
+        render_log::line(format_args!("sceGxmDraw refused a draw: {:08x}
+", result));
+    }
+}
 
 /// Draw checks (off by default since 2026-11-10, after the frame pool
 /// ended the GPU crashes: ~0.6-0.8 ms of display CPU per frame). Before each textured draw goes to the GPU, the bytes its
@@ -106,6 +126,112 @@ pub static RAW_VARIANTS: AtomicI32 = AtomicI32::new(1);
 /// lights; the same picture). 1 = on (default), 0 = the general ones.
 pub static RAW_FLAT_LIGHTS: AtomicI32 = AtomicI32::new(1);
 
+/// Draws into the PSP's 16-bit framebuffers (`draw_flags::
+/// TARGET_FORMAT_SHIFT`, Monster Hunter Freedom) get the frame-read
+/// programs, which blend themselves and cut the colour to the target's bits
+/// as the GE does (2026-11-17: MHF's guild hall was ~7 levels brighter and
+/// greyer than Sony's: faint additive glow passes the PSP's 5 bits drop).
+/// 1 = on (default: the fast programs where they fit, core frame.rs
+/// `read_variant`), 0 = blended in 8 bits as before; 2 = measuring only:
+/// the generic frame-read program writes the colour unblended and uncut;
+/// 3 = the generic program for every such draw (to compare pictures);
+/// 4 = normal alpha blends without the frame read (`ReadWay::Precut`);
+/// measuring: 5 = only unblended draws cut, 6 = only blended ones.
+pub static TARGET_CUT: AtomicI32 = AtomicI32::new(1);
+
+/// A GXM blend factor (core blend.rs `Factor` numbers) as the frame-read
+/// program's coefficients: k0 + k1 s + k2 s.a + k3 d + k4 d.a, returned as
+/// (k0, [k1, k2, k3, k4]).
+fn factor_coefficients(factor: u32) -> (f32, [f32; 4]) {
+    match factor {
+        1 => (1.0, [0.0, 0.0, 0.0, 0.0]),
+        2 => (0.0, [1.0, 0.0, 0.0, 0.0]),
+        3 => (1.0, [-1.0, 0.0, 0.0, 0.0]),
+        4 => (0.0, [0.0, 1.0, 0.0, 0.0]),
+        5 => (1.0, [0.0, -1.0, 0.0, 0.0]),
+        6 => (0.0, [0.0, 0.0, 1.0, 0.0]),
+        7 => (1.0, [0.0, 0.0, -1.0, 0.0]),
+        8 => (0.0, [0.0, 0.0, 0.0, 1.0]),
+        9 => (1.0, [0.0, 0.0, 0.0, -1.0]),
+        _ => (0.0, [0.0; 4]),
+    }
+}
+
+/// The frame-read program's blend and cut uniforms (uSource, uDestination,
+/// uBlend, uMinMax, uStep, uWiden, uWidenLow, uWrite, uPath; see
+/// nativeres_textured_read_f.cg) for packed `blend` (`blending`: on, not
+/// alpha only), the target's channel `bits`, which channels it writes and
+/// whether it is dithered.
+fn cut_uniforms(blend: u32, blending: bool, bits: [u32; 4], writes_color: bool, writes_alpha: bool, dithered: bool) -> [[f32; 4]; 9] {
+    let (source, destination, equation) = if blending { (blend & 0xF, (blend >> 4) & 0xF, (blend >> 8) & 7) } else { (1, 0, 0) };
+    let (source_constant, source_terms) = factor_coefficients(source);
+    let (destination_constant, destination_terms) = factor_coefficients(destination);
+    let (source_sign, destination_sign) = match equation {
+        1 => (1.0, -1.0),
+        2 => (-1.0, 1.0),
+        _ => (1.0, 1.0),
+    };
+    let min_max = match equation {
+        3 => [1.0, 0.0, 0.0, 0.0],
+        4 => [1.0, 1.0, 0.0, 0.0],
+        _ => [0.0; 4],
+    };
+    // Per channel: 1 / step, the step, the repeated top bits' factor.
+    let step = bits.map(|bits| if bits == 0 { 1.0 } else { (1u32 << bits) as f32 / 256.0 });
+    let widen = bits.map(|bits| match bits {
+        0 => 1.0,
+        1 => 255.0,
+        _ => (256 >> bits) as f32,
+    });
+    let widen_low = bits.map(|bits| if bits <= 1 { 0.0 } else { (256 >> bits) as f32 / (1u32 << bits) as f32 });
+    let color = if writes_color { 1.0 } else { 0.0 };
+    let write = [color, color, color, if writes_alpha { 1.0 } else { 0.0 }];
+    // The shader's short ways: normal alpha blending, additive, none.
+    let way = match (blending, source, destination, equation) {
+        (false, ..) => 2.0,
+        (true, 4, 5, 0) => 0.0,
+        (true, 4, 1, 0) => 1.0,
+        _ => 3.0,
+    };
+    let measuring = if TARGET_CUT.load(Ordering::Relaxed) == 2 { 1.0 } else { 0.0 };
+    let path = [way, if dithered { 1.0 } else { 0.0 }, measuring, 0.0];
+    [
+        source_terms,
+        destination_terms,
+        [source_constant, destination_constant, source_sign, destination_sign],
+        min_max,
+        step,
+        widen,
+        widen_low,
+        write,
+        path,
+    ]
+}
+
+/// The alpha-test range that lets every fragment pass (the frame-read
+/// program always runs its alpha test).
+const ALPHA_ALL_PASS: [f32; 4] = [0.0, 255.0, 0.0, 0.0];
+
+/// The frame-read program for `draw` if it goes to a 16-bit PSP target
+/// whose colour is cut as the GE does (`TARGET_CUT`), else None (the 8-bit
+/// way); `keep_target_alpha` as `Draws::keep_target_alpha`.
+fn read_choice(draw: &Draw, keep_target_alpha: bool) -> Option<ReadVariant> {
+    let mode = TARGET_CUT.load(Ordering::Relaxed);
+    if draw.flags & draw_flags::TARGET_FORMAT_MASK == 0 || mode == 0 {
+        return None;
+    }
+    if mode == 2 || mode == 3 {
+        return Some(ReadVariant::Generic);
+    }
+    let variant = read_variant(draw.flags, draw.blend, keep_target_alpha, mode != 4);
+    let off = matches!(variant, ReadVariant::Fast { way: ReadWay::Off, .. });
+    match mode {
+        5 if !off => None,
+        6 if off => None,
+        _ => Some(variant),
+    }
+}
+
 /// Measuring only (0 = off): our scene draws only
 /// its top <rows> pixel rows, to see how the GPU time scales with the area
 /// drawn.
@@ -115,6 +241,42 @@ pub static GPU_CLIP_ROWS: AtomicI32 = AtomicI32::new(0);
 /// `draw_mip_test`.
 pub static INDEX_TEST_FRAMES: AtomicI32 = AtomicI32::new(0);
 pub static MIP_TEST_FRAMES: AtomicI32 = AtomicI32::new(0);
+/// "shadetest <frames>": `draw_shade_test` after each of the next frames.
+pub static SHADE_TEST_FRAMES: AtomicI32 = AtomicI32::new(0);
+
+/// One quad of the shade test: its left and right corners' w and colour
+/// (0xAABBGGRR), the fog factor at every corner, the fragment program's
+/// fog colour and colour scale, and whether it goes through the alpha-test
+/// program. tools/shadetest.py has the same table and the expected pixels.
+struct ShadeCase {
+    w: [f32; 2],
+    color: [u32; 2],
+    fog: f32,
+    fog_and_scale: [f32; 4],
+    tested: bool,
+}
+
+/// The shade test's texel: one colour over the whole texture, so filtering
+/// can't change it (r 200, g 120, b 60, a 255).
+const SHADE_TEST_TEXEL: u32 = 0xFF3C_78C8;
+const SHADE_FOG: [f32; 4] = [127.0, 96.0, 79.0, 1.0];
+const SHADE_TESTS: [ShadeCase; 7] = [
+    // 2D (w 1), no fog.
+    ShadeCase { w: [1.0, 1.0], color: [0xFF32_6496; 2], fog: 1.0, fog_and_scale: [0.0, 0.0, 0.0, 1.0], tested: false },
+    // 3D, the same w at every corner.
+    ShadeCase { w: [4.0, 4.0], color: [0xFF32_6496; 2], fog: 1.0, fog_and_scale: [0.0, 0.0, 0.0, 1.0], tested: false },
+    // 3D, w 1 .. 8 across, half fog.
+    ShadeCase { w: [1.0, 8.0], color: [0xFF32_6496; 2], fog: 0.5, fog_and_scale: SHADE_FOG, tested: false },
+    // ... with colour doubling.
+    ShadeCase { w: [1.0, 8.0], color: [0xFF32_6496; 2], fog: 0.25, fog_and_scale: [SHADE_FOG[0], SHADE_FOG[1], SHADE_FOG[2], 2.0], tested: false },
+    // ... through the alpha-test program (alpha 200, all pass).
+    ShadeCase { w: [1.0, 8.0], color: [0xC832_6496; 2], fog: 0.75, fog_and_scale: SHADE_FOG, tested: true },
+    // Black to white across, w 1 .. 8: screen-linear, the middle is grey
+    // (with perspective it would be near black).
+    ShadeCase { w: [1.0, 8.0], color: [0xFF00_0000, 0xFFFF_FFFF], fog: 1.0, fog_and_scale: [0.0, 0.0, 0.0, 1.0], tested: false },
+    // MHF's ground: fogged, w 2 .. 6, through the alpha-test program.
+    ShadeCase { w: [2.0, 6.0], color: [0xFFAA_BBCC; 2], fog: 0.4, fog_and_scale: SHADE_FOG, tested: true },
+];
 /// The raw lod_bias field for the mip test (-1: as sceGxmTextureInitLinear
 /// leaves it), to learn its scale.
 pub static MIP_TEST_BIAS: AtomicI32 = AtomicI32::new(-1);
@@ -277,13 +439,14 @@ fn reserve_fragment_uniforms() -> *mut c_void {
     buffer
 }
 
-/// The program's colour scale and fog colour: rgb fog colour, a colour
+/// The program's colour scale and fog colour: rgb the fog colour as the
+/// GE's 8-bit values (0..255, as `GeShade` computes with them), a colour
 /// scale 2 with colour doubling (the shader clamps the result, like the PSP).
 fn fog_and_scale(draw: &Draw) -> [f32; 4] {
     let mut values = [0.0, 0.0, 0.0, if draw.flags & draw_flags::DOUBLE_COLOR != 0 { 2.0 } else { 1.0 }];
     if draw.flags & draw_flags::FOG != 0 {
         for (channel, value) in values.iter_mut().take(3).enumerate() {
-            *value = ((draw.fog_color >> (8 * channel)) & 0xFF) as f32 / 255.0;
+            *value = ((draw.fog_color >> (8 * channel)) & 0xFF) as f32;
         }
     }
     values
@@ -413,7 +576,7 @@ impl Draws {
     /// A draw's depth test and depth writes. Like on the PSP, depth is
     /// written only by draws with the depth test on (clears: "always").
     fn use_depth(&mut self, draw: &Draw) {
-        if draw.tests & test_flags::DEPTH_TEST == 0 {
+        if draw.tests & test_flags::DEPTH_TEST == 0 || NO_DEPTH.load(Ordering::Relaxed) != 0 {
             self.set_depth(gxm::DEPTH_FUNC_ALWAYS, gxm::DEPTH_WRITE_DISABLED);
             return;
         }
@@ -563,6 +726,72 @@ impl Draws {
         set_uniform(buffer, alpha_test, 4, alpha_range.as_ptr());
         self.state.tint = Some((parameter, fog_bits));
         self.alpha_test_cache = range_bits;
+    }
+
+    /// The uniforms of frame-read program `variant` (`Programs::
+    /// read_program`) for `draw`: for the generic one the blend GXM would do
+    /// (`Programs::blend_program`), the target's channel bits and the GE's
+    /// dither matrix; for the textured ones also fog, colour scale, alpha
+    /// test (`ALPHA_ALL_PASS` without) and BLEND_FIX. The fast untextured
+    /// ones have none.
+    fn read_fragment_uniforms(&mut self, frame: &Frame, draw: &Draw, variant: ReadVariant, tested: bool, textured: Option<([f32; 4], [f32; 4])>) {
+        let Some(bits) = nativeres_core::frame::target_channel_bits(draw.flags) else {
+            return;
+        };
+        stats().cut_draws += 1;
+        let generic = variant == ReadVariant::Generic;
+        if let ReadVariant::Fast { way, .. } = variant {
+            stats().cut_fast_draws += 1;
+            if matches!(way, ReadWay::Off | ReadWay::Precut) {
+                stats().cut_off_draws += 1;
+            }
+            if textured.is_none() {
+                return;
+            }
+        }
+        let program = self.programs.made_read_program(textured.is_some(), tested, variant);
+        let mut blend = draw.blend;
+        if !self.keep_target_alpha && blend & BLEND_ALPHA_ONLY == 0 {
+            blend |= BLEND_WRITES_ALPHA; // as blend_program: nobody reads it
+        }
+        let enabled = blend & BLEND_ENABLED != 0;
+        let writes_alpha = blend & BLEND_WRITES_ALPHA != 0;
+        let alpha_only = writes_alpha && blend & BLEND_ALPHA_ONLY != 0;
+        let dithered = draw.flags & draw_flags::DITHER != 0;
+        let buffer = reserve_fragment_uniforms();
+        if generic {
+            let cut = cut_uniforms(blend, enabled && !alpha_only, bits, !alpha_only, writes_alpha, dithered);
+            let rows: [[f32; 4]; 4] = core::array::from_fn(|y| {
+                core::array::from_fn(|x| if dithered { nativeres_core::frame::dither_value(frame.dither_matrix, x, y) as f32 } else { 0.0 })
+            });
+            for (parameter, values) in program.cut.iter().zip(&cut) {
+                set_uniform(buffer, *parameter, 4, values.as_ptr());
+            }
+            for (parameter, row) in program.dither.iter().zip(&rows) {
+                set_uniform(buffer, *parameter, 4, row.as_ptr());
+            }
+        }
+        if let Some((fog_and_scale, alpha_range)) = textured {
+            // BLEND_FIX: rgb x (x + y * source alpha), alpha -> FIX B.
+            let fix = if enabled && blend & BLEND_FIX_B_ALPHA != 0 {
+                let fix_b = ((blend >> 12) & 0xFF) as f32 / 255.0;
+                match (blend >> 20) & 3 {
+                    1 => [0.0, 1.0, 1.0, fix_b],
+                    2 => [1.0, -1.0, 1.0, fix_b],
+                    _ => [1.0, 0.0, 1.0, fix_b],
+                }
+            } else {
+                [1.0, 0.0, 0.0, 0.0]
+            };
+            set_uniform(buffer, program.fog_and_scale, 4, fog_and_scale.as_ptr());
+            if !program.alpha_test.is_null() {
+                set_uniform(buffer, program.alpha_test, 4, alpha_range.as_ptr());
+            }
+            if !program.blend_fix.is_null() {
+                set_uniform(buffer, program.blend_fix, 4, fix.as_ptr());
+            }
+        }
+        self.state.tint = None; // the cached default buffer is no longer the one in use
     }
 
     /// The 3D program with `transform` (a draw in model space) and
@@ -838,7 +1067,18 @@ impl Draws {
             }
         }
         let keep = self.keep_target_alpha;
-        let mut fragment = if programs_ready {
+        // A 16-bit PSP target: the frame-read program (alpha test included).
+        let choice = read_choice(draw, keep);
+        let read_variant = choice.unwrap_or(ReadVariant::Generic);
+        let read_program = match choice {
+            Some(variant) if programs_ready => self.programs.read_program(true, tested, variant).map(|program| program.program),
+            _ => None,
+        };
+        let read = read_program.is_some();
+        let read_alpha_range = if tested { alpha_range } else { ALPHA_ALL_PASS };
+        let mut fragment = if let Some(program) = read_program {
+            program
+        } else if programs_ready {
             self.programs.blend_program(if tested { Kind::TexturedTest } else { Kind::Textured }, draw.blend, keep)
         } else {
             null_mut()
@@ -957,7 +1197,11 @@ impl Draws {
             stats().convert_us += draw_clock().wrapping_sub(convert_start);
             if !skip(2) {
                 self.use_raw_transform(frame, draw, set, program, blocks, colors, uv_scale, fragment);
-                self.textured_fragment_uniforms(tested, fog_and_scale(draw), alpha_range, draw.blend);
+                if read {
+                    self.read_fragment_uniforms(frame, draw, read_variant, tested, Some((fog_and_scale(draw), read_alpha_range)));
+                } else {
+                    self.textured_fragment_uniforms(tested, fog_and_scale(draw), alpha_range, draw.blend);
+                }
             }
         } else if !fragment.is_null() {
             if draw.flags & draw_flags::CACHED_VERTICES != 0 {
@@ -999,7 +1243,11 @@ impl Draws {
                         self.use_programs(vertex, wvp, matrix, fragment);
                     }
                 }
-                self.textured_fragment_uniforms(tested, fog_and_scale(draw), alpha_range, draw.blend);
+                if read {
+                    self.read_fragment_uniforms(frame, draw, read_variant, tested, Some((fog_and_scale(draw), read_alpha_range)));
+                } else {
+                    self.textured_fragment_uniforms(tested, fog_and_scale(draw), alpha_range, draw.blend);
+                }
             }
         } else {
             self.use_default_viewport();
@@ -1082,7 +1330,7 @@ impl Draws {
                 gxm::sceGxmSetVertexStream(context(), 1, (out as *const u8).add(sprite_stride as usize) as *const c_void);
                 gxm::sceGxmSetVertexStream(context(), 2, self.programs.sprites.corners as *const c_void);
             }
-            gxm::sceGxmDraw(context(), gxm::PRIMITIVE_TRIANGLES, gxm::INDEX_FORMAT_U16, indices as *const c_void, index_count);
+            note_draw_result(gxm::sceGxmDraw(context(), gxm::PRIMITIVE_TRIANGLES, gxm::INDEX_FORMAT_U16, indices as *const c_void, index_count));
         }
     }
 
@@ -1111,7 +1359,15 @@ impl Draws {
             *out = basic_programs::ColorVertex { x: vertex.x * SCALE, y: vertex.y * SCALE, z: gpu_depth(vertex.z), color: vertex.color };
         }
         stats().convert_us += draw_clock().wrapping_sub(convert_start);
-        let fragment = self.programs.blend_program(Kind::Color, draw.blend, self.keep_target_alpha);
+        let choice = read_choice(draw, self.keep_target_alpha);
+        let read_variant = choice.unwrap_or(ReadVariant::Generic);
+        let read_program = choice.and_then(|variant| self.programs.read_program(false, false, variant).map(|program| program.program));
+        let read = read_program.is_some();
+        let fragment = if let Some(program) = read_program {
+            program
+        } else {
+            self.programs.blend_program(Kind::Color, draw.blend, self.keep_target_alpha)
+        };
         self.use_default_viewport();
         let Some(basic) = basic_programs::get() else {
             return;
@@ -1119,6 +1375,9 @@ impl Draws {
         if !skip(2) {
             let fragment = if fragment.is_null() { basic.color_fragment } else { fragment };
             self.use_programs(basic.color_vertex, basic.color_wvp, basic_programs::ORTHO.as_ptr(), fragment);
+            if read {
+                self.read_fragment_uniforms(frame, draw, read_variant, false, None);
+            }
         }
         if skip(1) {
             return;
@@ -1126,7 +1385,7 @@ impl Draws {
         // Safe: vertices and indices in the frame pool, the programs set.
         unsafe {
             gxm::sceGxmSetVertexStream(context(), 0, out as *const c_void);
-            gxm::sceGxmDraw(context(), gxm::PRIMITIVE_TRIANGLES, gxm::INDEX_FORMAT_U16, indices as *const c_void, index_count);
+            note_draw_result(gxm::sceGxmDraw(context(), gxm::PRIMITIVE_TRIANGLES, gxm::INDEX_FORMAT_U16, indices as *const c_void, index_count));
         }
     }
 
@@ -1230,6 +1489,82 @@ impl Draws {
     /// squares per row, the texture repeated 2, 4, ... 128 times across each,
     /// so the GPU (point mip filter) samples level 0, 1, ... 6. A right
     /// layout gives seven clean colours per row. In the test block.
+    /// The shade test (`SHADE_TESTS`): one 30x30 quad per case at PSP x
+    /// 20 + 40 i, y 100, through our textured programs exactly as a draw
+    /// goes (vertex program, fragment program for no blending, uniforms),
+    /// unblended over the frame. The PC tests never run the compiled
+    /// programs; tools/shadetest.py checks these pixels against the GE's
+    /// arithmetic (2026-11-18: a whole MHF scene came out black once while
+    /// the PC replay was right).
+    fn draw_shade_test(&mut self) {
+        if !self.programs.textured_ready() {
+            return;
+        }
+        // An 8x8 texture of one colour from the frame pool (GPU-mapped, kept
+        // until the frame is drawn; not the 1 MiB test block, which a game
+        // short of phycont memory like MHF doesn't leave room for).
+        let texels = frame_pool_alloc(64 * 4, 64) as *mut u32;
+        if texels.is_null() {
+            return;
+        }
+        for i in 0..64 {
+            // Safe: the pool gave room for 64 texels.
+            unsafe { texels.add(i).write(SHADE_TEST_TEXEL) };
+        }
+        let mut texture = gxm::Texture { control_words: [0; 4] };
+        // Safe: our texture struct over the block.
+        unsafe {
+            gxm::sceGxmTextureInitLinear(&mut texture, texels as *const c_void, gxm::TEXTURE_FORMAT_U8U8U8U8_ABGR, 8, 8, 0);
+            gxm::sceGxmTextureSetMinFilter(&mut texture, gxm::TEXTURE_FILTER_POINT);
+            gxm::sceGxmTextureSetMagFilter(&mut texture, gxm::TEXTURE_FILTER_POINT);
+        }
+        self.prepare_test();
+        self.state.vertex_program = null(); // our matrix, set anew
+        let vertex = self.programs.textured.vertex as *const c_void;
+        let wvp = self.programs.textured.wvp;
+        let matrix = self.native_matrix();
+        self.use_texture(&texture);
+        for (i, case) in SHADE_TESTS.iter().enumerate() {
+            let tested = case.tested && self.programs.textured.have_test;
+            let kind = if tested { Kind::TexturedTest } else { Kind::Textured };
+            let fragment = self.programs.blend_program(kind, 0, self.keep_target_alpha);
+            if fragment.is_null() {
+                continue;
+            }
+            self.use_programs(vertex, wvp, matrix, fragment as *const c_void);
+            self.textured_fragment_uniforms(tested, case.fog_and_scale, ALPHA_ALL_PASS, 0);
+            let vertices = frame_pool_alloc(4 * core::mem::size_of::<FrameVertex>() as u32, 8) as *mut FrameVertex;
+            let indices = frame_pool_alloc(6 * 2, 2) as *mut u16;
+            if vertices.is_null() || indices.is_null() {
+                return;
+            }
+            let (left, top, size) = (20.0 + 40.0 * i as f32, 100.0, 30.0);
+            let corner = |x: f32, y: f32, side: usize, u: f32, v: f32| FrameVertex {
+                x,
+                y,
+                z: 0.5,
+                w: case.w[side],
+                u,
+                v,
+                color: case.color[side],
+                fog: case.fog,
+            };
+            let quad = [
+                corner(left, top, 0, 0.0, 0.0),
+                corner(left + size, top, 1, 1.0, 0.0),
+                corner(left, top + size, 0, 0.0, 1.0),
+                corner(left + size, top + size, 1, 1.0, 1.0),
+            ];
+            // Safe: the pool gave room for 4 vertices and 6 indices.
+            unsafe {
+                core::ptr::copy_nonoverlapping(quad.as_ptr(), vertices, 4);
+                core::ptr::copy_nonoverlapping([0u16, 1, 2, 1, 3, 2].as_ptr(), indices, 6);
+                gxm::sceGxmSetVertexStream(context(), 0, vertices as *const c_void);
+                gxm::sceGxmDraw(context(), gxm::PRIMITIVE_TRIANGLES, gxm::INDEX_FORMAT_U16, indices as *const c_void, 6);
+            }
+        }
+    }
+
     fn draw_mip_test(&mut self) {
         const COLORS: [u32; 7] = [0xFF00_00FF, 0xFF00_FF00, 0xFFFF_0000, 0xFF00_FFFF, 0xFFFF_FF00, 0xFFFF_00FF, 0xFFFF_FFFF];
         let block = self.test_block();
@@ -1567,6 +1902,10 @@ pub fn draw_tests() {
     if MIP_TEST_FRAMES.load(Ordering::Relaxed) > 0 {
         MIP_TEST_FRAMES.fetch_sub(1, Ordering::Relaxed);
         draws.draw_mip_test();
+    }
+    if SHADE_TEST_FRAMES.load(Ordering::Relaxed) > 0 {
+        SHADE_TEST_FRAMES.fetch_sub(1, Ordering::Relaxed);
+        draws.draw_shade_test();
     }
     if ALPHA_LOG.load(Ordering::Relaxed) != 0 {
         draws.write_alpha_log();

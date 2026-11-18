@@ -209,7 +209,14 @@ pub mod op {
     /// Texture level 0 stride (bits 0..11) and address bits 24..28 (bits 16..20).
     pub const TEXTURE_BUFFER_WIDTH_0: u8 = 0xA8;
     pub const TEXTURE_FORMAT: u8 = 0xC3;
+    /// Render target pixel format: 0 = 565, 1 = 5551, 2 = 4444, 3 = 8888.
     pub const FRAMEBUFFER_PIXEL_FORMAT: u8 = 0xD2;
+    /// Dithering on (bit 0): 16-bit targets get the dither matrix's value
+    /// added before their colours are cut to 4..6 bits.
+    pub const DITHER_ENABLE: u8 = 0x20;
+    /// The dither matrix's rows 0..3 (0xE2..0xE5), four signed 4-bit
+    /// entries each (bits 0..16, column 0 lowest).
+    pub const DITHER_ROW_0: u8 = 0xE2;
     /// Colour write mask: a set bit keeps that framebuffer bit unchanged
     /// (bits 0..24 = RGB). All set = the draw writes no visible colour.
     pub const COLOR_MASK: u8 = 0xE8;

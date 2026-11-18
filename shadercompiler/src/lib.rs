@@ -183,6 +183,284 @@ extern "C" {
     fn sceIoDclose(fd: SceUID) -> i32;
 }
 
+// ---- The compiler's Vita language extensions ----
+//
+// Sony's runtime compiler ships with its Vita-specific Cg extensions
+// switched off: `__nativecolor` / `__regformat` (frame-read fragment
+// programs, which read the pixel under them and do the blending
+// themselves: nativeres_*_read_f.cg) are then unknown words. One flag in
+// the compile state turns them on; the compiler's function that fills that
+// state is hooked (taiHEN, in this app's process only) to set it. Found by
+// SceShaccCgExt (bythos14, Rinnegatamante; LGPL): its
+// `sceShaccCgExtEnableExtensions` sets the same byte at the same place,
+// for the same two builds of the module (checked by module NID).
+
+/// libshacccg builds whose layout the hook knows (SceShaccCgExt's list).
+const KNOWN_SHACCCG_NIDS: [u32; 2] = [0xEE15_880D, 0x6C3C_7547];
+/// The function filling the compile state (Thumb, segment 0).
+const FILL_STATE_OFFSET: u32 = 0x1F_E7A4;
+/// Its seventh argument + this: the "extension support" byte.
+const EXTENSION_FLAG_AT: usize = 0x14;
+/// The first argument + this: a pointer to the compile options' copy;
+/// its byte PEDANTIC_FLAG_AT goes to the third argument + PEDANTIC_ERROR_AT.
+const PEDANTIC_OPTIONS_AT: usize = 0x90;
+const PEDANTIC_FLAG_AT: usize = 0x3A;
+const PEDANTIC_ERROR_AT: usize = 0x0B;
+
+/// taihen.h tai_module_info_t.
+#[repr(C)]
+struct TaiModuleInfo {
+    size: u32,
+    modid: SceUID,
+    module_nid: u32,
+    name: [u8; 27],
+    exports_start: usize,
+    exports_end: usize,
+    imports_start: usize,
+    imports_end: usize,
+}
+const _: () = assert!(core::mem::size_of::<TaiModuleInfo>() == 56);
+
+/// taihen.h tai_offset_args_t.
+#[repr(C)]
+struct TaiOffsetArgs {
+    size: u32,
+    modid: SceUID,
+    segidx: i32,
+    offset: u32,
+    thumb: i32,
+    source: *const c_void,
+    /// For injections only (0 for a hook).
+    source_size: u32,
+}
+const _: () = assert!(core::mem::size_of::<TaiOffsetArgs>() == 28);
+
+/// taihen.h struct _tai_hook_user: what a tai_hook_ref_t points at.
+#[repr(C)]
+struct TaiHookUser {
+    next: *const TaiHookUser,
+    func: *const c_void,
+    old: *const c_void,
+}
+
+extern "C" {
+    fn taiGetModuleInfo(module: *const u8, info: *mut TaiModuleInfo) -> i32;
+    fn taiHookFunctionOffsetForUser(hook: *mut usize, args: *mut TaiOffsetArgs) -> SceUID;
+    fn taiHookRelease(uid: SceUID, hook: usize) -> i32;
+    fn taiInjectDataForUser(args: *mut TaiOffsetArgs) -> SceUID;
+    fn taiInjectRelease(uid: SceUID) -> i32;
+    fn sceKernelGetModuleInfo(uid: SceUID, info: *mut SceKernelModuleInfo) -> i32;
+}
+
+/// psp2common/kernel/modulemgr.h SceKernelModuleInfo (0x1B8 bytes); only
+/// the first segment's address is read.
+#[repr(C)]
+struct SceKernelModuleInfo {
+    size: u32,
+    head: [u8; 0x154 - 4],
+    segments: [SceKernelSegmentInfo; 4],
+    state: u32,
+}
+
+#[repr(C)]
+struct SceKernelSegmentInfo {
+    size: u32,
+    perms: u32,
+    vaddr: usize,
+    memsz: u32,
+    filesz: u32,
+    res: u32,
+}
+const _: () = assert!(core::mem::size_of::<SceKernelModuleInfo>() == 0x1B8);
+
+// ---- Intrinsics: GPU instructions as Cg functions ----
+//
+// Declarations with `__attribute__((Intrinsic, OpcodeName(...)))` make a
+// function one instruction (FBLEND: the GPU's 8-bit blend, which GXM's
+// patcher appends to blending fragment programs). Only the compiler's own
+// internal source may declare them. Before every compile it loads its
+// standard library text through one function (`LoadInternalString`);
+// SceShaccCgExt (as above) patches the call site to call its own loader
+// instead, which loads its declarations, then the standard library. The
+// same patches here, with our own declarations (INTRINSICS: only what our
+// frame-read programs use).
+
+/// The compiler's loader of internal source: (its state, NUL-terminated text).
+const LOAD_INTERNAL_STRING_OFFSET: usize = 0x20_11EC;
+/// The standard library's text (NUL-terminated) in segment 0.
+const STDLIB_TEXT_OFFSET: usize = 0x29_A778;
+/// The call that loads the standard library: replaced by a call to
+/// `load_internal_source` (r0 = the state, r1 = no_stdlib).
+const LOAD_CALL_OFFSET: u32 = 0x20_1D02;
+/// The two ways into it (standard library and none): both now set r1 =
+/// no_stdlib (r3) and branch to LOAD_CALL_OFFSET.
+const NOSTDLIB_PATH_OFFSET: u32 = 0x20_1D32;
+const STDLIB_PATH_OFFSET: u32 = 0x20_1B9C;
+
+/// Thumb: movw r2, #lo; movt r2, #hi; mov r0, r4; blx r2; nop. The halves
+/// of the address are filled in by `movw_movt`.
+const LOAD_CALL_PATCH: [u16; 7] = [0xF240, 0x0200, 0xF2C0, 0x0200, 0x4620, 0x4790, 0xBF00];
+/// Thumb: mov r1, r3; b LOAD_CALL_OFFSET (from NOSTDLIB_PATH_OFFSET).
+const NOSTDLIB_PATH_PATCH: [u16; 2] = [0x4619, 0xE7E5];
+/// Thumb: mov r1, r3; b.w LOAD_CALL_OFFSET (from STDLIB_PATH_OFFSET).
+const STDLIB_PATH_PATCH: [u16; 3] = [0x4619, 0xF000, 0xB8B0];
+
+/// Our intrinsic declarations (SceShaccCgExt's names and constants, so
+/// sources read the same; operand order as FBLEND/FWBLEND take them).
+/// Blend ops: ADD 1, SUB 2, MIN 3, MAX 4. Factors: ZERO 1, ONE 2, SRC1 3,
+/// ONE_MINUS_SRC1 4, SRC2 5, ONE_MINUS_SRC2 6, SRC1_ALPHA 9,
+/// ONE_MINUS_SRC1_ALPHA 10, SRC2_ALPHA 11, ONE_MINUS_SRC2_ALPHA 12. Write
+/// mask bits R 1, G 2, B 4, A 8.
+static INTRINSICS: &[u8] = b"\
+#define __BLEND_OP_ADD 1
+#define __BLEND_OP_SUB 2
+#define __BLEND_OP_MIN 3
+#define __BLEND_OP_MAX 4
+#define __BLEND_FACTOR_ZERO 1
+#define __BLEND_FACTOR_ONE 2
+#define __BLEND_FACTOR_SRC1 3
+#define __BLEND_FACTOR_ONE_MINUS_SRC1 4
+#define __BLEND_FACTOR_SRC2 5
+#define __BLEND_FACTOR_ONE_MINUS_SRC2 6
+#define __BLEND_FACTOR_SRC1_ALPHA 9
+#define __BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA 10
+#define __BLEND_FACTOR_SRC2_ALPHA 11
+#define __BLEND_FACTOR_ONE_MINUS_SRC2_ALPHA 12
+#define __BLEND_WMASK_RGB 7
+#define __BLEND_WMASK_RGBA 15
+unsigned char4 __fastblend(unsigned char4 src1, unsigned char4 src2, int colorOp, int colorFactor1, int colorFactor2, int alphaOp, int alphaFactor1, int alphaFactor2) __attribute__((Intrinsic, OpcodeName(\"FBLEND\")));
+unsigned char4 __fastblend_writemask(unsigned char4 src1, unsigned char4 src2, int colorOp, int factor1, int factor2, int alphaOp, unsigned char4 passThrough, int writeMask) __attribute__((Intrinsic, OpcodeName(\"FWBLEND\")));
+unsigned char4 __add_sat(unsigned char4 a, unsigned char4 b) __attribute__((Intrinsic, OpcodeName(\"ADDSAT\")));
+unsigned char4 __mul_sat(unsigned char4 a, unsigned char4 b) __attribute__((Intrinsic, OpcodeName(\"MULSAT\")));
+unsigned char4 __min(unsigned char4 a, unsigned char4 b) __attribute__((Intrinsic, OpcodeName(\"MIN\")));
+unsigned char4 __max(unsigned char4 a, unsigned char4 b) __attribute__((Intrinsic, OpcodeName(\"MAX\")));
+unsigned short __pixel_x() __attribute__((Intrinsic, OpcodeName(\"PIXEL_X\")));
+unsigned short __pixel_y() __attribute__((Intrinsic, OpcodeName(\"PIXEL_Y\")));
+\0";
+
+type LoadInternalString = unsafe extern "C" fn(*mut c_void, *const u8) -> bool;
+
+/// The compiler's loader and its standard library text, set before the
+/// patches go in.
+static LOADER: Shared<(usize, usize)> = Shared(UnsafeCell::new((0, 0)));
+
+/// Called by the patched compiler where it loaded its standard library.
+/// `no_stdlib` is the options' byte as the compiler holds it (a register:
+/// not trusted to be 0 or 1, so not a Rust bool).
+unsafe extern "C" fn load_internal_source(state: *mut c_void, no_stdlib: u32) -> bool {
+    let (load, stdlib) = *LOADER.0.get();
+    let load: LoadInternalString = core::mem::transmute(load);
+    load(state, INTRINSICS.as_ptr()) && (no_stdlib & 0xFF != 0 || load(state, stdlib as *const u8))
+}
+
+/// `movw rN, #lo; movt rN, #hi` (Thumb-2, in `patch[0..4]`) for `value`.
+fn movw_movt(patch: &mut [u16], value: u32) {
+    for (half, immediate) in [(0, value & 0xFFFF), (2, value >> 16)] {
+        patch[half] |= ((((immediate & 0x800) >> 11) << 10) | ((immediate & 0xF000) >> 12)) as u16;
+        patch[half + 1] |= ((immediate & 0xFF) | (((immediate & 0x700) >> 8) << 12)) as u16;
+    }
+}
+
+/// Puts in the loader patches: their inject ids, or why not (any put in
+/// are released then).
+fn enable_intrinsics(modid: SceUID) -> Result<[SceUID; 3], Text<128>> {
+    // Safe: our own structs; the patched code is only run by the compiler,
+    // on this thread, after all three patches are in.
+    unsafe {
+        let mut module: SceKernelModuleInfo = core::mem::zeroed();
+        module.size = core::mem::size_of::<SceKernelModuleInfo>() as u32;
+        let found = sceKernelGetModuleInfo(modid, &mut module);
+        if found < 0 {
+            return Err(Text::of(format_args!("module info: {:08x}", found as u32)));
+        }
+        let segment = module.segments[0].vaddr;
+        *LOADER.0.get() = ((segment + LOAD_INTERNAL_STRING_OFFSET) | 1, segment + STDLIB_TEXT_OFFSET);
+
+        let mut call = LOAD_CALL_PATCH;
+        movw_movt(&mut call, load_internal_source as *const () as usize as u32);
+        let patches: [(u32, *const u16, usize); 3] = [
+            (LOAD_CALL_OFFSET, call.as_ptr(), call.len()),
+            (NOSTDLIB_PATH_OFFSET, NOSTDLIB_PATH_PATCH.as_ptr(), NOSTDLIB_PATH_PATCH.len()),
+            (STDLIB_PATH_OFFSET, STDLIB_PATH_PATCH.as_ptr(), STDLIB_PATH_PATCH.len()),
+        ];
+        let mut ids = [-1; 3];
+        for (index, &(offset, code, halves)) in patches.iter().enumerate() {
+            let mut args = TaiOffsetArgs {
+                size: core::mem::size_of::<TaiOffsetArgs>() as u32,
+                modid,
+                segidx: 0,
+                offset,
+                thumb: 0,
+                source: code as *const c_void,
+                source_size: (halves * 2) as u32,
+            };
+            let id = taiInjectDataForUser(&mut args);
+            if id < 0 {
+                for &done in &ids[..index] {
+                    taiInjectRelease(done);
+                }
+                return Err(Text::of(format_args!("inject at {offset:x} failed: {:08x}", id as u32)));
+            }
+            ids[index] = id;
+        }
+        Ok(ids)
+    }
+}
+
+/// The hook's continuation (taiHEN's tai_hook_ref_t), set once before the
+/// compiler runs.
+static FILL_STATE_REF: Shared<usize> = Shared(UnsafeCell::new(0));
+
+type FillState = unsafe extern "C" fn(u32, u32, u32, u32, u32, u32, u32, u32) -> *mut c_void;
+
+/// The hooked function: sets the extension byte, then goes on as taiHEN's
+/// TAI_CONTINUE does (the next hook, or the original).
+unsafe extern "C" fn fill_state_hook(a1: u32, a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32, a8: u32) -> *mut c_void {
+    *((a7 as usize + EXTENSION_FLAG_AT) as *mut u8) = 1;
+    // Extensions only an error when the options ask for pedantic errors
+    // (the options' flag copied into the third argument's state; else
+    // e.g. the FRAGCOLOR semantic is refused "as an extension").
+    let options = *((a1 as usize + PEDANTIC_OPTIONS_AT) as *const *const u8);
+    *((a3 as usize + PEDANTIC_ERROR_AT) as *mut u8) = *options.add(PEDANTIC_FLAG_AT);
+    let current = *FILL_STATE_REF.0.get() as *const TaiHookUser;
+    let next = (*current).next;
+    let target = if next.is_null() { (*current).old } else { (*next).func };
+    let target: FillState = core::mem::transmute(target);
+    target(a1, a2, a3, a4, a5, a6, a7, a8)
+}
+
+/// Turns the extensions on: the hook's id and the compiler's module id, or
+/// why not.
+fn enable_extensions() -> Result<(SceUID, SceUID), Text<128>> {
+    // Safe: taiHEN calls with our own structs; the hook is installed
+    // before the compiler is first called, on this thread.
+    unsafe {
+        let mut info: TaiModuleInfo = core::mem::zeroed();
+        info.size = core::mem::size_of::<TaiModuleInfo>() as u32;
+        let found = taiGetModuleInfo(b"SceShaccCg\0".as_ptr(), &mut info);
+        if found < 0 {
+            return Err(Text::of(format_args!("SceShaccCg not found: {:08x}", found as u32)));
+        }
+        if !KNOWN_SHACCCG_NIDS.contains(&info.module_nid) {
+            return Err(Text::of(format_args!("unknown libshacccg build (NID {:08x})", info.module_nid)));
+        }
+        let mut args = TaiOffsetArgs {
+            size: core::mem::size_of::<TaiOffsetArgs>() as u32,
+            modid: info.modid,
+            segidx: 0,
+            offset: FILL_STATE_OFFSET,
+            thumb: 1,
+            source: fill_state_hook as *const c_void,
+            source_size: 0,
+        };
+        let hook = taiHookFunctionOffsetForUser(FILL_STATE_REF.0.get(), &mut args);
+        if hook < 0 {
+            return Err(Text::of(format_args!("hook failed: {:08x}", hook as u32)));
+        }
+        Ok((hook, info.modid))
+    }
+}
+
 // ---- Small helpers ----
 
 /// A static touched by one thread at a time (the app's main thread; the
@@ -518,9 +796,32 @@ fn run() {
     } else if heap_init() {
         // Safe: the heap is ready; the compiler is loaded.
         unsafe { sceShaccCgSetDefaultAllocator(heap_malloc, heap_free) };
+        let extensions = enable_extensions();
+        let intrinsics = match &extensions {
+            Ok((_, modid)) => {
+                let intrinsics = enable_intrinsics(*modid);
+                match &intrinsics {
+                    Ok(_) => say(format_args!("# extensions on, intrinsics on\n")),
+                    Err(why) => say(format_args!("# extensions on, intrinsics off: {}\n", core::str::from_utf8(why.as_bytes()).unwrap_or("?"))),
+                }
+                intrinsics.ok()
+            }
+            Err(why) => {
+                say(format_args!("# extensions off: {}\n", core::str::from_utf8(why.as_bytes()).unwrap_or("?")));
+                None
+            }
+        };
         compile_all();
-        // Safe: the compiler is loaded.
-        unsafe { sceShaccCgReleaseCompiler() };
+        // Safe: the compiler is loaded; the hook and the patches are ours.
+        unsafe {
+            sceShaccCgReleaseCompiler();
+            for id in intrinsics.into_iter().flatten() {
+                taiInjectRelease(id);
+            }
+            if let Ok((hook, _)) = extensions {
+                taiHookRelease(hook, *FILL_STATE_REF.0.get());
+            }
+        }
         let (peak, top, total, live, failed, bad_frees) = with_heap(|state| {
             let heap = &state.heap;
             (heap.peak(), heap.top(), heap.total_allocations(), heap.allocations(), heap.failed(), heap.bad_frees())

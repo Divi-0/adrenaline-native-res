@@ -17,10 +17,18 @@
 //!
 //! We do the same and hand the Vita the result like a 2D draw, plus each
 //! vertex's w. With a perspective projection (Final Fantasy's world map is a
-//! tilted plane seen with a 60 degree field of view) texture coordinates,
-//! colours and fog must not be interpolated linearly across the screen, but
-//! in proportion to 1 / w: the Vita's vertex program multiplies the position
-//! by w again so the GPU divides it out and interpolates that way.
+//! tilted plane seen with a 60 degree field of view) texture coordinates
+//! must not be interpolated linearly across the screen, but in proportion to
+//! 1 / w: the Vita's vertex program multiplies the position by w again so the
+//! GPU divides it out and interpolates that way. Colours and fog are the
+//! exception: the PSP interpolates them linearly on the screen (ppsspp-ref
+//! GPU/Software/Rasterizer.cpp, "Color interpolation is not perspective
+//! corrected on the PSP"; fog "through the depth plane, like Gouraud color").
+//! The vertex programs hand them over times w (w in vFog.y) and the fragment
+//! programs divide by the interpolated w, which undoes the perspective.
+//! Monster Hunter Freedom bakes its ground light and shadow edges into vertex
+//! colours of large ground triangles: with perspective they came out up to
+//! 4 levels brighter.
 //!
 //! Skinning (vertices with weights): before step 1, the position is
 //! replaced by the sum of `weight[i] * bone[i] * position` over the vertex's

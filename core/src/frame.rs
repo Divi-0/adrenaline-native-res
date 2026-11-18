@@ -165,6 +165,124 @@ pub mod draw_flags {
     /// texture's lod bias field (31 + this).
     pub const MIP_BIAS_SHIFT: u32 = 16;
     pub const MIP_BIAS_MASK: u32 = 0xFF << MIP_BIAS_SHIFT;
+    /// The PSP target's pixel format when it has 16 bits (bits 25..27,
+    /// `TARGET_565` / `TARGET_5551` / `TARGET_4444`; 0 = 8888). The PSP
+    /// cuts every pixel it writes there to 4..6 bits per channel, after
+    /// blending: faint additive passes (MHF's fire glow) add nothing where
+    /// our 8-bit targets add them up. The display then blends in the
+    /// fragment program and cuts the colour the same way
+    /// (`quantize_like_the_ge`).
+    pub const TARGET_FORMAT_SHIFT: u32 = 25;
+    pub const TARGET_FORMAT_MASK: u32 = 3 << TARGET_FORMAT_SHIFT;
+    pub const TARGET_565: u32 = 1;
+    pub const TARGET_5551: u32 = 2;
+    pub const TARGET_4444: u32 = 3;
+    /// With a 16-bit target: dithering on, `Frame::dither_matrix` added to
+    /// the colour before it is cut.
+    pub const DITHER: u32 = 1 << 27;
+}
+
+/// What the GE writes into a 16-bit target for an 8-bit colour channel
+/// (0..255, already blended): `dither` added (-8..7, 0 without), clamped,
+/// cut to `bits` bits (the GE drops the low bits), and widened back to 8
+/// bits the way a 16-bit framebuffer is read (the top bits repeated below,
+/// `color.rs` `expand`), since our targets keep 8 bits per channel.
+/// One bit (5551's alpha) widens to 0 or 255.
+pub fn quantize_like_the_ge(value: i32, dither: i32, bits: u32) -> u32 {
+    let cut = ((value + dither).clamp(0, 255) as u32) >> (8 - bits);
+    match bits {
+        1 => cut * 255,
+        _ => (cut << (8 - bits)) | (cut >> (2 * bits - 8)),
+    }
+}
+
+/// Bits per channel (R, G, B, A) of a 16-bit target
+/// (`draw_flags::TARGET_FORMAT_SHIFT`); None for 8888.
+pub fn target_channel_bits(flags: u32) -> Option<[u32; 4]> {
+    match (flags & draw_flags::TARGET_FORMAT_MASK) >> draw_flags::TARGET_FORMAT_SHIFT {
+        draw_flags::TARGET_565 => Some([5, 6, 5, 0]),
+        draw_flags::TARGET_5551 => Some([5, 5, 5, 1]),
+        draw_flags::TARGET_4444 => Some([4, 4, 4, 4]),
+        _ => None,
+    }
+}
+
+/// Entry (`x`, `y`) of a dither matrix as the GE keeps it
+/// (`Frame::dither_matrix`: row r in bits 16r..16r+16, four signed 4-bit
+/// entries, column 0 lowest), for PSP pixel (`x`, `y`).
+pub fn dither_value(matrix: u64, x: usize, y: usize) -> i32 {
+    let nibble = (matrix >> (16 * (y % 4) + 4 * (x % 4))) & 0xF;
+    ((nibble as i32) << 28) >> 28
+}
+
+/// The fast frame-read programs' cut of an 8-bit channel to 5 bits,
+/// widened back, as bit operations (nativeres_textured_read_f.cg
+/// READ_FAST: `v & 0xF8 | v >> 5`, four channels per instruction).
+/// The same as `quantize_like_the_ge(v, 0, 5)` (tests).
+pub fn cut_to_5_bits(value: u8) -> u8 {
+    (value & 0xF8) | (value >> 5)
+}
+
+/// The blend of a fast frame-read program (`ReadVariant`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReadWay {
+    /// Source alpha, one minus source alpha, add.
+    Normal,
+    /// Source alpha, one, add.
+    Add,
+    /// No blending.
+    Off,
+    /// Normal alpha blending by GXM, of the source cut to 5 bits first (no
+    /// frame read): exact where the source alpha is 255 or 0 (most pixels
+    /// of alpha-tested foliage), elsewhere GXM's rounding and no cut after
+    /// the blend (one 5-bit step at most). Frame-read draws cost MHF's
+    /// intro ~12-16 ms of GPU time (`read_variant`'s `exact_normal`).
+    Precut,
+}
+
+/// The frame-read program a draw into a 16-bit target gets.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReadVariant {
+    /// The generic program: any format, blend and dithering, in floating
+    /// point (uniforms).
+    Generic,
+    /// A fast one (5551, no dithering): its blend; `keep_alpha` = the
+    /// target's alpha stays (else the alpha is written, as blended).
+    Fast { way: ReadWay, keep_alpha: bool },
+}
+
+/// The frame-read program for a draw into a 16-bit target with `flags`
+/// and packed `blend` (`Draw::blend`), `keep_target_alpha` while a game
+/// reads its targets' alpha (the PSP's stencil). As the Vita's 8-bit
+/// path: without `keep_target_alpha` every draw writes the alpha (nobody
+/// reads it, so its cut doesn't matter). The fast programs only cut to 5
+/// bits: a draw that writes an alpha that is read (5551's one bit) gets
+/// the generic one; so do BLEND_FIX draws (FIX B through the alpha: the
+/// generic program's premultiply). `exact_normal`: normal alpha blends
+/// read the frame and blend as the GE does, else `ReadWay::Precut`.
+pub fn read_variant(flags: u32, blend: u32, keep_target_alpha: bool, exact_normal: bool) -> ReadVariant {
+    use crate::blend::{BLEND_ALPHA_ONLY, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_WRITES_ALPHA};
+    let format = (flags & draw_flags::TARGET_FORMAT_MASK) >> draw_flags::TARGET_FORMAT_SHIFT;
+    let alpha_only = blend & BLEND_WRITES_ALPHA != 0 && blend & BLEND_ALPHA_ONLY != 0;
+    let fix = blend & BLEND_ENABLED != 0 && blend & BLEND_FIX_B_ALPHA != 0;
+    if format != draw_flags::TARGET_5551 || flags & draw_flags::DITHER != 0 || alpha_only || fix {
+        return ReadVariant::Generic;
+    }
+    let writes_alpha = !keep_target_alpha || blend & BLEND_WRITES_ALPHA != 0;
+    if writes_alpha && keep_target_alpha {
+        return ReadVariant::Generic;
+    }
+    let way = if blend & BLEND_ENABLED == 0 {
+        ReadWay::Off
+    } else {
+        match (blend & 0xF, (blend >> 4) & 0xF, (blend >> 8) & 7) {
+            (4, 5, 0) if exact_normal => ReadWay::Normal,
+            (4, 5, 0) => ReadWay::Precut,
+            (4, 1, 0) => ReadWay::Add,
+            _ => return ReadVariant::Generic,
+        }
+    };
+    ReadVariant::Fast { way, keep_alpha: !writes_alpha }
 }
 
 /// The corners of triangle `t` of a strip, counted from its first vertex:
@@ -716,6 +834,10 @@ pub struct Frame {
     /// (`frame_builder`) go between them when the frame is finished. Part of
     /// the geometry.
     pub draw_merge_floor: u32,
+    /// The GE's dither matrix (`dither_value`), for draws with
+    /// `draw_flags::DITHER`: the one of the frame's last draw whose state was
+    /// worked out with dithering on. Part of the catalog.
+    pub dither_matrix: u64,
 }
 
 /// `Frame::draw_ring_index` of a draw whose list isn't in the ring.
@@ -803,6 +925,7 @@ impl Frame {
             palette_word_count,
             overflowed,
             last_texture,
+            dither_matrix,
             vertices,
             indices,
             draws,
@@ -868,6 +991,7 @@ impl Frame {
                 palette_word_count,
                 overflowed,
                 last_texture,
+                dither_matrix,
                 textures,
                 texture_lookup,
                 palette_count,
@@ -965,6 +1089,7 @@ impl Frame {
             palette_word_count: &mut *addr_of_mut!((*frame).palette_word_count),
             overflowed: &mut *addr_of_mut!((*frame).overflowed),
             last_texture: &mut *addr_of_mut!((*frame).last_texture),
+            dither_matrix: &mut *addr_of_mut!((*frame).dither_matrix),
             textures: &mut *addr_of_mut!((*frame).textures),
             texture_lookup: &mut *addr_of_mut!((*frame).texture_lookup),
             palette_count: &mut *addr_of_mut!((*frame).palette_count),
@@ -1952,6 +2077,7 @@ pub struct Catalog<'a> {
     palette_word_count: &'a mut u32,
     overflowed: &'a mut u32,
     last_texture: &'a mut u32,
+    dither_matrix: &'a mut u64,
     textures: &'a mut [TextureDescriptor; MAX_TEXTURES],
     texture_lookup: &'a mut [u16; TEXTURE_LOOKUP_SLOTS],
     palette_count: &'a mut u32,
@@ -1976,6 +2102,11 @@ pub struct PalettePlace {
 }
 
 impl Catalog<'_> {
+    /// Notes the GE's dither matrix for the frame (`Frame::dither_matrix`).
+    pub fn set_dither_matrix(&mut self, matrix: u64) {
+        *self.dither_matrix = matrix;
+    }
+
     pub fn textures(&self) -> &[TextureDescriptor] {
         &self.textures[..*self.texture_count as usize]
     }
@@ -2153,6 +2284,95 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_faint_additive_pass_adds_nothing_to_a_16_bit_target() {
+        // MHF's guild hall (2026-11-17): the hearth glow is drawn as many
+        // faint additive passes into a 5551 target. On the PSP each adds a
+        // few levels that the cut to 5 bits drops; in an 8-bit target they
+        // added up to a grey haze over the room.
+        let floor = quantize_like_the_ge(40, 0, 5);
+        assert_eq!(floor, 41); // 5 << 3 | 5 >> 2
+        let mut psp = floor;
+        let mut ours = floor;
+        for _ in 0..4 {
+            psp = quantize_like_the_ge(psp as i32 + 3, 0, 5);
+            ours += 3;
+        }
+        assert_eq!(psp, 41);
+        assert_eq!(ours, 53);
+        // A bigger step still gets through.
+        assert_eq!(quantize_like_the_ge(41 + 12, 0, 5), 49);
+    }
+
+    #[test]
+    fn widening_keeps_black_and_white() {
+        for bits in [4, 5, 6] {
+            assert_eq!(quantize_like_the_ge(255, 0, bits), 255, "{bits} bits");
+            assert_eq!(quantize_like_the_ge(0, 0, bits), 0, "{bits} bits");
+            assert_eq!(quantize_like_the_ge(300, 7, bits), 255, "{bits} bits, clamped");
+            assert_eq!(quantize_like_the_ge(2, -8, bits), 0, "{bits} bits, clamped");
+        }
+        assert_eq!([quantize_like_the_ge(127, 0, 1), quantize_like_the_ge(128, 0, 1)], [0, 255]);
+        // Every widened value cuts back to itself (no drift across passes).
+        for bits in [4, 5, 6] {
+            for value in 0..256 {
+                let once = quantize_like_the_ge(value, 0, bits);
+                assert_eq!(quantize_like_the_ge(once as i32, 0, bits), once);
+            }
+        }
+    }
+
+    #[test]
+    fn the_fast_cut_is_the_ges_cut() {
+        for value in 0..=255u8 {
+            assert_eq!(cut_to_5_bits(value) as u32, quantize_like_the_ge(value as i32, 0, 5), "{value}");
+        }
+    }
+
+    #[test]
+    fn draws_into_5551_get_fast_programs_for_common_blends() {
+        use crate::blend::{BLEND_ALPHA_ONLY, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_WRITES_ALPHA};
+        let target = |format: u32| format << draw_flags::TARGET_FORMAT_SHIFT;
+        let normal = BLEND_ENABLED | 4 | 5 << 4;
+        let add = BLEND_ENABLED | 4 | 1 << 4;
+        let fast = |way, keep_alpha| ReadVariant::Fast { way, keep_alpha };
+        let f5551 = target(draw_flags::TARGET_5551);
+        // Nobody reads the alpha: every draw writes it.
+        assert_eq!(read_variant(f5551, normal, false, true), fast(ReadWay::Normal, false));
+        assert_eq!(read_variant(f5551, add, false, true), fast(ReadWay::Add, false));
+        assert_eq!(read_variant(f5551, 0, false, true), fast(ReadWay::Off, false));
+        // Normal alpha blends without the frame read: GXM over the cut source.
+        assert_eq!(read_variant(f5551, normal, false, false), fast(ReadWay::Precut, false));
+        assert_eq!(read_variant(f5551, add, false, false), fast(ReadWay::Add, false));
+        // The alpha is read: kept by draws that don't write it...
+        assert_eq!(read_variant(f5551, normal, true, true), fast(ReadWay::Normal, true));
+        assert_eq!(read_variant(f5551, 0, true, true), fast(ReadWay::Off, true));
+        // ...and cut to one bit by the generic program where they do.
+        assert_eq!(read_variant(f5551, normal | BLEND_WRITES_ALPHA, true, true), ReadVariant::Generic);
+        // Stencil-only clears, other factors and equations, dithering,
+        // BLEND_FIX and other formats: generic.
+        assert_eq!(read_variant(f5551, BLEND_WRITES_ALPHA | BLEND_ALPHA_ONLY, false, true), ReadVariant::Generic);
+        assert_eq!(read_variant(f5551, BLEND_ENABLED | 1 | 1 << 4, false, true), ReadVariant::Generic);
+        assert_eq!(read_variant(f5551, normal | 1 << 8, false, true), ReadVariant::Generic);
+        assert_eq!(read_variant(f5551 | draw_flags::DITHER, normal, false, true), ReadVariant::Generic);
+        assert_eq!(read_variant(f5551, normal | BLEND_FIX_B_ALPHA, false, true), ReadVariant::Generic);
+        // Without blending the FIX bit means nothing.
+        assert_eq!(read_variant(f5551, BLEND_FIX_B_ALPHA, false, true), fast(ReadWay::Off, false));
+        assert_eq!(read_variant(target(draw_flags::TARGET_565), normal, false, true), ReadVariant::Generic);
+        assert_eq!(read_variant(target(draw_flags::TARGET_4444), normal, false, true), ReadVariant::Generic);
+    }
+
+    #[test]
+    fn dither_entries_are_signed_nibbles() {
+        // MHF's matrix: DITH0..3 = 000f0f, 00f0f1, 000f0f, 0000f1.
+        let matrix = 0x0f0f | 0xf0f1 << 16 | 0x0f0f << 32 | 0x00f1 << 48;
+        let rows: Vec<Vec<i32>> = (0..4).map(|y| (0..4).map(|x| dither_value(matrix, x, y)).collect()).collect();
+        assert_eq!(rows, [[-1, 0, -1, 0], [1, -1, 0, -1], [-1, 0, -1, 0], [1, -1, 0, 0]]);
+        assert_eq!(dither_value(matrix, 4, 5), dither_value(matrix, 0, 1), "the matrix repeats");
+        assert_eq!(dither_value(0x7 | 0x8 << 4, 1, 0), -8);
+        assert_eq!(dither_value(0x7, 0, 0), 7);
+    }
 
     /// MTX's ghost pictures and dark blur (2026-11-10): its motion blur keeps
     /// 95 % of the other framebuffer each frame, so whatever our target for

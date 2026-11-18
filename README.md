@@ -97,7 +97,9 @@ release workflow build and publish it (`.github/workflows/release.yml`).
 The compiled `.gxp` files are checked in, so a normal build doesn't compile shaders. Changing one
 takes the shader compiler app. Build it with `sh scripts/build-shadercompiler.sh` and install the
 VPK. It needs Sony's runtime compiler `libshacccg.suprx` in `ur0:data/`, which isn't included. Run
-`scripts/shader-variants.sh` after changing a source that has generated variants.
+`scripts/shader-variants.sh` after changing a source that has generated variants. The app switches on the
+compiler's Vita-specific Cg extensions (`__nativecolor`, used by the frame-read programs for the PSP's
+16-bit framebuffers) with a small hook in its own process.
 
 ## Credits
 
@@ -106,6 +108,9 @@ VPK. It needs Sony's runtime compiler `libshacccg.suprx` in `ur0:data/`, which i
 - [GePatch](https://github.com/TheOfficialFloW/GePatch) (TheFloW): how to hook the GE on the PSP side.
 - [PPSSPP](https://github.com/hrydgard/ppsspp): the reference for the GE's behaviour. Many parts of
   `core/` follow its semantics, and the comments name where.
+- [SceShaccCgExt](https://github.com/bythos14/SceShaccCgExt) (bythos14, Rinnegatamante): how to switch
+  on the Vita-specific Cg extensions of Sony's runtime shader compiler, which the shader compiler
+  app does the same way (its own code).
 
 ## License
 

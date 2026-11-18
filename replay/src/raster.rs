@@ -2,8 +2,10 @@
 //! Vita side does (Adrenaline/user/nativeres_render.c):
 //! - PSP coordinates doubled onto a 960x544 screen cleared to black,
 //! - textured draws (our GPU program): texture colour x vertex colour (x2
-//!   with colour doubling, then clamped), then fog; texture coordinates,
-//!   colours and fog interpolated with perspective (by the vertices' w),
+//!   with colour doubling, then clamped), then fog, both in the GE's integer
+//!   arithmetic (`ge_shade`); texture coordinates
+//!   interpolated with perspective (by the vertices' w), colours and fog
+//!   linearly on the screen as the PSP shades (core `transform.rs`),
 //! - untextured draws (vita2d's colour program): vertex colours interpolated
 //!   linearly in screen space,
 //! - the blend mode recorded per draw (`Draw::blend`, see core `blend.rs`),
@@ -167,7 +169,7 @@ fn draw_one(screen: &mut [u32], depth: &mut [f32], frame: &Frame, textures: &[Op
     };
     let mut corners = frame.screen_corners(draw);
     while let (Some(a), Some(b), Some(c)) = (corners.next(), corners.next(), corners.next()) {
-        draw_triangle(screen, depth, draw, texture, [a, b, c]);
+        draw_triangle(screen, depth, draw, texture, [a, b, c], frame.dither_matrix);
     }
 }
 
@@ -239,7 +241,8 @@ fn passes<T: PartialOrd>(function: u32, value: T, reference: T) -> bool {
     }
 }
 
-fn draw_triangle(screen: &mut [u32], depth: &mut [f32], draw: &Draw, texture: Option<&Texture>, corners: [FrameVertex; 3]) {
+fn draw_triangle(screen: &mut [u32], depth: &mut [f32], draw: &Draw, texture: Option<&Texture>, corners: [FrameVertex; 3], dither_matrix: u64) {
+    let target_bits = nativeres_core::frame::target_channel_bits(draw.flags);
     let position = |vertex: &FrameVertex| (vertex.x * SCALE, vertex.y * SCALE);
     let [p0, p1, p2] = [position(&corners[0]), position(&corners[1]), position(&corners[2])];
 
@@ -299,19 +302,8 @@ fn draw_triangle(screen: &mut [u32], depth: &mut [f32], draw: &Draw, texture: Op
                     let b = over_w.map(|weight| weight / total);
                     let u = b[0] * corners[0].u + b[1] * corners[1].u + b[2] * corners[2].u;
                     let v = b[0] * corners[0].v + b[1] * corners[1].v + b[2] * corners[2].v;
-                    let mut color = sample(texture, draw, u, v).times(Color::weighted(colors, b));
-                    color.r *= color_scale;
-                    color.g *= color_scale;
-                    color.b *= color_scale;
-                    let color = color.clamped();
-                    if draw.flags & draw_flags::FOG != 0 {
-                        // Like the Vita's shader: toward the fog colour, alpha kept.
-                        let fog = (b[0] * corners[0].fog + b[1] * corners[1].fog + b[2] * corners[2].fog).clamp(0.0, 1.0);
-                        let fog_color = Color { a: color.a, ..Color::from_rgba(draw.fog_color) };
-                        Color::mix(fog_color, color, fog)
-                    } else {
-                        color
-                    }
+                    // Colour and fog: linear on the screen, as the PSP shades.
+                    ge_shade(sample(texture, draw, u, v), Color::weighted(colors, linear), fog_at(linear, &corners), draw, color_scale)
                 }
                 None => Color::weighted(colors, linear),
             };
@@ -327,11 +319,57 @@ fn draw_triangle(screen: &mut [u32], depth: &mut [f32], draw: &Draw, texture: Op
             }
             let pixel = &mut screen[index];
             *pixel = blend(draw.blend, source, Color::from_rgba(*pixel)).to_rgba();
+            if let Some(bits) = target_bits {
+                // A 16-bit PSP target: cut as the GE does, after blending
+                // (the Vita's fragment programs do the same).
+                let dither = if draw.flags & draw_flags::DITHER != 0 {
+                    nativeres_core::frame::dither_value(dither_matrix, (index % WIDTH) / 2, (index / WIDTH) / 2)
+                } else {
+                    0
+                };
+                let p = *pixel;
+                let channel = |shift: u32, bits: u32, dither: i32| {
+                    nativeres_core::frame::quantize_like_the_ge(((p >> shift) & 0xFF) as i32, dither, bits) << shift
+                };
+                let alpha = if bits[3] == 0 { p & 0xFF00_0000 } else { channel(24, bits[3], 0) };
+                *pixel = alpha | channel(16, bits[2], dither) | channel(8, bits[1], dither) | channel(0, bits[0], dither);
+            }
         }
     }
 }
 
 /// Twice the signed area of (a, b, c); positive if c is left of a->b.
+/// The fog factor at a pixel (1 without fog): linear on the screen.
+fn fog_at(linear: [f32; 3], corners: &[FrameVertex; 3]) -> f32 {
+    linear[0] * corners[0].fog + linear[1] * corners[1].fog + linear[2] * corners[2].fog
+}
+
+/// The GE's texture function and fog in its integer arithmetic, as the
+/// Vita's fragment programs do it (`GeShade` in nativeres_textured_f.cg;
+/// ppsspp-ref GPU/Software/Sampler.cpp GetTextureFunctionOutput, DrawPixel.cpp
+/// fog): texel and vertex colour truncated to 8 bits, (p + 1) t >> 8 (x 2
+/// with colour doubling), fog factor floor(f x 256), (c f + fog (255 - f) +
+/// 255) >> 8. Rounding in float instead left MHF about one level brighter.
+fn ge_shade(texel: Color, vertex: Color, fog: f32, draw: &Draw, color_scale: f32) -> Color {
+    let to8 = |x: f32| (x.clamp(0.0, 1.0) * 255.0 + 0.01) as i32;
+    let scale = color_scale as i32;
+    let modulate = |p: f32, t: f32, s: i32| (((to8(p) + 1) * to8(t) * s) >> 8).min(255);
+    let mut c = [
+        modulate(vertex.r, texel.r, scale),
+        modulate(vertex.g, texel.g, scale),
+        modulate(vertex.b, texel.b, scale),
+        modulate(vertex.a, texel.a, 1),
+    ];
+    if draw.flags & draw_flags::FOG != 0 {
+        let f8 = ((fog.clamp(0.0, 1.0) * 256.0 + 0.01).floor() as i32).min(255);
+        for (i, channel) in c.iter_mut().take(3).enumerate() {
+            let fog_color = ((draw.fog_color >> (8 * i)) & 0xFF) as i32;
+            *channel = (*channel * f8 + fog_color * (255 - f8) + 255) >> 8;
+        }
+    }
+    Color { r: c[0] as f32 / 255.0, g: c[1] as f32 / 255.0, b: c[2] as f32 / 255.0, a: c[3] as f32 / 255.0 }
+}
+
 fn edge(a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> f32 {
     (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
 }
@@ -459,6 +497,58 @@ mod tests {
     use nativeres_core::blend::{Blend, BLEND_ALPHA_ONLY, BLEND_WRITES_ALPHA};
 
     const SOURCE: Color = Color { r: 1.0, g: 0.0, b: 0.0, a: 0.5 };
+
+    /// MHF (2026-11-18): rounding the texture function and fog in float left
+    /// the pictures about one level brighter than the PSP's. The GE
+    /// truncates: (150 + 1) x 200 >> 8 = 117 (150 x 200 / 255 = 117.6 would
+    /// round to 118); fog factor 0.5 -> 128, (117 x 128 + 0 x 127 + 255) >> 8
+    /// = 59; without fog the colour stays.
+    #[test]
+    fn the_texture_function_and_fog_truncate_like_the_ge() {
+        let byte = |value: u32| Color::from_rgba(value * 0x0101_0101);
+        let draw = Draw { flags: draw_flags::TEXTURED, ..Draw::default() };
+        let plain = ge_shade(byte(200), byte(150), 1.0, &draw, 1.0).to_rgba();
+        assert_eq!(plain & 0xFF, 117);
+        let fogged = Draw { flags: draw_flags::TEXTURED | draw_flags::FOG, fog_color: 0, ..Draw::default() };
+        assert_eq!(ge_shade(byte(200), byte(150), 0.5, &fogged, 1.0).to_rgba() & 0xFF, 59);
+        assert_eq!(ge_shade(byte(200), byte(150), 1.0, &fogged, 1.0).to_rgba() & 0xFF, 117);
+        let doubled = ge_shade(byte(200), byte(100), 1.0, &draw, 2.0).to_rgba();
+        assert_eq!(doubled & 0xFF, 157); // (101 x 200 x 2) >> 8
+    }
+
+    /// Monster Hunter Freedom's village ground (2026-11-18, dump
+    /// logs/mhf-outside/out.bin): light and shadow edges are vertex colours of
+    /// large triangles seen at an angle. The PSP shades linearly on the
+    /// screen; interpolated with perspective (by 1 / w) they came out up to 4
+    /// levels brighter. A triangle with a near (w 1) black and two far (w 8)
+    /// white corners, fogged the same way: half way across the screen the
+    /// colour and fog are half way too, not pulled towards the near corner.
+    #[test]
+    fn colours_and_fog_are_linear_on_the_screen_with_perspective() {
+        let corner = |x: f32, y: f32, w: f32, color: u32, fog: f32| FrameVertex { x, y, z: 0.5, w, color, fog, ..FrameVertex::default() };
+        let corners = [
+            corner(0.0, 0.0, 1.0, 0xFF00_0000, 0.0),
+            corner(100.0, 0.0, 8.0, 0xFFFF_FFFF, 1.0),
+            corner(0.0, 100.0, 8.0, 0xFFFF_FFFF, 1.0),
+        ];
+        let white = Texture { width: 1, height: 1, pixels: vec![0xFFFF_FFFF] };
+        let mut screen = vec![0u32; WIDTH * HEIGHT];
+        let mut depth = vec![1.0f32; WIDTH * HEIGHT];
+        // Unfogged: the screen-linear colour, 0.505 white (with perspective: 0.11).
+        let whole = Draw { scissor_right: 479, scissor_bottom: 271, ..Draw::default() };
+        let draw = Draw { flags: draw_flags::TEXTURED, ..whole };
+        draw_triangle(&mut screen, &mut depth, &draw, Some(&white), corners, 0);
+        let pixel = |screen: &[u32]| screen[50 * WIDTH + 50] & 0xFF; // PSP (25, 25), weights 1/2, 1/4, 1/4
+        assert!((pixel(&screen) as i32 - 129).abs() <= 1, "colour {}", pixel(&screen));
+        // Black geometry, white fog: the fog factor alone gives the colour.
+        let fogged = corners.map(|corner| FrameVertex { color: 0xFF00_0000, ..corner });
+        let draw = Draw { flags: draw_flags::TEXTURED | draw_flags::FOG, fog_color: 0x00FF_FFFF, ..whole };
+        screen.fill(0);
+        draw_triangle(&mut screen, &mut depth, &draw, Some(&white), fogged, 0);
+        // Fog factor about 1/2 half way: about half the fog colour (with
+        // perspective: 0.89, near white).
+        assert!((pixel(&screen) as i32 - 126).abs() <= 1, "fogged {}", pixel(&screen));
+    }
     const TARGET: Color = Color { r: 0.0, g: 0.0, b: 1.0, a: 0.0 };
 
     /// The target's alpha is the PSP's stencil: blended or not, a draw

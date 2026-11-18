@@ -63,6 +63,14 @@ pub struct RenderStats {
     pub flat_light_draws: u32,
     /// Draws blended with FIX B through the alpha (BLEND_FIX programs).
     pub fix_b_draws: u32,
+    /// Draws into 16-bit PSP targets with the frame-read programs
+    /// (draw.rs `TARGET_CUT`).
+    pub cut_draws: u32,
+    /// Of them, with a fast frame-read program (core frame.rs
+    /// `read_variant`).
+    pub cut_fast_draws: u32,
+    /// Of those, without a frame read (unblended, or `ReadWay::Precut`).
+    pub cut_off_draws: u32,
     /// Raw draws left out: no vertex program for their format (all
     /// `programs::RAW_PROGRAMS` places taken, or the shaders not ready).
     pub raw_no_program: u32,
@@ -109,6 +117,9 @@ impl RenderStats {
         flat_light_draws: 0,
         raw_no_program: 0,
         fix_b_draws: 0,
+        cut_draws: 0,
+        cut_fast_draws: 0,
+        cut_off_draws: 0,
         lookup_us: 0,
         palette_us: 0,
         begin_tex_us: 0,
@@ -194,7 +205,7 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
     );
     let _ = write!(
         text,
-        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} fix_b_draws={} ",
+        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} fix_b_draws={} cut_draws={} cut_fast_draws={} cut_off_draws={} ",
         per_frame(s.begin_us),
         per_frame(s.loop_us),
         per_frame(s.convert_us),
@@ -207,7 +218,10 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
         s.plain_draws / frames,
         s.lit_variant_draws / frames,
         s.flat_light_draws / frames,
-        s.fix_b_draws / frames
+        s.fix_b_draws / frames,
+        s.cut_draws / frames,
+        s.cut_fast_draws / frames,
+        s.cut_off_draws / frames
     );
     let _ = write!(
         text,

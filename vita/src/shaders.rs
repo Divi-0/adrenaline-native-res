@@ -29,6 +29,28 @@ embed_gxp!(nativeres_textured_test_f);
 // Grey FIX B blending through the alpha, without and with the alpha test.
 embed_gxp!(nativeres_textured_fix_f);
 embed_gxp!(nativeres_textured_test_fix_f);
+// Draws into the PSP's 16-bit framebuffers: frame-read programs that blend
+// themselves and cut the colour as the GE does (textured and untextured).
+embed_gxp!(nativeres_textured_read_f);
+embed_gxp!(nativeres_color_read_f);
+// Their fast variants for 5551 targets (one blend each; the keep ones
+// leave the target's alpha; "off" reads no frame).
+embed_gxp!(nativeres_textured_read_normal_f);
+embed_gxp!(nativeres_textured_read_normalkeep_f);
+embed_gxp!(nativeres_textured_read_add_f);
+embed_gxp!(nativeres_textured_read_addkeep_f);
+embed_gxp!(nativeres_textured_read_off_f);
+// With the alpha test.
+embed_gxp!(nativeres_textured_read_normaltest_f);
+embed_gxp!(nativeres_textured_read_normalkeeptest_f);
+embed_gxp!(nativeres_textured_read_addtest_f);
+embed_gxp!(nativeres_textured_read_addkeeptest_f);
+embed_gxp!(nativeres_textured_read_offtest_f);
+embed_gxp!(nativeres_color_read_normal_f);
+embed_gxp!(nativeres_color_read_normalkeep_f);
+embed_gxp!(nativeres_color_read_add_f);
+embed_gxp!(nativeres_color_read_addkeep_f);
+embed_gxp!(nativeres_color_read_off_f);
 // Decoded vertices in model space: the GPU transforms and lights them.
 embed_gxp!(nativeres_3d_v);
 // Raw PSP vertices, read by the GPU as the game wrote them: with up to

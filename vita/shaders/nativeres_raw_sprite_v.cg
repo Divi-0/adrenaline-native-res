@@ -78,7 +78,7 @@ void main(
 	out float4 vPosition : POSITION,
 	out float2 vTexcoord : TEXCOORD0,
 	out float4 vColor : TEXCOORD1,
-	out float vFog : TEXCOORD2,
+	out float2 vFog : TEXCOORD2,
 	out float3 vSpecular : TEXCOORD3)
 {
 	// The separate specular colour (LIGHTMODE 1), added after texturing by
@@ -110,7 +110,9 @@ void main(
 	float2 uvA = aTexcoord * uRawUv.xy + uRawUv.zw;
 	float2 uvB = aTexcoordB * uRawUv.xy + uRawUv.zw;
 	vTexcoord = float2(lerp(uvA.x, uvB.x, xFromB), lerp(uvA.y, uvB.y, yFromB)) * uUvScale;
-	vFog = lerp((va.z * uFog.x + uFog.y) * uFog.z, (vb.z * uFog.x + uFog.y) * uFog.z, yFromB);
+	// w 1 in vFog.y: the fragment program divides colour and fog by it
+	// (screen-linear shading, nativeres_3d_v.cg); flat here anyway.
+	vFog = float2(lerp((va.z * uFog.x + uFog.y) * uFog.z, (vb.z * uFog.x + uFog.y) * uFog.z, yFromB), 1.0f);
 
 	// B's colour, with nativeres_raw_v.cg's rules (lighting 0..2).
 	float mode = uFormat.y;
