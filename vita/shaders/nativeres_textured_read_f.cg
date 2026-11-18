@@ -231,17 +231,17 @@ __nativecolor __regformat unsigned char4 main(
 #endif
 #ifdef READ_FAST
 	// Blended as the GE does (above) from the whole values, cut to 5 bits
-	// per channel and widened back. An opaque source needs no terms:
-	// t(s, 255) = s, t(d, 0) = 0; most blended pixels in MHF are opaque
-	// texels of alpha-tested foliage, and the fp32 terms cost the GPU
-	// ~12 ms per intro frame when every pixel takes them.
+	// per channel and widened back. No branch for opaque sources (t(s, 255)
+	// = s, t(d, 0) = 0: the terms give the source anyway): the compiler
+	// predicates an `if (c.a != 255)` around the terms, so every pixel paid
+	// for them plus the branch (53 -> 47 instructions, normaltest 60 -> 57;
+	// MHF's intro, frozen frame: its blended layers 14.2 -> 11.0 ms GPU,
+	// the alpha-tested ground and houses 14.7 -> 13.0, though most of their
+	// pixels are opaque; 2026-11-18).
 #if defined(READ_NORMAL)
-	float4 value = c;
-	if (c.a != 255.0f) {
-		float4 d = (float4)target;
-		value = FLOOR((c * 2.0f + 1.0f) * ((c.a * 2.0f + 1.0f) * (1.0f / 1024.0f)))
-			+ FLOOR((d * 2.0f + 1.0f) * ((511.0f - c.a * 2.0f) * (1.0f / 1024.0f)));
-	}
+	float4 d = (float4)target;
+	float4 value = FLOOR((c * 2.0f + 1.0f) * ((c.a * 2.0f + 1.0f) * (1.0f / 1024.0f)))
+		+ FLOOR((d * 2.0f + 1.0f) * ((511.0f - c.a * 2.0f) * (1.0f / 1024.0f)));
 #elif defined(READ_INVISIBLE)
 	// A normal blend of alpha 0 (untextured only: every vertex alpha 0,
 	// core frame.rs `ReadWay::Invisible`): t(c, 0) = 0, t(d, 255) = d,
