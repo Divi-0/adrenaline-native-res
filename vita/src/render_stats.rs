@@ -71,6 +71,11 @@ pub struct RenderStats {
     pub cut_fast_draws: u32,
     /// Of those, without a frame read (unblended, or `ReadWay::Precut`).
     pub cut_off_draws: u32,
+    /// Normal alpha blends drawn unblended: every fragment opaque (draw.rs
+    /// `OPAQUE_SOURCES`, core `opaque_source`).
+    pub opaque_draws: u32,
+    /// The display thread's time finding them (vertex alphas read).
+    pub opaque_us: u64,
     /// Raw draws left out: no vertex program for their format (all
     /// `programs::RAW_PROGRAMS` places taken, or the shaders not ready).
     pub raw_no_program: u32,
@@ -120,6 +125,8 @@ impl RenderStats {
         cut_draws: 0,
         cut_fast_draws: 0,
         cut_off_draws: 0,
+        opaque_draws: 0,
+        opaque_us: 0,
         lookup_us: 0,
         palette_us: 0,
         begin_tex_us: 0,
@@ -205,7 +212,7 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
     );
     let _ = write!(
         text,
-        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} fix_b_draws={} cut_draws={} cut_fast_draws={} cut_off_draws={} ",
+        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} fix_b_draws={} cut_draws={} cut_fast_draws={} cut_off_draws={} opaque_draws={} opaque={}us ",
         per_frame(s.begin_us),
         per_frame(s.loop_us),
         per_frame(s.convert_us),
@@ -221,7 +228,9 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
         s.fix_b_draws / frames,
         s.cut_draws / frames,
         s.cut_fast_draws / frames,
-        s.cut_off_draws / frames
+        s.cut_off_draws / frames,
+        s.opaque_draws / frames,
+        per_frame(s.opaque_us)
     );
     let _ = write!(
         text,

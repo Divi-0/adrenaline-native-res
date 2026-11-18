@@ -28,6 +28,7 @@ use nativeres_core::frame::{
     ReadWay, NO_RING_INDICES,
 };
 use nativeres_core::texture;
+use nativeres_core::opaque_source::{for_opaque_source, lowest_vertex_alpha, raw_vertex_span};
 use nativeres_core::vertex::VertexFormat;
 
 use crate::arenas;
@@ -138,6 +139,66 @@ pub static RAW_FLAT_LIGHTS: AtomicI32 = AtomicI32::new(1);
 /// 4 = normal alpha blends without the frame read (`ReadWay::Precut`);
 /// measuring: 5 = only unblended draws cut, 6 = only blended ones.
 pub static TARGET_CUT: AtomicI32 = AtomicI32::new(1);
+
+/// Textured normal alpha blends into 5551 whose every fragment is opaque
+/// (an opaque texture, vertex alphas 255: core `opaque_source`) are drawn
+/// with the unblended frame-read program (no frame read; the same
+/// picture). 1 = on (default), 0 = the normal one.
+pub static OPAQUE_SOURCES: AtomicI32 = AtomicI32::new(1);
+
+/// True if every vertex of textured `draw` ends up with alpha 255: raw
+/// vertices by their lowest alpha and colour rules, screen-space ones as
+/// they are. False where that isn't known cheaply (vertices in model space
+/// or in the vertex cache, which the GPU may light).
+fn vertices_opaque(frame: &Frame, draw: &Draw) -> bool {
+    if draw.flags & draw_flags::RAW_VERTICES == 0 {
+        if draw.transform != 0 || draw.flags & draw_flags::CACHED_VERTICES != 0 {
+            return false;
+        }
+        let first = draw.first_vertex as usize;
+        return first
+            .checked_add(draw.vertex_count as usize)
+            .and_then(|end| frame.vertices.get(first..end))
+            .is_some_and(|vertices| vertices.iter().all(|vertex| vertex.color >> 24 == 0xFF));
+    }
+    let Some(colors) = (match draw.raw_colors {
+        0 => None,
+        n if n <= frame.raw_colors_count => frame.raw_colors.get(n as usize - 1),
+        _ => None,
+    }) else {
+        return false;
+    };
+    let Some((first, end)) = raw_vertex_span(frame, draw) else {
+        return false;
+    };
+    // The window's start and the end of its block, as the draw reads them.
+    let (base, region_end) = if draw.flags & draw_flags::RAW_PSP_RAM != 0 {
+        let ram = arenas::PSP_RAM_FOR_GPU.load(Ordering::Acquire);
+        let ram_bytes = arenas::PSP_RAM_FOR_GPU_BYTES.load(Ordering::Acquire) as usize;
+        let offset = (draw.first_vertex & 0x1FFF_FFFF).wrapping_sub(PSP_RAM_GPU_BASE) as usize;
+        if ram.is_null() || offset >= ram_bytes {
+            return false;
+        }
+        (ram as usize + offset, ram as usize + ram_bytes)
+    } else {
+        let arena = RAW_ARENA.load(Ordering::Relaxed) as usize;
+        let arena_bytes = RAW_ARENA_BYTES.load(Ordering::Relaxed) as usize;
+        if frame.raw_vertices.is_null() || draw.first_vertex >= frame.raw_vertices_len {
+            return false;
+        }
+        (frame.raw_vertices as usize + draw.first_vertex as usize, arena + arena_bytes)
+    };
+    let format = VertexFormat(draw.vertex_format);
+    let stride = format.layout().size as usize;
+    let start = base + first as usize * stride;
+    let stop = base + end as usize * stride;
+    if stride == 0 || stop > region_end || start > stop {
+        return false;
+    }
+    // Safe: inside the block the GPU reads the draw from (checked above).
+    let bytes = unsafe { core::slice::from_raw_parts(start as *const u8, stop - start) };
+    colors.alpha_always_255(lowest_vertex_alpha(format, bytes))
+}
 
 /// Untextured normal alpha blends into 5551 whose vertex alphas are all 0
 /// get the "invisible" frame-read program (core frame.rs
@@ -1148,8 +1209,18 @@ impl Draws {
 
     /// A textured draw. `palette`: the colour table of an index texture,
     /// else null. `uv_scale`: multiplies the texture coordinates (1, 1
-    /// except for render targets used as textures).
-    fn draw_textured(&mut self, frame: &Frame, draw: &Draw, draw_index: usize, texture: &TextureObject, palette: *const c_void, uv_scale: [f32; 2]) {
+    /// except for render targets used as textures). `opaque_texture`: every
+    /// texel the GPU can sample is opaque (frame_loop.rs `opaque_textures`).
+    fn draw_textured(
+        &mut self,
+        frame: &Frame,
+        draw: &Draw,
+        draw_index: usize,
+        texture: &TextureObject,
+        palette: *const c_void,
+        uv_scale: [f32; 2],
+        opaque_texture: bool,
+    ) {
         let convert_start = draw_clock();
         let Some((indices, index_count)) = self.draw_indices(frame, draw, draw_index) else {
             return; // the frame pool is full
@@ -1169,7 +1240,20 @@ impl Draws {
         }
         let keep = self.keep_target_alpha;
         // A 16-bit PSP target: the frame-read program (alpha test included).
-        let choice = read_choice(frame, draw, keep);
+        let mut choice = read_choice(frame, draw, keep);
+        // A normal blend of an opaque texture and vertices of alpha 255 is
+        // the source itself: drawn unblended, no frame read (core
+        // `opaque_source`; MHF's ground).
+        if let Some(variant) = choice {
+            if opaque_texture && for_opaque_source(variant) != variant && OPAQUE_SOURCES.load(Ordering::Relaxed) != 0 {
+                let start = draw_clock();
+                if vertices_opaque(frame, draw) {
+                    choice = Some(for_opaque_source(variant));
+                    stats().opaque_draws += 1;
+                }
+                stats().opaque_us += draw_clock().wrapping_sub(start);
+            }
+        }
         let read_variant = choice.unwrap_or(ReadVariant::Generic);
         let read_program = match choice {
             Some(variant) if programs_ready => self.programs.read_program(true, tested, variant).map(|program| program.program),
@@ -2032,8 +2116,16 @@ pub fn draw_state(draw: &Draw) {
 /// Textured draw `draw_index` of `frame` with `texture` (one of our texture
 /// objects or a render target's), the colour table `palette` (index
 /// textures; else null) and `uv_scale`. Inside a target scene.
-pub fn draw_textured(frame: &Frame, draw: &Draw, draw_index: usize, texture: &TextureObject, palette: *const c_void, uv_scale: [f32; 2]) {
-    draws().draw_textured(frame, draw, draw_index, texture, palette, uv_scale);
+pub fn draw_textured(
+    frame: &Frame,
+    draw: &Draw,
+    draw_index: usize,
+    texture: &TextureObject,
+    palette: *const c_void,
+    uv_scale: [f32; 2],
+    opaque_texture: bool,
+) {
+    draws().draw_textured(frame, draw, draw_index, texture, palette, uv_scale, opaque_texture);
 }
 
 /// Untextured draw `draw_index` of `frame`. Inside a target scene.

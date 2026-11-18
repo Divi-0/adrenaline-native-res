@@ -51,6 +51,7 @@ pub mod heap;
 pub mod lighting;
 pub mod log_ring;
 pub mod memory;
+pub mod opaque_source;
 pub mod options;
 
 pub mod palette_tables;

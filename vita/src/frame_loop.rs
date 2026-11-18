@@ -17,6 +17,7 @@ use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, Ordering};
 
 use nativeres_core::blend::{self, BLEND_ENABLED};
 use nativeres_core::frame::{draw_flags, Frame, MAX_TEXTURES};
+use nativeres_core::opaque_source::palette_texture_opaque;
 use nativeres_core::texture_cache::MAX_RENDER_TARGETS;
 
 use crate::capture::{COMPLETED_FRAME_COUNT, GPU_TRANSFORM_READY, set_mip_mode};
@@ -152,6 +153,9 @@ pub struct FrameLoop {
     palettes: [*const c_void; MAX_TEXTURES],
     waiting: [u8; MAX_TEXTURES],
     uv_scales: [[f32; 2]; MAX_TEXTURES],
+    /// Index textures whose every texel the GPU can sample is opaque (their
+    /// colour table's entries, core `opaque_source`); false for the others.
+    opaque_textures: [bool; MAX_TEXTURES],
 }
 
 static FRAME_LOOP: SingleThreaded<FrameLoop> = SingleThreaded::new(FrameLoop {
@@ -170,6 +174,7 @@ static FRAME_LOOP: SingleThreaded<FrameLoop> = SingleThreaded::new(FrameLoop {
     palettes: [null(); MAX_TEXTURES],
     waiting: [0; MAX_TEXTURES],
     uv_scales: [[1.0; 2]; MAX_TEXTURES],
+    opaque_textures: [false; MAX_TEXTURES],
 });
 
 /// True if the GE can have drawn framebuffer `psp_address` (physical, see
@@ -520,6 +525,7 @@ impl FrameLoop {
     fn find_palettes(&mut self, frame: &Frame, render_count: u32) {
         for (i, descriptor) in frame.textures().iter().enumerate() {
             self.palettes[i] = null();
+            self.opaque_textures[i] = false;
             // Safe: textures from the cache or targets, alive this frame.
             let Some(texture) = (unsafe { self.textures[i].as_ref() }) else {
                 continue;
@@ -528,13 +534,14 @@ impl FrameLoop {
             if unsafe { gxm::sceGxmTextureGetFormat(&texture.gxm) } != gxm::TEXTURE_FORMAT_P8_ABGR {
                 continue;
             }
-            self.palettes[i] = palettes::palette_for(frame, descriptor, render_count);
-            if self.palettes[i].is_null() {
-                let words = &frame.palette_words[..(frame.palette_word_count as usize).min(frame.palette_words.len())];
+            let (table, mut opaque_entries) = palettes::palette_for(frame, descriptor, render_count);
+            self.palettes[i] = table;
+            if table.is_null() {
                 // Safe: a palette texture of ours has its 256-word table.
-                let table = unsafe { &mut *(gxm::sceGxmTextureGetPalette(&texture.gxm) as *mut [u32; 256]) };
-                crate::texture_palette(descriptor, words, table);
+                let own = unsafe { &mut *(gxm::sceGxmTextureGetPalette(&texture.gxm) as *mut [u32; 256]) };
+                opaque_entries = palettes::fill_table(frame, descriptor, own);
             }
+            self.opaque_textures[i] = palette_texture_opaque(descriptor.format, opaque_entries);
         }
     }
 
@@ -642,7 +649,7 @@ impl FrameLoop {
                 if t < texture_count {
                     // Safe: textures from the cache or targets, alive this frame.
                     if let Some(texture) = unsafe { self.textures[t].as_ref() } {
-                        draw::draw_textured(frame, draw, i, texture, self.palettes[t], self.uv_scales[t]);
+                        draw::draw_textured(frame, draw, i, texture, self.palettes[t], self.uv_scales[t], self.opaque_textures[t]);
                     }
                 }
             } else {
