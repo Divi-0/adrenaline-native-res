@@ -108,6 +108,42 @@ pub fn ours_to_draw(screen: AdrenalineScreen) -> bool {
     !(screen.pops_mode || screen.draw_native || screen.savestate_screen || screen.home_menu || screen.xmb)
 }
 
+/// Whether a frame taken from the frame handover (`triple_buffer`) belongs
+/// to a game the user quit. Forgetting our render targets in the XMB was
+/// not enough: the handover still held the quit game's last frame, and
+/// with nothing of ours shown the next game's start drew it again ("the
+/// newest frame we have", for a paused game), its textures read from
+/// memory the next game had overwritten: Monster Hunter's frozen, garbled
+/// frame over MTX's boot (user, 2026-11-19).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AfterQuit {
+    /// The XMB was seen and no frame was published since.
+    quit: bool,
+}
+
+impl AfterQuit {
+    pub const fn new() -> Self {
+        AfterQuit { quit: false }
+    }
+
+    /// The PSP runs its XMB: every frame the display holds is the quit
+    /// game's. The caller takes the waiting frame first (one published
+    /// while the HOME menu was open, never taken), so the next new one is
+    /// the next game's.
+    pub fn quit(&mut self) {
+        self.quit = true;
+    }
+
+    /// A frame was taken (`is_new`: published since the last take): may it
+    /// be shown? After a quit only from the first new one on.
+    pub fn may_show(&mut self, is_new: bool) -> bool {
+        if is_new {
+            self.quit = false;
+        }
+        !self.quit
+    }
+}
+
 /// A sample of the CPU-picture check differs when its R + G + B differ by
 /// more than this (0..765): far above what upscaling and filtering change.
 pub const CPU_PICTURE_DIFFERENCE: u32 = 96;
@@ -218,6 +254,37 @@ mod tests {
     #[test]
     fn the_xmb_after_quitting_shows_sonys_picture() {
         assert!(!ours_to_draw(AdrenalineScreen { xmb: true, ..AdrenalineScreen::default() }));
+    }
+
+    /// Monster Hunter quit from the HOME menu, then MTX started
+    /// (2026-11-19): MHF's last frame, still in the handover, was drawn over
+    /// MTX's boot. Also the frame the game published while the HOME menu
+    /// was open (the display took none then): taken at the quit, never
+    /// shown. The next game's first frame is.
+    #[test]
+    fn the_quit_games_last_frame_is_not_shown_in_the_next_game() {
+        use crate::triple_buffer::TripleBuffer;
+        let buffer = TripleBuffer::new();
+        let (mut producer, mut consumer) = TripleBuffer::sides();
+        let mut after_quit = AfterQuit::new();
+        buffer.publish(&mut producer, 1);
+        let (_, is_new) = buffer.take(&mut consumer).unwrap();
+        assert!(after_quit.may_show(is_new), "MHF running");
+        // HOME menu open: the game publishes one more, the display takes none.
+        buffer.publish(&mut producer, 2);
+        // "Quit the game?" > Yes: the XMB.
+        let _ = buffer.take(&mut consumer);
+        after_quit.quit();
+        // MTX boots: no frame of its own yet, the handover gives MHF's.
+        let (_, is_new) = buffer.take(&mut consumer).unwrap();
+        assert!(!is_new);
+        assert!(!after_quit.may_show(is_new), "MHF's frame over MTX's boot");
+        // MTX's first frame.
+        buffer.publish(&mut producer, 3);
+        let (_, is_new) = buffer.take(&mut consumer).unwrap();
+        assert!(after_quit.may_show(is_new), "MTX's own frame");
+        let (_, is_new) = buffer.take(&mut consumer).unwrap();
+        assert!(after_quit.may_show(is_new), "held while MTX pauses");
     }
 
     /// Measured during MTX's intro movie, renderer on (2026-11-10): how

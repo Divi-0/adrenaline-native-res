@@ -16,6 +16,7 @@ use core::ptr::null;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, Ordering};
 
 use nativeres_core::blend::{self, BLEND_ENABLED};
+use nativeres_core::display_loop::AfterQuit;
 use nativeres_core::frame::{draw_flags, Frame, MAX_TEXTURES};
 use nativeres_core::opaque_source::palette_texture_opaque;
 use nativeres_core::texture_cache::MAX_RENDER_TARGETS;
@@ -156,6 +157,8 @@ pub struct FrameLoop {
     /// Index textures whose every texel the GPU can sample is opaque (their
     /// colour table's entries, core `opaque_source`); false for the others.
     opaque_textures: [bool; MAX_TEXTURES],
+    /// The game was quit: its frames still in the handover are never shown.
+    after_quit: AfterQuit,
 }
 
 static FRAME_LOOP: SingleThreaded<FrameLoop> = SingleThreaded::new(FrameLoop {
@@ -175,6 +178,7 @@ static FRAME_LOOP: SingleThreaded<FrameLoop> = SingleThreaded::new(FrameLoop {
     waiting: [0; MAX_TEXTURES],
     uv_scales: [[1.0; 2]; MAX_TEXTURES],
     opaque_textures: [false; MAX_TEXTURES],
+    after_quit: AfterQuit::new(),
 });
 
 /// True if the GE can have drawn framebuffer `psp_address` (physical, see
@@ -209,6 +213,13 @@ pub fn leave_game() {
     let (state, targets) = unsafe { (FRAME_LOOP.get(), targets::targets()) };
     targets.forget();
     state.frame_pending = false;
+    // The frame waiting in the handover is the quit game's too (published
+    // while the HOME menu was open): taken now, so only the next game's
+    // frames are new (display_loop::AfterQuit).
+    let mut is_new = 0;
+    // Safe: display thread; a valid out pointer. The frame isn't used.
+    let _ = unsafe { acquire_frame(&mut is_new) };
+    state.after_quit.quit();
 }
 
 impl FrameLoop {
@@ -253,6 +264,12 @@ impl FrameLoop {
         let Some(frame) = (unsafe { frame.as_ref() }) else {
             return false;
         };
+        if !self.after_quit.may_show(is_new) {
+            // The quit game's last frame: the next game's start shows its
+            // own picture until its first frame of ours.
+            self.frame_pending = false;
+            return false;
+        }
         if GPU_DRAW.load(Ordering::Relaxed) == 0 {
             self.frame_pending = false;
             return false;
