@@ -40,7 +40,7 @@ mod trace;
 use std::process::ExitCode;
 
 use nativeres_core::bench::{self, Mode};
-use nativeres_core::block_cache::BlockCache;
+use nativeres_core::block_cache::{BlockCache, BlockStore, CAPTURE_BLOCKS, SMALL_BLOCKS};
 use nativeres_core::capture::{Capture, Event};
 use nativeres_core::dump::DumpView;
 use nativeres_core::frame::{Frame, FrameVertex};
@@ -219,8 +219,10 @@ fn run(dump_path: &str, png_path: &str, trace: bool) -> Result<(), String> {
     std::thread::scope(|scope| -> Result<(), String> {
         if threaded {
             scope.spawn(|| {
+                // Stage B's own store, small as on the Vita (stage_thread.rs).
+                let mut store = Box::new(BlockStore::<SMALL_BLOCKS>::new());
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    let mut memory = BlockCache::new(shared_memory);
+                    let mut memory = BlockCache::new(&mut *store, shared_memory);
                     // Safe: the capture outlives the scope; this is its only
                     // stage B thread (`Capture::run_stage_b_thread`).
                     let run = unsafe { Capture::run_stage_b_thread(capture_address as *mut Capture, &mut memory) };
@@ -231,6 +233,7 @@ fn run(dump_path: &str, png_path: &str, trace: bool) -> Result<(), String> {
             });
         }
         let result = (|| -> Result<(), String> {
+            let mut store = Box::new(BlockStore::<CAPTURE_BLOCKS>::new());
             for round in 0..rounds {
                 capture
                     .load_state(&mut Reader::new(&dump.snapshot))
@@ -242,7 +245,7 @@ fn run(dump_path: &str, png_path: &str, trace: bool) -> Result<(), String> {
                         continue;
                     };
                     // A fresh block cache per event, as on the Vita.
-                    let mut memory = BlockCache::new(&dump.memory);
+                    let mut memory = BlockCache::new(&mut *store, &dump.memory);
                     if let Some(finished) = capture.handle_traced(event, &mut memory, Some(&mut frame), &mut *tracer) {
                         stats = Some(finished);
                     }
@@ -425,11 +428,12 @@ fn print_sublists(dump_path: &str) -> Result<(), String> {
         .load_state(&mut Reader::new(&dump.snapshot))
         .ok_or("the dump's capture state can't be restored (other version?)")?;
     let mut sublists = sublists::SubLists::new();
+    let mut store = Box::new(BlockStore::<CAPTURE_BLOCKS>::new());
     for &(event_type, args) in &dump.events {
         let Some(event) = Event::from_ring(event_type, args) else {
             continue;
         };
-        let mut memory = BlockCache::new(&dump.memory);
+        let mut memory = BlockCache::new(&mut *store, &dump.memory);
         capture.handle_traced(event, &mut memory, Some(&mut frame), &mut sublists);
     }
     sublists.print();
@@ -493,10 +497,11 @@ fn bench(dump_path: &str, runs: u32, only: Option<&str>) -> Result<(), String> {
     capture.set_gpu_transform(gpu_transform());
     capture.set_vertex_cache(new_vertex_cache());
     let mut frame = new_frame();
+    let mut store = Box::new(BlockStore::new());
     let modes = [("walk", Mode::WalkOnly), ("stats", Mode::Stats), ("produce", Mode::Produce), ("full", Mode::Full)];
     for (name, mode) in modes.into_iter().filter(|(name, _)| only.is_none_or(|only| only == *name)) {
         let start = std::time::Instant::now();
-        let totals = bench::run(&dump, sorted, mode, runs, &mut capture, &mut frame)
+        let totals = bench::run(&dump, sorted, mode, runs, &mut capture, &mut frame, &mut store)
             .ok_or("the dump's capture state can't be restored (other version?)")?;
         let per_run = start.elapsed() / runs;
         println!(

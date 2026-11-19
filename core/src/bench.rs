@@ -14,7 +14,7 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::block_cache::BlockCache;
+use crate::block_cache::{BlockCache, BlockStore, CAPTURE_BLOCKS};
 
 /// Measuring aid: each bit skips one part of the capture thread's per-draw work, so the
 /// difference in time is what that part costs on the Vita (PC instruction
@@ -115,8 +115,9 @@ pub struct Totals {
 }
 
 /// Runs the dump's events `runs` times from its saved start state. `None` if
-/// the state can't be restored. `capture` and `frame` are only working
-/// space; `sorted_blocks` comes from `DumpView::sort_blocks`.
+/// the state can't be restored. `capture`, `frame` and `store` (the block
+/// cache's, as big as the live capture's) are only working space;
+/// `sorted_blocks` comes from `DumpView::sort_blocks`.
 pub fn run(
     dump: &DumpView,
     sorted_blocks: &[u32],
@@ -124,6 +125,7 @@ pub fn run(
     runs: u32,
     capture: &mut Capture,
     frame: &mut Frame,
+    store: &mut BlockStore<CAPTURE_BLOCKS>,
 ) -> Option<Totals> {
     let mut totals = Totals::default();
     let mut copies = 0;
@@ -137,7 +139,7 @@ pub fn run(
             let Some(event) = Event::from_ring(event_type, args) else {
                 continue;
             };
-            let mut memory = BlockCache::new(DumpBlocks { view: dump, sorted: sorted_blocks });
+            let mut memory = BlockCache::new(store, DumpBlocks { view: dump, sorted: sorted_blocks });
             let frame = if matches!(mode, Mode::Full | Mode::Produce) { Some(&mut *frame) } else { None };
             capture.handle(event, &mut memory, frame);
             copies += memory.copies + memory.line_copies;
@@ -221,11 +223,12 @@ mod tests {
         let sorted = dump.sort_blocks(&mut index).unwrap();
         let mut capture = Capture::new();
         let mut frame = new_boxed_frame();
+        let mut store = Box::new(BlockStore::new());
 
         // The list and its vertices share one block but not one line
         // (`block_cache::LINE_SIZE`): two copies for the full capture, one
         // for the modes that don't read vertices.
-        let full = run(&dump, sorted, Mode::Full, 3, &mut capture, &mut frame).unwrap();
+        let full = run(&dump, sorted, Mode::Full, 3, &mut capture, &mut frame, &mut store).unwrap();
         assert_eq!((full.copies, full.draws, full.vertices), (2, 1, 6));
         // The crash of 2026-11-06: the Vita
         // hashed the bench frame after its vertex cache was freed. The bench
@@ -233,7 +236,7 @@ mod tests {
         assert_eq!((full.description_hash, full.vertex_hash), (frame.description_hash(), frame.vertex_hash()));
         assert_ne!(full.description_hash, 0);
         for mode in [Mode::Stats, Mode::WalkOnly] {
-            let totals = run(&dump, sorted, mode, 3, &mut capture, &mut frame).unwrap();
+            let totals = run(&dump, sorted, mode, 3, &mut capture, &mut frame, &mut store).unwrap();
             assert_eq!(totals, Totals { copies: 1, ..Totals::default() }, "{mode:?}");
         }
         assert!(!capture.walk_only);

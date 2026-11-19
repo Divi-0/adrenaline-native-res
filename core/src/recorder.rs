@@ -4521,7 +4521,8 @@ mod tests {
         let words: Vec<u32> = (0..2 * BLOCK_WORDS as u32).map(|i| i.wrapping_mul(0x0103_0507) & 0x3F7F_7F7F).collect();
         let mut reference = TestMemory::default();
         reference.write(VERTICES, &words);
-        let mut cache = BlockCache::new(WordsSource(words));
+        let mut store = crate::block_cache::BlockStore::<{ crate::block_cache::SMALL_BLOCKS }>::new();
+        let mut cache = BlockCache::new(&mut store, WordsSource(words));
         let mut compared = 0;
         for format in [SPRITE_FORMAT, (1 << 23) | 3 | (5 << 2) | (3 << 7), (1 << 23) | (3 << 7) | (3 << 9) | (7 << 14)] {
             let mut ge = GeState::new();

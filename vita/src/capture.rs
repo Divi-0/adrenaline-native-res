@@ -15,7 +15,7 @@ use core::fmt::Write;
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, Ordering};
 
-use nativeres_core::block_cache::{BlockCache, BlockSource, BLOCK_SIZE, BLOCK_WORDS};
+use nativeres_core::block_cache::{BlockCache, BlockSource, BlockStore, BLOCK_SIZE, BLOCK_WORDS, CAPTURE_BLOCKS};
 use nativeres_core::capture::{Capture, Event};
 use nativeres_core::draw_stream;
 use nativeres_core::event_ring::{self, Next, RawEvent, Ring, RingHeader, RingReader, RingSource};
@@ -456,28 +456,35 @@ struct CopyStats {
     direct_bytes: u32,
 }
 
-/// The live capture (~1 MiB with its draw stream rings), in a block of
-/// phycont memory of its own made when the capture thread starts (main
-/// memory is short: it was in the module's data, 0.66 MiB of it).
-/// Dereferences to the `Capture`; only the capture thread uses it, and only
-/// after `allocate`.
-pub struct CaptureBox(*mut Capture);
+/// The live capture (~1 MiB with its draw stream rings) and its block
+/// cache's store (~130 KiB, more than the capture thread's stack), in a
+/// block of phycont memory of their own made when the capture thread starts
+/// (main memory is short: the capture was in the module's data, 0.66 MiB of
+/// it). Dereferences to the `Capture`; only the capture thread uses it, and
+/// only after `allocate`.
+pub struct CaptureBox {
+    capture: *mut Capture,
+    store: *mut BlockStore<CAPTURE_BLOCKS>,
+}
 
-/// Its block, whole MiB (phycont blocks come in MiB), for the memory plan.
-const CAPTURE_BLOCK_BYTES: usize = (core::mem::size_of::<Capture>() + 0xF_FFFF) & !0xF_FFFF;
+/// Where the store lies in the block: after the capture, on a cache line.
+const STORE_OFFSET: usize = (core::mem::size_of::<Capture>() + 63) & !63;
+/// The block, whole MiB (phycont blocks come in MiB), for the memory plan.
+const CAPTURE_BLOCK_BYTES: usize = (STORE_OFFSET + core::mem::size_of::<BlockStore<CAPTURE_BLOCKS>>() + 0xF_FFFF) & !0xF_FFFF;
 #[no_mangle]
 #[used]
 #[allow(non_upper_case_globals)]
 pub static nativeres_plan_phycont_capture: u32 = CAPTURE_BLOCK_BYTES as u32;
 
 impl CaptureBox {
-    const NONE: CaptureBox = CaptureBox(core::ptr::null_mut());
+    const NONE: CaptureBox = CaptureBox { capture: core::ptr::null_mut(), store: core::ptr::null_mut() };
 
     /// Makes the capture in phycont memory (kept until Adrenaline ends).
     /// False if there was no memory for it.
     fn allocate(&mut self) -> bool {
-        // Safe: plain system calls; the block is zeroed and ours alone, and
-        // `init_zeroed` is made for zeroed memory.
+        // Safe: plain system calls; the block is zeroed and ours alone,
+        // `init_zeroed` is made for zeroed memory, and a zeroed store is a
+        // store (`BlockStore`).
         unsafe {
             let uid = sys::alloc_block(
                 b"NativeResCaptureState\0".as_ptr(),
@@ -492,26 +499,40 @@ impl CaptureBox {
             sys::sceKernelGetMemBlockBase(uid, &mut base);
             core::ptr::write_bytes(base as *mut u8, 0, CAPTURE_BLOCK_BYTES);
             Capture::init_zeroed(base as *mut Capture);
-            self.0 = base as *mut Capture;
+            self.capture = base as *mut Capture;
+            self.store = (base as *mut u8).add(STORE_OFFSET) as *mut BlockStore<CAPTURE_BLOCKS>;
         }
         true
+    }
+
+    /// The capture and its block cache's store, both at once.
+    fn with_store(&mut self) -> (&mut Capture, &mut BlockStore<CAPTURE_BLOCKS>) {
+        debug_assert!(!self.capture.is_null() && !self.store.is_null());
+        // Safe: set by `allocate` before the capture thread uses them; two
+        // separate parts of the block; the capture thread alone uses them.
+        unsafe { (&mut *self.capture, &mut *self.store) }
+    }
+
+    /// The block cache's store.
+    fn store(&mut self) -> &mut BlockStore<CAPTURE_BLOCKS> {
+        self.with_store().1
     }
 }
 
 impl core::ops::Deref for CaptureBox {
     type Target = Capture;
     fn deref(&self) -> &Capture {
-        debug_assert!(!self.0.is_null());
+        debug_assert!(!self.capture.is_null());
         // Safe: set by `allocate` before the capture thread uses it.
-        unsafe { &*self.0 }
+        unsafe { &*self.capture }
     }
 }
 
 impl core::ops::DerefMut for CaptureBox {
     fn deref_mut(&mut self) -> &mut Capture {
-        debug_assert!(!self.0.is_null());
+        debug_assert!(!self.capture.is_null());
         // Safe: as `deref`; the capture thread alone uses it.
-        unsafe { &mut *self.0 }
+        unsafe { &mut *self.capture }
     }
 }
 
@@ -659,8 +680,9 @@ impl BlockSource for VitaBlocks<'_> {
 }
 
 impl CaptureState {
-    fn memory(&mut self, check_vram: bool) -> BlockCache<VitaBlocks<'_>> {
-        BlockCache::new(VitaBlocks { dump: &mut self.dump, vram: &mut self.vram, copies: &mut self.copies, check_vram })
+    fn memory(&mut self, check_vram: bool) -> BlockCache<'_, VitaBlocks<'_>, CAPTURE_BLOCKS> {
+        let source = VitaBlocks { dump: &mut self.dump, vram: &mut self.vram, copies: &mut self.copies, check_vram };
+        BlockCache::new(self.capture.store(), source)
     }
 
     /// Handles one event; true if it completed a frame (then `last_frame`
@@ -673,7 +695,8 @@ impl CaptureState {
             self.dump.record_event(event.event_type, &event.args);
         }
         let CaptureState { capture, last_frame, dump, vram, copies, .. } = self;
-        let mut memory = BlockCache::new(VitaBlocks { dump, vram, copies, check_vram: true });
+        let (capture, store) = capture.with_store();
+        let mut memory = BlockCache::new(store, VitaBlocks { dump, vram, copies, check_vram: true });
         memory.whole_blocks = COPY_LINES.load(Ordering::Relaxed) == 0;
         match capture.handle(parsed, &mut memory, frame) {
             Some(stats) => {
@@ -753,7 +776,8 @@ impl CaptureState {
             // before the frame's publish.
             let frame = if recording { Some(unsafe { frames::building() }) } else { None };
             let CaptureState { capture, dump, vram, copies, .. } = self;
-            let mut memory = BlockCache::new(VitaBlocks { dump, vram, copies, check_vram: true });
+            let (capture, store) = capture.with_store();
+            let mut memory = BlockCache::new(store, VitaBlocks { dump, vram, copies, check_vram: true });
             memory.whole_blocks = COPY_LINES.load(Ordering::Relaxed) == 0;
             if copied {
                 capture.resume_after_vram(&mut memory, frame, waited);
@@ -1462,6 +1486,6 @@ pub fn start() {
 }
 
 /// For `dump_file`: the memory view that reads a dumped frame's textures.
-pub fn texture_memory(state: &mut CaptureState) -> BlockCache<VitaBlocks<'_>> {
+pub fn texture_memory(state: &mut CaptureState) -> BlockCache<'_, VitaBlocks<'_>, CAPTURE_BLOCKS> {
     state.memory(false)
 }

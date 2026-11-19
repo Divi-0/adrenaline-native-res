@@ -13,7 +13,7 @@ use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, Ordering};
 
-use nativeres_core::block_cache::{BlockCache, BlockSource, BLOCK_SIZE, BLOCK_WORDS};
+use nativeres_core::block_cache::{BlockCache, BlockSource, BlockStore, BLOCK_SIZE, BLOCK_WORDS, SMALL_BLOCKS};
 use nativeres_core::capture::{Capture, StageBRun};
 use nativeres_core::memory::{RAM_END, RAM_START};
 use nativeres_core::vram_requests::{StageVramReads, VramRequests, VRAM_SIZE, VRAM_START};
@@ -23,7 +23,7 @@ use crate::{platform, sys};
 
 /// As the capture thread (capture.rs): the two stages are one job.
 const PRIORITY: i32 = 0x70;
-/// Two block caches (~17 KiB each) live on it.
+/// Its block cache's store (~17 KiB, `SMALL_BLOCKS`) lives on it.
 const STACK_SIZE: u32 = 0x20000;
 /// Cores 0-2 (as the recorder thread's default).
 const CORES: i32 = 0x0001_0000 | 0x0002_0000 | 0x0004_0000;
@@ -254,10 +254,11 @@ impl BlockSource for StageBlocks {
 unsafe extern "C" fn stage_thread(_args: u32, _argp: *mut c_void) -> i32 {
     let sema = SEMA.load(Ordering::Relaxed);
     let mut cores = CORES;
-    // Stage B's block caches, kept from one wake-up to the next (making one
-    // clears 16 KiB, and stage B is woken hundreds of times per frame);
-    // emptied at every frame end and for every new serving.
-    let mut live = BlockCache::new(StageBlocks { requests: core::ptr::null() });
+    // Stage B's block cache, kept from one wake-up to the next (stage B is
+    // woken hundreds of times per frame); emptied at every frame end and for
+    // every new serving.
+    let mut store = BlockStore::<SMALL_BLOCKS>::new();
+    let mut live = BlockCache::new(&mut store, StageBlocks { requests: core::ptr::null() });
     let mut serving = u32::MAX;
     let mut cpu_at_frame_end = crate::threads::run_us();
     loop {
