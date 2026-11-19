@@ -1481,11 +1481,90 @@ impl Frame {
         hash
     }
 
+    /// Debug `rawhash`: a hash of what the raw draws give the GPU, the same
+    /// for the same PSP frame in every run of a deterministic scene (MHF's
+    /// intro): per raw draw its flags, format and colour rule, its corners
+    /// counted from its lowest one (where a run lands in the arena differs
+    /// from run to run), the vertex bytes from the lowest to the highest
+    /// corner, its bones and its transform and camera. Taken on the capture
+    /// thread when the frame is complete and on the display thread before
+    /// the GPU gets it: which side a one-frame glitch comes from.
+    /// Zero-copy draws (`RAW_PSP_RAM`) and raw sprites hash their corners
+    /// only.
+    pub fn raw_draw_hash(&self) -> u64 {
+        let parts = self.raw_draw_hash_parts();
+        parts.iter().fold(0xCBF2_9CE4_8422_2325u64, |hash, &part| (hash ^ part).wrapping_mul(0x0100_0000_01B3))
+    }
 
-
-
-
-
+    /// `raw_draw_hash` in four parts: draw fields, corners, vertex bytes,
+    /// bones with transforms (which of them differs between runs).
+    pub fn raw_draw_hash_parts(&self) -> [u64; 4] {
+        let mut hashes = [0xCBF2_9CE4_8422_2325u64; 4];
+        let mut add = |part: usize, word: u32| hashes[part] = (hashes[part] ^ word as u64).wrapping_mul(0x0100_0000_01B3);
+        let arena = self.raw_bytes();
+        for (index, draw) in self.draws().iter().enumerate() {
+            if draw.flags & draw_flags::RAW_VERTICES == 0 {
+                continue;
+            }
+            add(0, draw.flags & !draw_flags::INDEX_RUNS);
+            add(0, draw.vertex_format);
+            add(0, draw.raw_colors);
+            let corners = self.draw_index_count(draw) as usize;
+            let at = self.draw_ring_index[index];
+            let in_ring = at != NO_RING_INDICES && !self.ring_indices.is_null() && at as usize + corners <= self.ring_indices_len as usize;
+            let ring: &[u16] = if in_ring {
+                // Safe: inside the ring the frame's draws were written to
+                // (checked against its length), which outlives the frame.
+                unsafe { core::slice::from_raw_parts(self.ring_indices.add(at as usize), corners) }
+            } else {
+                &[]
+            };
+            let (mut lowest, mut highest) = (u16::MAX, 0u16);
+            let mut note = |corner: u16| (lowest, highest) = (lowest.min(corner), highest.max(corner));
+            if in_ring {
+                ring.iter().for_each(|&corner| note(corner));
+            } else {
+                self.draw_indices(draw).for_each(note);
+            }
+            if corners == 0 || lowest > highest {
+                continue;
+            }
+            if in_ring {
+                ring.iter().for_each(|&corner| add(1, (corner - lowest) as u32));
+            } else {
+                self.draw_indices(draw).for_each(|corner| add(1, (corner - lowest) as u32));
+            }
+            let format = crate::vertex::VertexFormat(draw.vertex_format);
+            if draw.flags & (draw_flags::RAW_PSP_RAM | draw_flags::RAW_SPRITES) == 0 {
+                let layout = format.layout();
+                let stride = layout.size as usize;
+                let start = draw.first_vertex as usize + lowest as usize * stride;
+                let end = draw.first_vertex as usize + highest as usize * stride + format.bytes_used(&layout) as usize;
+                match arena.get(start..end) {
+                    Some(bytes) => {
+                        let mut words = bytes.chunks_exact(4);
+                        words.by_ref().for_each(|w| add(2, u32::from_le_bytes([w[0], w[1], w[2], w[3]])));
+                        words.remainder().iter().for_each(|&byte| add(2, byte as u32));
+                    }
+                    None => add(2, 0xDEAD_0000),
+                }
+            }
+            if draw.bones != 0 {
+                let first = draw.bones as usize - 1;
+                let floats = 12 * format.weight_count() as usize;
+                match self.bone_floats.get(first..first + floats) {
+                    Some(bones) => bones.iter().for_each(|value| add(3, value.to_bits())),
+                    None => add(3, 0xDEAD_0001),
+                }
+            }
+            if let Some((transform, camera)) = self.raw_transform_of(draw) {
+                transform.world.iter().flatten().for_each(|value| add(3, value.to_bits()));
+                camera.view.iter().flatten().chain(camera.projection.iter().flatten()).for_each(|value| add(3, value.to_bits()));
+                camera.viewport.iter().for_each(|value| add(3, value.to_bits()));
+            }
+        }
+        hashes
+    }
 }
 
 /// A frame's vertices, indices and draws while recording (`Frame::split`).

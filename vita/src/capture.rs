@@ -13,7 +13,7 @@
 use core::ffi::c_void;
 use core::fmt::Write;
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use nativeres_core::block_cache::{BlockCache, BlockSource, BlockStore, BLOCK_SIZE, BLOCK_WORDS, CAPTURE_BLOCKS};
 use nativeres_core::capture::{Capture, Event};
@@ -159,6 +159,34 @@ pub static READ_WATCH: AtomicBool = AtomicBool::new(false);
 static READ_CHANGED: AtomicU32 = AtomicU32::new(0);
 static READ_CHECKED: AtomicU32 = AtomicU32::new(0);
 static READ_FIRST: AtomicU32 = AtomicU32::new(0);
+
+/// Debug `rawhash`: `Frame::raw_draw_hash` of every recorded frame when it
+/// is complete (log `rawhash=<frame>:<hash>`) and of every frame the
+/// display draws (`note_drawn_hash`; log `drawn=<frame>:<hash>,...`, those
+/// drawn since the last line). The same PSP frame hashes the same in every
+/// run of a deterministic scene; a one-frame glitch whose recorded hash is
+/// off comes from the capture side, one whose drawn hash alone is off from
+/// later on. Off by default (it reads the frame's raw data again).
+pub static RAW_HASH: AtomicBool = AtomicBool::new(false);
+static RECORDED_HASH: AtomicU64 = AtomicU64::new(0);
+static RECORDED_HASH_FRAME: AtomicU32 = AtomicU32::new(0);
+static RECORDED_PARTS: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+const DRAWN_HASHES: usize = 8;
+static DRAWN_HASHES_WRITTEN: AtomicU32 = AtomicU32::new(0);
+static DRAWN_HASHES_LOGGED: AtomicU32 = AtomicU32::new(0);
+static DRAWN_HASH_FRAMES: [AtomicU32; DRAWN_HASHES] = [const { AtomicU32::new(0) }; DRAWN_HASHES];
+static DRAWN_HASH_VALUES: [AtomicU64; DRAWN_HASHES] = [const { AtomicU64::new(0) }; DRAWN_HASHES];
+
+/// Display thread, debug `rawhash`: `frame` is about to be drawn.
+pub fn note_drawn_hash(frame: &Frame) {
+    if !RAW_HASH.load(Ordering::Relaxed) {
+        return;
+    }
+    let slot = DRAWN_HASHES_WRITTEN.load(Ordering::Relaxed) as usize % DRAWN_HASHES;
+    DRAWN_HASH_FRAMES[slot].store(frame.frame_number, Ordering::Relaxed);
+    DRAWN_HASH_VALUES[slot].store(frame.raw_draw_hash(), Ordering::Relaxed);
+    DRAWN_HASHES_WRITTEN.fetch_add(1, Ordering::Release);
+}
 
 /// Copiers read small ranges until two reads agree
 /// (`nativeres_core::draw_stream::STABLE_COPIES`; on by default).
@@ -1144,6 +1172,17 @@ fn log_frame(state: &mut CaptureState, timing: &mut FrameTiming, flip: &RawEvent
     // Copied ranges the game rewrote before the frame's
     // end (`nativeres_core::copy_watch`): changed/checked, the first one
     // (address+words, ms from its copy), the youngest changed one's age.
+    if RAW_HASH.load(Ordering::Relaxed) {
+        let _ = write!(text, " rawhash={}:{:016x} ", RECORDED_HASH_FRAME.load(Ordering::Relaxed), RECORDED_HASH.load(Ordering::Relaxed));
+        let parts = RECORDED_PARTS.each_ref().map(|part| part.load(Ordering::Relaxed));
+        let _ = write!(text, "parts={:08x}/{:08x}/{:08x}/{:08x} drawn=", parts[0], parts[1], parts[2], parts[3]);
+        let written = DRAWN_HASHES_WRITTEN.load(Ordering::Acquire);
+        let logged = DRAWN_HASHES_LOGGED.swap(written, Ordering::Relaxed);
+        for n in written.saturating_sub(DRAWN_HASHES as u32).max(logged)..written {
+            let slot = n as usize % DRAWN_HASHES;
+            let _ = write!(text, "{}:{:016x},", DRAWN_HASH_FRAMES[slot].load(Ordering::Relaxed), DRAWN_HASH_VALUES[slot].load(Ordering::Relaxed));
+        }
+    }
     if READ_WATCH.load(Ordering::Relaxed) {
         let _ = write!(
             text,
@@ -1402,6 +1441,16 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
             start_time = now;
             let newest = ring.event(ring.header().write_count.wrapping_sub(1) % event_ring::CAPACITY);
             timing.behind_us = newest.psp_time_us.wrapping_sub(event.psp_time_us).min(10_000_000);
+            if recording && RAW_HASH.load(Ordering::Relaxed) {
+                // Safe: the capture thread, the frame complete, before its publish.
+                let frame = unsafe { frames::building() };
+                RECORDED_HASH.store(frame.raw_draw_hash(), Ordering::Relaxed);
+                let parts = frame.raw_draw_hash_parts();
+                for (slot, part) in RECORDED_PARTS.iter().zip(parts) {
+                    slot.store(part as u32, Ordering::Relaxed);
+                }
+                RECORDED_HASH_FRAME.store(frame.frame_number, Ordering::Relaxed);
+            }
             log_frame(state, &mut timing, &event, recording, &ring.header());
             if recording {
                 let frame = frames::building();

@@ -349,6 +349,7 @@ impl FrameLoop {
         DRAWN_DRAW_COUNT.store(frame.draw_count, Ordering::Relaxed);
 
         ext::frame_draw_started(frame);
+        crate::capture::note_drawn_hash(frame);
 
         self.prepare_sampled_targets(targets, frame);
         targets.publish_addresses();
