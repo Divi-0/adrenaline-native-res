@@ -190,6 +190,38 @@ impl<'s, S: BlockSource, const BLOCKS: usize> BlockCache<'s, S, BLOCKS> {
         self.last = 0;
     }
 
+    /// Reads every filled line again from the source and compares
+    /// (debug `readwatch`: did the game, or the plugin's VRAM copy, change
+    /// what the walk read while the walk ran?). Returns (changed lines,
+    /// lines checked, the first changed line's address).
+    pub fn changed_lines(&mut self) -> (u32, u32, u32) {
+        let (mut changed, mut checked, mut first) = (0, 0, 0);
+        let mut fresh = [0u32; LINE_WORDS];
+        for slot in 0..BLOCKS {
+            let address = self.store.addresses[slot];
+            if address == EMPTY {
+                continue;
+            }
+            for line in 0..LINES_PER_BLOCK {
+                if self.store.lines[slot] & (1 << line) == 0 {
+                    continue;
+                }
+                let line_address = address + line as u32 * LINE_SIZE;
+                if !self.source.copy_words(line_address, &mut fresh) {
+                    continue;
+                }
+                checked += 1;
+                if fresh[..] != self.store.blocks[slot][line * LINE_WORDS..(line + 1) * LINE_WORDS] {
+                    if changed == 0 {
+                        first = line_address;
+                    }
+                    changed += 1;
+                }
+            }
+        }
+        (changed, checked, first)
+    }
+
     /// The cache slot holding the block at `block_address`, loading it if
     /// needed. `None` if the block isn't readable.
     #[inline]
@@ -586,6 +618,37 @@ mod tests {
         assert_eq!(cache.read_u32(0), None);
         assert_eq!(cache.read_u32(RAM), Some(RAM));
         assert_eq!(cache.copies, 1);
+    }
+
+    /// A source whose words are their address plus `delta`.
+    struct ShiftingSource {
+        delta: u32,
+    }
+
+    impl BlockSource for ShiftingSource {
+        fn copy_block(&mut self, address: u32, out: &mut [u32; BLOCK_WORDS]) -> bool {
+            self.copy_words(address, out)
+        }
+
+        fn copy_words(&mut self, address: u32, out: &mut [u32]) -> bool {
+            for (index, word) in out.iter_mut().enumerate() {
+                *word = address + 4 * index as u32 + self.delta;
+            }
+            true
+        }
+    }
+
+    /// `readwatch`: the filled lines are read again; lines whose memory
+    /// changed since are counted, the first one's address given.
+    #[test]
+    fn changed_lines_are_found() {
+        let mut store = Store::new();
+        let mut cache = BlockCache::new(&mut store, ShiftingSource { delta: 0 });
+        cache.read_u32(RAM + 8);
+        cache.read_u32(RAM + 5 * BLOCK_SIZE + 2 * LINE_SIZE);
+        assert_eq!(cache.changed_lines(), (0, 2, 0));
+        cache.source.delta = 1;
+        assert_eq!(cache.changed_lines(), (2, 2, RAM));
     }
 
     /// The small stores work the same way.

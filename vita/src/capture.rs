@@ -151,6 +151,15 @@ pub fn set_copy_watch(on: u32) {
     nativeres_core::copy_watch::ON.store(on != 0, Ordering::Relaxed);
 }
 
+/// Debug `readwatch`: at the end of every event (the game still held at its
+/// GE sync) the lines the walk read through the block cache are read again
+/// and compared (`BlockCache::changed_lines`); log `readwatch=changed/
+/// checked@first`. Off by default (it reads everything twice).
+pub static READ_WATCH: AtomicBool = AtomicBool::new(false);
+static READ_CHANGED: AtomicU32 = AtomicU32::new(0);
+static READ_CHECKED: AtomicU32 = AtomicU32::new(0);
+static READ_FIRST: AtomicU32 = AtomicU32::new(0);
+
 /// Copiers read small ranges until two reads agree
 /// (`nativeres_core::draw_stream::STABLE_COPIES`; on by default).
 pub fn set_stable_copies(on: u32) {
@@ -698,13 +707,22 @@ impl CaptureState {
         let (capture, store) = capture.with_store();
         let mut memory = BlockCache::new(store, VitaBlocks { dump, vram, copies, check_vram: true });
         memory.whole_blocks = COPY_LINES.load(Ordering::Relaxed) == 0;
-        match capture.handle(parsed, &mut memory, frame) {
+        let result = match capture.handle(parsed, &mut memory, frame) {
             Some(stats) => {
                 *last_frame = stats;
                 true
             }
             None => false,
+        };
+        if READ_WATCH.load(Ordering::Relaxed) {
+            let (changed, checked, first) = memory.changed_lines();
+            READ_CHANGED.fetch_add(changed, Ordering::Relaxed);
+            READ_CHECKED.fetch_add(checked, Ordering::Relaxed);
+            if changed > 0 && READ_FIRST.load(Ordering::Relaxed) == 0 {
+                READ_FIRST.store(first, Ordering::Relaxed);
+            }
         }
+        result
     }
 
     /// After each frame: updates the plugin's VRAM copy requests for the
@@ -1126,6 +1144,15 @@ fn log_frame(state: &mut CaptureState, timing: &mut FrameTiming, flip: &RawEvent
     // Copied ranges the game rewrote before the frame's
     // end (`nativeres_core::copy_watch`): changed/checked, the first one
     // (address+words, ms from its copy), the youngest changed one's age.
+    if READ_WATCH.load(Ordering::Relaxed) {
+        let _ = write!(
+            text,
+            " readwatch={}/{}@{:08x}",
+            READ_CHANGED.swap(0, Ordering::Relaxed),
+            READ_CHECKED.swap(0, Ordering::Relaxed),
+            READ_FIRST.swap(0, Ordering::Relaxed)
+        );
+    }
     if nativeres_core::copy_watch::ON.load(Ordering::Relaxed) {
         let r = nativeres_core::copy_watch::check(sample_psp_ram);
         let _ = write!(
