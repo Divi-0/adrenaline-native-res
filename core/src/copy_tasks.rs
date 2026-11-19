@@ -329,11 +329,13 @@ struct OwnLine(AtomicU32);
 /// end and GE sync); only otherwise does the producer read `claimed` and the
 /// slot's `done` number. Measured on the Vita before (MTX race): ~650 cycles
 /// per task, most of it barriers and cache lines coming from the copier's core.
-pub struct CopyTasks {
-    tasks: UnsafeCell<[CopyTask; MAX_TASKS]>,
+///
+/// `N` slots (`MAX_TASKS` by default; `draw_stream`'s VRAM ring is smaller).
+pub struct CopyTasks<const N: usize = MAX_TASKS> {
+    tasks: UnsafeCell<[CopyTask; N]>,
     /// Per slot: the number + 1 of the last task copied from it (written by
     /// whoever copied it, release; the producer never writes it).
-    done: [AtomicU32; MAX_TASKS],
+    done: [AtomicU32; N],
     // Producer only.
     position: u32,
     /// Every task numbered below this is copied (`complete` saw it; a plain
@@ -347,13 +349,13 @@ pub struct CopyTasks {
 
 // Safe: the producer and the copiers touch a slot one after the other,
 // handed over through `published`, `claimed` and `done` (module doc).
-unsafe impl Sync for CopyTasks {}
+unsafe impl<const N: usize> Sync for CopyTasks<N> {}
 
-impl CopyTasks {
-    pub const fn new() -> CopyTasks {
+impl<const N: usize> CopyTasks<N> {
+    pub const fn new() -> CopyTasks<N> {
         CopyTasks {
-            tasks: UnsafeCell::new([CopyTask::EMPTY; MAX_TASKS]),
-            done: [const { AtomicU32::new(0) }; MAX_TASKS],
+            tasks: UnsafeCell::new([CopyTask::EMPTY; N]),
+            done: [const { AtomicU32::new(0) }; N],
             position: 0,
             known_done: AtomicU32::new(0),
             published: OwnLine(AtomicU32::new(0)),
@@ -366,11 +368,11 @@ impl CopyTasks {
     /// task before it must be done: known done (`known_done`), or else if
     /// nobody has taken it, the producer copies the oldest tasks itself
     /// (`copy`) until it is taken, then waits the moment its copier needs.
-    /// (That task is published: fewer than `MAX_TASKS` wait unpublished.)
-    pub fn push(&mut self, task: CopyTask, mut copy: impl FnMut(&CopyTasks) -> bool) {
-        let slot = self.position as usize % MAX_TASKS;
-        let before = self.position.wrapping_sub(MAX_TASKS as u32);
-        let reused = self.position as usize >= MAX_TASKS;
+    /// (That task is published: fewer than `N` wait unpublished.)
+    pub fn push(&mut self, task: CopyTask, mut copy: impl FnMut(&CopyTasks<N>) -> bool) {
+        let slot = self.position as usize % N;
+        let before = self.position.wrapping_sub(N as u32);
+        let reused = self.position as usize >= N;
         if reused && before.wrapping_sub(self.known_done.load(Ordering::Relaxed)) as i32 >= 0 {
             // Whatever waits unpublished is newer than `before`: published,
             // the copiers (and `copy`) can reach it.
@@ -424,7 +426,7 @@ impl CopyTasks {
         let Some(number) = self.take() else {
             return false;
         };
-        let slot = number as usize % MAX_TASKS;
+        let slot = number as usize % N;
         // Safe: a published task this caller took (module documentation).
         let task = unsafe { (*self.tasks.get())[slot] };
         run(&task, source, stable);
@@ -459,7 +461,7 @@ impl CopyTasks {
     }
 }
 
-impl Default for CopyTasks {
+impl<const N: usize> Default for CopyTasks<N> {
     fn default() -> Self {
         CopyTasks::new()
     }
@@ -564,7 +566,7 @@ mod tests {
 
     #[test]
     fn the_ring_wraps_and_the_producer_copies_what_nobody_took() {
-        let mut tasks = Box::new(CopyTasks::new());
+        let mut tasks = Box::new(CopyTasks::<MAX_TASKS>::new());
         let mut out = vec![0u8; MAX_TASKS * 3];
         let mut source = Counting { reads: 0, fail_at: None };
         for n in 0..(MAX_TASKS * 3) as u32 {
@@ -598,7 +600,7 @@ mod tests {
     /// published (it would copy a slot still being written).
     #[test]
     fn nothing_unpublished_is_taken() {
-        let tasks = CopyTasks::new();
+        let tasks = CopyTasks::<MAX_TASKS>::new();
         assert!(tasks.take().is_none());
         assert!(!tasks.copy_one(&mut Counting { reads: 0, fail_at: None }, false));
         assert!(tasks.complete() && tasks.all_taken());
@@ -609,7 +611,7 @@ mod tests {
     /// end that publishes first can't miss them.
     #[test]
     fn pushed_tasks_wait_for_publish() {
-        let mut tasks = CopyTasks::new();
+        let mut tasks = CopyTasks::<MAX_TASKS>::new();
         let mut out = [0u8; 2];
         let mut source = Counting { reads: 0, fail_at: None };
         for n in 0..2 {

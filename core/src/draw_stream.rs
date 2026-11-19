@@ -96,6 +96,21 @@ const MAX_JOB_WORDS: usize = MAX_WORDS / 4;
 /// 28.75 fps, walk p50 29.5 -> 27.3 ms, late flips 158 -> ~117.
 pub static COPIER_LAG_JOBS: AtomicU32 = AtomicU32::new(512);
 
+/// Copy tasks from VRAM go into a ring of their own (`DrawStream::vram_tasks`)
+/// that the copier empties first and that may lag only this many tasks
+/// before the producer copies them itself, while RAM's may lag
+/// `COPIER_LAG_JOBS`. The copier finishes only at the game's GE sync; when
+/// that wait times out (heavy frames), the PSP plugin refreshes its VRAM
+/// copy at the next list's enqueue, and a copier hundreds of tasks behind
+/// read the next frame's VRAM: MTX's riders, whose vertices it keeps in
+/// VRAM, were drawn for a frame as huge sheets with stretched textures
+/// (2026-11-19; `copierlag 2` fixed it at 41 instead of 31 ms of capture
+/// per paused race frame, VRAM copied by the producer at 37.7 ms).
+pub const VRAM_LAG_TASKS: u32 = 16;
+/// The VRAM ring's size (MTX's paused race: ~720 VRAM tasks per frame,
+/// taken as they come).
+pub const MAX_VRAM_TASKS: usize = 512;
+
 /// Copy tasks are published to the copier this many at a time
 /// (`DrawStream::copy_task`; the rest whenever the producer waits for
 /// copies). A power of two (the check is a mask on the A9).
@@ -415,8 +430,10 @@ pub struct DrawStream {
     /// noted by the consumer as it starts the segment's first job
     /// (`QueuedDraw::segment`); read by the producer once idle.
     segment_starts: UnsafeCell<[u32; MAX_SEGMENTS]>,
-    /// The copies of draws the capture thread writes itself (`copy_tasks`).
+    /// The copies of draws the capture thread writes itself (`copy_tasks`):
+    /// from RAM, and from VRAM (`VRAM_LAG_TASKS`).
     tasks: CopyTasks,
+    vram_tasks: CopyTasks<MAX_VRAM_TASKS>,
 }
 
 // Safe: the producer and the consumer touch disjoint parts (see the module
@@ -454,6 +471,7 @@ impl DrawStream {
             raw_tables_with_consumer: true,
             segment_starts: UnsafeCell::new([0; MAX_SEGMENTS]),
             tasks: CopyTasks::new(),
+            vram_tasks: CopyTasks::new(),
         }
     }
 
@@ -496,7 +514,9 @@ impl DrawStream {
 
     /// True if no published job or copy task waits for a copier to take it.
     pub fn all_copied(&self) -> bool {
-        self.claimed.load(Ordering::Relaxed) == self.published.load(Ordering::Acquire) && self.tasks.all_taken()
+        self.claimed.load(Ordering::Relaxed) == self.published.load(Ordering::Acquire)
+            && self.tasks.all_taken()
+            && self.vram_tasks.all_taken()
     }
 
     /// Copier: copies the deferred ranges of the published jobs nobody has
@@ -504,17 +524,32 @@ impl DrawStream {
     /// (`copy_tasks`). False if there was none.
     pub fn copy_published(&self) -> bool {
         let mut any = false;
-        while self.copy_one() || self.copy_one_task() {
+        // VRAM tasks first, whenever there is one (`VRAM_LAG_TASKS`).
+        while self.copy_one_vram_task() || self.copy_one() || self.copy_one_task() {
             any = true;
         }
         any
     }
 
-    /// Takes the oldest copy task nobody has taken yet and copies it. False
-    /// if there was none (or no reader to copy with).
+    /// Takes the oldest copy task nobody has taken yet, from VRAM first, and
+    /// copies it. False if there was none (or no reader to copy with).
     fn copy_one_task(&self) -> bool {
         match self.reader {
-            Some(reader) => self.tasks.copy_one(&mut ReaderSource { copy_bytes: reader.copy_bytes, sample: reader.sample }, STABLE_COPIES.load(Ordering::Relaxed)),
+            Some(reader) => {
+                let stable = STABLE_COPIES.load(Ordering::Relaxed);
+                let source = &mut ReaderSource { copy_bytes: reader.copy_bytes, sample: reader.sample };
+                self.vram_tasks.copy_one(source, stable) || self.tasks.copy_one(source, stable)
+            }
+            None => false,
+        }
+    }
+
+    /// Takes the oldest VRAM copy task nobody has taken yet and copies it.
+    fn copy_one_vram_task(&self) -> bool {
+        match self.reader {
+            Some(reader) => self
+                .vram_tasks
+                .copy_one(&mut ReaderSource { copy_bytes: reader.copy_bytes, sample: reader.sample }, STABLE_COPIES.load(Ordering::Relaxed)),
             None => false,
         }
     }
@@ -594,7 +629,9 @@ impl DrawStream {
     /// The GE sync waits for this (capture.rs).
     pub fn copies_complete(&self) -> bool {
         self.publish_tasks();
-        (self.copier.is_none() || self.copies_finished.load(Ordering::Acquire) == self.job_position) && self.tasks.complete()
+        // (Both rings asked: `complete` notes their free slots.)
+        let tasks = self.tasks.complete() & self.vram_tasks.complete();
+        (self.copier.is_none() || self.copies_finished.load(Ordering::Acquire) == self.job_position) && tasks
     }
 
     /// Producer, where it must not go on before every job is copied (the GE
@@ -639,6 +676,22 @@ impl DrawStream {
         if !memory.defer(start, span.next_multiple_of(4)) {
             return false;
         }
+        if (crate::memory::VRAM_START..crate::memory::VRAM_END).contains(&physical(start)) {
+            // Published at once and never left behind (`VRAM_LAG_TASKS`).
+            self.vram_tasks
+                .push(task, |tasks| tasks.copy_one(&mut ReaderSource { copy_bytes: reader.copy_bytes, sample: reader.sample }, stable));
+            if self.vram_tasks.publish() {
+                (copier.wake)();
+            }
+            if self.vram_tasks.untaken() > VRAM_LAG_TASKS {
+                let previous = crate::phase::enter(crate::phase::HELP);
+                while self.vram_tasks.untaken() > VRAM_LAG_TASKS / 2 && self.copy_one_vram_task() {
+                    crate::copy_tasks::PRODUCER_TASKS.fetch_add(1, Ordering::Relaxed);
+                }
+                crate::phase::leave(previous);
+            }
+            return true;
+        }
         self.tasks.push(task, |tasks| tasks.copy_one(&mut ReaderSource { copy_bytes: reader.copy_bytes, sample: reader.sample }, stable));
         // Published (and the copier woken) every `TASK_BATCH` tasks: each
         // publish and wake is three barriers (`copy_thread::wake`). Whoever
@@ -668,7 +721,7 @@ impl DrawStream {
     /// (`copy_task`) and wakes the copier for them. Before anything that
     /// waits for the copies or copies the untaken ones itself.
     fn publish_tasks(&self) {
-        if self.tasks.publish() {
+        if self.tasks.publish() | self.vram_tasks.publish() {
             if let Some(copier) = self.copier {
                 (copier.wake)();
             }
@@ -879,7 +932,7 @@ impl DrawStream {
         while self.copy_one_task() {
             crate::copy_tasks::PRODUCER_TASKS.fetch_add(1, Ordering::Relaxed);
         }
-        while !self.tasks.complete() {
+        while !(self.tasks.complete() & self.vram_tasks.complete()) {
             match self.hooks {
                 Some(hooks) => (hooks.wait)(),
                 None => core::hint::spin_loop(),
@@ -1384,6 +1437,58 @@ mod tests {
         assert!(!copied.zero_copy(0x0890_0000, 4100), "beyond the range");
         assert!(!copied.zero_copy(0x0891_0000, 16), "the index range");
         assert_eq!(copied.borrow_words(0x0890_0008, 1), Some(&[0x0890_0008][..]), "still readable");
+    }
+
+    /// MTX's race glitch (2026-11-19): with the copier 512 tasks behind, the
+    /// riders' vertices (in VRAM) were copied after the plugin had refreshed
+    /// its VRAM copy for the next frame: huge stretched sheets for a frame.
+    /// VRAM tasks go into their own ring: never more than `VRAM_LAG_TASKS`
+    /// left to the copier, and the copier takes them before RAM's, which
+    /// still may lag `COPIER_LAG_JOBS`.
+    #[test]
+    fn vram_copy_tasks_never_lag_and_go_first() {
+        use crate::copy_tasks::Layout;
+        static HOOKS: CopierHooks = CopierHooks { wake: || {} };
+        struct AllDeferrable;
+        impl PspMemory for AllDeferrable {
+            fn read_u32(&mut self, _address: u32) -> Option<u32> {
+                None
+            }
+            fn defer(&mut self, _address: u32, _bytes: u32) -> bool {
+                true // RAM and VRAM the plugin's copy holds
+            }
+        }
+        let reader = DeferredReader {
+            copy_bytes: |address, out| {
+                out.fill((address >> 4) as u8 | 1);
+                true
+            },
+            ..FAKE_READER
+        };
+        let mut stream = Box::new(DrawStream::new());
+        stream.reader = Some(reader);
+        stream.copier = Some(&HOOKS);
+        let (mut ram, mut vram) = (vec![0u8; 100 * 16], vec![0u8; 40 * 16]);
+        let task = |source: u32, out: &mut [u8]| CopyTask { source, length: 16, destination: out.as_mut_ptr(), layout: Layout::Plain };
+        for i in 0..100 {
+            assert!(stream.hand_over_task(&mut AllDeferrable, task(0x0890_0000 + 16 * i as u32, &mut ram[16 * i..])));
+        }
+        assert_eq!(stream.tasks.untaken(), 100, "RAM tasks may wait for the copier");
+        for i in 0..40 {
+            assert!(stream.hand_over_task(&mut AllDeferrable, task(0x4415_5000 + 16 * i as u32, &mut vram[16 * i..])));
+            assert!(stream.vram_tasks.untaken() <= VRAM_LAG_TASKS, "task {i}");
+        }
+        assert!(vram[..16].iter().all(|&byte| byte != 0), "the producer copied the oldest VRAM task itself");
+        assert!(ram.iter().all(|&byte| byte == 0), "but no RAM task");
+        // The copier takes VRAM's first.
+        let (ram_before, vram_before) = (stream.tasks.untaken(), stream.vram_tasks.untaken());
+        assert!(vram_before > 0);
+        assert!(stream.copy_one_task());
+        assert_eq!((stream.tasks.untaken(), stream.vram_tasks.untaken()), (ram_before, vram_before - 1));
+        // All of them by the frame's end.
+        stream.wait_for_tasks();
+        assert!(ram.iter().chain(&vram).all(|&byte| byte != 0));
+        assert!(stream.all_copied());
     }
 
     /// Test memory whose main RAM may be read later by the consumer.
