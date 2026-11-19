@@ -28,7 +28,7 @@ use nativeres_core::frame::{
     ReadWay, NO_RING_INDICES,
 };
 use nativeres_core::texture;
-use nativeres_core::opaque_source::{alpha_test_lets_255_pass, for_opaque_source, lowest_vertex_alpha, raw_vertex_span};
+use nativeres_core::opaque_source::{alpha_test_is_one_sided, alpha_test_lets_255_pass, for_opaque_source, lowest_vertex_alpha, raw_vertex_span};
 use nativeres_core::vertex::VertexFormat;
 
 use crate::arenas;
@@ -327,13 +327,18 @@ fn read_choice(frame: &Frame, draw: &Draw, keep_target_alpha: bool) -> Option<Re
 
 /// The alpha values the PSP's alpha test `function` (its 3 bits) with
 /// `reference` (0..255) lets pass: `lo..=hi`, or with `outside` the ones
-/// outside that range; None for "always".
+/// outside that range; None for "always". "Not equal" 0 and 255 as the
+/// range they leave (1..255, 0..254): the first is one-sided (core
+/// `alpha_test_is_one_sided`: the fast frame-read programs' test).
 fn alpha_test_bounds(function: u32, reference: u32) -> Option<(f32, f32, bool)> {
+    let reference_number = reference;
     let reference = reference as f32;
     Some(match function & 7 {
         0 => (1.0, 0.0, false),               // never
         1 => return None,                     // always
         2 => (reference, reference, false),   // equal
+        3 if reference_number == 0 => (1.0, 255.0, false), // not equal 0
+        3 if reference_number == 255 => (0.0, 254.0, false), // not equal 255
         3 => (reference, reference, true),    // not equal
         4 => (0.0, reference - 1.0, false),   // less
         5 => (0.0, reference, false),         // less or equal
@@ -854,7 +859,7 @@ impl Draws {
         let stats = stats();
         stats.alpha_tested += 1;
         let passes_all = !outside && lo <= 0.0 && hi >= 255.0;
-        let rejects_only_zero = (!outside && lo == 1.0 && hi >= 255.0) || (outside && lo == 0.0 && hi == 0.0);
+        let rejects_only_zero = !outside && lo == 1.0 && hi >= 255.0; // greater 0, not equal 0
         if passes_all || (rejects_only_zero && alpha_zero_changes_nothing(draw)) {
             stats.alpha_test_skipped += 1;
             return None;
@@ -1281,6 +1286,11 @@ impl Draws {
                 }
             }
             stats().opaque_us += draw_clock().wrapping_sub(start);
+        }
+        // The fast frame-read programs test one side only (alpha from lo
+        // up); other tests (less, equal, not equal) take the generic one.
+        if tested && !alpha_test_is_one_sided(alpha_range) {
+            choice = choice.map(|_| ReadVariant::Generic);
         }
         let read_variant = choice.unwrap_or(ReadVariant::Generic);
         let read_program = match choice {
@@ -1769,7 +1779,12 @@ impl Draws {
     /// the alpha-test program where `case.tested`.
     fn shade_test_quad(&mut self, left: f32, top: f32, case: &ShadeCase, program: ShadeProgram, alpha_test: [f32; 4]) {
         let tested = case.tested && self.programs.textured.have_test;
-        let off = ReadVariant::Fast { way: ReadWay::Off, keep_alpha: false, dither: false };
+        // As the draws: the fast program for one-sided tests, else the generic one.
+        let off = if tested && !alpha_test_is_one_sided(alpha_test) {
+            ReadVariant::Generic
+        } else {
+            ReadVariant::Fast { way: ReadWay::Off, keep_alpha: false, dither: false }
+        };
         let fragment = match program {
             ShadeProgram::EightBit => {
                 let kind = if tested { Kind::TexturedTest } else { Kind::Textured };
@@ -1796,6 +1811,18 @@ impl Draws {
                 set_uniform(buffer, fog_and_scale, 4, case.fog_and_scale.as_ptr());
                 if !alpha.is_null() {
                     set_uniform(buffer, alpha, 4, alpha_test.as_ptr());
+                }
+                if off == ReadVariant::Generic {
+                    // Unblended into 5551, undithered, no BLEND_FIX (as
+                    // `read_fragment_uniforms` for such a draw).
+                    let cut = cut_uniforms(0, false, [5, 5, 5, 1], true, !self.keep_target_alpha, false);
+                    for (parameter, values) in read.cut.iter().zip(&cut) {
+                        set_uniform(buffer, *parameter, 4, values.as_ptr());
+                    }
+                    for parameter in &read.dither {
+                        set_uniform(buffer, *parameter, 4, [0.0f32; 4].as_ptr());
+                    }
+                    set_uniform(buffer, read.blend_fix, 4, [1.0f32, 0.0, 0.0, 0.0].as_ptr());
                 }
                 self.state.tint = None; // the cached default buffer is no longer the one in use
             }

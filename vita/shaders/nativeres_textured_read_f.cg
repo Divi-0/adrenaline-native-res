@@ -31,7 +31,9 @@
 // game reads it) stays, else the alpha is written as blended (nobody
 // reads it then); READ_TEST (textured only): with the alpha test, whose
 // `discard` costs the GPU even where it passes (the 8-bit path's
-// nativeres_textured_test_f.cg likewise); READ_DITHER: the GE's dither
+// nativeres_textured_test_f.cg likewise), one-sided (alpha from lo up:
+// greater, greater or equal; draw.rs sends other tests to the generic
+// program); READ_DITHER: the GE's dither
 // value added after the blend, read from uDitherTexture (texture unit 1:
 // the matrix as an 8x8 texture, value + 8 in red, sampled at WPOS / 16:
 // draw.rs `use_dither_texture`; 13 instructions less than `DitherValue`'s
@@ -216,7 +218,16 @@ __nativecolor __regformat unsigned char4 main(
 	// The separate specular colour after texturing, then the doubling (PPSSPP:
 	// v = p * t + s, then the colour doubling, clamped), then fog.
 	float4 c = GeShade(tex2D(tex, vTexcoord), vColor * overW, vSpecular * overW, vFog.x * overW, uFogAndScale);
-#if !defined(READ_FAST) || defined(READ_TEST)
+#if defined(READ_FAST) && defined(READ_TEST)
+	// The alpha test on the whole alpha, one-sided: only tests that pass
+	// the alphas from lo up (greater, greater or equal: core opaque_source.rs
+	// `alpha_test_is_one_sided`; the others take the generic program), for
+	// which the two-sided test below is "alpha < lo - 0.5" (y - alpha > 0
+	// for every alpha). 3 instructions less (normaltest 57 -> 54, offtest
+	// 39 -> 36; 2026-11-19).
+	if (c.a < uAlphaTest.x)
+		discard;
+#elif !defined(READ_FAST)
 	// The alpha test on the whole alpha, as nativeres_textured_test_f.cg
 	// (uAlphaTest: x = lo - 0.5, y = hi + 0.5, z = 1 or -1 for NOTEQUAL).
 	if ((c.a - uAlphaTest.x) * (uAlphaTest.y - c.a) * uAlphaTest.z < 0.0f)

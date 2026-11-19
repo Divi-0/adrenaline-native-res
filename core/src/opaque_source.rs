@@ -122,6 +122,18 @@ pub fn alpha_test_lets_255_pass(uniform: [f32; 4]) -> bool {
     (255.0 - uniform[0]) * (uniform[1] - 255.0) * uniform[2] > 0.0
 }
 
+/// True if an alpha test with fragment-program uniform `uniform` (as
+/// `alpha_test_lets_255_pass`) passes exactly the alphas from a lower bound
+/// up (greater, greater or equal, equal 255; nearly every test games use):
+/// then "discard where alpha < x" is the same test as the two-sided
+/// (alpha - x)(y - alpha) z < 0, since y - alpha > 0 for every alpha
+/// 0..255. The fast frame-read programs test that way (3 instructions
+/// less, nativeres_textured_read_f.cg READ_TEST); the other tests take the
+/// generic program.
+pub fn alpha_test_is_one_sided(uniform: [f32; 4]) -> bool {
+    uniform[2] > 0.0 && uniform[1] > 255.0
+}
+
 /// The vertex numbers a raw draw (`draw_flags::RAW_VERTICES`) uses, as
 /// `first..end` counted from its window (`Draw::first_vertex`): from its
 /// index runs or its triangle list. None without any.
@@ -190,6 +202,37 @@ mod tests {
             assert!(!alpha_test_lets_255_pass(uniform(0.0, r - 1.0, false)), "less {reference}");
         }
         assert!(!alpha_test_lets_255_pass(uniform(1.0, 0.0, false)), "never");
+    }
+
+    #[test]
+    fn one_sided_alpha_tests_are_the_lower_bound_alone() {
+        // As draw.rs `alpha_test_uniform(lo, hi, outside)` and
+        // `alpha_test_bounds` (not equal 0 as greater or equal 1) build them.
+        let uniform = |lo: f32, hi: f32, outside: bool| [lo - 0.5, hi + 0.5, if outside { -1.0 } else { 1.0 }, 0.0];
+        let two_sided = |u: [f32; 4], a: f32| (a - u[0]) * (u[1] - a) * u[2] >= 0.0;
+        let one_sided = |u: [f32; 4], a: f32| a >= u[0];
+        for reference in 0..=255 {
+            let r = reference as f32;
+            let tests = [
+                (uniform(r, 255.0, false), true),        // greater or equal
+                (uniform(r + 1.0, 255.0, false), true),  // greater
+                (uniform(r, r, false), reference == 255), // equal (255: from 255 up)
+                (uniform(r, r, true), false),            // not equal
+                (uniform(0.0, r, false), reference == 255), // less or equal (255: all)
+                (uniform(0.0, r - 1.0, false), false),   // less
+            ];
+            for (i, (u, expected)) in tests.into_iter().enumerate() {
+                assert_eq!(alpha_test_is_one_sided(u), expected, "test {i} reference {reference}");
+                if expected {
+                    for alpha in 0..=255 {
+                        let a = alpha as f32;
+                        assert_eq!(one_sided(u, a), two_sided(u, a), "test {i} reference {reference} alpha {alpha}");
+                    }
+                }
+            }
+        }
+        // Never (draw.rs `alpha_test_bounds`: 1..0): the generic program.
+        assert!(!alpha_test_is_one_sided(uniform(1.0, 0.0, false)), "never");
     }
 
     #[test]
