@@ -68,8 +68,8 @@ pub const STALE_FRAMES: u32 = 16;
 /// blocks in a row (the walk finds one after the other) held 9 frames, the
 /// picture frozen ~0.3 s (2026-11-20).
 pub const DISTRUST_FRAMES: u32 = 3;
-/// At most this many runs of distrusted blocks get ranges of their own in
-/// a plan (the others wait for the next one, or DISTRUST_FRAMES).
+/// The ranges a plan gives the blocks to be copied again (runs joined over
+/// growing gaps until they fit).
 pub const REFRESH_RUNS: usize = 4;
 /// Unused blocks between used ones that are requested too, so the plugin
 /// gets few ranges (doubled until the ranges fit into the table).
@@ -130,6 +130,9 @@ pub struct VramRequests {
     /// `refresh_wanted` blocks in a range new to the plugin's table of a
     /// published plan, copy not confirmed yet.
     refresh_pending: [bool; BLOCKS],
+    /// `frame + 1` when a copy of the block in full was last confirmed (0 =
+    /// never): counts as a read for STALE_FRAMES.
+    refreshed_at: [u32; BLOCKS],
     /// The last plan built, and the last two published (the plugin's table:
     /// a range in it isn't new to the plugin, so not copied in full again;
     /// the one before, as the plugin may not have taken the last one yet).
@@ -194,6 +197,7 @@ impl VramRequests {
             distrusted_until: [0; BLOCKS],
             refresh_wanted: [false; BLOCKS],
             refresh_pending: [false; BLOCKS],
+            refreshed_at: [0; BLOCKS],
             built: Plan::EMPTY,
             table: Plan::EMPTY,
             previous_table: Plan::EMPTY,
@@ -217,12 +221,19 @@ impl VramRequests {
         if block >= BLOCKS {
             return false;
         }
-        let last = self.block_last_used[block];
+        let stale = self.stale(block);
         self.block_last_used[block] = self.frame + 1;
         if self.ready[block] {
-            // Frames since its last read (0: read this frame already).
-            if last != 0 && (self.frame + 1).wrapping_sub(last) >= STALE_FRAMES && !self.previous_block_recent(block) {
+            if stale && !self.previous_block_recent(block) {
                 self.distrusted_until[block] = self.frame + DISTRUST_FRAMES;
+                // The draws may read more blocks back after the pause
+                // (vertices, indices: no wait for those): all stale blocks
+                // are copied again with this one.
+                for other in 0..BLOCKS {
+                    if self.ready[other] && self.stale(other) {
+                        self.refresh_wanted[other] = true;
+                    }
+                }
             }
             if self.distrusted_until[block] != 0 && (self.distrusted_until[block].wrapping_sub(self.frame) as i32) > 0 {
                 // Back after a pause: maybe stale (see STALE_FRAMES). Read
@@ -240,6 +251,14 @@ impl VramRequests {
         }
         self.missing += 1;
         false
+    }
+
+    /// Neither read nor copied again in full for STALE_FRAMES frames or
+    /// more (but read before).
+    fn stale(&self, block: usize) -> bool {
+        let since = |mark: u32| if mark == 0 { u32::MAX } else { (self.frame + 1).wrapping_sub(mark) };
+        self.block_last_used[block] != 0
+            && since(self.block_last_used[block]).min(since(self.refreshed_at[block])) >= STALE_FRAMES
     }
 
     /// The block before `block` was read in this frame or the last one: a
@@ -350,6 +369,7 @@ impl VramRequests {
                     self.refresh_pending[block] = false;
                     self.refresh_wanted[block] = false;
                     self.distrusted_until[block] = 0;
+                    self.refreshed_at[block] = self.frame + 1;
                 }
             }
             self.any_pending = false;
@@ -419,24 +439,19 @@ impl VramRequests {
         (0..BLOCKS).filter(|&block| self.refresh_wanted[block] && (block == 0 || !self.refresh_wanted[block - 1])).count()
     }
 
-    /// Appends up to `room` ranges, one per run of `refresh_wanted` blocks,
-    /// each new to the plugin (in neither its table nor this plan: it copies
-    /// only new ranges in full), grown by a block at a time until it is.
-    /// Returns the new count.
+    /// Appends up to `room` ranges over the `refresh_wanted` blocks (runs
+    /// joined over growing gaps until they fit), each new to the plugin (in
+    /// neither its table nor this plan: it copies only new ranges in full),
+    /// grown by a block at a time until it is. Returns the new count.
     fn add_refresh_ranges(&self, plan: &mut Plan, room: usize) -> usize {
-        let limit = (plan.count + room).min(MAX_RANGES);
+        let mut runs = [VramRange::default(); MAX_RANGES];
+        let found = self.add_block_ranges(&mut runs, 0, room, |requests, block| requests.refresh_wanted[block]);
         let mut count = plan.count;
-        let mut block = 0;
-        while block < BLOCKS && count < limit {
-            if !self.refresh_wanted[block] {
-                block += 1;
-                continue;
+        for run in &runs[..found] {
+            if count >= MAX_RANGES {
+                break;
             }
-            let mut end = block + 1;
-            while end < BLOCKS && self.refresh_wanted[end] {
-                end += 1;
-            }
-            let (mut first, mut last) = (block, end);
+            let (mut first, mut last) = ((run.offset / BLOCK_SIZE) as usize, ((run.offset + run.size) / BLOCK_SIZE) as usize);
             let range_of = |first: usize, last: usize| VramRange { offset: first as u32 * BLOCK_SIZE, size: (last - first) as u32 * BLOCK_SIZE };
             let mut range = range_of(first, last);
             let known = |range: &VramRange| self.table.ranges().contains(range) || self.previous_table.ranges().contains(range);
@@ -450,7 +465,6 @@ impl VramRequests {
             }
             plan.ranges[count] = range;
             count += 1;
-            block = end;
         }
         count
     }
@@ -758,6 +772,37 @@ mod tests {
         assert!(ranges.iter().enumerate().all(|(i, range)| !ranges[..i].contains(range)), "no extra range: {ranges:?}");
         frame(&mut requests, 3, 3);
         assert!(requests.block_ready(sublist));
+    }
+
+    /// Run 2 in MHF's village (2026-11-20): the walk's waits went on, but
+    /// draws then read vertices or indices in other blocks back after the
+    /// pause, distrusted too (no wait for those): 1-2 frames still held. The
+    /// first refresh takes every stale block along (used, unread for
+    /// STALE_FRAMES+ frames), so the later reads find them copied again.
+    #[test]
+    fn the_first_refresh_takes_every_stale_block_along() {
+        let mut requests = Box::new(VramRequests::new());
+        let list = block_address(0x555);
+        let vertices = block_address(0x6A0);
+        let every_frame = block_address(0x400);
+        for block in [list, vertices, every_frame] {
+            requests.block_ready(block);
+        }
+        frame(&mut requests, 0, 1);
+        frame(&mut requests, 1, 1);
+        assert!(requests.block_ready(list) && requests.block_ready(vertices));
+        for _ in 0..STALE_FRAMES {
+            requests.block_ready(every_frame);
+            frame(&mut requests, 1, 1);
+        }
+        requests.take_missing();
+        assert!(!requests.block_ready(list), "back after a pause: distrusted");
+        requests.plan_mid_frame(1);
+        requests.published(2);
+        assert!(requests.note_copied(2));
+        assert!(requests.block_ready(list));
+        assert!(requests.block_ready(vertices), "copied again along with the list's block");
+        assert_eq!(requests.take_missing(), 1, "only the first read missed");
     }
 
     /// The same when the block's run is exactly a range of the table
