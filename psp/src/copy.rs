@@ -40,7 +40,7 @@ use core::ptr::{addr_of, read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};
 
 use nativeres_core::psp_copy::{
-    best_method, copy_span, ge_probe_list, KnownRanges, Refresh, CHECK_BLOCK_BYTES, GE_PROBE_LIST_WORDS,
+    best_method, cache_line_span, copy_pieces, copy_span, CACHE_LINE_BYTES, ge_probe_list, KnownRanges, Refresh, CHECK_BLOCK_BYTES, GE_PROBE_LIST_WORDS,
     REFRESH_BYTES_PER_FRAME,
 };
 use nativeres_core::psp_link::{copy_method, VRAM_CACHED, VRAM_COPY_ADDRESS, VRAM_COPY_CACHED_ADDRESS, VRAM_UNCACHED};
@@ -82,6 +82,38 @@ fn cached_copy(offset: u32) -> *mut u32 {
 // of word loads and stores as written (the compiler would make the plain
 // ones a memcpy call: that is method MEMCPY).
 
+/// Before reading `size` bytes of VRAM at `from` through the cache: the
+/// lines covering them written back and invalidated, so the reads come from
+/// VRAM (core `psp_copy::cache_line_span`: the plain invalidate refuses
+/// word-aligned ranges).
+///
+/// Safe to call with any range: the kernel call only maintains the cache.
+unsafe fn drop_cached_lines(from: *const u32, size: u32) {
+    if get!(verify_copies) & 2 != 0 {
+        // Debug `copyverify` bit 1: the old call, for A/Bs.
+        sceKernelDcacheInvalidateRange(from.cast(), size);
+        return;
+    }
+    let (start, size) = cache_line_span(from as u32, size);
+    sceKernelDcacheWritebackInvalidateRange(start as *const c_void, size);
+}
+
+/// After writing `size` bytes of the copy at `to` through the cache: the
+/// lines covering them written back, whole (core `psp_copy::
+/// cache_line_span`), so the Vita side, which reads the copy uncached, sees
+/// all of it.
+///
+/// Safe to call with any range: the kernel call only maintains the cache.
+unsafe fn write_back_copy(to: *mut u32, size: u32) {
+    if get!(verify_copies) & 2 != 0 {
+        // Debug `copyverify` bit 1: the old call, for A/Bs.
+        sceKernelDcacheWritebackRange(to.cast(), size);
+        return;
+    }
+    let (start, size) = cache_line_span(to as u32, size);
+    sceKernelDcacheWritebackRange(start as *const c_void, size);
+}
+
 /// Word by word, both sides uncached: no cache maintenance needed.
 fn copy_words(offset: u32, size: u32) {
     let (from, to) = (uncached_vram(offset), uncached_copy(offset));
@@ -97,11 +129,11 @@ fn copy_cached(offset: u32, size: u32) {
     let (from, to) = (cached_vram(offset), cached_copy(offset));
     // Safe: inside VRAM and the copy area.
     unsafe {
-        sceKernelDcacheInvalidateRange(from.cast(), size);
+        drop_cached_lines(from, size);
         for word in 0..(size / 4) as usize {
             write_volatile(to.add(word), read_volatile(from.add(word)));
         }
-        sceKernelDcacheWritebackRange(to.cast(), size);
+        write_back_copy(to, size);
     }
 }
 
@@ -112,7 +144,7 @@ fn copy_unrolled(offset: u32, size: u32) {
     let words = (size / 4) as usize;
     // Safe: inside VRAM and the copy area.
     unsafe {
-        sceKernelDcacheInvalidateRange(from.cast(), size);
+        drop_cached_lines(from, size);
         let mut word = 0;
         while word + 8 <= words {
             let mut eight = [0u32; 8];
@@ -128,7 +160,7 @@ fn copy_unrolled(offset: u32, size: u32) {
             write_volatile(to.add(word), read_volatile(from.add(word)));
             word += 1;
         }
-        sceKernelDcacheWritebackRange(to.cast(), size);
+        write_back_copy(to, size);
     }
 }
 
@@ -139,7 +171,7 @@ fn copy_vfpu(offset: u32, size: u32) {
     // Safe: inside VRAM and the copy area; nps_vfpu_copy64 needs 16-byte
     // alignment, checked.
     unsafe {
-        sceKernelDcacheInvalidateRange(from.cast(), size);
+        drop_cached_lines(from, size);
         let mut done = 0;
         if (from as u32) & 15 == 0 && (to as u32) & 15 == 0 {
             nps_vfpu_copy64(from, to, size / 64);
@@ -148,7 +180,7 @@ fn copy_vfpu(offset: u32, size: u32) {
         for word in (done / 4) as usize..(size / 4) as usize {
             write_volatile(to.add(word), read_volatile(from.add(word)));
         }
-        sceKernelDcacheWritebackRange(to.cast(), size);
+        write_back_copy(to, size);
     }
 }
 
@@ -157,9 +189,9 @@ fn copy_memcpy(offset: u32, size: u32) {
     let (from, to) = (cached_vram(offset), cached_copy(offset));
     // Safe: inside VRAM and the copy area.
     unsafe {
-        sceKernelDcacheInvalidateRange(from.cast(), size);
+        drop_cached_lines(from, size);
         memcpy(to.cast(), from.cast(), size as usize);
-        sceKernelDcacheWritebackRange(to.cast(), size);
+        write_back_copy(to, size);
     }
 }
 
@@ -200,7 +232,8 @@ fn copy_with(method: u32, offset: u32, size: u32) -> bool {
             let (from, to) = (cached_vram(offset), cached_copy(offset));
             // Safe: inside VRAM and the copy area.
             return unsafe {
-                sceKernelDcacheWritebackInvalidateRange(to.cast(), size);
+                let (start, lines) = cache_line_span(to as u32, size);
+                sceKernelDcacheWritebackInvalidateRange(start as *const c_void, lines);
                 dmac(to.cast(), from.cast(), size) >= 0
             };
         }
@@ -294,12 +327,49 @@ fn set_probe_us(index: usize, us: u32) {
 /// method in use, word by word where that can't.
 fn copy_vram(offset: u32, size: u32) {
     let Some((offset, size)) = copy_span(offset, size) else { return };
+    if get!(verify_copies) & 4 != 0 {
+        // Debug `copyverify` bit 2: one interruptible copy, as before, for A/Bs.
+        copy_piece(offset, size);
+    } else {
+        // In pieces, each with interrupts off (core `psp_copy::copy_pieces`):
+        // the game's thread never runs in the middle of one.
+        for (offset, size) in copy_pieces(offset, size) {
+            without_interrupts(|| copy_piece(offset, size));
+        }
+    }
+    if get!(verify_copies) & 1 != 0 {
+        verify_copy(offset, size);
+    }
+}
+
+/// `copy_vram`'s copy of one piece.
+fn copy_piece(offset: u32, size: u32) {
     let method = METHOD.load(Relaxed);
     if copy_with(method, offset, size) {
         set!(copy_method, method);
     } else {
         copy_words(offset, size);
         set!(copy_method, copy_method::WORDS);
+    }
+}
+
+/// Debug `copyverify`: the copy just made compared with VRAM, cache line by
+/// cache line (both uncached, as the Vita side reads the copy).
+fn verify_copy(offset: u32, size: u32) {
+    let (vram, copy) = (uncached_vram(0), uncached_copy(0));
+    let (start, lines) = cache_line_span(offset, size);
+    let mut line = start;
+    while line < start + lines {
+        let from = line.max(offset);
+        let to = (line + CACHE_LINE_BYTES).min(offset + size);
+        // Safe: inside VRAM and the copy area (the span is inside both).
+        let same = (from / 4..to / 4).all(|word| unsafe { read_volatile(vram.add(word as usize)) == read_volatile(copy.add(word as usize)) });
+        add!(verify_checked, 1);
+        if !same {
+            add!(verify_bad, 1);
+            set!(verify_last_bad, line);
+        }
+        line += CACHE_LINE_BYTES;
     }
 }
 

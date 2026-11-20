@@ -152,9 +152,21 @@ pub struct VramRequestTable {
     /// while they fit this many bytes, the rest by the change check
     /// (`psp_copy::WHOLE_AT_ENQUEUE_BYTES`; 0: change check only).
     pub whole_bytes: u32,
+    /// Vita, debug `copyverify`: bit 0 = the plugin compares every VRAM copy
+    /// with VRAM right after making it, line by line (`psp_copy::
+    /// CACHE_LINE_BYTES`, both read uncached), and counts the lines that
+    /// differ: `verify_checked`, `verify_bad`, the last bad line's VRAM
+    /// offset (`verify_last_bad`, plugin). Slow (reads everything twice).
+    /// Bit 1: the cached copies' old cache maintenance (plain invalidate /
+    /// write-back of the word-aligned range), for A/Bs. Bit 2: copies in
+    /// one interruptible piece, as before `psp_copy::copy_pieces`.
+    pub verify_copies: u32,
+    pub verify_checked: u32,
+    pub verify_bad: u32,
+    pub verify_last_bad: u32,
 }
 
-const _: () = assert!(core::mem::size_of::<VramRequestTable>() == 380);
+const _: () = assert!(core::mem::size_of::<VramRequestTable>() == 396);
 // The ring fits before the table, the table into the page.
 const _: () = assert!(
     core::mem::size_of::<RingHeader>() + CAPACITY as usize * core::mem::size_of::<RawEvent>()

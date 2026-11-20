@@ -177,6 +177,16 @@ static DRAWN_HASHES_LOGGED: AtomicU32 = AtomicU32::new(0);
 static DRAWN_HASH_FRAMES: [AtomicU32; DRAWN_HASHES] = [const { AtomicU32::new(0) }; DRAWN_HASHES];
 static DRAWN_HASH_VALUES: [AtomicU64; DRAWN_HASHES] = [const { AtomicU64::new(0) }; DRAWN_HASHES];
 
+/// Debug `skinwatch`: `Frame::longest_skinned_edge` of every recorded
+/// frame when it is complete (log `skinwatch=<edge px>@<draw>/<skinned
+/// triangles>`): MHF's one-frame streaks are huge triangles of skinned
+/// characters. Off by default (it transforms every skinned vertex on the
+/// CPU). `dump-glitch` (debug plugin) uses the same measure.
+pub static SKIN_WATCH: AtomicBool = AtomicBool::new(false);
+static SKIN_EDGE: AtomicU32 = AtomicU32::new(0);
+static SKIN_DRAW: AtomicU32 = AtomicU32::new(0);
+static SKIN_TRIANGLES: AtomicU32 = AtomicU32::new(0);
+
 /// Display thread, debug `rawhash`: `frame` is about to be drawn.
 pub fn note_drawn_hash(frame: &Frame) {
     if !RAW_HASH.load(Ordering::Relaxed) {
@@ -453,6 +463,16 @@ static VRAM_WHOLE_BYTES: AtomicU32 = AtomicU32::new(nativeres_core::psp_copy::WH
 
 pub fn set_vram_whole_bytes(bytes: u32) {
     VRAM_WHOLE_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// Debug `copyverify`: bit 0: the plugin checks every VRAM copy right after
+/// making it (`VramRequestTable::verify_copies`; log `copyverify=bad/checked
+/// @last bad offset`); bit 1: the old cache maintenance; bit 2: copies in one
+/// interruptible piece (as before). Off by default.
+static VRAM_VERIFY: AtomicU32 = AtomicU32::new(0);
+
+pub fn set_copy_verify(on: u32) {
+    VRAM_VERIFY.store(on & 7, Ordering::Relaxed);
 }
 
 /// Menu "NativeRes Distant Textures" (Adrenaline config byte
@@ -887,6 +907,11 @@ unsafe fn publish_vram_plan(table: *mut VramRequestTable, plan: &Plan) -> Option
         write_volatile(addr_of_mut!((*table).whole_bytes), whole);
         crate::adrenaline::writeback(addr_of_mut!((*table).whole_bytes) as *mut c_void, 4);
     }
+    let verify = VRAM_VERIFY.load(Ordering::Relaxed);
+    if read_volatile(addr_of!((*table).verify_copies)) != verify {
+        write_volatile(addr_of_mut!((*table).verify_copies), verify);
+        crate::adrenaline::writeback(addr_of_mut!((*table).verify_copies) as *mut c_void, 4);
+    }
     if read_volatile(addr_of!((*table).recent_mask)) != plan.recent_mask {
         write_volatile(addr_of_mut!((*table).recent_mask), plan.recent_mask);
         crate::adrenaline::writeback(addr_of_mut!((*table).recent_mask) as *mut c_void, 4);
@@ -1183,6 +1208,22 @@ fn log_frame(state: &mut CaptureState, timing: &mut FrameTiming, flip: &RawEvent
             let _ = write!(text, "{}:{:016x},", DRAWN_HASH_FRAMES[slot].load(Ordering::Relaxed), DRAWN_HASH_VALUES[slot].load(Ordering::Relaxed));
         }
     }
+    if VRAM_VERIFY.load(Ordering::Relaxed) & 1 != 0 {
+        let table = vram_table();
+        // Safe: the table is mapped PSP memory.
+        let (checked, bad, last) = unsafe {
+            (
+                read_volatile(addr_of!((*table).verify_checked)),
+                read_volatile(addr_of!((*table).verify_bad)),
+                read_volatile(addr_of!((*table).verify_last_bad)),
+            )
+        };
+        let _ = write!(text, " copyverify={bad}/{checked}@{last:06x}");
+    }
+    if SKIN_WATCH.load(Ordering::Relaxed) {
+        let edge = f32::from_bits(SKIN_EDGE.load(Ordering::Relaxed));
+        let _ = write!(text, " skinwatch={}@{}/{}", edge as u32, SKIN_DRAW.load(Ordering::Relaxed) as i32, SKIN_TRIANGLES.load(Ordering::Relaxed));
+    }
     if READ_WATCH.load(Ordering::Relaxed) {
         let _ = write!(
             text,
@@ -1450,6 +1491,14 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
                     slot.store(part as u32, Ordering::Relaxed);
                 }
                 RECORDED_HASH_FRAME.store(frame.frame_number, Ordering::Relaxed);
+            }
+            if recording && SKIN_WATCH.load(Ordering::Relaxed) {
+                // Safe: as above.
+                let frame = unsafe { frames::building() };
+                let (edge, draw, triangles) = frame.longest_skinned_edge();
+                SKIN_EDGE.store(edge.to_bits(), Ordering::Relaxed);
+                SKIN_DRAW.store(draw, Ordering::Relaxed);
+                SKIN_TRIANGLES.store(triangles, Ordering::Relaxed);
             }
             log_frame(state, &mut timing, &event, recording, &ring.header());
             if recording {

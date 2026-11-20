@@ -38,6 +38,47 @@ pub fn copy_span(offset: u32, size: u32) -> Option<(u32, u32)> {
     (offset < VRAM_SIZE && size != 0 && size <= VRAM_SIZE - offset).then_some((offset, size))
 }
 
+/// Copies are made in pieces of at most this many bytes, each with
+/// interrupts off (`copy_pieces`). A copy the game's thread could interrupt
+/// held the VRAM words its loop had just read: the game moved data in VRAM,
+/// its enqueue-time copy wrote the new bytes, and when the copy thread went
+/// on (the game waiting for the Vita's walk) it stored the old ones over
+/// them. MHF (2026-11-20): one 64-byte line of the hunter's vertices with
+/// old bytes until the next enqueue, a one-frame streak (the bytes at
+/// 0x040ED680 were those the game had moved to 0x040EB680, or zeros).
+/// ~7 us per KiB with memcpy: 4 KiB keeps interrupts off for ~30 us.
+pub const COPY_PIECE_BYTES: u32 = 4 * 1024;
+
+/// `size` bytes at `offset` as pieces (offset, size) of at most
+/// [`COPY_PIECE_BYTES`], in order, covering them exactly.
+pub fn copy_pieces(offset: u32, size: u32) -> impl Iterator<Item = (u32, u32)> {
+    let end = offset.saturating_add(size);
+    (offset..end).step_by(COPY_PIECE_BYTES as usize).map(move |at| (at, (end - at).min(COPY_PIECE_BYTES)))
+}
+
+/// The PSP's data cache line: cache maintenance works on whole lines.
+pub const CACHE_LINE_BYTES: u32 = 64;
+
+/// The whole cache lines covering `size` bytes at `address` (start and size
+/// multiples of [`CACHE_LINE_BYTES`]), for the cached copy methods' cache
+/// maintenance before they read VRAM through the cache.
+///
+/// sceKernelDcacheInvalidateRange refuses a range that is not line-aligned
+/// (as PPSSPP has it: SCE_KERNEL_ERROR_CACHE_ALIGNMENT) and does nothing,
+/// and the copies are only word-aligned (`copy_span`): lines of VRAM cached
+/// by an earlier copy could stay and be read again after the game rewrote
+/// VRAM. So the plugin writes the covering lines back and invalidates them
+/// (sceKernelDcacheWritebackInvalidateRange; a plain invalidate of the
+/// wider range would drop the game's own unwritten bytes next to ours), and
+/// writes the copy's lines back whole. A precaution: suspected for MHF's
+/// one-line streaks (2026-11-20), but an A/B (debug `copyverify 2`, 2 x 150
+/// s each) showed no difference; their cause was `copy_pieces`.
+pub fn cache_line_span(address: u32, size: u32) -> (u32, u32) {
+    let start = address & !(CACHE_LINE_BYTES - 1);
+    let end = address.saturating_add(size).saturating_add(CACHE_LINE_BYTES - 1) & !(CACHE_LINE_BYTES - 1);
+    (start, end - start)
+}
+
 /// The word (index into the block) of the change check's `sample`: spread
 /// over the block, at different columns (texture rows are often 64-512
 /// bytes).
@@ -315,6 +356,39 @@ pub fn plugins_txt_with_ours(existing: &[u8], out: &mut [u8]) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::psp_link::copy_method;
+
+    #[test]
+    fn copies_go_in_pieces_that_cover_the_range_exactly() {
+        // MHF's glitch: a range over the hunter's vertices, copied whole.
+        let pieces: Vec<(u32, u32)> = copy_pieces(0x0C_C1CC, 0x2_1600).collect();
+        assert_eq!(pieces.first(), Some(&(0x0C_C1CC, COPY_PIECE_BYTES)));
+        let mut at = 0x0C_C1CC;
+        for &(offset, size) in &pieces {
+            assert_eq!(offset, at, "in order, no gap");
+            assert!(size > 0 && size <= COPY_PIECE_BYTES);
+            at += size;
+        }
+        assert_eq!(at, 0x0C_C1CC + 0x2_1600, "the whole range");
+        assert_eq!(copy_pieces(0x100, 1024).collect::<Vec<_>>(), [(0x100, 1024)], "a block is one piece");
+        assert_eq!(copy_pieces(0x100, 0).count(), 0);
+        assert_eq!(copy_pieces(0, 2 * COPY_PIECE_BYTES).count(), 2);
+    }
+
+    #[test]
+    fn cache_maintenance_covers_whole_lines() {
+        // MHF's glitch: a word-aligned copy over the hunter's vertices; the
+        // stale line 0x040ED680..0x040ED6C0 lies inside, the ends are partial.
+        let (start, size) = cache_line_span(0x040E_D664, 0x9A);
+        assert_eq!((start, size), (0x040E_D640, 0xC0));
+        assert!(start <= 0x040E_D680 && 0x040E_D6C0 <= start + size);
+        for (address, size) in [(0x0400_0000, 64), (0x0400_0004, 4), (0x0400_003C, 8), (0x0400_0040, 0x10000), (0x041F_FFFC, 4)] {
+            let (start, covered) = cache_line_span(address, size);
+            assert_eq!((start % CACHE_LINE_BYTES, covered % CACHE_LINE_BYTES), (0, 0), "{address:#x}+{size}");
+            assert!(start <= address && address + size <= start + covered, "{address:#x}+{size}");
+            assert!(covered < size + 2 * CACHE_LINE_BYTES, "{address:#x}+{size}: no more than the partial lines");
+        }
+        assert_eq!(cache_line_span(0x0400_0040, 0x10000), (0x0400_0040, 0x10000), "aligned stays as it is");
+    }
 
     fn known(ranges: &[(u32, u32)]) -> KnownRanges {
         let mut known = KnownRanges::new();

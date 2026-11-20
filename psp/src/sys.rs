@@ -219,6 +219,7 @@ extern "C" {
     pub fn sceKernelDcacheWritebackInvalidateAll();
     pub fn sceKernelDcacheWritebackRange(address: *const c_void, size: u32);
     pub fn sceKernelDcacheWritebackInvalidateRange(address: *const c_void, size: u32);
+    /// Refuses ranges not aligned to cache lines (core `psp_copy::cache_line_span`).
     pub fn sceKernelDcacheInvalidateRange(address: *const c_void, size: u32);
 
     pub fn sceKernelCpuSuspendIntr() -> u32;

@@ -403,6 +403,11 @@ fn run(dump_path: &str, png_path: &str, trace: bool) -> Result<(), String> {
     }
 
     let image = raster::render_frame(&frame, &mut dump.memory, dump.original.as_ref());
+    {
+        // What debug skinwatch / dump-glitch measure on the Vita.
+        let (edge, draw, triangles) = frame.longest_skinned_edge();
+        println!("skinned: longest edge {edge} px in draw {} ({triangles} skinned triangles)", draw as i32);
+    }
     write_png(png_path, &image)?;
 
     if let Some(original) = &dump.original {

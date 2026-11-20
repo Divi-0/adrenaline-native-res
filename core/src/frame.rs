@@ -1565,6 +1565,52 @@ impl Frame {
         }
         hashes
     }
+
+    /// Debug `skinwatch` / `dump-glitch`: the longest triangle edge (PSP
+    /// pixels) among the skinned raw draws' triangles that reach the screen,
+    /// after the near-plane cut (`screen_corners`, the CPU twin of the raw
+    /// vertex programs), the draw it is in (`u32::MAX`: none) and how many
+    /// skinned triangles there were. MHF's one-frame streaks start at
+    /// skinned characters, whose triangles are small: a streak is one huge
+    /// triangle. Zero-copy draws (`RAW_PSP_RAM`) give no corners: not seen.
+    pub fn longest_skinned_edge(&self) -> (f32, u32, u32) {
+        let (mut longest, mut at, mut triangles) = (0.0f32, u32::MAX, 0u32);
+        for (index, draw) in self.draws().iter().enumerate() {
+            if draw.flags & draw_flags::RAW_VERTICES == 0 || draw.bones == 0 {
+                continue;
+            }
+            let (edge, count) = longest_edge_on_screen(self.screen_corners(draw));
+            triangles += count;
+            if edge > longest {
+                (longest, at) = (edge, index as u32);
+            }
+        }
+        (longest, at, triangles)
+    }
+}
+
+/// `Frame::longest_skinned_edge` for one draw's corners (three per
+/// triangle): the longest edge (its larger extent, x or y) of a triangle
+/// whose bounds overlap the PSP's 480 x 272 screen (infinite for a NaN corner), and the triangle count.
+pub fn longest_edge_on_screen(mut corners: impl Iterator<Item = FrameVertex>) -> (f32, u32) {
+    let (mut longest, mut count) = (0.0f32, 0u32);
+    while let (Some(a), Some(b), Some(c)) = (corners.next(), corners.next(), corners.next()) {
+        count += 1;
+        let (xs, ys) = ([a.x, b.x, c.x], [a.y, b.y, c.y]);
+        if xs.iter().chain(&ys).any(|value| value.is_nan()) {
+            longest = f32::INFINITY;
+            continue;
+        }
+        let low = |values: [f32; 3]| values[0].min(values[1]).min(values[2]);
+        let high = |values: [f32; 3]| values[0].max(values[1]).max(values[2]);
+        if high(xs) < 0.0 || low(xs) >= 480.0 || high(ys) < 0.0 || low(ys) >= 272.0 {
+            continue;
+        }
+        // No sqrt in core: an edge's length as the larger of its x and y extents.
+        let edge = |p: &FrameVertex, q: &FrameVertex| (p.x - q.x).abs().max((p.y - q.y).abs());
+        longest = longest.max(edge(&a, &b)).max(edge(&b, &c)).max(edge(&c, &a));
+    }
+    (longest, count)
 }
 
 /// A frame's vertices, indices and draws while recording (`Frame::split`).
@@ -2393,6 +2439,22 @@ mod tests {
         assert_eq!([0, 1, 2, 3].map(strip_triangle), [[0, 1, 2], [2, 1, 3], [2, 3, 4], [4, 3, 5]]);
         let run = [crate::command::primitive::TRIANGLE_STRIP as u16, 5, 10];
         assert_eq!(run_indices(&run).collect::<Vec<_>>(), [10, 11, 12, 12, 11, 13, 12, 13, 14]);
+    }
+
+    #[test]
+    fn the_longest_edge_counts_triangles_on_the_screen_only() {
+        use super::{longest_edge_on_screen, FrameVertex};
+        let at = |x: f32, y: f32| FrameVertex { x, y, ..FrameVertex::default() };
+        // A small one on screen, a streak reaching in from far away, one off screen.
+        let small = [at(100.0, 100.0), at(110.0, 100.0), at(100.0, 104.0)];
+        let streak = [at(200.0, 100.0), at(-3000.0, 150.0), at(201.0, 102.0)];
+        let off = [at(600.0, 10.0), at(5000.0, 10.0), at(600.0, 20.0)];
+        assert_eq!(longest_edge_on_screen(small.into_iter()), (10.0, 1));
+        assert_eq!(longest_edge_on_screen(small.into_iter().chain(off)), (10.0, 2));
+        assert_eq!(longest_edge_on_screen(small.into_iter().chain(streak).chain(off)), (3201.0, 3));
+        let nan = [at(f32::NAN, 0.0), at(1.0, 1.0), at(2.0, 2.0)];
+        assert_eq!(longest_edge_on_screen(nan.into_iter()).0, f32::INFINITY);
+        assert_eq!(longest_edge_on_screen(core::iter::empty()), (0.0, 0));
     }
 
     use super::*;
