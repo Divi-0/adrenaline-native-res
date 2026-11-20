@@ -605,6 +605,13 @@ fn run_plain_commands(
                     ge.set_register(command);
                     done += 1;
                 }
+                PlainAction::Origin => {
+                    // As `walk`'s main loop: the offset is the ORIGIN
+                    // command's own address.
+                    ge.offset = pc.wrapping_add(4 * done as u32);
+                    ge.set_register(command);
+                    done += 1;
+                }
                 PlainAction::Call | PlainAction::Ret => {
                     done += 1;
                     let after = pc.wrapping_add(4 * done as u32);
@@ -722,6 +729,11 @@ pub enum PlainAction {
     /// ~1,570 of the ~7,400 commands per frame that ended a plain run
     /// (each such stop goes round the main loop, a few hundred cycles).
     Address,
+    /// ORIGIN (the offset becomes the command's own address), for a visitor
+    /// that doesn't want it. MHF's intro has one per model part (~855 per
+    /// frame), each of which ended a plain run and went round `walk`'s main
+    /// loop: ~80 % of the commands that stopped a run there (2026-11-20).
+    Origin,
     /// CALL / RET for a visitor that doesn't want them: the run follows
     /// them into the window of the new depth. MTX calls a sub-list for
     /// nearly every draw: ~3,580 of the run-ending commands per race frame.
@@ -759,6 +771,8 @@ impl PlainActions {
                 PlainAction::Stop
             } else if is_address(opcode) && !crate::bench::experiment(crate::bench::NO_ADDRESS_RUNS) {
                 PlainAction::Address
+            } else if opcode == op::ORIGIN && !crate::bench::experiment(crate::bench::NO_ADDRESS_RUNS) {
+                PlainAction::Origin
             } else if opcode == op::CALL && !crate::bench::experiment(crate::bench::NO_CALL_RUNS) {
                 PlainAction::Call
             } else if opcode == op::RET && !crate::bench::experiment(crate::bench::NO_CALL_RUNS) {
@@ -1121,6 +1135,37 @@ mod tests {
         let result = walk(&mut list, &mut ge, &mut memory, &mut recorder, 1000, &mut 0);
         assert_eq!(result, WalkResult::Finished);
         assert_eq!(recorder.opcodes, vec![op::BASE, op::JUMP, op::PRIM, op::FINISH, op::END]);
+    }
+
+    /// MHF's model parts: a CALL into a sub-list whose ORIGIN, inside a
+    /// plain run, makes the vertex and index addresses after it relative to
+    /// the ORIGIN command's own address, also not at the run's start; the
+    /// RET restores the caller's offset.
+    #[test]
+    fn origin_in_a_plain_run_sets_the_offset_to_its_own_address() {
+        let mut memory = TestMemory::default();
+        const SUB: u32 = 0x0891_0000;
+        memory.write(LIST, &[cmd(op::BASE, 0x08_0000), cmd(op::CALL, 0x91_0000), cmd(op::PRIM, 1), cmd(op::FINISH, 0), cmd(op::END, 0)]);
+        memory.write(
+            SUB,
+            &[
+                cmd(op::FOG_COLOR, 0x11),
+                cmd(op::ORIGIN, 0),
+                cmd(op::VERTEX_ADDRESS, 0x40),
+                cmd(op::INDEX_ADDRESS, 0x80),
+                cmd(op::PRIM, 3),
+                cmd(op::RET, 0),
+            ],
+        );
+        let mut list = DisplayList::new(0, LIST, 0);
+        let mut ge = GeState::new();
+        let mut visitor = PrimBatches::default();
+        assert_eq!(walk(&mut list, &mut ge, &mut memory, &mut visitor, 1000, &mut 0), WalkResult::Finished);
+        // BASE 8 + 0x40 + offset (the ORIGIN at SUB + 4).
+        assert_eq!(visitor.vertex_addresses[0], (0x0800_0040u32.wrapping_add(SUB + 4)) & 0x0FFF_FFFF);
+        assert_eq!(ge.index_address, (0x0800_0080u32.wrapping_add(SUB + 4)) & 0x0FFF_FFFF);
+        assert_eq!(ge.offset, 0, "RET gives back the caller's offset");
+        assert_eq!(visitor.batches, [vec![3], vec![1]]);
     }
 
     /// A list that stalls keeps its offset for when it goes on, even if
