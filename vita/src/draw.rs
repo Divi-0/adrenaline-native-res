@@ -424,7 +424,7 @@ struct ShadeCase {
 /// can't change it (r 200, g 120, b 60, a 255).
 const SHADE_TEST_TEXEL: u32 = 0xFF3C_78C8;
 const SHADE_FOG: [f32; 4] = [127.0, 96.0, 79.0, 1.0];
-const SHADE_TESTS: [ShadeCase; 8] = [
+const SHADE_TESTS: [ShadeCase; 9] = [
     // 2D (w 1), no fog.
     ShadeCase { w: [1.0, 1.0], color: [0xFF32_6496; 2], fog: 1.0, fog_and_scale: [0.0, 0.0, 0.0, 1.0], tested: false },
     // 3D, the same w at every corner.
@@ -442,6 +442,10 @@ const SHADE_TESTS: [ShadeCase; 8] = [
     ShadeCase { w: [2.0, 6.0], color: [0xFFAA_BBCC; 2], fog: 0.4, fog_and_scale: SHADE_FOG, tested: true },
     // 2D, no fog, colour doubling (clamped), half alpha.
     ShadeCase { w: [1.0, 1.0], color: [0x80A0_C8F0; 2], fog: 1.0, fog_and_scale: [0.0, 0.0, 0.0, 2.0], tested: false },
+    // 2D, no fog, white: a known one-level miss (tools/shadetest.py
+    // KNOWN_MISSES): 1 / w on the GPU is not exact, p1 = floor(255 x 0.9999x
+    // + 1.01) = 255, not 256.
+    ShadeCase { w: [1.0, 1.0], color: [0xFFFF_FFFF; 2], fog: 1.0, fog_and_scale: [0.0, 0.0, 0.0, 1.0], tested: false },
 ];
 /// The raw lod_bias field for the mip test (-1: as sceGxmTextureInitLinear
 /// leaves it), to learn its scale.
