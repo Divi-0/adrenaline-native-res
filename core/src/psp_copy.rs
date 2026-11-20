@@ -316,20 +316,35 @@ pub fn ge_probe_list(mode: u32, from: u32, to: u32, bytes: u32, list: &mut [u32;
     n
 }
 
-/// The line in Adrenaline's plugins.txt (ms0:/seplugins/plugins.txt) that
-/// loads the PSP plugin with every PSP game.
+/// One plugin's line in Adrenaline's plugins.txt
+/// (ms0:/seplugins/plugins.txt), with the comment above it.
+pub struct PluginsTxtEntry {
+    /// The plugin's file name, as found in any line about it.
+    pub file: &'static [u8],
+    pub comment: &'static [u8],
+    pub line: &'static [u8],
+}
+
+/// The line that loads the PSP plugin with every PSP game.
 pub const PLUGINS_TXT_LINE: &[u8] = b"game, ms0:/seplugins/nativeres.prx, on";
-const PLUGINS_TXT_COMMENT: &[u8] = b"# NativeRes capture plugin, every PSP game (added by nativeres.suprx)";
-/// The plugin's file name, as found in any line about it.
-const PLUGIN_FILE: &[u8] = b"nativeres.prx";
+pub const OUR_PLUGINS_TXT_ENTRY: PluginsTxtEntry = PluginsTxtEntry {
+    file: b"nativeres.prx",
+    comment: b"# NativeRes capture plugin, every PSP game (added by nativeres.suprx)",
+    line: PLUGINS_TXT_LINE,
+};
 
 /// plugins.txt with our line added: None when it already has a line about
 /// the plugin (on or off: the user's choice stays) or `out` is too small,
 /// else the new file's length in `out`.
 pub fn plugins_txt_with_ours(existing: &[u8], out: &mut [u8]) -> Option<usize> {
+    plugins_txt_with(existing, out, &OUR_PLUGINS_TXT_ENTRY)
+}
+
+/// plugins.txt with `entry`'s line added, as [`plugins_txt_with_ours`].
+pub fn plugins_txt_with(existing: &[u8], out: &mut [u8], entry: &PluginsTxtEntry) -> Option<usize> {
     let mentions = existing
         .split(|&byte| byte == b'\n')
-        .any(|line| line.windows(PLUGIN_FILE.len()).any(|window| window.eq_ignore_ascii_case(PLUGIN_FILE)));
+        .any(|line| line.windows(entry.file.len()).any(|window| window.eq_ignore_ascii_case(entry.file)));
     if mentions {
         return None;
     }
@@ -345,9 +360,9 @@ pub fn plugins_txt_with_ours(existing: &[u8], out: &mut [u8]) -> Option<usize> {
     if !existing.is_empty() && existing.last() != Some(&b'\n') {
         push(newline)?;
     }
-    push(PLUGINS_TXT_COMMENT)?;
+    push(entry.comment)?;
     push(newline)?;
-    push(PLUGINS_TXT_LINE)?;
+    push(entry.line)?;
     push(newline)?;
     Some(length)
 }
@@ -717,5 +732,21 @@ mod tests {
         // Too small a buffer: nothing.
         let mut small = [0u8; 16];
         assert_eq!(plugins_txt_with_ours(b"vsh, ms0:/x.prx, on\n", &mut small), None);
+    }
+
+    #[test]
+    fn plugins_txt_takes_another_plugins_line_beside_ours() {
+        const OTHER: PluginsTxtEntry =
+            PluginsTxtEntry { file: b"other_tool.prx", comment: b"# another tool", line: b"vsh, ms0:/seplugins/other_tool.prx, on" };
+        let mut out = [0u8; 512];
+        let n = plugins_txt_with(b"game, ms0:/seplugins/nativeres.prx, on\n", &mut out, &OTHER).unwrap();
+        assert_eq!(
+            &out[..n],
+            &b"game, ms0:/seplugins/nativeres.prx, on\n# another tool\nvsh, ms0:/seplugins/other_tool.prx, on\n"[..]
+        );
+        let mut again = [0u8; 512];
+        assert_eq!(plugins_txt_with(&out[..n], &mut again, &OTHER), None);
+        // Ours is still added to a file with only the other line.
+        assert!(plugins_txt_with_ours(b"vsh, ms0:/seplugins/other_tool.prx, on\n", &mut again).is_some());
     }
 }

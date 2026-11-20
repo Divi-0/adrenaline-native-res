@@ -13,7 +13,7 @@
 
 use core::ffi::c_void;
 
-use nativeres_core::psp_copy::plugins_txt_with_ours;
+use nativeres_core::psp_copy::{plugins_txt_with, PluginsTxtEntry, OUR_PLUGINS_TXT_ENTRY};
 
 use crate::{adrenaline, render_log, sys, SingleThreaded};
 
@@ -132,19 +132,27 @@ fn write_file(path: &[u8], bytes: &[u8]) -> bool {
 /// Installs the PSP plugin and its plugins.txt line (start thread, once,
 /// before the PSP side boots).
 pub fn install() {
+    install_prx(PRX, b"/seplugins/nativeres.prx", &OUR_PLUGINS_TXT_ENTRY, "psp plugin");
+}
+
+/// Installs `prx` as `<ms0><file>` (written only when it differs) and
+/// `entry`'s plugins.txt line (added only when no line mentions the file),
+/// logging the outcome as `label`. Start thread only (its buffers), before
+/// the PSP side boots; also for an extension's own PSP plugin.
+pub fn install_prx(prx_bytes: &[u8], file: &[u8], entry: &PluginsTxtEntry, label: &str) {
     let start = sys::now_us();
     // Safe: the start thread is the only user.
     let buffers = unsafe { BUFFERS.get() };
     let (mut directory, mut prx, mut list) = ([0u8; 64], [0u8; 64], [0u8; 64]);
     let directory = path(&mut directory, b"/seplugins");
-    let prx = path(&mut prx, b"/seplugins/nativeres.prx");
+    let prx = path(&mut prx, file);
     let list = path(&mut list, b"/seplugins/plugins.txt");
     // Safe: a NUL-terminated path; fails harmlessly when it exists.
     unsafe { sys::sceIoMkdir(directory.as_ptr(), 0o777) };
 
-    let plugin = if file_equals(prx, PRX, &mut buffers.chunk) {
+    let plugin = if file_equals(prx, prx_bytes, &mut buffers.chunk) {
         "up to date"
-    } else if write_file(prx, PRX) {
+    } else if write_file(prx, prx_bytes) {
         "written"
     } else {
         "NOT written"
@@ -154,16 +162,17 @@ pub fn install() {
         Read::Missing => Some(0),
         Read::TooBig => None,
     };
-    let line = match existing.map(|length| plugins_txt_with_ours(&buffers.existing[..length], &mut buffers.updated)) {
+    let line = match existing.map(|length| plugins_txt_with(&buffers.existing[..length], &mut buffers.updated, entry)) {
         None => "plugins.txt too big, not changed",
         Some(None) => "line there",
         Some(Some(length)) if write_file(list, &buffers.updated[..length]) => "line added",
         Some(Some(_)) => "line NOT added",
     };
     render_log::line(format_args!(
-        "psp plugin: {} {} bytes {}, {}, {} us\n",
+        "{}: {} {} bytes {}, {}, {} us\n",
+        label,
         shown(prx),
-        PRX.len(),
+        prx_bytes.len(),
         plugin,
         line,
         sys::now_us() - start
