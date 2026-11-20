@@ -190,11 +190,13 @@ impl LightingRegisters {
         if ge.register(op::LIGHTING_ENABLE) & 1 == 0 || !any_light {
             return None;
         }
+        // Four runs of registers, each copied in one piece.
+        let registers = ge.registers();
         let mut words = [0; LIGHTING_REGISTER_COUNT];
         let mut copy = |first: u8, last: u8| {
-            for opcode in first..=last {
-                words[lighting_slot(opcode)] = ge.register(opcode);
-            }
+            let slot = lighting_slot(first);
+            let count = (last - first) as usize + 1;
+            words[slot..slot + count].copy_from_slice(&registers[first as usize..=last as usize]);
         };
         copy(0x17, 0x1B);
         copy(0x51, 0x51);

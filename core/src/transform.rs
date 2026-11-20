@@ -663,6 +663,8 @@ pub struct TransformCache {
     matrix_generation: u32,
     bone_generation: u32,
     lighting_changes: u32,
+    /// `lighting::LIGHTS_ON` when `inputs.lighting` was taken.
+    lights_on: bool,
 }
 
 impl TransformCache {
@@ -676,6 +678,7 @@ impl TransformCache {
             matrix_generation: 0,
             bone_generation: 0,
             lighting_changes: 0,
+            lights_on: false,
         }
     }
 
@@ -704,13 +707,35 @@ impl TransformCache {
         if !same_base {
             self.generation = self.generation.wrapping_add(1);
             let inputs = &mut self.inputs;
-            let camera_changed = inputs.take_base(ge, format);
+            // Only the format changed (MHF's intro: ~540 of ~650 redos a
+            // frame): the matrices and registers are the ones taken.
+            let same_matrices = self.valid
+                && self.matrix_generation == ge.matrix_generation()
+                && self.transform_changes == ge.transform_changes();
+            let camera_changed = if same_matrices {
+                inputs.format = format.0;
+                false
+            } else {
+                inputs.take_base(ge, format)
+            };
             inputs.take_bones(ge, format);
-            let lighting = LightingRegisters::of(ge);
-            if inputs.lighting != lighting || inputs.lights_change == 0 {
-                inputs.lights_change = self.generation;
+            // The lighting registers are the ones taken last time if none
+            // changed since: not copied and compared again (76 words; MHF's
+            // intro changes the format ~600 times a frame, the lighting
+            // ~120 times).
+            let lights_on = crate::lighting::LIGHTS_ON.load(core::sync::atomic::Ordering::Relaxed);
+            let same_lighting = self.valid
+                && self.lighting_changes == ge.lighting_changes()
+                && self.lights_on == lights_on
+                && inputs.lights_change != 0;
+            if !same_lighting {
+                let lighting = LightingRegisters::of(ge);
+                if inputs.lighting != lighting || inputs.lights_change == 0 {
+                    inputs.lights_change = self.generation;
+                }
+                inputs.lighting = lighting;
             }
-            inputs.lighting = lighting;
+            self.lights_on = lights_on;
             inputs.base_change = self.generation;
             inputs.bone_change = self.generation;
             inputs.lighting_change = self.generation;
@@ -731,6 +756,7 @@ impl TransformCache {
             // lit draw are (unlit draws: not).
             if self.lighting_changes != ge.lighting_changes() {
                 let lighting = LightingRegisters::of(ge);
+                self.lights_on = crate::lighting::LIGHTS_ON.load(core::sync::atomic::Ordering::Relaxed);
                 if self.inputs.lighting != lighting {
                     self.generation = self.generation.wrapping_add(1);
                     self.inputs.lighting = lighting;
@@ -1442,6 +1468,53 @@ mod tests {
         bones[1][9] = -5.0;
         upload(&mut ge, op::BONE_MATRIX_NUMBER, op::BONE_MATRIX_DATA, &bones.concat());
         check(&ge, "lights on, new bones");
+    }
+
+    /// A new format redoes the inputs; their lighting registers are taken
+    /// again only if one changed, and must be what taking them gives.
+    #[test]
+    fn a_new_format_keeps_the_lighting_unless_a_lighting_register_changed() {
+        let mut ge = ge_with_viewport();
+        upload(&mut ge, op::WORLD_MATRIX_NUMBER, op::WORLD_MATRIX_DATA, &IDENTITY_43);
+        set(&mut ge, op::LIGHTING_ENABLE, 1);
+        set(&mut ge, op::LIGHT_ENABLE_0, 1);
+        set(&mut ge, op::MATERIAL_AMBIENT, 0x10_2030);
+        let skinned = VertexFormat((3 << 9) | (1 << 14) | (3 << 7) | (3 << 5));
+        let plain = VertexFormat((3 << 7) | (3 << 5));
+        fn check(cache: &mut TransformCache, ge: &GeState, format: VertexFormat, what: &str) -> u32 {
+            let inputs = cache.get(ge, format);
+            assert_eq!(inputs.lighting(), TransformInputs::of(ge, format).lighting(), "{what}");
+            let raw = Raw3d { position: [1.0, 2.0, 0.5], texcoord: [0.5, 0.25], color: None, weights: [1.0; 8] };
+            let built = Transform::from_inputs(inputs);
+            let whole = Transform::new(ge, format);
+            assert_eq!(built.frame_vertex(&raw, 0), whole.frame_vertex(&raw, 0), "{what}");
+            assert_eq!(built.rows().gpu_transform(), whole.rows().gpu_transform(), "{what}");
+            assert!(built.lights == whole.lights, "{what}: lights");
+            inputs.lights_change()
+        }
+        let mut cache = TransformCache::new();
+        let first = check(&mut cache, &ge, skinned, "first");
+        let camera = cache.get(&ge, skinned).camera_change();
+        assert_eq!(check(&mut cache, &ge, plain, "new format"), first, "same lighting, same number");
+        assert_eq!(cache.get(&ge, plain).camera_change(), camera, "same camera");
+        set(&mut ge, op::VIEWPORT_X_SCALE, 0x43_0000);
+        check(&mut cache, &ge, skinned, "new format and viewport");
+        let mut view = IDENTITY_43;
+        view[11] = -3.0;
+        upload(&mut ge, op::VIEW_MATRIX_NUMBER, op::VIEW_MATRIX_DATA, &view);
+        check(&mut cache, &ge, plain, "new format and view");
+        assert_ne!(cache.get(&ge, plain).camera_change(), camera, "new camera");
+        set(&mut ge, op::MATERIAL_AMBIENT, 0x40_5060);
+        let second = check(&mut cache, &ge, skinned, "new format and material colour");
+        assert_ne!(second, first);
+        set(&mut ge, op::LIGHT_ENABLE_0, 0);
+        check(&mut cache, &ge, plain, "new format, lights off");
+        set(&mut ge, op::LIGHT_ENABLE_0, 1);
+        upload(&mut ge, op::WORLD_MATRIX_NUMBER, op::WORLD_MATRIX_DATA, &IDENTITY_43);
+        check(&mut cache, &ge, skinned, "new format and matrix, lights on again");
+        cache.forget();
+        set(&mut ge, op::MATERIAL_AMBIENT, 0x70_8090);
+        check(&mut cache, &ge, skinned, "forgotten");
     }
 
     #[test]
