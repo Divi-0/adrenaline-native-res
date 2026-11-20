@@ -33,10 +33,10 @@
 
 use core::ffi::c_void;
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering::Relaxed};
 
 use nativeres_core::display_loop;
-use nativeres_core::game_fps::{self, GameFps, LABEL_HEIGHT, LABEL_WIDTH};
+use nativeres_core::game_fps::{self, DrawStats, GameFps, LABEL_HEIGHT, LABEL_WIDTH, STATS_HEIGHT, STATS_WIDTH};
 
 use crate::basic_programs::TextureVertex;
 use crate::capture::COMPLETED_FRAME_COUNT;
@@ -172,7 +172,8 @@ pub mod timings {
     /// drawing, end scene + swap, the LCD sync.
     pub const DRAW_PROFILE_PARTS: usize = 4;
 
-    pub(super) static GAME_FPS_LABEL: AtomicBool = AtomicBool::new(true);
+    /// 0 off, 1 the GAME label, 2 the diagnostics (game_fps::DrawStats).
+    pub(super) static GAME_FPS_LABEL: AtomicU8 = AtomicU8::new(1);
     pub(super) static SONY_COPY_EARLY: AtomicBool = AtomicBool::new(true);
     pub(super) static LAST_LCD_SYNC_US: AtomicU64 = AtomicU64::new(0);
     pub(super) static SONY_COPY_AFTER_SYNC: [AtomicU32; SONY_TIMING_BUCKETS] = [const { AtomicU32::new(0) }; SONY_TIMING_BUCKETS];
@@ -180,8 +181,9 @@ pub mod timings {
     pub(super) static DRAW_PROFILE_US: [AtomicU64; DRAW_PROFILE_PARTS] = [const { AtomicU64::new(0) }; DRAW_PROFILE_PARTS];
     pub(super) static DRAW_PROFILE_LOOPS: AtomicU32 = AtomicU32::new(0);
 
-    pub fn set_game_fps_label(on: bool) {
-        GAME_FPS_LABEL.store(on, Relaxed);
+    /// 0 off, 1 the GAME label (top left), 2 the diagnostics (top right).
+    pub fn set_game_fps_label(mode: u8) {
+        GAME_FPS_LABEL.store(mode.min(2), Relaxed);
     }
 
     pub fn set_sony_copy_early(on: bool) {
@@ -333,8 +335,10 @@ type Draw = unsafe extern "C" fn(*mut Context, u32, u32, *const c_void, u32) -> 
 unsafe extern "C" fn draw_hooked(context: *mut Context, primitive: u32, index_format: u32, indices: *const c_void, count: u32) -> i32 {
     if SONY_TEXTURE_SET.swap(false, Relaxed) && SHOWING_OURS.load(Relaxed) {
         targets::present_frame();
-        if GAME_FPS_LABEL.load(Relaxed) {
-            draw_game_fps();
+        match GAME_FPS_LABEL.load(Relaxed) {
+            1 => draw_game_fps(),
+            2 => draw_stats(),
+            _ => {}
         }
         return 0;
     }
@@ -536,7 +540,9 @@ pub fn install() {
 
 /// Two label pictures and their quads, used in turn: the one written is
 /// never the one the GPU may still read from the last pass.
-const LABEL_TEXTURE_BYTES: usize = LABEL_WIDTH * LABEL_HEIGHT * 4;
+/// Room for the diagnostics (STATS_WIDTH x STATS_HEIGHT); the GAME label
+/// uses its top-left LABEL_WIDTH x LABEL_HEIGHT.
+const LABEL_TEXTURE_BYTES: usize = STATS_WIDTH * STATS_HEIGHT * 4;
 const LABEL_QUAD_BYTES: usize = 4 * core::mem::size_of::<TextureVertex>();
 const LABEL_BLOCK_BYTES: usize = 2 * (LABEL_TEXTURE_BYTES + LABEL_QUAD_BYTES);
 #[no_mangle]
@@ -548,6 +554,8 @@ pub static nativeres_plan_fixed_game_fps_label: u32 = sys::pages(LABEL_BLOCK_BYT
 const LABEL_X: f32 = 252.0;
 const LABEL_Y: f32 = 4.0;
 const LABEL_SCALE: f32 = 2.0;
+/// The diagnostics: top right, 4 pixels in.
+const STATS_RIGHT: f32 = 956.0;
 
 struct Label {
     tried: bool,
@@ -556,6 +564,7 @@ struct Label {
     /// The picture/quad in use (0 or 1), None before the first value.
     current: Option<usize>,
     fps: GameFps,
+    stats: DrawStats,
 }
 
 static LABEL: SingleThreaded<Label> = SingleThreaded::new(Label {
@@ -564,6 +573,7 @@ static LABEL: SingleThreaded<Label> = SingleThreaded::new(Label {
     textures: [gxm::Texture { control_words: [0; 4] }; 2],
     current: None,
     fps: GameFps::new(),
+    stats: DrawStats::new(),
 });
 
 impl Label {
@@ -589,8 +599,8 @@ impl Label {
                             &mut self.textures[index],
                             self.texture_pixels(index) as *const c_void,
                             gxm::TEXTURE_FORMAT_U8U8U8U8_ABGR,
-                            LABEL_WIDTH as u32,
-                            LABEL_HEIGHT as u32,
+                            STATS_WIDTH as u32,
+                            STATS_HEIGHT as u32,
                             0,
                         )
                     };
@@ -602,20 +612,43 @@ impl Label {
 
     /// Draws the value into the other picture and quad, then uses those.
     fn write(&mut self, fps: u32) {
-        let index = self.current.map_or(0, |current| current ^ 1);
         let mut pixels = [0u32; LABEL_WIDTH * LABEL_HEIGHT];
         let used = game_fps::draw_label(fps, &mut pixels);
+        self.show(&pixels, LABEL_WIDTH, LABEL_HEIGHT, used, LABEL_X);
+    }
+
+    /// Draws the diagnostics into the other picture and quad, then uses those.
+    fn write_stats(&mut self, values: &game_fps::DrawStatsValues) {
+        let mut pixels = [0u32; STATS_WIDTH * STATS_HEIGHT];
+        let used = game_fps::draw_stats_label(values, &mut pixels);
+        let left = STATS_RIGHT - used as f32 * LABEL_SCALE;
+        self.show(&pixels, STATS_WIDTH, STATS_HEIGHT, used, left);
+    }
+
+    /// `pixels` (`width` x `height`, `used` texels wide) into the other
+    /// picture, its quad at (`left`, LABEL_Y), then uses those.
+    fn show(&mut self, pixels: &[u32], width: usize, height: usize, used: usize, left: f32) {
+        let index = self.current.map_or(0, |current| current ^ 1);
         // Safe: our picture and quad, which the GPU doesn't read now (the
-        // other pair is the one in use).
+        // other pair is the one in use); rows inside the picture.
         unsafe {
-            core::ptr::copy_nonoverlapping(pixels.as_ptr(), self.texture_pixels(index), pixels.len());
-            let right = used as f32 / LABEL_WIDTH as f32;
-            let width = used as f32 * LABEL_SCALE;
-            let height = LABEL_HEIGHT as f32 * LABEL_SCALE;
-            let corners = [(0.0, 0.0, 0.0, 0.0), (width, 0.0, right, 0.0), (0.0, height, 0.0, 1.0), (width, height, right, 1.0)];
+            let texture = self.texture_pixels(index);
+            for row in 0..height {
+                core::ptr::copy_nonoverlapping(pixels.as_ptr().add(row * width), texture.add(row * STATS_WIDTH), width);
+            }
+            let right = used as f32 / STATS_WIDTH as f32;
+            let bottom = height as f32 / STATS_HEIGHT as f32;
+            let quad_width = used as f32 * LABEL_SCALE;
+            let quad_height = height as f32 * LABEL_SCALE;
+            let corners = [
+                (0.0, 0.0, 0.0, 0.0),
+                (quad_width, 0.0, right, 0.0),
+                (0.0, quad_height, 0.0, bottom),
+                (quad_width, quad_height, right, bottom),
+            ];
             let quad = self.quad(index);
             for (i, (x, y, u, v)) in corners.into_iter().enumerate() {
-                quad.add(i).write(TextureVertex { x: LABEL_X + x, y: LABEL_Y + y, z: 0.5, w: 1.0, u, v });
+                quad.add(i).write(TextureVertex { x: left + x, y: LABEL_Y + y, z: 0.5, w: 1.0, u, v });
             }
         }
         self.current = Some(index);
@@ -634,6 +667,31 @@ fn draw_game_fps() {
     if label.fps.update(now(), COMPLETED_FRAME_COUNT.load(Relaxed)) {
         if let Some(fps) = label.fps.fps() {
             label.write(fps);
+        }
+    }
+    let Some(current) = label.current else {
+        return;
+    };
+    // Safe: inside the display's scene; our texture and quad.
+    unsafe { targets::draw_quad(&label.textures[current], label.quad(current)) };
+}
+
+/// Display thread, inside the display's scene, right after our picture:
+/// the diagnostics (game_fps::DrawStats), redrawn once a second.
+fn draw_stats() {
+    // Safe: display thread only.
+    let label = unsafe { LABEL.get() };
+    if !label.make() {
+        return;
+    }
+    let profile = profile();
+    let cpu_us = profile.rendered.saturating_sub(profile.start);
+    // The last finished pass's wait in sceGxmDisplayQueueAddEntry.
+    let swap_us = if profile.swapped >= profile.drawn { profile.swapped - profile.drawn } else { 0 };
+    let shown = targets::SHOWN_FRAME_NUMBER.load(Relaxed);
+    if label.stats.pass(now(), shown, cpu_us, swap_us, COMPLETED_FRAME_COUNT.load(Relaxed)) {
+        if let Some(values) = label.stats.values() {
+            label.write_stats(&values);
         }
     }
     let Some(current) = label.current else {
