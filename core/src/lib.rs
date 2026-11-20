@@ -42,6 +42,7 @@ pub mod dump;
 pub mod event_ring;
 pub mod frame;
 pub mod frame_builder;
+pub mod frame_gate;
 pub mod frame_pool;
 pub mod game_fps;
 pub mod ge_context;

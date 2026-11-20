@@ -1055,10 +1055,6 @@ impl GeSyncs {
     }
 }
 
-/// Recorded frames whose list walk stopped early that are held back in a
-/// row before one is shown anyway (the main loop's `held_back`).
-const MAX_HELD_BACK: u32 = 3;
-
 /// Recorded frames held back after a new session while the GE's own state
 /// hasn't come (`Capture::waiting_for_ge_state`): the plugin answers at the
 /// game's next GE sync, normally within the first frame. A plugin that
@@ -1086,6 +1082,10 @@ pub static VRAM_WAIT_WANTED: AtomicBool = AtomicBool::new(true);
 /// (no new session). It replaces ours; the log line's `gestate_regdiff=` /
 /// `gestate_mtxdiff=` say how far our walk was from it (0 / 0 = exact).
 pub static GE_STATE_CHECK: AtomicBool = AtomicBool::new(false);
+
+/// Recorded frames dropped because the plugin gave up waiting in the
+/// game's GE sync while they were walked (core `frame_gate`; log `torn=`).
+static TORN_FRAMES: AtomicU32 = AtomicU32::new(0);
 
 /// One line per frame, e.g. `frame=12 dt=16.7ms cpu=... lists=1/1 ...`.
 /// `sync`: the ring header, for the plugin's GE sync counts (`gesync=`).
@@ -1248,6 +1248,7 @@ fn log_frame(state: &mut CaptureState, timing: &mut FrameTiming, flip: &RawEvent
             (r.youngest_age_us % 1000) / 100
         );
     }
+    let _ = write!(text, " torn={}", TORN_FRAMES.load(Ordering::Relaxed));
     let length = text.len();
     line[length] = b'\n';
     log::append(&line[..=length]);
@@ -1295,9 +1296,11 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
     let mut recording = false;
     // Renderer on, but this frame is walked without recording (behind).
     let mut skipping = false;
-    // Recorded frames held back in a row because their list walk stopped
-    // early (see MAX_HELD_BACK).
-    let mut held_back = 0u32;
+    // Whether each recorded frame is shown (core frame_gate).
+    let mut gate = nativeres_core::frame_gate::FrameGate::new();
+    // The plugin's given-up GE sync waits when the frame being recorded
+    // started (set where `recording` is).
+    let mut timeouts_at_start = 0u32;
     // Frames completed since the new session while the GE's state hadn't
     // come (see MAX_GE_STATE_FRAMES).
     let mut ge_state_frames = 0u32;
@@ -1513,18 +1516,27 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
                 // A walk that stopped at a bad address or ran away lacks the
                 // rest of its list (MTX's attract demo: the logo and menu
                 // overlay at the end; the list had changed under a late
-                // walk): held back too, but at most MAX_HELD_BACK frames in
+                // walk): held back too, but at most frame_gate::MAX_HELD_BACK in
                 // a row, so a game that always ends that way still shows.
+                // A frame whose GE sync the plugin gave up waiting in (the
+                // game rewrote what the walk read: torn) is never shown.
                 let stopped_early = state.last_frame.bad_addresses > 0 || state.last_frame.endless_lists > 0;
-                let hold_back = stopped_early && held_back < MAX_HELD_BACK;
                 // After a savestate load: the registers of the time before
                 // until the GE's own come (the village's fog in MHF's field).
                 let without_ge_state = state.capture.waiting_for_ge_state() && ge_state_frames < ge_state_limit;
-                if state.last_frame.dropped_events == 0 && missing == 0 && !hold_back && !without_ge_state {
+                let checks = nativeres_core::frame_gate::FrameChecks {
+                    dropped_events: state.last_frame.dropped_events,
+                    missing_vram: missing,
+                    stopped_early,
+                    without_ge_state,
+                    sync_timeouts: (timeouts_at_start, ring.header().sync_timeouts),
+                };
+                if gate.should_show(&checks) {
                     frames::publish();
-                    held_back = 0;
                 } else {
-                    held_back += hold_back as u32;
+                    if checks.sync_timeouts.0 != checks.sync_timeouts.1 {
+                        TORN_FRAMES.fetch_add(1, Ordering::Relaxed);
+                    }
                     frame.clear();
                 }
             } else if skipping {
@@ -1552,6 +1564,7 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
             // A requested dump is recorded anyway.
             let wanted = have_frames && renderer_enabled();
             recording = wanted && (ext::dump_requested() || !state.reader.newer_frame_waiting(&ring));
+            timeouts_at_start = ring.header().sync_timeouts;
             skipping = wanted && !recording;
             // Stage B on its own thread, switched between frames. Not while
             // a dump runs: the dump records the blocks the capture thread
