@@ -2292,8 +2292,20 @@ pub fn mip_test_default_bias() -> u32 {
     MIP_TEST_DEFAULT_BIAS.load(Ordering::Relaxed)
 }
 
-/// Makes the arenas the capture records into (once, at the first drawn
-/// frame that wants them; "vertexcache 0|1|2": 1 main memory, 2 phycont
+/// Makes our programs now (once; after that only a flag is read), which
+/// tells the capture that the GPU transform is ready
+/// (`capture::GPU_TRANSFORM_READY`), so the arenas follow. Called as soon as
+/// the renderer is on, before any frame is drawn: made at the first drawn
+/// frame instead, a renderer switched on in a heavy scene never got there
+/// (MTX's paused race, 10,342 draws: without the GPU transform the capture
+/// recorded every draw on the CPU, ~92 ms per frame, every GE sync timed
+/// out and every frame was dropped as torn, 602 of 602).
+pub fn make_programs() {
+    draws().programs.textured_ready();
+}
+
+/// Makes the arenas the capture records into (once, at the display loop's
+/// first pass with the renderer on and our programs made; "vertexcache 0|1|2": 1 main memory, 2 phycont
 /// with the raw arena): the raw arena not without the raw vertex program;
 /// 3D sprites go raw only once their program exists; zero copy only once
 /// the GPU may read PSP RAM (all in arenas.rs and capture.rs).

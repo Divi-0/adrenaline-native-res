@@ -237,7 +237,9 @@ impl FrameLoop {
             self.frame_pending = false;
             return false;
         }
-        // The vertex cache's arena, once asked for.
+        // Our programs before the first frame (see draw::make_programs),
+        // then the vertex cache's arena, once asked for.
+        draw::make_programs();
         let arenas_wanted = VERTEX_CACHE_WANTED.load(Ordering::Relaxed);
         if arenas_wanted != 0 && !self.arena_tried && GPU_TRANSFORM_READY.load(Ordering::Acquire) != 0 {
             self.arena_tried = true;
