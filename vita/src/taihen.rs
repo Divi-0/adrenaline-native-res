@@ -75,7 +75,16 @@ impl Hook {
     /// # Safety
     /// Only from inside the hook, after `hook_import` succeeded.
     pub unsafe fn next(&self) -> *const c_void {
-        let current = self.reference.load(Ordering::Relaxed) as *const HookLink;
+        // taiHEN patches the import before it writes the reference back
+        // (taiHookFunctionImportForUser returns it last): a call from
+        // another thread in that window found 0 and faulted (2026-11-20,
+        // C2-12828-1 in SceGxmDisplayQueue on the first "fliplog start").
+        // Such a call waits for it; afterwards this is one load as before.
+        let mut current = self.reference.load(Ordering::Acquire) as *const HookLink;
+        while current.is_null() {
+            crate::sys::sceKernelDelayThread(50);
+            current = self.reference.load(Ordering::Acquire) as *const HookLink;
+        }
         let next = (*current).next as *const HookLink;
         if next.is_null() {
             (*current).original
