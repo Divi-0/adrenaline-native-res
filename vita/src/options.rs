@@ -119,12 +119,13 @@ fn load() {
 
 /// Our settings thread: applies the file, puts "NativeRes Renderer" into
 /// Adrenaline's menu and keeps Graphics Filtering in line (menu.rs, every
-/// 50 ms), and keeps the ARM clock (the system can lower it again, e.g.
-/// after standby; checked every 10 s).
+/// 50 ms), and keeps the ARM clock, also every 50 ms: the system lowers it
+/// again after standby and at every PSP reboot (a game's start drops it to
+/// 333 MHz; checked every 10 s until 2026-11-20, the game then loaded at
+/// 333 MHz for up to 10 s).
 unsafe extern "C" fn options_thread(_args: u32, _argp: *mut core::ffi::c_void) -> i32 {
     load();
     let mut menu_installed = false;
-    let mut tick = 0u32;
     loop {
         if skipped(start_skip::MENU) {
             // Left out (`startskip=`).
@@ -133,13 +134,10 @@ unsafe extern "C" fn options_thread(_args: u32, _argp: *mut core::ffi::c_void) -
         } else {
             menu_installed = menu::try_install();
         }
-        tick = tick.wrapping_add(1);
         crate::blocks::note_free_user_memory();
-        if tick % 200 == 0 {
-            let mhz = ARM_CLOCK.load(Relaxed);
-            if sys::scePowerGetArmClockFrequency() != mhz {
-                sys::scePowerSetArmClockFrequency(mhz);
-            }
+        let mhz = ARM_CLOCK.load(Relaxed);
+        if sys::scePowerGetArmClockFrequency() != mhz {
+            sys::scePowerSetArmClockFrequency(mhz);
         }
         sys::sceKernelDelayThread(50 * 1000);
     }
