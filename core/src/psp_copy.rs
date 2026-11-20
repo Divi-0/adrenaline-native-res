@@ -357,6 +357,74 @@ mod tests {
     use super::*;
     use crate::psp_link::copy_method;
 
+    /// MHF's streak (2026-11-20), modelled: a copy loop reads 64 bytes into
+    /// registers, then stores them. `game_at` is the point where the game's
+    /// thread runs: it moves the model data in VRAM and its enqueue-time copy
+    /// writes the new bytes (whole, as `refresh_before_walk`). The game can
+    /// only run between whole pieces when each runs with interrupts off
+    /// (`copy_pieces`), but anywhere in one interruptible copy, including
+    /// between a chunk's load and its store.
+    fn copy_with_the_game_running(range: (u32, u32), game_at: (u32, bool), pieces: bool) -> (Vec<u8>, Vec<u8>) {
+        const CHUNK: u32 = 64;
+        let (offset, size) = range;
+        let mut vram: Vec<u8> = (0..offset + size).map(|i| (i % 251) as u8).collect();
+        let mut copy = vec![0u8; vram.len()];
+        // The game: data moved down by 0x2000 (or anything new), then its own whole copy.
+        let mut game_ran = false;
+        let mut run_game = |vram: &mut Vec<u8>, copy: &mut Vec<u8>| {
+            for byte in vram[offset as usize..].iter_mut() {
+                *byte = byte.wrapping_add(0x55);
+            }
+            copy[offset as usize..].copy_from_slice(&vram[offset as usize..]);
+        };
+        let spans: Vec<(u32, u32)> = if pieces { copy_pieces(offset, size).collect() } else { vec![(offset, size)] };
+        for (piece, piece_size) in spans {
+            let mut at = piece;
+            // In pieces the game can only run before a piece starts.
+            if pieces && !game_ran && piece + piece_size > game_at.0 {
+                run_game(&mut vram, &mut copy);
+                game_ran = true;
+            }
+            while at < piece + piece_size {
+                let held: Vec<u8> = vram[at as usize..(at + CHUNK) as usize].to_vec(); // load
+                if !pieces && !game_ran && at >= game_at.0 && game_at.1 {
+                    // Interruptible: between the load and the store.
+                    run_game(&mut vram, &mut copy);
+                    game_ran = true;
+                }
+                copy[at as usize..(at + CHUNK) as usize].copy_from_slice(&held); // store
+                at += CHUNK;
+                if !pieces && !game_ran && at > game_at.0 && !game_at.1 {
+                    // Interruptible: between two chunks.
+                    run_game(&mut vram, &mut copy);
+                    game_ran = true;
+                }
+            }
+        }
+        (vram, copy)
+    }
+
+    #[test]
+    fn the_game_never_runs_inside_a_copy_piece() {
+        let range = (0x2000, 4 * COPY_PIECE_BYTES);
+        let differing_lines = |(vram, copy): (Vec<u8>, Vec<u8>)| {
+            (range.0..range.0 + range.1).step_by(64).filter(|&at| vram[at as usize..at as usize + 64] != copy[at as usize..at as usize + 64]).count()
+        };
+        // One interruptible copy, the game in the middle of a chunk: the
+        // resumed copy stores one line of old bytes over the game's copy.
+        let middle = range.0 + 0x1680;
+        assert_eq!(differing_lines(copy_with_the_game_running(range, (middle, true), false)), 1, "the glitch: one stale line");
+        assert_eq!(differing_lines(copy_with_the_game_running(range, (middle, false), false)), 0, "between chunks it is harmless");
+        // In pieces with interrupts off the game runs only between pieces,
+        // and every later piece reads the new bytes.
+        for game_at in [range.0, middle, range.0 + COPY_PIECE_BYTES, range.0 + range.1 - 64] {
+            for between_load_and_store in [true, false] {
+                let result = copy_with_the_game_running(range, (game_at, between_load_and_store), true);
+                assert_eq!(differing_lines(result), 0, "game at {game_at:#x}");
+            }
+        }
+    }
+
     #[test]
     fn copies_go_in_pieces_that_cover_the_range_exactly() {
         // MHF's glitch: a range over the hunter's vertices, copied whole.
