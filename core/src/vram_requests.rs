@@ -59,9 +59,18 @@ pub const LOOKAHEAD_BLOCKS: usize = 64;
 /// and the game froze for a few seconds"). Read on from a block just read,
 /// it is what the copy kept current before this rule, and worked.
 pub const STALE_FRAMES: u32 = 16;
-/// How long a block back after a pause is not read: by then it has been
-/// recent at two enqueues, so the plugin has copied or checked it.
+/// How long at most a block back after a pause is not read: by then it has
+/// been recent at two enqueues, so the plugin has copied or checked it.
+/// Usually it is trusted much sooner: the distrusted block gets a range of
+/// its own in the next plan (also mid-frame, while the walk waits), which
+/// the plugin copies in full as a range new to its table, and is trusted
+/// once that copy is confirmed. Running through MHF's village, three such
+/// blocks in a row (the walk finds one after the other) held 9 frames, the
+/// picture frozen ~0.3 s (2026-11-20).
 pub const DISTRUST_FRAMES: u32 = 3;
+/// At most this many runs of distrusted blocks get ranges of their own in
+/// a plan (the others wait for the next one, or DISTRUST_FRAMES).
+pub const REFRESH_RUNS: usize = 4;
 /// Unused blocks between used ones that are requested too, so the plugin
 /// gets few ranges (doubled until the ranges fit into the table).
 pub const GAP_BLOCKS: usize = 8;
@@ -84,6 +93,8 @@ pub struct Plan {
 }
 
 impl Plan {
+    const EMPTY: Plan = Plan { ranges: [VramRange { offset: 0, size: 0 }; MAX_RANGES], count: 0, recent_mask: 0 };
+
     pub fn ranges(&self) -> &[VramRange] {
         &self.ranges[..self.count]
     }
@@ -113,6 +124,18 @@ pub struct VramRequests {
     /// ([`STALE_FRAMES`]); 0 = trusted. Not `ready`: stage B reads those
     /// flags meanwhile (`ready_for_stage`).
     distrusted_until: [u32; BLOCKS],
+    /// Distrusted blocks to be copied again in full (ranges of their own in
+    /// the plans, see DISTRUST_FRAMES) until a copy is confirmed.
+    refresh_wanted: [bool; BLOCKS],
+    /// `refresh_wanted` blocks in a range new to the plugin's table of a
+    /// published plan, copy not confirmed yet.
+    refresh_pending: [bool; BLOCKS],
+    /// The last plan built, and the last two published (the plugin's table:
+    /// a range in it isn't new to the plugin, so not copied in full again;
+    /// the one before, as the plugin may not have taken the last one yet).
+    built: Plan,
+    table: Plan,
+    previous_table: Plan,
 }
 
 impl Default for VramRequests {
@@ -169,6 +192,11 @@ impl VramRequests {
             missing: 0,
             capture_blocks: 0,
             distrusted_until: [0; BLOCKS],
+            refresh_wanted: [false; BLOCKS],
+            refresh_pending: [false; BLOCKS],
+            built: Plan::EMPTY,
+            table: Plan::EMPTY,
+            previous_table: Plan::EMPTY,
         }
     }
 
@@ -198,7 +226,9 @@ impl VramRequests {
             }
             if self.distrusted_until[block] != 0 && (self.distrusted_until[block].wrapping_sub(self.frame) as i32) > 0 {
                 // Back after a pause: maybe stale (see STALE_FRAMES). Read
-                // as missing, so the walk stops here and the frame waits.
+                // as missing, so the walk stops here and waits, and copied
+                // again in full.
+                self.refresh_wanted[block] = true;
                 self.missing += 1;
                 return false;
             }
@@ -315,6 +345,12 @@ impl VramRequests {
             for block in 0..BLOCKS {
                 self.ready[block] |= self.pending[block];
                 self.pending[block] = false;
+                if self.refresh_pending[block] {
+                    // Copied again in full since it came back: trusted.
+                    self.refresh_pending[block] = false;
+                    self.refresh_wanted[block] = false;
+                    self.distrusted_until[block] = 0;
+                }
             }
             self.any_pending = false;
         }
@@ -346,15 +382,18 @@ impl VramRequests {
         // older ones, still kept, after them. One run over both was ~616
         // KiB when MTX's title (attract demo lists) was left for the rider
         // select: too big to copy whole, and its wipe showed stale tiles.
-        let hot = self.add_block_ranges(&mut plan.ranges, self.texture_count, MAX_RANGES - 1, |requests, block| {
+        // Room kept for the distrusted blocks' ranges of their own.
+        let refresh_room = self.refresh_runs().min(REFRESH_RUNS);
+        let hot = self.add_block_ranges(&mut plan.ranges, self.texture_count, MAX_RANGES - 1 - refresh_room, |requests, block| {
             requests.block_used(block) && requests.block_recent(block)
         });
         for i in self.texture_count..hot {
             plan.recent_mask |= 1 << i;
         }
-        plan.count = self.add_block_ranges(&mut plan.ranges, hot, MAX_RANGES, |requests, block| {
+        plan.count = self.add_block_ranges(&mut plan.ranges, hot, MAX_RANGES - refresh_room, |requests, block| {
             requests.block_used(block) && !requests.block_recent(block)
         });
+        plan.count = self.add_refresh_ranges(&mut plan, refresh_room);
         self.capture_blocks = (0..BLOCKS).filter(|&block| self.block_used(block)).count() as u32;
 
         // Only whole blocks a range covers are kept up to date by the plugin
@@ -371,7 +410,49 @@ impl VramRequests {
             self.ready[block] &= self.covered[block];
             self.pending[block] &= self.covered[block];
         }
+        self.built = plan;
         plan
+    }
+
+    /// Runs of neighbouring `refresh_wanted` blocks.
+    fn refresh_runs(&self) -> usize {
+        (0..BLOCKS).filter(|&block| self.refresh_wanted[block] && (block == 0 || !self.refresh_wanted[block - 1])).count()
+    }
+
+    /// Appends up to `room` ranges, one per run of `refresh_wanted` blocks,
+    /// each new to the plugin (in neither its table nor this plan: it copies
+    /// only new ranges in full), grown by a block at a time until it is.
+    /// Returns the new count.
+    fn add_refresh_ranges(&self, plan: &mut Plan, room: usize) -> usize {
+        let limit = (plan.count + room).min(MAX_RANGES);
+        let mut count = plan.count;
+        let mut block = 0;
+        while block < BLOCKS && count < limit {
+            if !self.refresh_wanted[block] {
+                block += 1;
+                continue;
+            }
+            let mut end = block + 1;
+            while end < BLOCKS && self.refresh_wanted[end] {
+                end += 1;
+            }
+            let (mut first, mut last) = (block, end);
+            let range_of = |first: usize, last: usize| VramRange { offset: first as u32 * BLOCK_SIZE, size: (last - first) as u32 * BLOCK_SIZE };
+            let mut range = range_of(first, last);
+            let known = |range: &VramRange| self.table.ranges().contains(range) || self.previous_table.ranges().contains(range);
+            while (plan.ranges[..count].contains(&range) || known(&range)) && (first > 0 || last < BLOCKS) {
+                if last < BLOCKS {
+                    last += 1;
+                } else {
+                    first -= 1;
+                }
+                range = range_of(first, last);
+            }
+            plan.ranges[count] = range;
+            count += 1;
+            block = end;
+        }
+        count
     }
 
     /// The last plan was written to the shared table as `generation`: its
@@ -383,6 +464,24 @@ impl VramRequests {
                 self.any_pending = true;
             }
         }
+        // Distrusted blocks in a range new to the plugin's table: it copies
+        // that range in full, so they are trusted once this generation is
+        // copied (`note_copied`).
+        for range in self.built.ranges() {
+            if self.table.ranges().contains(range) || self.previous_table.ranges().contains(range) {
+                continue;
+            }
+            let first = (range.offset / BLOCK_SIZE) as usize;
+            let end = ((range.offset + range.size) / BLOCK_SIZE) as usize;
+            for block in first..end.min(BLOCKS) {
+                if self.refresh_wanted[block] {
+                    self.refresh_pending[block] = true;
+                    self.any_pending = true;
+                }
+            }
+        }
+        self.previous_table = self.table;
+        self.table = self.built;
         self.pending_generation = generation;
     }
 
@@ -598,17 +697,107 @@ mod tests {
         assert_eq!(requests.take_missing(), 1);
         assert!(!requests.block_ready(sublist), "the same frame again");
         requests.take_missing();
+        // The plugin doesn't confirm a copy (generation 2 never copied):
+        // trusted again after DISTRUST_FRAMES all the same.
         for _ in 1..DISTRUST_FRAMES {
-            frame(&mut requests, 1, 1);
+            frame(&mut requests, 1, 2);
             assert!(!requests.block_ready(sublist));
             requests.take_missing();
         }
-        frame(&mut requests, 1, 1);
+        frame(&mut requests, 1, 2);
         assert!(requests.block_ready(sublist), "recent at the enqueues since: trusted again");
         assert_eq!(requests.take_missing(), 0);
         // Read every frame from now on: stays trusted.
         frame(&mut requests, 1, 1);
         assert!(requests.block_ready(sublist));
+    }
+
+    /// Running through MHF's village (2026-11-20, user: "stutters while
+    /// running"): blocks back after a pause came in a row (three per spot,
+    /// the walk finding one after the other), each distrusted for
+    /// DISTRUST_FRAMES frames: 9 frames held, the picture frozen ~0.3 s.
+    /// A distrusted block now gets a range of its own in the next plan (also
+    /// mid-frame), new to the plugin's table, so the plugin copies it in
+    /// full; once that generation is copied the block is trusted, within the
+    /// same frame. The next plan drops the range again.
+    #[test]
+    fn a_block_back_after_a_pause_is_trusted_once_copied_again() {
+        let mut requests = Box::new(VramRequests::new());
+        let sublist = block_address(0x555); // 0x041556B8, from the log
+        let every_frame = block_address(0x400);
+        requests.block_ready(sublist);
+        requests.block_ready(every_frame);
+        frame(&mut requests, 0, 1);
+        frame(&mut requests, 1, 1);
+        assert!(requests.block_ready(sublist));
+        let mut last = frame(&mut requests, 1, 1);
+        for _ in 0..STALE_FRAMES {
+            assert!(requests.block_ready(every_frame));
+            last = frame(&mut requests, 1, 1);
+        }
+        requests.take_missing();
+        assert!(!requests.block_ready(sublist), "back after a pause: distrusted");
+        let plan = requests.plan_mid_frame(1);
+        let own: Vec<_> = plan.ranges().iter().filter(|range| !last.ranges().contains(range)).collect();
+        assert!(
+            own.iter().any(|range| range.offset <= 0x555 * BLOCK_SIZE && range.offset + range.size > 0x555 * BLOCK_SIZE),
+            "a range new to the plugin's table covers the block: {:?} after {:?}",
+            plan.ranges(),
+            last.ranges()
+        );
+        requests.published(2);
+        assert!(!requests.note_copied(1), "generation 2 isn't copied yet");
+        assert!(!requests.block_ready(sublist), "not copied again yet");
+        assert!(requests.note_copied(2));
+        assert!(requests.block_ready(sublist), "copied again: trusted within the same frame");
+        assert!(requests.block_ready(every_frame));
+        // The extra range goes; the block stays trusted.
+        let next = frame(&mut requests, 2, 3);
+        assert_eq!(requests.refresh_runs(), 0, "nothing left to copy again");
+        let ranges = next.ranges();
+        assert!(ranges.iter().enumerate().all(|(i, range)| !ranges[..i].contains(range)), "no extra range: {ranges:?}");
+        frame(&mut requests, 3, 3);
+        assert!(requests.block_ready(sublist));
+    }
+
+    /// The same when the block's run is exactly a range of the table
+    /// already: the extra range must still be new to the plugin (it copies
+    /// only new ranges in full).
+    #[test]
+    fn a_lone_block_back_after_a_pause_still_gets_a_new_range() {
+        let mut requests = Box::new(VramRequests::new());
+        let lone = block_address(0x700);
+        let every_frame = block_address(0x100);
+        for block in 0x700..0x700 + LOOKAHEAD_BLOCKS as u32 {
+            requests.block_ready(block_address(block));
+        }
+        requests.block_ready(every_frame);
+        frame(&mut requests, 0, 1);
+        frame(&mut requests, 1, 1);
+        assert!(requests.block_ready(lone));
+        let mut last = frame(&mut requests, 1, 1);
+        for _ in 0..STALE_FRAMES {
+            requests.block_ready(every_frame);
+            last = frame(&mut requests, 1, 1);
+        }
+        requests.take_missing();
+        assert!(!requests.block_ready(lone));
+        // The rest of its run read on from it (trusted: the block before
+        // was just read), so the run as a whole is the same as before.
+        let run = *last.ranges().iter().find(|range| range.offset == 0x700 * BLOCK_SIZE).expect("the block's run");
+        for block in 0x701..0x700 + run.size / BLOCK_SIZE {
+            assert!(requests.block_ready(block_address(block)));
+        }
+        let plan = requests.plan_mid_frame(1);
+        assert!(plan.ranges().contains(&run), "the run as before: {:?}", plan.ranges());
+        assert!(
+            plan.ranges().iter().any(|range| !last.ranges().contains(range)
+                && range.offset <= 0x700 * BLOCK_SIZE
+                && range.offset + range.size > 0x700 * BLOCK_SIZE),
+            "{:?} after {:?}",
+            plan.ranges(),
+            last.ranges()
+        );
     }
 
     /// MHF's lists in VRAM move on as a ring (~0.35 KiB per frame); each

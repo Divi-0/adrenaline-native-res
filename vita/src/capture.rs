@@ -859,8 +859,10 @@ impl CaptureState {
 
     /// Publishes the table with the blocks the walk just missed and waits
     /// until the plugin has copied it. False if the table didn't change
-    /// (the block was requested already, e.g. distrusted after a pause) or
-    /// the copy didn't come in time.
+    /// (the block was requested already and its copy is out) or the copy
+    /// didn't come in time. A block distrusted after a pause changes it: it
+    /// gets a range of its own, which the plugin copies in full
+    /// (`VramRequests::block_ready`, `DISTRUST_FRAMES`).
     fn wait_for_new_vram(&mut self, ring: &SharedRing, first_stop: u64, timeouts: u32) -> bool {
         let table = vram_table();
         // Safe: as in request_vram.
