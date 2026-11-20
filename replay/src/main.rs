@@ -501,6 +501,8 @@ fn bench(dump_path: &str, runs: u32, only: Option<&str>) -> Result<(), String> {
     let mut capture = Box::new(Capture::new());
     capture.set_gpu_transform(gpu_transform());
     capture.set_vertex_cache(new_vertex_cache());
+    // The raw draws written by the capture thread itself, as on the Vita.
+    capture.set_direct_lists(new_direct_lists());
     let mut frame = new_frame();
     let mut store = Box::new(BlockStore::new());
     let modes = [("walk", Mode::WalkOnly), ("stats", Mode::Stats), ("produce", Mode::Produce), ("full", Mode::Full)];
