@@ -24,6 +24,8 @@ macro_rules! embed_gxp {
 // coordinates, colour and fog per vertex.
 embed_gxp!(nativeres_textured_v);
 embed_gxp!(nativeres_textured_f);
+// The same without fog and specular (most 2D draws): a third of the work.
+embed_gxp!(nativeres_textured_flat_f);
 // The same with the PSP's alpha test (discard).
 embed_gxp!(nativeres_textured_test_f);
 // Grey FIX B blending through the alpha, without and with the alpha test.

@@ -47,6 +47,9 @@ pub enum Kind {
     Color,
     TextureTint,
     Textured,
+    /// `Textured` for draws without fog and without a separate specular
+    /// colour (nativeres_textured_flat_f.cg): the same pixels, less work.
+    TexturedFlat,
     TexturedTest,
     TexturedFix,
     TexturedTestFix,
@@ -91,6 +94,10 @@ pub struct Textured {
     pub vertex: *mut gxm::VertexProgram,
     pub wvp: *const ProgramParameter,
     pub fog_and_scale: *const ProgramParameter,
+    /// nativeres_textured_flat_f.cg: without fog and specular.
+    pub have_flat: bool,
+    fragment_flat_id: PatcherId,
+    pub fog_and_scale_flat: *const ProgramParameter,
     /// nativeres_textured_test_f.cg: the fragment program with the alpha test.
     pub have_test: bool,
     fragment_test_id: PatcherId,
@@ -981,6 +988,9 @@ impl Programs {
                 vertex: null_mut(),
                 wvp: null(),
                 fog_and_scale: null(),
+                have_flat: false,
+                fragment_flat_id: null_mut(),
+                fog_and_scale_flat: null(),
                 have_test: false,
                 fragment_test_id: null_mut(),
                 fog_and_scale_test: null(),
@@ -1088,10 +1098,28 @@ impl Programs {
             return false;
         }
         render_log::line(format_args!("our programs ready\n"));
+        self.make_flat_program();
         self.make_alpha_test_program();
         self.make_blend_fix_programs();
         self.make_3d_program();
         true
+    }
+
+    /// The variant without fog and specular (nativeres_textured_flat_f.cg).
+    fn make_flat_program(&mut self) {
+        let textured = &mut self.textured;
+        let program = gxp(&shaders::nativeres_textured_flat_f);
+        let Some(id) = register(program) else {
+            render_log::line(format_args!("flat program: invalid GXP\n"));
+            return;
+        };
+        textured.fragment_flat_id = id;
+        textured.fog_and_scale_flat = parameter(program, b"uFogAndScale\0");
+        if textured.fog_and_scale_flat.is_null() {
+            render_log::line(format_args!("flat program: parameters missing\n"));
+            return;
+        }
+        textured.have_flat = true;
     }
 
     /// The alpha-test variant (nativeres_textured_test_f.cg). Once it is
@@ -1215,6 +1243,7 @@ impl Programs {
             Kind::TexturedFix if textured.have_fix => textured.fragment_fix_id,
             Kind::TexturedTestFix if textured.have_test && textured.have_fix => textured.fragment_test_fix_id,
             Kind::Textured => textured.fragment_id,
+            Kind::TexturedFlat if textured.have_flat => textured.fragment_flat_id,
             _ => return null_mut(),
         };
         basic_programs::fragment_program(id, blend_info, gxp(&shaders::nativeres_textured_v))
@@ -1234,7 +1263,7 @@ impl Programs {
         // uniform (draw.rs textured_fragment_uniforms), not part of the program.
         if blend & BLEND_ENABLED != 0 && blend & BLEND_FIX_B_ALPHA != 0 {
             kind = match kind {
-                Kind::Textured => Kind::TexturedFix,
+                Kind::Textured | Kind::TexturedFlat => Kind::TexturedFix,
                 Kind::TexturedTest => Kind::TexturedTestFix,
                 other => other,
             };

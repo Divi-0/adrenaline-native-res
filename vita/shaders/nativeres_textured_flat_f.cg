@@ -1,0 +1,36 @@
+// NativeRes: fragment program for textured draws without fog and without a
+// separate specular colour (Final Fantasy's 2D: tile maps, sprites, clouds):
+// nativeres_textured_f.cg's GeShade with both left out, the same pixels.
+//
+// Why exact: without fog the vertex fog factor is 1 and the fog colour 0
+// (draw.rs fog_and_scale), so GeShade's f = 255 and its fog step gives
+// floor((255 c + 255) / 256) = floor(c + 1 - (c + 1) / 256) = c for every
+// c in 0..255; the specular part is 0 (nativeres_textured_v.cg). What is
+// left is the GE's modulate in its integer arithmetic, as there: texel and
+// vertex colour truncated to 8 bits, (p + 1) t >> 8 (x 2 with colour
+// doubling, RGB only), clamped.
+//
+// Cost (tools/gxpinfo.py): a fraction of nativeres_textured_f.cg's; a
+// full-screen layer is shaded per pixel, and Final Fantasy's cloud scenes
+// draw ~8 of them per frame.
+//
+// uFogAndScale: a = colour scale (1 or 2); rgb unused (no fog).
+//
+// Compiled on the Vita with the shader compiler app (README.md "Shaders").
+#define FLOOR(x) ((x) - frac(x))
+
+float4 main(
+	float2 vTexcoord : TEXCOORD0,
+	float4 vColor : TEXCOORD1,
+	float2 vFog : TEXCOORD2,
+	uniform sampler2D tex,
+	uniform float4 uFogAndScale) : COLOR
+{
+	// Colour came times w (screen-linear, nativeres_3d_v.cg).
+	float overW = 1.0f / vFog.y;
+	float4 t = FLOOR(tex2D(tex, vTexcoord) * 255.0f + 0.01f);
+	float4 p1 = FLOOR(vColor * overW * 255.0f + 1.01f); // p + 1
+	float4 c = FLOOR(p1 * t * (float4(uFogAndScale.aaa, 1.0f) * (1.0f / 256.0f)));
+	c.rgb = min(c.rgb, 255.0f);
+	return c * (1.0f / 255.0f);
+}

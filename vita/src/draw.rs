@@ -163,6 +163,18 @@ pub static OPAQUE_SOURCES: AtomicI32 = AtomicI32::new(1);
 /// 1 = on (default), 0 = the tested program.
 pub static OPAQUE_UNTESTED: AtomicI32 = AtomicI32::new(1);
 
+/// Textured draws without fog and without a separate specular colour (most
+/// 2D: Final Fantasy's tile maps and clouds) go through the flat program
+/// (nativeres_textured_flat_f.cg: 14 instructions per pixel instead of 31,
+/// the same pixels). 1 = on (default), 0 = the full program.
+pub static FLAT_SHADING: AtomicI32 = AtomicI32::new(1);
+
+/// Whether textured `draw` may take the flat program: no fog, no separate
+/// specular colour (the two parts it leaves out).
+fn flat_shading(frame: &Frame, draw: &Draw) -> bool {
+    draw.flags & draw_flags::FOG == 0 && FLAT_SHADING.load(Ordering::Relaxed) != 0 && !separate_specular(frame, draw)
+}
+
 /// True if every vertex of textured `draw` ends up with alpha 255: raw
 /// vertices by their lowest alpha and colour rules, screen-space ones as
 /// they are. False where that isn't known cheaply (vertices in model space
@@ -382,6 +394,9 @@ enum ShadeProgram {
     /// The fast 5551 "off" ones (nativeres_textured_read_off_f.cg, with the
     /// test _offtest_f): the colour cut to 5 bits per channel, widened.
     Cut5551,
+    /// The flat one (nativeres_textured_flat_f.cg), for the cases without
+    /// fog and alpha test: the same pixels as `EightBit`.
+    Flat,
 }
 
 /// The shade test's alpha-test cases: PSP compare function and reference,
@@ -409,7 +424,7 @@ struct ShadeCase {
 /// can't change it (r 200, g 120, b 60, a 255).
 const SHADE_TEST_TEXEL: u32 = 0xFF3C_78C8;
 const SHADE_FOG: [f32; 4] = [127.0, 96.0, 79.0, 1.0];
-const SHADE_TESTS: [ShadeCase; 7] = [
+const SHADE_TESTS: [ShadeCase; 8] = [
     // 2D (w 1), no fog.
     ShadeCase { w: [1.0, 1.0], color: [0xFF32_6496; 2], fog: 1.0, fog_and_scale: [0.0, 0.0, 0.0, 1.0], tested: false },
     // 3D, the same w at every corner.
@@ -425,6 +440,8 @@ const SHADE_TESTS: [ShadeCase; 7] = [
     ShadeCase { w: [1.0, 8.0], color: [0xFF00_0000, 0xFFFF_FFFF], fog: 1.0, fog_and_scale: [0.0, 0.0, 0.0, 1.0], tested: false },
     // MHF's ground: fogged, w 2 .. 6, through the alpha-test program.
     ShadeCase { w: [2.0, 6.0], color: [0xFFAA_BBCC; 2], fog: 0.4, fog_and_scale: SHADE_FOG, tested: true },
+    // 2D, no fog, colour doubling (clamped), half alpha.
+    ShadeCase { w: [1.0, 1.0], color: [0x80A0_C8F0; 2], fog: 1.0, fog_and_scale: [0.0, 0.0, 0.0, 2.0], tested: false },
 ];
 /// The raw lod_bias field for the mip test (-1: as sceGxmTextureInitLinear
 /// leaves it), to learn its scale.
@@ -873,8 +890,8 @@ impl Draws {
     /// Our textured fragment program's uniforms: fog colour and colour
     /// scale, for the alpha-test program its range, for the BLEND_FIX ones
     /// FIX B. Set into a fresh default uniform buffer only when something
-    /// changed.
-    fn textured_fragment_uniforms(&mut self, tested: bool, fog_and_scale: [f32; 4], alpha_range: [f32; 4], blend: u32) {
+    /// changed. `flat`: the draw took the flat program (`Kind::TexturedFlat`).
+    fn textured_fragment_uniforms(&mut self, tested: bool, flat: bool, fog_and_scale: [f32; 4], alpha_range: [f32; 4], blend: u32) {
         let textured = &self.programs.textured;
         if blend & BLEND_ENABLED != 0 && blend & BLEND_FIX_B_ALPHA != 0 && textured.have_fix {
             // The BLEND_FIX variants (blend_program picked them): FIX B and
@@ -894,7 +911,10 @@ impl Draws {
             return;
         }
         if !tested {
-            let parameter = textured.fog_and_scale;
+            let parameter = if flat { textured.fog_and_scale_flat } else { textured.fog_and_scale };
+            if flat {
+                stats().flat_draws += 1;
+            }
             self.use_fragment_color(parameter, fog_and_scale);
             return;
         }
@@ -1299,13 +1319,26 @@ impl Draws {
         };
         let read = read_program.is_some();
         let read_alpha_range = if tested { alpha_range } else { ALPHA_ALL_PASS };
+        let mut flat = false;
         let mut fragment = if let Some(program) = read_program {
             program
         } else if programs_ready {
-            self.programs.blend_program(if tested { Kind::TexturedTest } else { Kind::Textured }, draw.blend, keep)
+            let kind = if tested {
+                Kind::TexturedTest
+            } else if self.programs.textured.have_flat && flat_shading(frame, draw) {
+                flat = true;
+                Kind::TexturedFlat
+            } else {
+                Kind::Textured
+            };
+            self.programs.blend_program(kind, draw.blend, keep)
         } else {
             null_mut()
         };
+        if flat && fragment.is_null() {
+            flat = false;
+            fragment = self.programs.blend_program(Kind::Textured, draw.blend, keep);
+        }
         if tested && fragment.is_null() {
             // No program for this blend mode: without the test, as before.
             tested = false;
@@ -1432,7 +1465,7 @@ impl Draws {
                 if read {
                     self.read_fragment_uniforms(frame, draw, read_variant, tested, Some((fog_and_scale(draw), read_alpha_range)));
                 } else {
-                    self.textured_fragment_uniforms(tested, fog_and_scale(draw), alpha_range, draw.blend);
+                    self.textured_fragment_uniforms(tested, flat, fog_and_scale(draw), alpha_range, draw.blend);
                 }
             }
         } else if !fragment.is_null() {
@@ -1478,7 +1511,7 @@ impl Draws {
                 if read {
                     self.read_fragment_uniforms(frame, draw, read_variant, tested, Some((fog_and_scale(draw), read_alpha_range)));
                 } else {
-                    self.textured_fragment_uniforms(tested, fog_and_scale(draw), alpha_range, draw.blend);
+                    self.textured_fragment_uniforms(tested, flat, fog_and_scale(draw), alpha_range, draw.blend);
                 }
             }
         } else {
@@ -1724,6 +1757,7 @@ impl Draws {
     /// The shade test: 30x30 quads at PSP x 20 + 40 i through our textured
     /// programs exactly as a draw goes (vertex program, fragment program for
     /// no blending, uniforms), unblended over the frame:
+    /// - y 60: the cases without fog and alpha test through the flat program;
     /// - y 100: `SHADE_TESTS` through the 8-bit programs;
     /// - y 140: the same through the 5551 "off" programs (cut to 5 bits);
     /// - y 180 (8-bit) and y 220 (5551): the alpha test, `SHADE_ALPHA_TESTS`
@@ -1761,6 +1795,10 @@ impl Draws {
             let left = 20.0 + 40.0 * i as f32;
             self.shade_test_quad(left, 100.0, case, ShadeProgram::EightBit, ALPHA_ALL_PASS);
             self.shade_test_quad(left, 140.0, case, ShadeProgram::Cut5551, ALPHA_ALL_PASS);
+            let no_fog = case.fog == 1.0 && case.fog_and_scale[..3] == [0.0; 3];
+            if no_fog && !case.tested {
+                self.shade_test_quad(left, 60.0, case, ShadeProgram::Flat, ALPHA_ALL_PASS);
+            }
         }
         for (i, &(function, reference)) in SHADE_ALPHA_TESTS.iter().enumerate() {
             let Some((lo, hi, outside)) = alpha_test_bounds(function, reference) else {
@@ -1790,6 +1828,10 @@ impl Draws {
                 let kind = if tested { Kind::TexturedTest } else { Kind::Textured };
                 self.programs.blend_program(kind, 0, self.keep_target_alpha)
             }
+            ShadeProgram::Flat if self.programs.textured.have_flat => {
+                self.programs.blend_program(Kind::TexturedFlat, 0, self.keep_target_alpha)
+            }
+            ShadeProgram::Flat => return,
             ShadeProgram::Cut5551 => match self.programs.read_program(true, tested, off) {
                 Some(read) => read.program,
                 None => return,
@@ -1803,7 +1845,8 @@ impl Draws {
         let matrix = self.native_matrix();
         self.use_programs(vertex, wvp, matrix, fragment as *const c_void);
         match program {
-            ShadeProgram::EightBit => self.textured_fragment_uniforms(tested, case.fog_and_scale, alpha_test, 0),
+            ShadeProgram::EightBit => self.textured_fragment_uniforms(tested, false, case.fog_and_scale, alpha_test, 0),
+            ShadeProgram::Flat => self.textured_fragment_uniforms(false, true, case.fog_and_scale, alpha_test, 0),
             ShadeProgram::Cut5551 => {
                 let read = self.programs.made_read_program(true, tested, off);
                 let (fog_and_scale, alpha) = (read.fog_and_scale, read.alpha_test);
