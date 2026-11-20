@@ -22,7 +22,11 @@ import sys
 
 # In the order they run in, roughly: walk, batch, direct draw, copies, memory.
 HOT = [
-    r"Capture>::handle_traced::<",            # the walk loop
+    # The walk loop: inlined into run_queue (the live capture's NoTrace
+    # instantiation only).
+    r"Capture>::run_queue::<.*NoTrace>$",
+    r"GeState>::upload_matrix_run$",
+    r"Matrices>::upload$",
     r"ListWindow>::refill::<",
     r"capture::Both<.*>::visit::<",
     r"Recorder as .*CommandVisitor>::visit_prims::<",
@@ -40,6 +44,13 @@ HOT = [
     r"recorder::raw_colors_if_enabled$",
     r"VertexFormat>::layout$",
     r"RawTables>::add_bones$",
+    r"RawTables>::add_raw_colors$",
+    r"raw_blocks::raw_transform_with",
+    r"Frame>::raw_transform_of$",
+    r"Lights>::(gpu|normal_rows|gpu_ready)$",
+    r"recorder::convert_indices::<2",
+    r"Geometry>::reserve_indices$",
+    r"Geometry>::finish_raw_listed_draw$",
     r"RawArena>::reserve$",
     r"Geometry>::finish_raw_draw$",
     r"DrawStream>::(copy_task|hand_over_task)::<",
