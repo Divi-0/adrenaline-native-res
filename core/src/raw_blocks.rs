@@ -56,7 +56,9 @@ pub fn raw_transform_with(
     lit: Option<(bool, bool)>,
     lights: Option<&mut crate::lighting::GpuLightsCache>,
 ) -> Option<u32> {
-    let (inputs_change, lighting_change) = inputs.changes();
+    // Numbers without the format (`TransformInputs::raw_changes`): MHF's
+    // parts change the format and nothing else here ~550 times a frame.
+    let (inputs_change, lighting_change) = inputs.raw_changes();
     let key = lighting_key(lit);
     // The newest entry's camera and world, if it was written from the same
     // matrices and registers (0: inputs without change numbers,

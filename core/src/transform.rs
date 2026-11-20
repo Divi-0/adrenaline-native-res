@@ -450,6 +450,11 @@ pub struct TransformInputs {
     /// base changed but they didn't. With `camera_change` (the view) it
     /// names a draw's GPU light set (`Lights::gpu` reads nothing else).
     lights_change: u32,
+    /// When the matrices or `TRANSFORM_REGISTERS` were last taken: the base
+    /// without the format. Kept when only the format changed (MHF: once per
+    /// model part); with `lights_change` it names a raw draw's transform
+    /// (world, camera, light set: `raw_blocks::raw_transform`).
+    matrices_change: u32,
 }
 
 impl TransformInputs {
@@ -467,6 +472,7 @@ impl TransformInputs {
         lighting_change: 0,
         camera_change: 0,
         lights_change: 0,
+        matrices_change: 0,
     };
 
     /// The inputs of a draw with the current GE state in `format`, on their
@@ -530,6 +536,14 @@ impl TransformInputs {
     /// with `of`): equal numbers, equal parts.
     pub fn changes(&self) -> (u32, u32) {
         (self.base_change, self.lighting_change)
+    }
+
+    /// When the matrices and registers were last taken and when the
+    /// lighting registers last changed (`TransformCache`'s numbers; 0 for
+    /// inputs made with `of`): equal numbers, equal `raw_world`,
+    /// `raw_camera` and light sets. The format isn't part of them.
+    pub fn raw_changes(&self) -> (u32, u32) {
+        (self.matrices_change, self.lights_change)
     }
 
     /// When the camera's part of the base last changed (`TransformCache`'s
@@ -624,6 +638,7 @@ impl TransformInputs {
             lighting_change,
             camera_change,
             lights_change,
+            matrices_change,
         } = self;
         target.format = *format;
         target.world = *world;
@@ -642,6 +657,7 @@ impl TransformInputs {
         target.lighting_change = *lighting_change;
         target.camera_change = *camera_change;
         target.lights_change = *lights_change;
+        target.matrices_change = *matrices_change;
     }
 }
 
@@ -716,6 +732,7 @@ impl TransformCache {
                 inputs.format = format.0;
                 false
             } else {
+                inputs.matrices_change = self.generation;
                 inputs.take_base(ge, format)
             };
             inputs.take_bones(ge, format);
