@@ -58,11 +58,6 @@ impl Color {
         Color { r: self.r * other.r, g: self.g * other.g, b: self.b * other.b, a: self.a * other.a }
     }
 
-    fn clamped(self) -> Color {
-        let clamp = |value: f32| value.clamp(0.0, 1.0);
-        Color { r: clamp(self.r), g: clamp(self.g), b: clamp(self.b), a: clamp(self.a) }
-    }
-
     /// `b0 * c0 + b1 * c1 + b2 * c2`.
     fn weighted(colors: [Color; 3], weights: [f32; 3]) -> Color {
         let sum = |channel: fn(&Color) -> f32| (0..3).map(|i| weights[i] * channel(&colors[i])).sum();

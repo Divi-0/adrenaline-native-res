@@ -371,7 +371,7 @@ mod tests {
         let mut copy = vec![0u8; vram.len()];
         // The game: data moved down by 0x2000 (or anything new), then its own whole copy.
         let mut game_ran = false;
-        let mut run_game = |vram: &mut Vec<u8>, copy: &mut Vec<u8>| {
+        let run_game = |vram: &mut Vec<u8>, copy: &mut Vec<u8>| {
             for byte in vram[offset as usize..].iter_mut() {
                 *byte = byte.wrapping_add(0x55);
             }

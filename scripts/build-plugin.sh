@@ -33,7 +33,7 @@ cargo $NIGHTLY build --release -p nativeres-plugin --target $VITA_TARGET \
 # segment on to the next boundary then.
 python3 scripts/hot-order.py target/$VITA_TARGET/release/libnativeres_plugin.a "$OUT/hot-order.ld"
 arm-vita-eabi-gcc -Wl,-q -nostartfiles -nostdlib \
-  -Wl,-u,module_start -Wl,-u,module_stop \
+  -Wl,-u,module_start -Wl,-u,module_stop -Wl,-e,module_start -Wl,-z,noexecstack \
   -Wl,--section-ordering-file="$OUT/hot-order.ld" \
   -Wl,--defsym,__sce_headroom=0x2000 \
   -o "$OUT/nativeres.elf" \
