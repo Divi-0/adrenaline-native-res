@@ -35,9 +35,26 @@ const STABLE_CHECK_BYTES: usize = 256;
 /// Reads after the first, at most, until two agree.
 const STABLE_TRIES: usize = 3;
 
-/// Tasks the producer copied itself (copier behind or the GE sync), since
-/// the session started (capture log); never reset here.
-pub static PRODUCER_TASKS: AtomicU32 = AtomicU32::new(0);
+/// Tasks the producer copied itself, by cause (`producer_copied`), since
+/// the session started (capture log `helped=`); never reset here.
+pub static PRODUCER_TASKS: [AtomicU32; 5] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+/// Why the producer copied a task itself (`PRODUCER_TASKS`' index): the
+/// copier more than `VRAM_LAG_TASKS` VRAM tasks behind, more than
+/// `COPIER_LAG_JOBS` RAM tasks behind, at the GE sync (`copy_untaken`), at
+/// the frame's end (`wait_for_tasks`), or a full ring (`CopyTasks::push`).
+pub mod helped {
+    pub const VRAM_LAG: usize = 0;
+    pub const RAM_LAG: usize = 1;
+    pub const SYNC: usize = 2;
+    pub const FRAME_END: usize = 3;
+    pub const RING_FULL: usize = 4;
+}
+
+/// Counts a task the producer copied itself for `cause` (`helped`).
+#[inline]
+pub fn producer_copied(cause: usize) {
+    PRODUCER_TASKS[cause].fetch_add(1, Ordering::Relaxed);
+}
 /// Tasks whose source couldn't be read (their place is filled with zeros:
 /// the draw is already in the frame), since the session started.
 pub static UNREADABLE_TASKS: AtomicU32 = AtomicU32::new(0);
@@ -379,7 +396,7 @@ impl<const N: usize> CopyTasks<N> {
             self.publish();
             while self.claimed.0.load(Ordering::Acquire).wrapping_sub(before) as i32 <= 0 {
                 if copy(self) {
-                    PRODUCER_TASKS.fetch_add(1, Ordering::Relaxed);
+                    producer_copied(helped::RING_FULL);
                 }
             }
             while self.done[slot].load(Ordering::Acquire) != before.wrapping_add(1) {

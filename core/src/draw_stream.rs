@@ -110,6 +110,13 @@ pub const VRAM_LAG_TASKS: u32 = 16;
 /// The VRAM ring's size (MTX's paused race: ~720 VRAM tasks per frame,
 /// taken as they come).
 pub const MAX_VRAM_TASKS: usize = 512;
+/// VRAM tasks are read once, small ones too (`STABLE_COPIES` is for RAM):
+/// they read the plugin's copy of VRAM, which the game can't write, only
+/// the plugin (at a list's enqueue, or a refresh the walk asked for). MHF's
+/// intro: ~330 of its ~800 VRAM tasks a frame are small (2026-11-20), and
+/// read twice they cost the copier, which then fell behind
+/// `VRAM_LAG_TASKS`, the capture thread.
+const VRAM_STABLE: bool = false;
 
 /// Copy tasks are published to the copier this many at a time
 /// (`DrawStream::copy_task`; the rest whenever the producer waits for
@@ -538,7 +545,7 @@ impl DrawStream {
             Some(reader) => {
                 let stable = STABLE_COPIES.load(Ordering::Relaxed);
                 let source = &mut ReaderSource { copy_bytes: reader.copy_bytes, sample: reader.sample };
-                self.vram_tasks.copy_one(source, stable) || self.tasks.copy_one(source, stable)
+                self.vram_tasks.copy_one(source, VRAM_STABLE) || self.tasks.copy_one(source, stable)
             }
             None => false,
         }
@@ -547,9 +554,7 @@ impl DrawStream {
     /// Takes the oldest VRAM copy task nobody has taken yet and copies it.
     fn copy_one_vram_task(&self) -> bool {
         match self.reader {
-            Some(reader) => self
-                .vram_tasks
-                .copy_one(&mut ReaderSource { copy_bytes: reader.copy_bytes, sample: reader.sample }, STABLE_COPIES.load(Ordering::Relaxed)),
+            Some(reader) => self.vram_tasks.copy_one(&mut ReaderSource { copy_bytes: reader.copy_bytes, sample: reader.sample }, VRAM_STABLE),
             None => false,
         }
     }
@@ -646,7 +651,7 @@ impl DrawStream {
                 PRODUCER_COPIES.fetch_add(1, Ordering::Relaxed);
             }
             while self.copy_one_task() {
-                crate::copy_tasks::PRODUCER_TASKS.fetch_add(1, Ordering::Relaxed);
+                crate::copy_tasks::producer_copied(crate::copy_tasks::helped::SYNC);
             }
             crate::phase::leave(previous);
         }
@@ -679,14 +684,14 @@ impl DrawStream {
         if (crate::memory::VRAM_START..crate::memory::VRAM_END).contains(&physical(start)) {
             // Published at once and never left behind (`VRAM_LAG_TASKS`).
             self.vram_tasks
-                .push(task, |tasks| tasks.copy_one(&mut ReaderSource { copy_bytes: reader.copy_bytes, sample: reader.sample }, stable));
+                .push(task, |tasks| tasks.copy_one(&mut ReaderSource { copy_bytes: reader.copy_bytes, sample: reader.sample }, VRAM_STABLE));
             if self.vram_tasks.publish() {
                 (copier.wake)();
             }
             if self.vram_tasks.untaken() > VRAM_LAG_TASKS {
                 let previous = crate::phase::enter(crate::phase::HELP);
                 while self.vram_tasks.untaken() > VRAM_LAG_TASKS / 2 && self.copy_one_vram_task() {
-                    crate::copy_tasks::PRODUCER_TASKS.fetch_add(1, Ordering::Relaxed);
+                    crate::copy_tasks::producer_copied(crate::copy_tasks::helped::VRAM_LAG);
                 }
                 crate::phase::leave(previous);
             }
@@ -710,7 +715,7 @@ impl DrawStream {
         if self.tasks.pushed() % 16 == 0 && self.tasks.untaken() > limit {
             let previous = crate::phase::enter(crate::phase::HELP);
             while self.tasks.untaken() > limit / 2 && self.copy_one_task() {
-                crate::copy_tasks::PRODUCER_TASKS.fetch_add(1, Ordering::Relaxed);
+                crate::copy_tasks::producer_copied(crate::copy_tasks::helped::RAM_LAG);
             }
             crate::phase::leave(previous);
         }
@@ -930,7 +935,7 @@ impl DrawStream {
     pub fn wait_for_tasks(&self) {
         self.publish_tasks();
         while self.copy_one_task() {
-            crate::copy_tasks::PRODUCER_TASKS.fetch_add(1, Ordering::Relaxed);
+            crate::copy_tasks::producer_copied(crate::copy_tasks::helped::FRAME_END);
         }
         while !(self.tasks.complete() & self.vram_tasks.complete()) {
             match self.hooks {
@@ -1489,6 +1494,52 @@ mod tests {
         stream.wait_for_tasks();
         assert!(ram.iter().chain(&vram).all(|&byte| byte != 0));
         assert!(stream.all_copied());
+    }
+
+    /// VRAM tasks read the plugin's copy of VRAM, which only the plugin
+    /// writes (at a list's enqueue, or a refresh the walk asked for): the
+    /// game can't rewrite it while it is copied, so a small VRAM task is
+    /// read once, not again until two reads agree as RAM's are (MHF's intro:
+    /// ~330 small VRAM tasks a frame, 2026-11-20).
+    #[test]
+    fn small_vram_tasks_are_read_once_and_small_ram_tasks_twice() {
+        use crate::copy_tasks::Layout;
+        use core::sync::atomic::AtomicU32;
+        static HOOKS: CopierHooks = CopierHooks { wake: || {} };
+        static RAM_READS: AtomicU32 = AtomicU32::new(0);
+        static VRAM_READS: AtomicU32 = AtomicU32::new(0);
+        struct AllDeferrable;
+        impl PspMemory for AllDeferrable {
+            fn read_u32(&mut self, _address: u32) -> Option<u32> {
+                None
+            }
+            fn defer(&mut self, _address: u32, _bytes: u32) -> bool {
+                true
+            }
+        }
+        let reader = DeferredReader {
+            copy_bytes: |address, out| {
+                let vram = (crate::memory::VRAM_START..crate::memory::VRAM_END).contains(&physical(address));
+                if vram { &VRAM_READS } else { &RAM_READS }.fetch_add(1, Ordering::Relaxed);
+                out.fill(7);
+                true
+            },
+            ..FAKE_READER
+        };
+        assert!(STABLE_COPIES.load(Ordering::Relaxed), "the default: small RAM ranges checked");
+        let mut stream = Box::new(DrawStream::new());
+        stream.reader = Some(reader);
+        stream.copier = Some(&HOOKS);
+        let (mut ram, mut vram) = (vec![0u8; 64], vec![0u8; 64]);
+        let task = |source: u32, out: &mut [u8]| CopyTask { source, length: 64, destination: out.as_mut_ptr(), layout: Layout::Plain };
+        assert!(stream.hand_over_task(&mut AllDeferrable, task(0x0890_0000, &mut ram)));
+        assert!(stream.hand_over_task(&mut AllDeferrable, task(0x4415_5000, &mut vram)));
+        // The copier's way (VRAM first), then the producer's at the frame's end.
+        assert!(stream.copy_one_task());
+        stream.wait_for_tasks();
+        assert!(ram.iter().chain(&vram).all(|&byte| byte == 7));
+        assert_eq!(VRAM_READS.load(Ordering::Relaxed), 1, "VRAM: read once");
+        assert_eq!(RAM_READS.load(Ordering::Relaxed), 2, "RAM: read until two reads agree");
     }
 
     /// Test memory whose main RAM may be read later by the consumer.

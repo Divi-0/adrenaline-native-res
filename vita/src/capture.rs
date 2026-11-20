@@ -1128,7 +1128,7 @@ fn log_frame(state: &mut CaptureState, timing: &mut FrameTiming, flip: &RawEvent
     let method = copy_method::name(method);
     let _ = write!(
         text,
-        "frame={} rec={} dt={}.{}ms cpu={}us run={}us copy={}us/{}x/{}direct/{}k stream={}waited/{}busy stage={}waited/{}busy/{}cpu waits={}/{}/{}/{}/{} badread={}@{:08x}+{:x} vram={}x/{}k/{}us/{} sync={}/{}us enq={}/{}us changes={} thread={}/{:08x} vramlist={}k/{}missing free={}k ours={}k wakes={} copier={}us/{}/{}/{} gesync={}/{}ms/{} behind={}.{}ms ",
+        "frame={} rec={} dt={}.{}ms cpu={}us run={}us copy={}us/{}x/{}direct/{}k stream={}waited/{}busy stage={}waited/{}busy/{}cpu waits={}/{}/{}/{}/{} badread={}@{:08x}+{:x} vram={}x/{}k/{}us/{} sync={}/{}us enq={}/{}us changes={} thread={}/{:08x} vramlist={}k/{}missing free={}k ours={}k wakes={} copier={}us/{}/{}/{} helped={}/{}/{}/{}/{} gesync={}/{}ms/{} behind={}.{}ms ",
         timing.frame_number,
         recorded as u8,
         frame_time / 1000,
@@ -1174,6 +1174,13 @@ fn log_frame(state: &mut CaptureState, timing: &mut FrameTiming, flip: &RawEvent
         crate::copy_thread::WAKES.load(Ordering::Relaxed),
         nativeres_core::draw_stream::PRODUCER_COPIES.load(Ordering::Relaxed),
         nativeres_core::draw_stream::UNSTABLE_READS.load(Ordering::Relaxed),
+        // Copy tasks the capture thread copied itself, by cause
+        // (`copy_tasks::helped`: VRAM lag, RAM lag, GE sync, frame end, ring full).
+        nativeres_core::copy_tasks::PRODUCER_TASKS[0].load(Ordering::Relaxed),
+        nativeres_core::copy_tasks::PRODUCER_TASKS[1].load(Ordering::Relaxed),
+        nativeres_core::copy_tasks::PRODUCER_TASKS[2].load(Ordering::Relaxed),
+        nativeres_core::copy_tasks::PRODUCER_TASKS[3].load(Ordering::Relaxed),
+        nativeres_core::copy_tasks::PRODUCER_TASKS[4].load(Ordering::Relaxed),
         sync.sync_waits,
         sync.sync_wait_us / 1000,
         sync.sync_timeouts,
