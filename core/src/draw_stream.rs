@@ -106,7 +106,24 @@ pub static COPIER_LAG_JOBS: AtomicU32 = AtomicU32::new(512);
 /// VRAM, were drawn for a frame as huge sheets with stretched textures
 /// (2026-11-19; `copierlag 2` fixed it at 41 instead of 31 ms of capture
 /// per paused race frame, VRAM copied by the producer at 37.7 ms).
-pub const VRAM_LAG_TASKS: u32 = 16;
+///
+/// 128 since 2026-11-20 (was 16): with 16 the capture thread copied ~280 of
+/// MHF's ~800 VRAM tasks per intro frame itself (the copier, at a low
+/// priority on busy cores, falls behind while the walk queues one task per
+/// model part). 128 is still far from the hundreds of 2026-11-19, and the
+/// game's GE sync still waits for every copy (`copy_untaken`): no sync
+/// timed out in any test. Deploy A/B, MHF intro: capture run 29.0 -> 26.7
+/// ms, dt 34.0 -> 33.3, none copied by the capture; MTX race start (4
+/// rounds): 27.9 -> 28.85 fps, run 33.2 -> 32.0 ms, webcam flags alike, no
+/// torn frame or sync timeout; a filmed 3-minute LA drive: no one-frame
+/// glitch in 5,095 frames, no torn frame, no sync timeout.
+/// Debug `vramlag <tasks>` (`set_vram_lag`).
+pub static VRAM_LAG_TASKS: AtomicU32 = AtomicU32::new(128);
+
+/// Sets `VRAM_LAG_TASKS`, kept within 2..=`MAX_VRAM_TASKS` / 2.
+pub fn set_vram_lag(tasks: u32) {
+    VRAM_LAG_TASKS.store(tasks.clamp(2, MAX_VRAM_TASKS as u32 / 2), Ordering::Relaxed);
+}
 /// The VRAM ring's size (MTX's paused race: ~720 VRAM tasks per frame,
 /// taken as they come).
 pub const MAX_VRAM_TASKS: usize = 512;
@@ -688,9 +705,10 @@ impl DrawStream {
             if self.vram_tasks.publish() {
                 (copier.wake)();
             }
-            if self.vram_tasks.untaken() > VRAM_LAG_TASKS {
+            let limit = VRAM_LAG_TASKS.load(Ordering::Relaxed);
+            if self.vram_tasks.untaken() > limit {
                 let previous = crate::phase::enter(crate::phase::HELP);
-                while self.vram_tasks.untaken() > VRAM_LAG_TASKS / 2 && self.copy_one_vram_task() {
+                while self.vram_tasks.untaken() > limit / 2 && self.copy_one_vram_task() {
                     crate::copy_tasks::producer_copied(crate::copy_tasks::helped::VRAM_LAG);
                 }
                 crate::phase::leave(previous);
@@ -1473,15 +1491,17 @@ mod tests {
         let mut stream = Box::new(DrawStream::new());
         stream.reader = Some(reader);
         stream.copier = Some(&HOOKS);
-        let (mut ram, mut vram) = (vec![0u8; 100 * 16], vec![0u8; 40 * 16]);
+        // More VRAM tasks than the copier may leave untaken.
+        let vram_count = VRAM_LAG_TASKS.load(Ordering::Relaxed) as usize + 24;
+        let (mut ram, mut vram) = (vec![0u8; 100 * 16], vec![0u8; vram_count * 16]);
         let task = |source: u32, out: &mut [u8]| CopyTask { source, length: 16, destination: out.as_mut_ptr(), layout: Layout::Plain };
         for i in 0..100 {
             assert!(stream.hand_over_task(&mut AllDeferrable, task(0x0890_0000 + 16 * i as u32, &mut ram[16 * i..])));
         }
         assert_eq!(stream.tasks.untaken(), 100, "RAM tasks may wait for the copier");
-        for i in 0..40 {
+        for i in 0..vram_count {
             assert!(stream.hand_over_task(&mut AllDeferrable, task(0x4415_5000 + 16 * i as u32, &mut vram[16 * i..])));
-            assert!(stream.vram_tasks.untaken() <= VRAM_LAG_TASKS, "task {i}");
+            assert!(stream.vram_tasks.untaken() <= VRAM_LAG_TASKS.load(Ordering::Relaxed), "task {i}");
         }
         assert!(vram[..16].iter().all(|&byte| byte != 0), "the producer copied the oldest VRAM task itself");
         assert!(ram.iter().all(|&byte| byte == 0), "but no RAM task");
