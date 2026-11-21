@@ -22,6 +22,9 @@ pub mod format {
     pub const CLUT8: u8 = 5;
     pub const CLUT16: u8 = 6;
     pub const CLUT32: u8 = 7;
+    pub const DXT1: u8 = 8;
+    pub const DXT3: u8 = 9;
+    pub const DXT5: u8 = 10;
 }
 
 /// Largest texture the PSP supports.
@@ -29,7 +32,7 @@ pub const MAX_SIZE: u16 = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeError {
-    /// DXT compressed or invalid format.
+    /// Invalid format (or one the called decoder doesn't do).
     UnsupportedFormat,
     /// Larger than 512x512 or zero-sized.
     BadSize,
@@ -56,8 +59,52 @@ fn bits_per_pixel(format: u8) -> Option<u32> {
         format::BGR5650 | format::ABGR5551 | format::ABGR4444 | format::CLUT16 => Some(16),
         format::ABGR8888 | format::CLUT32 => Some(32),
         format::CLUT4 => Some(4),
-        format::CLUT8 => Some(8),
+        format::CLUT8 | format::DXT3 | format::DXT5 => Some(8),
+        format::DXT1 => Some(4),
         _ => None,
+    }
+}
+
+/// DXT1/3/5: 4x4 texel blocks (PSP order: index rows before colours, see
+/// `decode_dxt`).
+pub fn is_dxt_format(format: u8) -> bool {
+    (format::DXT1..=format::DXT5).contains(&format)
+}
+
+/// A DXT texture's blocks as PPSSPP lays them out (DecodeDXTBlocks): rows of
+/// `per_row` blocks (the buffer width / 4, at least 1; a buffer width of 0
+/// counts as 16 bytes, GetTextureBufw), `rows` block rows, `row_blocks`
+/// decoded per row. A texture wider than its buffer runs on into the next
+/// row's blocks. Swizzling doesn't apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DxtLayout {
+    block_bytes: u32,
+    per_row: u32,
+    rows: u32,
+    row_blocks: u32,
+}
+
+impl DxtLayout {
+    fn of(texture: &TextureDescriptor) -> Option<DxtLayout> {
+        let (block_bytes, bits) = match texture.format {
+            format::DXT1 => (8, 4),
+            format::DXT3 | format::DXT5 => (16, 8),
+            _ => return None,
+        };
+        let buffer_width = if texture.buffer_width != 0 { texture.buffer_width } else { 8 * 16 / bits };
+        Some(DxtLayout {
+            block_bytes,
+            per_row: (buffer_width / 4).max(1),
+            rows: (texture.height as u32).div_ceil(4),
+            row_blocks: (texture.width as u32).div_ceil(4),
+        })
+    }
+
+    /// Bytes from the first block to the end of the last one decoded
+    /// (PPSSPP's SourceExtent).
+    fn bytes(&self) -> u32 {
+        let extra = self.row_blocks.saturating_sub(self.per_row);
+        (self.per_row * self.rows + extra) * self.block_bytes
     }
 }
 
@@ -250,6 +297,9 @@ pub fn quick_sample(words: &[u32; QUICK_SAMPLES]) -> u32 {
 /// How many bytes the texture's pixels occupy, starting at its address.
 /// `None` for unsupported formats.
 pub fn data_size(texture: &TextureDescriptor) -> Option<u32> {
+    if let Some(layout) = DxtLayout::of(texture) {
+        return Some(layout.bytes());
+    }
     let bits = bits_per_pixel(texture.format)?;
     let height = texture.height as u32;
     // Swizzled textures always occupy whole 8-row blocks.
@@ -279,6 +329,9 @@ pub struct CompactLayout {
 /// contiguous (buffer width = width), its buffer is narrower than the
 /// texture (rows overlap), or the format is unsupported.
 pub fn compact_layout(texture: &TextureDescriptor) -> Option<CompactLayout> {
+    if is_dxt_format(texture.format) {
+        return None; // block rows, not texel rows
+    }
     let bits = bits_per_pixel(texture.format)?;
     let width_bits = texture.width as u32 * bits;
     if width_bits % 8 != 0 {
@@ -413,8 +466,12 @@ pub fn decode_texture(
 ) -> Result<(), DecodeError> {
     let (bits, row) = check_decode(data, texture, out.len(), out_stride)?;
     let (width, height) = (texture.width as usize, texture.height as usize);
-    let colors = PaletteColors::new(texture.clut_format, palette);
     let forced_alpha = if texture.flags & texture_flags::IGNORE_ALPHA != 0 { 0xFF00_0000 } else { 0 };
+    if let Some(layout) = DxtLayout::of(texture) {
+        decode_dxt(data, texture.format, &layout, out, out_stride, forced_alpha, (width, height));
+        return Ok(());
+    }
+    let colors = PaletteColors::new(texture.clut_format, palette);
     let mut bytes = [0u8; MAX_ROW_BYTES];
     let bytes = &mut bytes[..texel_bytes(width, bits)];
 
@@ -463,6 +520,98 @@ pub fn decode_texture(
         }
     }
     Ok(())
+}
+
+/// Decodes DXT blocks the way PPSSPP does (GPU/Common/TextureDecoder.cpp,
+/// DXTDecoder). The PSP stores a block in the reverse order of the PC's:
+/// bytes 0-3 the index rows (2 bits per texel, low bits first), 4-7 the two
+/// RGB565 colours (red in the high bits); DXT3: bytes 8-15 one 16-bit alpha
+/// row each (4 bits per texel); DXT5: bytes 8-13 the 48 bits of 3-bit alpha
+/// indices (12 per row), 14 and 15 the two alphas. `data` holds at least
+/// `layout.bytes()` (check_decode).
+fn decode_dxt(
+    data: &[u8],
+    format: u8,
+    layout: &DxtLayout,
+    out: &mut [u32],
+    out_stride: usize,
+    forced_alpha: u32,
+    (width, height): (usize, usize),
+) {
+    let block_bytes = layout.block_bytes as usize;
+    for block_row in 0..layout.rows as usize {
+        let y = block_row * 4;
+        let block_height = (height - y).min(4);
+        let mut index = block_row * layout.per_row as usize;
+        for x in (0..width).step_by(4) {
+            let block = &data[index * block_bytes..(index + 1) * block_bytes];
+            index += 1;
+            let block_width = (width - x).min(4);
+            // DXT1's colours carry their alpha (255, transparent black);
+            // DXT3/5's are 0 and get the block's own.
+            let colors = dxt_colors(block, format == format::DXT1);
+            for row in 0..block_height {
+                let out = &mut out[(y + row) * out_stride + x..][..block_width];
+                let mut indices = block[row] as u32;
+                match format {
+                    format::DXT3 => {
+                        let mut alpha = u16::from_le_bytes([block[8 + 2 * row], block[9 + 2 * row]]) as u32;
+                        for texel in out.iter_mut() {
+                            *texel = colors[(indices & 3) as usize] | (alpha & 0xF) << 28 | forced_alpha;
+                            indices >>= 2;
+                            alpha >>= 4;
+                        }
+                    }
+                    format::DXT5 => {
+                        let alphas = dxt5_alphas(block[14], block[15]);
+                        let all = u64::from(u32::from_le_bytes([block[8], block[9], block[10], block[11]]))
+                            | u64::from(u16::from_le_bytes([block[12], block[13]])) << 32;
+                        let mut alpha = (all >> (12 * row)) as u32;
+                        for texel in out.iter_mut() {
+                            *texel = colors[(indices & 3) as usize] | (alphas[(alpha & 7) as usize] as u32) << 24 | forced_alpha;
+                            indices >>= 2;
+                            alpha >>= 3;
+                        }
+                    }
+                    _ => {
+                        for texel in out.iter_mut() {
+                            *texel = colors[(indices & 3) as usize] | forced_alpha;
+                            indices >>= 2;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A DXT block's four colours (`0xAABBGGRR`), PPSSPP's DecodeColors.
+fn dxt_colors(block: &[u8], dxt1: bool) -> [u32; 4] {
+    let c1 = u16::from_le_bytes([block[4], block[5]]) as u32;
+    let c2 = u16::from_le_bytes([block[6], block[7]]) as u32;
+    let split = |c: u32| [(c >> 8) & 0xF8, (c >> 3) & 0xFC, (c << 3) & 0xF8];
+    let (first, second) = (split(c1), split(c2));
+    let alpha = if dxt1 { 255 } else { 0 };
+    let make = |[r, g, b]: [u32; 3]| alpha << 24 | b << 16 | g << 8 | r;
+    let mix = |a: [u32; 3], b: [u32; 3]| -> [u32; 3] { core::array::from_fn(|i| (a[i] + a[i] + b[i]) / 3) };
+    if c1 > c2 {
+        [make(first), make(second), make(mix(first, second)), make(mix(second, first))]
+    } else {
+        let average: [u32; 3] = core::array::from_fn(|i| (first[i] + second[i]) / 2);
+        [make(first), make(second), make(average), 0]
+    }
+}
+
+/// A DXT5 block's eight alphas, PPSSPP's DecodeAlphaDXT5 (8.8 fixed point
+/// weights, + 31 before the shift).
+fn dxt5_alphas(alpha1: u8, alpha2: u8) -> [u8; 8] {
+    let (a1, a2) = (alpha1 as u32, alpha2 as u32);
+    let lerp = |n: u32, steps: u32| ((a1 * ((steps - n) << 8) / steps + a2 * (n << 8) / steps + 31) >> 8) as u8;
+    if alpha1 > alpha2 {
+        [alpha1, alpha2, lerp(1, 7), lerp(2, 7), lerp(3, 7), lerp(4, 7), lerp(5, 7), lerp(6, 7)]
+    } else {
+        [alpha1, alpha2, lerp(1, 5), lerp(2, 5), lerp(3, 5), lerp(4, 5), 0, 255]
+    }
 }
 
 /// 16-bit direct colour textures (BGR5650, ABGR5551, ABGR4444) have the same
@@ -914,13 +1063,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_compressed_formats() {
-        let data = bytes(&[0; 8]);
+    fn rejects_invalid_formats() {
+        // 8-10 are DXT (dxt_tests), 11-15 don't exist.
+        let data = bytes(&[0; 64]);
         let mut out = [0u32; 16];
-        assert_eq!(
-            decode_texture(&data, &texture(8, 4, 4), &[], &mut out, 4),
-            Err(DecodeError::UnsupportedFormat)
-        );
+        for format in 11..16 {
+            assert_eq!(
+                decode_texture(&data, &texture(format, 4, 4), &[], &mut out, 4),
+                Err(DecodeError::UnsupportedFormat)
+            );
+            assert_eq!(data_size(&texture(format, 4, 4)), None);
+        }
     }
 
     /// GE state for a 64x64 texture at ADDRESS with levels 1..3 (32, 16, 8)
@@ -987,5 +1140,145 @@ mod tests {
         assert_eq!((level2.width, level2.height, level2.buffer_width), (16, 16, 16));
         assert_eq!(level2.address, ADDRESS + (64 * 64 + 32 * 32) * 4);
         assert_eq!(level2.flags & texture_flags::LEVELS_MASK, 0, "a level alone has no levels");
+    }
+}
+
+/// DXT1/3/5 (Need for Speed Underground Rivals' title and cars): expected
+/// values worked out by hand from PPSSPP's decoder (GPU/Common/
+/// TextureDecoder.cpp, DXTDecoder; layout DecodeDXTBlocks).
+#[cfg(test)]
+mod dxt_tests {
+    use super::*;
+
+    fn dxt(format: u8, width: u16, height: u16, buffer_width: u32) -> TextureDescriptor {
+        TextureDescriptor { address: 0x0900_0000, buffer_width, width, height, format, ..Default::default() }
+    }
+
+    /// A PSP DXT1 block: the four index rows first, then the two colours.
+    fn block1(lines: [u8; 4], color1: u16, color2: u16) -> Vec<u8> {
+        let mut block = lines.to_vec();
+        block.extend_from_slice(&color1.to_le_bytes());
+        block.extend_from_slice(&color2.to_le_bytes());
+        block
+    }
+
+    fn decode(data: &[u8], texture: &TextureDescriptor) -> Vec<u32> {
+        let (width, height) = (texture.width as usize, texture.height as usize);
+        let mut out = vec![0u32; width * height];
+        decode_texture(data, texture, &[], &mut out, width).unwrap();
+        out
+    }
+
+    #[test]
+    fn dxt1_four_colours_when_the_first_colour_is_larger() {
+        // Row 0 uses indices 0, 1, 2, 3; red 0xF800 against blue 0x001F.
+        let data = block1([0b11_10_01_00, 0, 0, 0], 0xF800, 0x001F);
+        let out = decode(&data, &dxt(format::DXT1, 4, 4, 4));
+        // (2 * 0xF8 + 0) / 3 = 0xA5, (0xF8 + 0) / 3 = 0x52.
+        assert_eq!(&out[..4], &[0xFF00_00F8, 0xFFF8_0000, 0xFF52_00A5, 0xFFA5_0052]);
+        assert!(out[4..].iter().all(|&texel| texel == 0xFF00_00F8));
+    }
+
+    #[test]
+    fn dxt1_three_colours_and_transparent_black_otherwise() {
+        let data = block1([0b11_10_01_00, 0, 0, 0], 0x001F, 0xF800);
+        let out = decode(&data, &dxt(format::DXT1, 4, 4, 4));
+        assert_eq!(&out[..4], &[0xFFF8_0000, 0xFF00_00F8, 0xFF7C_007C, 0x0000_0000]);
+    }
+
+    #[test]
+    fn dxt1_ignored_alpha_makes_the_transparent_texel_opaque() {
+        let data = block1([0b11_00_00_00, 0, 0, 0], 0x001F, 0xF800);
+        let texture = TextureDescriptor { flags: texture_flags::IGNORE_ALPHA, ..dxt(format::DXT1, 4, 4, 4) };
+        assert_eq!(decode(&data, &texture)[3], 0xFF00_0000);
+    }
+
+    #[test]
+    fn dxt3_alpha_is_the_nibble_shifted_up() {
+        let mut data = block1([0, 0, 0, 0], 0xF800, 0x001F);
+        for line in [0xF0A5u16, 0, 0, 0] {
+            data.extend_from_slice(&line.to_le_bytes());
+        }
+        let out = decode(&data, &dxt(format::DXT3, 4, 4, 4));
+        // PPSSPP: alpha << 28, the nibble not repeated (0xF -> 0xF0).
+        assert_eq!(&out[..4], &[0x5000_00F8, 0xA000_00F8, 0x0000_00F8, 0xF000_00F8]);
+        assert_eq!(out[4], 0x0000_00F8);
+    }
+
+    fn block5(alpha1: u8, alpha2: u8, indices: u64) -> Vec<u8> {
+        let mut data = block1([0, 0, 0, 0], 0xF800, 0x001F);
+        data.extend_from_slice(&(indices as u32).to_le_bytes());
+        data.extend_from_slice(&((indices >> 32) as u16).to_le_bytes());
+        data.extend_from_slice(&[alpha1, alpha2]);
+        data
+    }
+
+    #[test]
+    fn dxt5_eight_alphas_when_the_first_alpha_is_larger() {
+        // Row 0 alpha indices 0, 1, 2, 7.
+        let data = block5(255, 0, 1 << 3 | 2 << 6 | 7 << 9);
+        let out = decode(&data, &dxt(format::DXT5, 4, 4, 4));
+        let alphas: Vec<u32> = out[..4].iter().map(|texel| texel >> 24).collect();
+        // lerp8: (255 * (6 << 8) / 7 + 31) >> 8 = 218, n = 6: 36.
+        assert_eq!(alphas, [255, 0, 218, 36]);
+        assert!(out.iter().all(|texel| texel & 0x00FF_FFFF == 0x0000_00F8));
+    }
+
+    #[test]
+    fn dxt5_six_alphas_plus_zero_and_full_otherwise() {
+        let data = block5(0, 255, 1 << 3 | 2 << 6 | 6 << 9 | 7 << 12);
+        let texture = dxt(format::DXT5, 8, 4, 8);
+        let mut data = data;
+        data.extend(block5(0, 255, 0));
+        let out = decode(&data, &texture);
+        let alphas: Vec<u32> = out[..5].iter().map(|texel| texel >> 24).collect();
+        // lerp6: (255 * (1 << 8) / 5 + 31) >> 8 = 51; index 6 = 0, 7 = 255.
+        assert_eq!(alphas, [0, 255, 51, 0, 0]);
+        // Row 1 starts at bit 12: index 7.
+        assert_eq!(out[8] >> 24, 255);
+    }
+
+    #[test]
+    fn dxt_blocks_are_laid_out_in_rows_of_the_buffer_width() {
+        // 8x8 DXT1, buffer 8 wide: blocks 0 1 / 2 3, one colour each.
+        let colors = [0xF800u16, 0x07E0, 0x001F, 0xFFFF];
+        let data: Vec<u8> = colors.iter().flat_map(|&color| block1([0; 4], color, 0)).collect();
+        let texture = dxt(format::DXT1, 8, 8, 8);
+        assert_eq!(data_size(&texture), Some(32));
+        let out = decode(&data, &texture);
+        assert_eq!([out[0], out[4], out[4 * 8], out[4 * 8 + 4]], [0xFF00_00F8, 0xFF00_FC00, 0xFFF8_0000, 0xFFF8_FCF8]);
+        assert_eq!(out[3 * 8 + 3], 0xFF00_00F8);
+    }
+
+    #[test]
+    fn dxt_rows_wider_than_the_buffer_run_on_into_the_next_row() {
+        // 8 wide, buffer 4: one block per row, a row decodes two.
+        let colors = [0xF800u16, 0x07E0, 0x001F];
+        let data: Vec<u8> = colors.iter().flat_map(|&color| block1([0; 4], color, 0)).collect();
+        let texture = dxt(format::DXT1, 8, 8, 4);
+        assert_eq!(data_size(&texture), Some(24));
+        let out = decode(&data, &texture);
+        assert_eq!([out[0], out[4], out[4 * 8], out[4 * 8 + 4]], [0xFF00_00F8, 0xFF00_FC00, 0xFF00_FC00, 0xFFF8_0000]);
+    }
+
+    #[test]
+    fn dxt_partial_blocks_and_ignored_swizzle() {
+        // NFS UR: a 2x64 DXT5 strip, buffer 4.
+        let data: Vec<u8> = (0..16).flat_map(|_| block5(255, 255, 0)).collect();
+        let texture = TextureDescriptor { swizzled: 1, ..dxt(format::DXT5, 2, 64, 4) };
+        assert_eq!(data_size(&texture), Some(16 * 16));
+        let out = decode(&data, &texture);
+        assert!(out.iter().all(|&texel| texel == 0xFF00_00F8));
+    }
+
+    #[test]
+    fn dxt_data_sizes() {
+        // NFS UR's title: 512x512 DXT1 with a 480 buffer, 32x32 DXT5 with 24.
+        assert_eq!(data_size(&dxt(format::DXT1, 512, 512, 480)), Some((120 * 128 + 8) * 8));
+        assert_eq!(data_size(&dxt(format::DXT5, 32, 32, 24)), Some((6 * 8 + 2) * 16));
+        assert_eq!(data_size(&dxt(format::DXT3, 4, 4, 4)), Some(16));
+        // Buffer width 0 counts as 16 bytes: 32 DXT1 texels.
+        assert_eq!(data_size(&dxt(format::DXT1, 32, 4, 0)), Some(8 * 8));
+        assert_eq!(compact_layout(&dxt(format::DXT1, 32, 32, 64)), None);
     }
 }

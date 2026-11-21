@@ -88,7 +88,18 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
         .collect();
     for (index, texture) in textures.iter().enumerate() {
         if texture.is_none() {
-            println!("texture {index}: could not be decoded from the dump");
+            let t = &frame.textures()[index];
+            println!(
+                "texture {index}: could not be decoded from the dump (addr={:08x} fmt={} {}x{} bufw={} swz={} bytes={:?} in dump={})",
+                t.address,
+                t.format,
+                t.width,
+                t.height,
+                t.buffer_width,
+                t.swizzled,
+                data_size(t),
+                data_size(t).is_some_and(|size| memory.bytes(t.address, size).is_some())
+            );
         }
     }
     // Debugging: REPLAY_SHOW_TEXTURE=n describes texture n and some of its texels.
