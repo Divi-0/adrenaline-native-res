@@ -51,6 +51,21 @@ pub fn for_gpu(name: &'static [u8], bytes: u32) -> Option<GpuBlock> {
     )
 }
 
+/// CDRAM (the GPU's own memory) the GPU reads and writes: the off-screen
+/// targets (targets.rs), which main memory has no room for. Whole 256 KiB
+/// units (the kernel's rule for CDRAM blocks).
+pub fn for_gpu_cdram(name: &'static [u8], bytes: u32) -> Option<GpuBlock> {
+    allocate(
+        name,
+        sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW,
+        bytes.next_multiple_of(CDRAM_UNIT),
+        gxm::MEMORY_ATTRIB_READ | gxm::MEMORY_ATTRIB_WRITE,
+    )
+}
+
+/// CDRAM blocks come in whole 256 KiB.
+pub const CDRAM_UNIT: u32 = 256 * 1024;
+
 /// Cached main memory the CPU fills and the GPU reads (see the module's head).
 #[allow(dead_code)] // for the unswizzle quads and sprite corners, still C
 pub fn gpu_input(name: &'static [u8], bytes: u32) -> Option<GpuBlock> {

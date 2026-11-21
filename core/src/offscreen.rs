@@ -83,6 +83,40 @@ pub fn sampled(draws: &[Draw], textures: &[TextureDescriptor], shown: u32) -> [u
     found
 }
 
+/// Whether the frame can be drawn as one scene per target: first each
+/// off-screen framebuffer's draws (`drawn` says which have targets), then
+/// all of the shown framebuffer's in one scene. True when that gives what
+/// the GE's order gives: every such framebuffer is drawn in one run, its
+/// draws don't sample the shown framebuffer, and no shown draw before its
+/// run samples it. Fewer scenes, and each target drawn once per frame: a
+/// second scene on the same render target waited for the GPU (sceGxmEndScene
+/// ~50 ms per frame on NFS UR's title).
+pub fn offscreen_first(draws: &[Draw], textures: &[TextureDescriptor], shown: u32, drawn: impl Fn(u32) -> bool) -> bool {
+    let samples = |draw: &Draw, framebuffer: u32| {
+        draw.flags & crate::frame::draw_flags::TEXTURED != 0
+            && textures.get(draw.texture as usize).is_some_and(|texture| reads_framebuffer(texture, framebuffer))
+    };
+    let mut seen = [0u32; MAX_OFFSCREEN];
+    let mut seen_count = 0;
+    for (framebuffer, range) in runs(draws) {
+        if framebuffer == shown || !drawn(framebuffer) {
+            continue;
+        }
+        if seen[..seen_count].contains(&framebuffer) || seen_count == MAX_OFFSCREEN {
+            return false; // drawn in two runs
+        }
+        seen[seen_count] = framebuffer;
+        seen_count += 1;
+        if draws[range.clone()].iter().any(|draw| samples(draw, shown)) {
+            return false;
+        }
+        if draws[..range.start].iter().any(|draw| draw.framebuffer == shown && samples(draw, framebuffer)) {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +173,35 @@ mod tests {
         assert_eq!(sampled(&draws, &[texture(TRAIL | 0x0020_0000, format::BGR5650)], SHOWN), [TRAIL, 0]);
         assert_eq!(sampled(&draws, &[texture(TRAIL, format::CLUT8)], SHOWN), [0, 0]);
         assert_eq!(sampled(&draws, &[texture(TRAIL, format::DXT1)], SHOWN), [0, 0]);
+    }
+
+    fn textured(framebuffer: u32, texture: u32) -> Draw {
+        Draw { framebuffer, texture, flags: crate::frame::draw_flags::TEXTURED, ..Default::default() }
+    }
+
+    #[test]
+    fn nfs_title_draws_its_trail_buffer_first() {
+        // Clear, fade the trail buffer, quad, screen with the trail buffer.
+        let draws = vec![draw(SHOWN), draw(TRAIL), draw(QUAD), textured(SHOWN, 1), draw(SHOWN), textured(SHOWN, 0)];
+        let (_, textures) = nfs_title();
+        assert!(offscreen_first(&draws, &textures, SHOWN, |framebuffer| framebuffer == TRAIL));
+    }
+
+    #[test]
+    fn not_first_when_the_order_matters() {
+        let textures = vec![texture(TRAIL, format::BGR5650), texture(SHOWN, format::BGR5650)];
+        let has_target = |framebuffer| framebuffer == TRAIL;
+        // A shown draw reads the trail buffer before the frame draws it.
+        let early_read = vec![textured(SHOWN, 0), draw(TRAIL), textured(SHOWN, 0)];
+        assert!(!offscreen_first(&early_read, &textures, SHOWN, has_target));
+        // The trail buffer's draws read the screen.
+        let reads_screen = vec![draw(SHOWN), textured(TRAIL, 1), textured(SHOWN, 0)];
+        assert!(!offscreen_first(&reads_screen, &textures, SHOWN, has_target));
+        // Drawn in two runs.
+        let twice = vec![draw(TRAIL), draw(SHOWN), draw(TRAIL), textured(SHOWN, 0)];
+        assert!(!offscreen_first(&twice, &textures, SHOWN, has_target));
+        // Framebuffers without targets don't count.
+        assert!(offscreen_first(&twice, &textures, SHOWN, |_| false));
     }
 
     #[test]

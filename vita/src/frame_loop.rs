@@ -12,13 +12,16 @@
 //! coordinates are simply doubled: the PSP screen is 480x272.
 
 use core::ffi::c_void;
+use core::ops::Range;
 use core::ptr::null;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, Ordering};
 
 use nativeres_core::blend::{self, BLEND_ENABLED};
 use nativeres_core::display_loop::AfterQuit;
 use nativeres_core::frame::{draw_flags, Frame, MAX_TEXTURES};
+use nativeres_core::offscreen;
 use nativeres_core::opaque_source::palette_texture_opaque;
+use nativeres_core::texture::format as texture_format;
 use nativeres_core::texture_cache::MAX_RENDER_TARGETS;
 
 use crate::capture::{COMPLETED_FRAME_COUNT, GPU_TRANSFORM_READY, set_mip_mode};
@@ -26,7 +29,7 @@ use crate::draw::{self, REDRAW_SKIP};
 use crate::frames::{acquire_frame, wait_for_frame};
 use crate::gpu_textures::TextureObject;
 use crate::render_stats::stats;
-use crate::targets::{self, Targets, SONY_PICTURE, SONY_PICTURE_STRIDE, TARGET_COUNT};
+use crate::targets::{self, Targets, SONY_PICTURE, SONY_PICTURE_STRIDE, TARGET_COUNT, TARGET_HEIGHT, TARGET_WIDTH};
 use crate::textures::{self, FrameInfo};
 use crate::{ext, frame_pool, gxm, options, palettes, render_log, sys, SingleThreaded};
 
@@ -354,6 +357,13 @@ impl FrameLoop {
         crate::capture::note_drawn_hash(frame);
 
         self.prepare_sampled_targets(targets, frame);
+        // Off-screen framebuffers this frame samples (core offscreen.rs):
+        // targets of their own, so their textures come from there.
+        for &framebuffer in offscreen::sampled(frame.draws(), frame.textures(), frame.shown_framebuffer).iter() {
+            if framebuffer != 0 && targets.find(framebuffer).is_none() {
+                targets.offscreen_for(framebuffer, render_count);
+            }
+        }
         targets.publish_addresses();
 
         // Decode (or find in the cache) every texture of the frame once.
@@ -365,8 +375,11 @@ impl FrameLoop {
             loop_start_us: LOOP_START_US.load(Ordering::Relaxed),
             render_targets: [0; MAX_RENDER_TARGETS],
         };
-        let sampled_targets =
-            targets.targets.iter().filter(|t| t.exists() && t.psp_address != 0 && t.psp_address != frame.shown_framebuffer);
+        let sampled_targets = targets
+            .targets
+            .iter()
+            .chain(targets.offscreen.iter())
+            .filter(|t| t.exists() && t.psp_address != 0 && t.psp_address != frame.shown_framebuffer);
         for (slot, target) in info.render_targets.iter_mut().zip(sampled_targets) {
             *slot = target.psp_address;
         }
@@ -427,22 +440,32 @@ impl FrameLoop {
         }
         self.refresh_stale_targets(targets, frame, target);
 
-        let begin_start = now();
-        targets.begin_scene(target);
-        let loop_start = now();
-        stats().begin_us += loop_start - begin_start;
-        self.draw_draws(frame);
-        draw::draw_tests(); // GPU tests, alpha log
-        let end_start = now();
-        stats().loop_us += end_start - loop_start;
-        // vita2d draws with GXM's defaults (all at z 0.5, no depth test, no culling).
-        draw::end_draws();
-        // Safe: the display thread's context, inside the target scene.
-        let end_result = unsafe { gxm::sceGxmEndScene(gxm::context(), null(), frame_pool::close_segment()) };
-        if end_result < 0 {
-            frame_pool::scene_failed();
-        }
-        stats().end_us += now() - end_start;
+        let uses_offscreen = frame
+            .draws()
+            .iter()
+            .any(|draw| draw.framebuffer != frame.shown_framebuffer && targets.find_offscreen(draw.framebuffer).is_some());
+        let end_result = if uses_offscreen {
+            self.draw_runs(targets, frame, target)
+        } else {
+            let begin_start = now();
+            targets.begin_scene(target);
+            let loop_start = now();
+            stats().begin_us += loop_start - begin_start;
+            self.draw_draws(frame, 0..frame.draws().len(), frame.shown_framebuffer);
+            draw::draw_tests(); // GPU tests, alpha log
+            let end_start = now();
+            stats().loop_us += end_start - loop_start;
+            // vita2d draws with GXM's defaults (all at z 0.5, no depth test, no culling).
+            draw::end_draws();
+            // Safe: the display thread's context, inside the target scene.
+            let end_result = unsafe { gxm::sceGxmEndScene(gxm::context(), null(), frame_pool::close_segment()) };
+            if end_result < 0 {
+                frame_pool::scene_failed();
+            }
+            stats().end_us += now() - end_start;
+            end_result
+        };
+        stats().gxm_draws += frame.draw_count;
         if end_result < 0 && self.end_logs > 0 {
             self.end_logs -= 1;
             render_log::line(format_args!("sceGxmEndScene (target) failed: {:08x}\n", end_result));
@@ -487,7 +510,7 @@ impl FrameLoop {
     fn prepare_sampled_targets(&mut self, targets: &mut Targets, frame: &Frame) {
         let idle_us = now().wrapping_sub(self.last_drawn_us);
         if nativeres_core::frame::targets_outdated(self.last_drawn_frame, frame.frame_number, idle_us) {
-            for target in targets.targets.iter_mut().filter(|t| t.psp_address != 0) {
+            for target in targets.targets.iter_mut().chain(targets.offscreen.iter_mut()).filter(|t| t.psp_address != 0) {
                 target.needs_clear = true;
             }
         }
@@ -518,11 +541,11 @@ impl FrameLoop {
             if !self.textures[i].is_null() || wanted.format >= 4 || wanted.address == frame.shown_framebuffer {
                 continue;
             }
-            let Some(k) = targets.find(wanted.address) else {
+            let Some(target) = targets.sampled(wanted.address) else {
                 continue;
             };
-            let target = &mut targets.targets[k];
-            if blend::samples_target_alpha(wanted.flags) {
+            // A 16-bit 565 framebuffer has no alpha: read opaque.
+            if blend::samples_target_alpha(wanted.flags) && wanted.format != texture_format::BGR5650 {
                 self.target_alpha_read = render_count;
                 self.textures[i] = &target.texture;
             } else {
@@ -643,18 +666,19 @@ impl FrameLoop {
     /// vertices are already one draw here (the core merges them,
     /// Frame::finish_draw; Final Fantasy's menu: ~1200 glyph draws per
     /// frame), so each becomes one sceGxmDraw.
-    fn draw_draws(&mut self, frame: &Frame) {
+    fn draw_draws(&mut self, frame: &Frame, range: Range<usize>, framebuffer: u32) {
         let skip = REDRAW_SKIP.load(Ordering::Relaxed);
         let only_first = DRAW_ONLY_FIRST.load(Ordering::Relaxed);
         let only_count = DRAW_ONLY_COUNT.load(Ordering::Relaxed);
         let texture_count = frame.textures().len();
         let mut alpha_read = false;
-        for (i, draw) in frame.draws().iter().enumerate() {
+        for (i, draw) in frame.draws().iter().enumerate().take(range.end).skip(range.start) {
             if draw.blend & BLEND_ENABLED != 0 && blend::reads_destination_alpha(draw.blend) {
                 alpha_read = true;
             }
-            // Off-screen rendering isn't supported yet.
-            if draw.framebuffer != frame.shown_framebuffer || skip & 32 != 0 {
+            // Only the scene's framebuffer (other off-screen ones: without a
+            // target, skipped).
+            if draw.framebuffer != framebuffer || skip & 32 != 0 {
                 continue;
             }
             if only_count != 0 && (i < only_first as usize || i - only_first as usize >= only_count as usize) {
@@ -679,7 +703,76 @@ impl FrameLoop {
         if alpha_read {
             self.target_alpha_read = self.render_count;
         }
-        stats().gxm_draws += frame.draw_count;
+    }
+
+    /// A frame drawing into off-screen targets. Where the order allows it
+    /// (core `offscreen::offscreen_first`): each off-screen framebuffer's
+    /// draws in a scene of its own first, then all of the shown
+    /// framebuffer's in one scene (each target drawn once per frame: a second
+    /// scene on the same render target waited ~50 ms for the GPU). Else one
+    /// scene per run of draws into the same framebuffer, in the frame's
+    /// order. Draws into framebuffers without a target are skipped as before.
+    /// Only the last scene closes the frame pool's segment (scenes finish in
+    /// order). Returns the last failed sceGxmEndScene's result, or 0.
+    fn draw_runs(&mut self, targets: &mut Targets, frame: &Frame, target: usize) -> i32 {
+        let shown = frame.shown_framebuffer;
+        // The framebuffers with off-screen targets now (copied: the scenes
+        // below change the targets' ages).
+        let mut with_target = [0u32; targets::OFFSCREEN_COUNT];
+        for (address, target) in with_target.iter_mut().zip(targets.offscreen.iter()) {
+            *address = if target.exists() { target.psp_address } else { 0 };
+        }
+        let has_target = move |framebuffer: u32| framebuffer != 0 && framebuffer != shown && with_target.contains(&framebuffer);
+        let draws = frame.draws();
+        let mut end_result = 0;
+        if offscreen::offscreen_first(draws, frame.textures(), shown, has_target) {
+            let offscreen_runs = || offscreen::runs(draws).filter(|(framebuffer, _)| has_target(*framebuffer));
+            for (framebuffer, range) in offscreen_runs() {
+                end_result = self.draw_scene(targets, frame, target, framebuffer, range, false).min(end_result);
+            }
+            end_result = self.draw_scene(targets, frame, target, shown, 0..draws.len(), true).min(end_result);
+        } else {
+            let drawn = |framebuffer: u32| framebuffer == shown || has_target(framebuffer);
+            let last = offscreen::runs(draws).filter(|(framebuffer, _)| drawn(*framebuffer)).count();
+            for (number, (framebuffer, range)) in offscreen::runs(draws).filter(|(framebuffer, _)| drawn(*framebuffer)).enumerate() {
+                end_result = self.draw_scene(targets, frame, target, framebuffer, range, number + 1 == last).min(end_result);
+            }
+        }
+        stats().offscreen_frames += 1;
+        end_result
+    }
+
+    /// One scene of `draw_runs`: the draws in `range` into `framebuffer`
+    /// (the shown one: `target`; else its off-screen target). Returns
+    /// sceGxmEndScene's result.
+    fn draw_scene(&mut self, targets: &mut Targets, frame: &Frame, target: usize, framebuffer: u32, range: Range<usize>, is_last: bool) -> i32 {
+        let begin_start = now();
+        let offscreen_target = targets.find_offscreen(framebuffer).filter(|_| framebuffer != frame.shown_framebuffer);
+        match offscreen_target {
+            Some(k) => targets.begin_offscreen_scene(k, self.render_count),
+            None => targets.begin_scene(target),
+        }
+        let loop_start = now();
+        stats().begin_us += loop_start - begin_start;
+        self.draw_draws(frame, range, framebuffer);
+        if is_last {
+            draw::draw_tests(); // GPU tests, alpha log
+        }
+        if offscreen_target.is_some() {
+            // Back to our targets' size for whatever draws next.
+            draw::set_target_size(TARGET_WIDTH, TARGET_HEIGHT);
+        }
+        let end_start = now();
+        stats().loop_us += end_start - loop_start;
+        draw::end_draws();
+        let notification = if is_last { frame_pool::close_segment() } else { null() };
+        // Safe: the display thread's context, inside the scene.
+        let result = unsafe { gxm::sceGxmEndScene(gxm::context(), null(), notification) };
+        if result < 0 && is_last {
+            frame_pool::scene_failed();
+        }
+        stats().end_us += now() - end_start;
+        result
     }
 }
 

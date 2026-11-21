@@ -34,6 +34,9 @@ pub struct RenderStats {
     pub stale_copies: u32,
     /// Targets filled from Sony's picture.
     pub seeded_targets: u32,
+    /// Frames drawn in several scenes for off-screen targets (frame_loop.rs
+    /// `draw_runs`).
+    pub offscreen_frames: u32,
     /// Frames left out: textures rewritten after the GE drew them.
     pub moved_on_frames: u32,
     /// sceGxmBeginScene (can wait for the GPU).
@@ -114,6 +117,7 @@ impl RenderStats {
         stale_targets: 0,
         stale_copies: 0,
         seeded_targets: 0,
+        offscreen_frames: 0,
         moved_on_frames: 0,
         begin_us: 0,
         loop_us: 0,
@@ -247,10 +251,11 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
     );
     let _ = write!(
         text,
-        "stale_targets={} stale_copies={} seeded={} lookup={}us tex_begin={}us tex_hash={}us palette={}us tex_finds={} tex_scans={} end={}us",
+        "stale_targets={} stale_copies={} seeded={} offscreen_frames={} lookup={}us tex_begin={}us tex_hash={}us palette={}us tex_finds={} tex_scans={} end={}us",
         s.stale_targets,
         s.stale_copies,
         s.seeded_targets,
+        s.offscreen_frames,
         per_frame(s.lookup_us),
         per_frame(s.begin_tex_us),
         per_frame(s.hash_tex_us),
