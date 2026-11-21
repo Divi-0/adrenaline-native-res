@@ -261,10 +261,13 @@ pub enum ReadVariant {
     /// The generic program: any format, blend and dithering, in floating
     /// point (uniforms).
     Generic,
-    /// A fast one (5551): its blend; `keep_alpha` = the target's alpha
-    /// stays (else the alpha is written, as blended); `dither` = the GE's
-    /// dither value is added after the blend (`draw_flags::DITHER`).
-    Fast { way: ReadWay, keep_alpha: bool, dither: bool },
+    /// A fast one (5551, or 565 with `green6`): its blend; `keep_alpha` =
+    /// the target's alpha stays (else the alpha is written, as blended);
+    /// `dither` = the GE's dither value is added after the blend
+    /// (`draw_flags::DITHER`); `green6` = a 565 target: green cut to 6 bits,
+    /// the alpha written uncut as the generic program writes it (565 has no
+    /// alpha; never `keep_alpha`).
+    Fast { way: ReadWay, keep_alpha: bool, dither: bool, green6: bool },
 }
 
 impl ReadVariant {
@@ -274,7 +277,9 @@ impl ReadVariant {
     /// else stays as it is.
     pub fn for_invisible_source(self) -> ReadVariant {
         match self {
-            ReadVariant::Fast { way: ReadWay::Normal, keep_alpha, dither } => ReadVariant::Fast { way: ReadWay::Invisible, keep_alpha, dither },
+            ReadVariant::Fast { way: ReadWay::Normal, keep_alpha, dither, green6 } => {
+                ReadVariant::Fast { way: ReadWay::Invisible, keep_alpha, dither, green6 }
+            }
             other => other,
         }
     }
@@ -297,7 +302,9 @@ pub fn read_variant(flags: u32, blend: u32, keep_target_alpha: bool, exact_norma
     let format = (flags & draw_flags::TARGET_FORMAT_MASK) >> draw_flags::TARGET_FORMAT_SHIFT;
     let alpha_only = blend & BLEND_WRITES_ALPHA != 0 && blend & BLEND_ALPHA_ONLY != 0;
     let fix = blend & BLEND_ENABLED != 0 && blend & BLEND_FIX_B_ALPHA != 0;
-    if format != draw_flags::TARGET_5551 || alpha_only || fix {
+    // 565 (NFS UR): the same programs with green cut to 6 bits.
+    let green6 = format == draw_flags::TARGET_565;
+    if !(format == draw_flags::TARGET_5551 || green6) || alpha_only || fix {
         return ReadVariant::Generic;
     }
     let dither = flags & draw_flags::DITHER != 0;
@@ -312,10 +319,17 @@ pub fn read_variant(flags: u32, blend: u32, keep_target_alpha: bool, exact_norma
             (4, 5, 0) if exact_normal || dither => ReadWay::Normal,
             (4, 5, 0) => ReadWay::Precut,
             (4, 1, 0) => ReadWay::Add,
+            // Zero, one (565, untextured): the target itself (source term
+            // 0, destination term the target, as `ReadWay::Invisible`),
+            // dithered and cut again.
+            (0, 1, 0) if green6 && flags & draw_flags::TEXTURED == 0 => ReadWay::Invisible,
             _ => return ReadVariant::Generic,
         }
     };
-    ReadVariant::Fast { way, keep_alpha: !writes_alpha, dither }
+    if green6 && !writes_alpha {
+        return ReadVariant::Generic; // no 565 programs keep the alpha
+    }
+    ReadVariant::Fast { way, keep_alpha: !writes_alpha, dither, green6 }
 }
 
 /// The corners of triangle `t` of a strip, counted from its first vertex:
@@ -2510,8 +2524,8 @@ mod tests {
         let target = |format: u32| format << draw_flags::TARGET_FORMAT_SHIFT;
         let normal = BLEND_ENABLED | 4 | 5 << 4;
         let add = BLEND_ENABLED | 4 | 1 << 4;
-        let fast = |way, keep_alpha| ReadVariant::Fast { way, keep_alpha, dither: false };
-        let dithered = |way, keep_alpha| ReadVariant::Fast { way, keep_alpha, dither: true };
+        let fast = |way, keep_alpha| ReadVariant::Fast { way, keep_alpha, dither: false, green6: false };
+        let dithered = |way, keep_alpha| ReadVariant::Fast { way, keep_alpha, dither: true, green6: false };
         let f5551 = target(draw_flags::TARGET_5551);
         // Nobody reads the alpha: every draw writes it.
         assert_eq!(read_variant(f5551, normal, false, true), fast(ReadWay::Normal, false));
@@ -2540,8 +2554,45 @@ mod tests {
         assert_eq!(read_variant(f5551, normal | BLEND_FIX_B_ALPHA, false, true), ReadVariant::Generic);
         // Without blending the FIX bit means nothing.
         assert_eq!(read_variant(f5551, BLEND_FIX_B_ALPHA, false, true), fast(ReadWay::Off, false));
-        assert_eq!(read_variant(target(draw_flags::TARGET_565), normal, false, true), ReadVariant::Generic);
         assert_eq!(read_variant(target(draw_flags::TARGET_4444), normal, false, true), ReadVariant::Generic);
+        // Zero, one stays generic on 5551.
+        assert_eq!(read_variant(f5551, BLEND_ENABLED | 1 << 4, false, true), ReadVariant::Generic);
+    }
+
+    #[test]
+    fn draws_into_565_get_fast_programs_with_green_cut_to_6_bits() {
+        use crate::blend::BLEND_ENABLED;
+        let f565 = draw_flags::TARGET_565 << draw_flags::TARGET_FORMAT_SHIFT;
+        let normal = BLEND_ENABLED | 4 | 5 << 4;
+        let add = BLEND_ENABLED | 4 | 1 << 4;
+        let zero_one = BLEND_ENABLED | 1 << 4;
+        let fast = |way, dither| ReadVariant::Fast { way, keep_alpha: false, dither, green6: true };
+        // NFS UR's title: dithered normal (logo, cars), add (trail buffer),
+        // zero/one (untextured).
+        let dithered = f565 | draw_flags::DITHER;
+        assert_eq!(read_variant(dithered | draw_flags::TEXTURED, normal, false, true), fast(ReadWay::Normal, true));
+        assert_eq!(read_variant(dithered | draw_flags::TEXTURED, add, false, true), fast(ReadWay::Add, true));
+        assert_eq!(read_variant(dithered, zero_one, false, true), fast(ReadWay::Invisible, true));
+        assert_eq!(read_variant(f565, 0, false, true), fast(ReadWay::Off, false));
+        assert_eq!(read_variant(f565, normal, false, false), fast(ReadWay::Precut, false));
+        // Textured zero/one: no textured invisible program.
+        assert_eq!(read_variant(f565 | draw_flags::TEXTURED, zero_one, false, true), ReadVariant::Generic);
+        // Keeping the alpha: generic (565 has none to keep).
+        assert_eq!(read_variant(f565, normal, true, true), ReadVariant::Generic);
+    }
+
+    /// The 565 programs' green cut: 6 bits widened = v & 0xFC | v >> 6, and
+    /// the "off" programs' float form of it (nativeres_textured_read_f.cg:
+    /// h = floor(v / 4), h x 4.0625 - 0.46875 rounded by the cast).
+    #[test]
+    fn the_fast_6_bit_cut_is_the_ges_cut() {
+        for value in 0..=255u32 {
+            let bits = (value & 0xFC) | (value >> 6);
+            assert_eq!(bits, quantize_like_the_ge(value as i32, 0, 6), "{value}");
+            let h = (value / 4) as f32;
+            let float = h * 4.0625 - 0.46875;
+            assert!((float - bits as f32).abs() < 0.47, "{value}: {float}");
+        }
     }
 
     #[test]
@@ -2559,7 +2610,7 @@ mod tests {
 
     #[test]
     fn only_normal_blends_become_invisible() {
-        let fast = |way, keep_alpha, dither| ReadVariant::Fast { way, keep_alpha, dither };
+        let fast = |way, keep_alpha, dither| ReadVariant::Fast { way, keep_alpha, dither, green6: false };
         for keep_alpha in [false, true] {
             for dither in [false, true] {
                 let normal = fast(ReadWay::Normal, keep_alpha, dither);

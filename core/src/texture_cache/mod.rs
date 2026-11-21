@@ -307,6 +307,9 @@ struct Entry {
     /// in by the worker), compared with the frame's capture-time sample
     /// (`lookup_sample`).
     quick: u32,
+    /// Every texel decoded has alpha 255 (`texture::all_texels_opaque`,
+    /// all levels): `TextureCache::opaque`.
+    opaque: bool,
 }
 
 const NO_DESCRIPTOR: TextureDescriptor = TextureDescriptor {
@@ -337,6 +340,7 @@ const FREE_ENTRY: Entry = Entry {
     unhashed: 0,
     sample_hash: 0,
     quick: 0,
+    opaque: false,
 };
 
 const FREE_RETIRED: Retired = Retired { texture: None, shape: NO_SHAPE, ready_at: 0 };
@@ -389,6 +393,11 @@ pub struct TextureCache {
     pub lookup_sample: u32,
     /// See `moved_on`.
     moved_on: u32,
+    /// Per texture of the last `textures_for_frame`: `opaque`.
+    frame_opaque: [bool; MAX_TEXTURES],
+    /// The entry the last `look_up` returned `Lookup::Ready` from was
+    /// opaque (`ready`).
+    last_opaque: bool,
     failed_next: usize,
     refresh: Option<PendingRefresh>,
     stats: TextureStats,
@@ -424,6 +433,8 @@ impl TextureCache {
             lookup_levels: crate::frame::TextureLevels { address: [0; 8], buffer_width: [0; 8], log2_size: [0; 8] },
             lookup_sample: 0,
             moved_on: 0,
+            frame_opaque: [false; MAX_TEXTURES],
+            last_opaque: false,
             failed_next: 0,
             refresh: None,
             stats: TextureStats {
@@ -463,6 +474,7 @@ impl TextureCache {
         for n in 0..count {
             let index = (n + self.render_count as usize) % count;
             let texture = &textures[index];
+            self.last_opaque = false;
             out[index] = if is_render_target(&start, texture) {
                 Lookup::RenderTarget
             } else {
@@ -476,7 +488,24 @@ impl TextureCache {
                 }
                 lookup
             };
+            self.frame_opaque[index] = matches!(out[index], Lookup::Ready(_)) && self.last_opaque;
         }
+    }
+
+    /// True if every texel of the last `textures_for_frame`'s texture
+    /// `index` (ready) has alpha 255 (`texture::all_texels_opaque`): a
+    /// normal alpha blend of it under vertices of alpha 255 is the texture
+    /// itself (core opaque_source.rs).
+    pub fn opaque(&self, index: usize) -> bool {
+        self.frame_opaque.get(index).copied().unwrap_or(false)
+    }
+
+    /// `Lookup::Ready` with entry `slot`'s texture, noting whether it is
+    /// opaque (`opaque`).
+    fn ready(&mut self, slot: usize) -> Lookup {
+        let entry = &self.entries[slot];
+        self.last_opaque = entry.opaque;
+        Lookup::Ready(entry.texture.unwrap())
     }
 
     /// Textures of the last `textures_for_frame` whose pixels the game had
@@ -800,7 +829,6 @@ impl TextureCache {
             }
             let entry = &mut self.entries[slot];
             entry.last_used = render_count;
-            let texture = entry.texture.unwrap();
             // Changed at its last re-check: re-checked now, past the budgets.
             let mut changing = entry.changes > 0 && !vram_pending;
             if !vram_pending && big {
@@ -837,21 +865,21 @@ impl TextureCache {
             }
             if !changing {
                 if render_count.wrapping_sub(self.entries[slot].verified_at) < VERIFY_INTERVAL || vram_pending {
-                    return Lookup::Ready(texture);
+                    return self.ready(slot);
                 }
                 // Big: the worker re-checks it, off this thread's budgets.
                 if self.can_refresh_in_background(host, wanted) {
                     if self.start_refresh(host, slot, wanted) {
                         self.entries[slot].verified_at = render_count;
                     }
-                    return Lookup::Ready(texture);
+                    return self.ready(slot);
                 }
                 let size = StagedLayout::of(wanted).size;
                 // One texture per frame may exceed the budget, otherwise
                 // textures bigger than the budget would never be re-checked.
                 let fits_budget = size <= self.verify_budget || self.verify_budget == VERIFY_BYTES_PER_FRAME;
                 if !fits_budget || self.past_deadline(host) {
-                    return Lookup::Ready(texture);
+                    return self.ready(slot);
                 }
                 self.verify_budget = self.verify_budget.saturating_sub(size);
             }
@@ -909,7 +937,7 @@ impl TextureCache {
                         // since (staged_quick_hash).
                         entry.quick = hashed_quick;
                         if !decoded_unhashed {
-                            return Lookup::Ready(entry.texture.unwrap());
+                            return self.ready(slot);
                         }
                         changes = 0;
                     } else {
@@ -957,6 +985,8 @@ impl TextureCache {
         let mut quick = if on_gpu { quick_hash(host, wanted) } else { 0 };
         let decode_start = host.now_us();
         let mut result = Ok(());
+        // Unswizzled on the GPU: not looked at (16-bit with alpha: rarely opaque).
+        let mut opaque = false;
         if !on_gpu || !self.unswizzle_on_gpu(host, wanted, texture, shape) {
             if staged_size == 0 {
                 // The hash came from an earlier copy this frame (or there was none).
@@ -969,6 +999,7 @@ impl TextureCache {
             let data = &staging[..staged_size as usize];
             // Palette textures: their colours come per frame (palette tables).
             result = host.decode(texture, format, &layout.as_texture, data, palette, self.smooth, 0);
+            opaque = texture::all_texels_opaque(data, &layout.as_texture);
             // Mip levels 1.. (menu "NativeRes Distant Textures"): each staged
             // from its own address and decoded into its place. Only level 0
             // is hashed: a game rewrites a texture's levels with it.
@@ -983,6 +1014,7 @@ impl TextureCache {
                 result = if size == 0 {
                     Err(DecodeError::BadAddress)
                 } else {
+                    opaque &= texture::all_texels_opaque(&staging[..size], &level_layout.as_texture);
                     host.decode(texture, format, &level_layout.as_texture, &staging[..size], palette, self.smooth, level as u8)
                 };
             }
@@ -1032,8 +1064,9 @@ impl TextureCache {
             unhashed,
             sample_hash: new_sample_hash,
             quick,
+            opaque,
         };
-        Lookup::Ready(texture)
+        self.ready(slot)
     }
 
     /// Has the GPU unswizzle `wanted` into `target` (see

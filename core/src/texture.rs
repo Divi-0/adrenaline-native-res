@@ -585,6 +585,44 @@ fn decode_dxt(
     }
 }
 
+/// True if every texel `decode_texture` makes of `texture` from `data` has
+/// alpha 255; false when unsure. Lets the display draw a normal alpha blend
+/// of it unblended (core opaque_source.rs: no frame read on 16-bit
+/// targets). Worked out from the source, not the decoded texels (those are
+/// in uncached GPU memory on the Vita): 5650 and textures whose alpha is
+/// ignored always; DXT1 when no decoded block uses its transparent colour
+/// (3-colour mode, index 3); DXT5 when every alpha index used gives 255;
+/// DXT3 never (PPSSPP's alpha is the nibble << 28: 0xF0 at most); others
+/// not looked at (false).
+pub fn all_texels_opaque(data: &[u8], texture: &TextureDescriptor) -> bool {
+    if texture.flags & texture_flags::IGNORE_ALPHA != 0 || texture.format == format::BGR5650 {
+        return true;
+    }
+    let Some(layout) = DxtLayout::of(texture) else {
+        return false;
+    };
+    if texture.format == format::DXT3 || (data.len() as u64) < layout.bytes() as u64 {
+        return false;
+    }
+    let block_bytes = layout.block_bytes as usize;
+    (0..layout.rows as usize).all(|row| {
+        let first = row * layout.per_row as usize;
+        (first..first + layout.row_blocks as usize).all(|index| {
+            let block = &data[index * block_bytes..(index + 1) * block_bytes];
+            if texture.format == format::DXT1 {
+                let (c1, c2) = (u16::from_le_bytes([block[4], block[5]]), u16::from_le_bytes([block[6], block[7]]));
+                // 3-colour mode: index 3 is transparent black.
+                c1 > c2 || block[..4].iter().all(|&line| (0..4).all(|texel| (line >> (2 * texel)) & 3 != 3))
+            } else {
+                let alphas = dxt5_alphas(block[14], block[15]);
+                let all = u64::from(u32::from_le_bytes([block[8], block[9], block[10], block[11]]))
+                    | u64::from(u16::from_le_bytes([block[12], block[13]])) << 32;
+                (0..16).all(|texel| alphas[((all >> (3 * texel)) & 7) as usize] == 255)
+            }
+        })
+    })
+}
+
 /// A DXT block's four colours (`0xAABBGGRR`), PPSSPP's DecodeColors.
 fn dxt_colors(block: &[u8], dxt1: bool) -> [u32; 4] {
     let c1 = u16::from_le_bytes([block[4], block[5]]) as u32;
@@ -1269,6 +1307,33 @@ mod dxt_tests {
         assert_eq!(data_size(&texture), Some(16 * 16));
         let out = decode(&data, &texture);
         assert!(out.iter().all(|&texel| texel == 0xFF00_00F8));
+    }
+
+    #[test]
+    fn opaque_texels_from_the_source() {
+        // DXT1 in 4-colour mode, or 3-colour mode without index 3: opaque.
+        let four = block1([0xFF; 4], 0xF800, 0x001F);
+        let three_unused = block1([0b10_01_00_10; 4], 0x001F, 0xF800);
+        let three_used = block1([0b11_00_00_00, 0, 0, 0], 0x001F, 0xF800);
+        let texture = dxt(format::DXT1, 8, 4, 8);
+        let both = |a: &[u8], b: &[u8]| [a, b].concat();
+        assert!(all_texels_opaque(&both(&four, &three_unused), &texture));
+        assert!(!all_texels_opaque(&both(&four, &three_used), &texture));
+        // Each opaque claim matches the decoded texels.
+        for data in [both(&four, &three_unused), both(&four, &three_used)] {
+            assert_eq!(all_texels_opaque(&data, &texture), decode(&data, &texture).iter().all(|texel| texel >> 24 == 0xFF));
+        }
+        // DXT5 with alphas 255, 255 (the 6-alpha mode): indices 0..5 and 7
+        // give 255, index 6 gives 0.
+        let full = block5(255, 255, 7 | 7 << 3);
+        assert!(all_texels_opaque(&full, &dxt(format::DXT5, 4, 4, 4)));
+        let six = block5(255, 255, 6);
+        assert!(!all_texels_opaque(&six, &dxt(format::DXT5, 4, 4, 4)));
+        // DXT3 never; 5650 and ignored alpha always; others not looked at.
+        assert!(!all_texels_opaque(&[0xFF; 16], &dxt(format::DXT3, 4, 4, 4)));
+        assert!(all_texels_opaque(&[], &TextureDescriptor { format: format::BGR5650, ..dxt(format::DXT1, 4, 4, 4) }));
+        assert!(all_texels_opaque(&three_used, &TextureDescriptor { flags: texture_flags::IGNORE_ALPHA, ..dxt(format::DXT1, 4, 4, 4) }));
+        assert!(!all_texels_opaque(&[0xFF; 64], &TextureDescriptor { format: format::ABGR8888, ..dxt(format::DXT1, 4, 4, 4) }));
     }
 
     #[test]

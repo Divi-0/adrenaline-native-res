@@ -159,6 +159,13 @@ pub fn for_frame(
     STATS.add(&display.cache.take_stats());
 }
 
+/// Display thread, after `for_frame`: whether every texel of the frame's
+/// texture `index` (from the cache) has alpha 255 (`TextureCache::opaque`).
+pub fn opaque(index: usize) -> bool {
+    // Safe: only the display thread calls this.
+    unsafe { DISPLAY.get() }.cache.opaque(index)
+}
+
 /// Display thread, after `for_frame`: whether the frame waits for textures
 /// (isn't drawn).
 pub fn frame_done(waited: bool) {

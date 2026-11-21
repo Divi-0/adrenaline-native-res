@@ -575,6 +575,10 @@ impl FrameLoop {
             };
             // Safe: a texture description of ours.
             if unsafe { gxm::sceGxmTextureGetFormat(&texture.gxm) } != gxm::TEXTURE_FORMAT_P8_ABGR {
+                // Direct colour (and DXT): the cache knows from the source
+                // (core texture::all_texels_opaque: 5650, DXT1 without
+                // transparent texels, ignored alpha).
+                self.opaque_textures[i] = textures::opaque(i);
                 continue;
             }
             let (table, mut opaque_entries) = palettes::palette_for(frame, descriptor, render_count);

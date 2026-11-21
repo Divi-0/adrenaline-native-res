@@ -67,6 +67,8 @@ pub struct RefreshResult {
     /// `Host::captured_frame_number` right after the copy: the copied data
     /// may be newer than what this frame and earlier ones drew with.
     pub newer_than_frame: u32,
+    /// Decoded: every texel has alpha 255 (`texture::all_texels_opaque`).
+    pub opaque: bool,
 }
 
 /// The job as the display thread remembers it.
@@ -85,7 +87,7 @@ pub(super) struct PendingRefresh {
 pub fn run_refresh<H: Host>(host: &mut H, job: &RefreshJob, staging: &mut [u8]) -> RefreshResult {
     let start = host.now_us();
     let mut result =
-        RefreshResult { outcome: RefreshOutcome::Unreadable, data_hash: 0, work_us: 0, newer_than_frame: 0 };
+        RefreshResult { outcome: RefreshOutcome::Unreadable, data_hash: 0, work_us: 0, newer_than_frame: 0, opaque: false };
     let layout = StagedLayout::whole(&job.key);
     let size = stage(host, &job.key, &layout, staging) as usize;
     if size == 0 {
@@ -101,6 +103,7 @@ pub fn run_refresh<H: Host>(host: &mut H, job: &RefreshJob, staging: &mut [u8]) 
             return result;
         }
     }
+    result.opaque = texture::all_texels_opaque(data, &job.key);
     result.outcome = match host.decode(job.texture, job.format, &job.key, data, &[], job.smooth, 0) {
         Ok(()) => RefreshOutcome::Decoded,
         Err(error) => RefreshOutcome::DecodeFailed(error),
@@ -181,6 +184,7 @@ impl TextureCache {
             let entry = &mut self.entries[pending.entry];
             entry.texture = Some(job.texture);
             entry.shape = job.shape();
+            entry.opaque = result.opaque;
             entry.quick = 0; // copied at some point: its sample isn't known
             if job.hash {
                 // Same data as at the last hash: no longer volatile.

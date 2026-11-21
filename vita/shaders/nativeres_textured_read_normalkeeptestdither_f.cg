@@ -29,7 +29,8 @@
 // colour itself.
 //
 // Fast variants (scripts/shader-variants.sh, programs.rs `ReadVariant`):
-// for 5551 targets and the common blends, one per way: READ_NORMAL (source alpha, one minus source alpha, add), READ_ADD
+// for 5551 targets (and with READ_565 for 565 targets: green cut to 6
+// bits, no keep-alpha ones) and the common blends, one per way: READ_NORMAL (source alpha, one minus source alpha, add), READ_ADD
 // (source alpha, one, add), READ_OFF (no blending: no frame read, see
 // there), READ_INVISIBLE (untextured only: normal blending of a source
 // whose alpha is 0, the target dithered and cut again); READ_KEEP_ALPHA: the target's alpha (the PSP's stencil, while a
@@ -282,14 +283,31 @@ __nativecolor __regformat unsigned char4 main(
 	// 2026-11-18). The alpha as it is: GXM's blending uses it when the
 	// program draws a normal alpha blend (`ReadWay::Precut`).
 	// (value's rgb comes unfloored here: FOG_UNFLOORED, floored by h.)
+#ifdef READ_565
+	// Green in 6 bits: widened = 4 g + (g >> 4) with g = v >> 2, and
+	// g x 4.0625 - 0.46875 lies within 0.47 of it (core frame.rs
+	// `the_fast_6_bit_cut_is_the_ges_cut`); per channel in one go.
+	float4 h = FLOOR(value * float4(0.125f, 0.25f, 0.125f, 0.125f));
+	unsigned char4 cut = (unsigned char4)(h * float4(8.25f, 4.0625f, 8.25f, 8.25f) - float4(0.375f, 0.46875f, 0.375f, 0.375f));
+#else
 	float4 h = FLOOR(value * 0.125f);
 	unsigned char4 cut = (unsigned char4)(h * 8.25f - 0.375f);
+#endif
 	cut.a = (unsigned char)value.a;
 #else
 	// 5 bits widened = v & 0xF8 | v >> 5 (core frame.rs `cut_to_5_bits`,
 	// the same as `quantize_like_the_ge`); value is whole, the cast exact.
+#ifdef READ_565
+	// 565: the float cut as READ_OFF's (green 6 bits); value is whole.
+	// The alpha (565 has none) written uncut, as the generic program
+	// writes it.
+	float4 h = FLOOR(value * float4(0.125f, 0.25f, 0.125f, 0.125f));
+	unsigned char4 cut = (unsigned char4)(h * float4(8.25f, 4.0625f, 8.25f, 8.25f) - float4(0.375f, 0.46875f, 0.375f, 0.375f));
+	cut.a = (unsigned char)value.a;
+#else
 	unsigned char4 v = (unsigned char4)value;
 	unsigned char4 cut = (v & 0xF8) | (v >> 5);
+#endif
 #ifdef READ_KEEP_ALPHA
 	cut.a = target.a;
 #endif

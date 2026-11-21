@@ -17,6 +17,8 @@
 #                                   addkeep ones also READ_KEEP_ALPHA, the textured ...test ones also
 #                                   READ_TEST (fast 5551 variants, programs.rs read_gxp); each
 #                                   of these also as ...dither_f with READ_DITHER
+#   nativeres_textured_read_<way>565[test][dither]_f.cg, nativeres_color_read_<way>565[dither]_f.cg
+#                                   the fast ways for 565 targets (READ_565), with invisible565
 #   nativeres_color_read_invisible[keep][dither]_f.cg
 #                                   UNTEXTURED READ_INVISIBLE (normal blends of alpha 0)
 # Run after changing a source, then compile the shaders on the Vita
@@ -60,6 +62,14 @@ for dither in "" dither; do
       variant nativeres_textured_read_f "UNTEXTURED $WAY READ_KEEP_ALPHA $DITHER" nativeres_color_read_${way}keep${dither}_f
     fi
   done
+  # 565 targets (READ_565: green cut to 6 bits; no keep-alpha ones).
+  for way in normal add off; do
+    WAY=READ_$(echo $way | tr a-z A-Z)
+    variant nativeres_textured_read_f "$WAY READ_565 $DITHER" nativeres_textured_read_${way}565${dither}_f
+    variant nativeres_textured_read_f "$WAY READ_565 READ_TEST $DITHER" nativeres_textured_read_${way}565test${dither}_f
+    variant nativeres_textured_read_f "UNTEXTURED $WAY READ_565 $DITHER" nativeres_color_read_${way}565${dither}_f
+  done
+  variant nativeres_textured_read_f "UNTEXTURED READ_INVISIBLE READ_565 $DITHER" nativeres_color_read_invisible565${dither}_f
   # Untextured only: normal blending of alpha 0 (ReadWay::Invisible).
   variant nativeres_textured_read_f "UNTEXTURED READ_INVISIBLE $DITHER" nativeres_color_read_invisible${dither}_f
   variant nativeres_textured_read_f "UNTEXTURED READ_INVISIBLE READ_KEEP_ALPHA $DITHER" nativeres_color_read_invisiblekeep${dither}_f
