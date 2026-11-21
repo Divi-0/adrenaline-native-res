@@ -20,6 +20,8 @@
 #   nativeres_textured_read_<way>565[test][dither]_f.cg, nativeres_color_read_<way>565[dither]_f.cg
 #                                   the fast ways for 565 targets (READ_565), with invisible565;
 #                                   textured also ..565nofog.. (NO_FOG: draws without fog)
+#   nativeres_color_read_subtract565_f.cg
+#                                   UNTEXTURED READ_SUBTRACT READ_565 (one, one, reverse subtract)
 #   nativeres_color_read_invisible[keep][dither]_f.cg
 #                                   UNTEXTURED READ_INVISIBLE (normal blends of alpha 0)
 # Run after changing a source, then compile the shaders on the Vita
@@ -74,6 +76,10 @@ for dither in "" dither; do
     variant nativeres_textured_read_f "$WAY READ_565 NO_FOG READ_TEST $DITHER" nativeres_textured_read_${way}565nofogtest${dither}_f
   done
   variant nativeres_textured_read_f "UNTEXTURED READ_INVISIBLE READ_565 $DITHER" nativeres_color_read_invisible565${dither}_f
+  # One, one, reverse subtract: untextured 565, undithered only (ReadWay::Subtract).
+  if [ -z "$dither" ]; then
+    variant nativeres_textured_read_f "UNTEXTURED READ_SUBTRACT READ_565" nativeres_color_read_subtract565_f
+  fi
   # Untextured only: normal blending of alpha 0 (ReadWay::Invisible).
   variant nativeres_textured_read_f "UNTEXTURED READ_INVISIBLE $DITHER" nativeres_color_read_invisible${dither}_f
   variant nativeres_textured_read_f "UNTEXTURED READ_INVISIBLE READ_KEEP_ALPHA $DITHER" nativeres_color_read_invisiblekeep${dither}_f

@@ -518,8 +518,8 @@ pub struct ReadProgram {
     pub dither: [*const ProgramParameter; 4],
 }
 
-/// Fast frame-read ways (`ReadWay`, all five).
-const READ_WAYS: usize = 5;
+/// Fast frame-read ways (`ReadWay`, all six).
+const READ_WAYS: usize = 6;
 
 /// Frame-read programs (`read_index`): untextured generic + the ways x
 /// alpha kept or not x dithered or not, then the 565 ones (ways x dithered
@@ -556,11 +556,16 @@ fn read_index(textured: bool, tested: bool, variant: ReadVariant) -> usize {
 /// "off" ones keep the alpha by GXM's colour mask: one program for both,
 /// and for `ReadWay::Precut` (GXM blends).
 fn read_gxp(textured: bool, tested: bool, variant: ReadVariant) -> *const gxm::Program {
-    use ReadWay::{Add, Invisible, Normal, Off, Precut};
+    use ReadWay::{Add, Invisible, Normal, Off, Precut, Subtract};
     use shaders::*;
     let ReadVariant::Fast { way, keep_alpha, dither, green6, fogless } = variant else {
         return if textured { gxp(&nativeres_textured_read_f) } else { gxp(&nativeres_color_read_f) };
     };
+    // `ReadWay::Subtract` has one program: untextured 565 undithered
+    // (`read_variant` gives it no other draw). Null: no program.
+    if way == Subtract {
+        return if green6 && !textured && !dither { gxp(&nativeres_color_read_subtract565_f) } else { null() };
+    }
     if green6 && fogless && textured {
         // Textured 565 draws without fog.
         return match (way, tested, dither) {
@@ -576,6 +581,7 @@ fn read_gxp(textured: bool, tested: bool, variant: ReadVariant) -> *const gxm::P
             (Off | Precut, true, false) => gxp(&nativeres_textured_read_off565nofogtest_f),
             (Off | Precut, false, true) => gxp(&nativeres_textured_read_off565nofogdither_f),
             (Off | Precut, true, true) => gxp(&nativeres_textured_read_off565nofogtestdither_f),
+            (Subtract, _, _) => null(), // above
         };
     }
     if green6 {
@@ -601,6 +607,7 @@ fn read_gxp(textured: bool, tested: bool, variant: ReadVariant) -> *const gxm::P
             (true, Off | Precut, true, false) => gxp(&nativeres_textured_read_off565test_f),
             (true, Off | Precut, false, true) => gxp(&nativeres_textured_read_off565dither_f),
             (true, Off | Precut, true, true) => gxp(&nativeres_textured_read_off565testdither_f),
+            (_, Subtract, _, _) => null(), // above
         };
     }
     if !textured {
@@ -619,6 +626,7 @@ fn read_gxp(textured: bool, tested: bool, variant: ReadVariant) -> *const gxm::P
             (Invisible, true, false) => gxp(&nativeres_color_read_invisiblekeep_f),
             (Invisible, false, true) => gxp(&nativeres_color_read_invisibledither_f),
             (Invisible, true, true) => gxp(&nativeres_color_read_invisiblekeepdither_f),
+            (Subtract, _, _) => null(), // above
         };
     }
     // `ReadWay::Invisible` is untextured only (a textured draw never gets
@@ -644,6 +652,7 @@ fn read_gxp(textured: bool, tested: bool, variant: ReadVariant) -> *const gxm::P
         (Add, true, true, true) => gxp(&nativeres_textured_read_addkeeptestdither_f),
         (Off | Precut, _, false, true) => gxp(&nativeres_textured_read_offdither_f),
         (Off | Precut, _, true, true) => gxp(&nativeres_textured_read_offtestdither_f),
+        (Subtract, _, _, _) => null(), // above
     }
 }
 
@@ -669,6 +678,9 @@ impl ReadProgram {
         }
         self.tried = true;
         let fragment_gxp = read_gxp(textured, tested, variant);
+        if fragment_gxp.is_null() {
+            return false; // no such program (`read_gxp`)
+        }
         let (vertex_gxp, label) = if textured {
             (gxp(&shaders::nativeres_textured_v), "textured")
         } else {

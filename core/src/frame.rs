@@ -246,6 +246,12 @@ pub enum ReadWay {
     /// alpha 0, dithered, every frame in the field (~6.5 ms of GPU time
     /// with the normal program).
     Invisible,
+    /// One, one, reverse subtract (target minus colour, clamped at 0),
+    /// untextured, into 565 without dither: NFS UR fades its trail buffer
+    /// (an off-screen target) by a grey every frame. A term with factor
+    /// 255 is the colour itself (`ge_blend_term`), so the GE's blend is
+    /// max(d - s, 0), as the generic program works it out.
+    Subtract,
 }
 
 /// One term of the GE's blend: colour `c` times factor `f` (both 0..255)
@@ -325,6 +331,9 @@ pub fn read_variant(flags: u32, blend: u32, keep_target_alpha: bool, exact_norma
             // 0, destination term the target, as `ReadWay::Invisible`),
             // dithered and cut again.
             (0, 1, 0) if green6 && flags & draw_flags::TEXTURED == 0 => ReadWay::Invisible,
+            // One, one, reverse subtract (565, untextured, undithered: the
+            // one program made of it).
+            (1, 1, 2) if green6 && flags & draw_flags::TEXTURED == 0 && !dither => ReadWay::Subtract,
             _ => return ReadVariant::Generic,
         }
     };
@@ -2586,6 +2595,29 @@ mod tests {
         assert_eq!(read_variant(f565 | draw_flags::TEXTURED, zero_one, false, true), ReadVariant::Generic);
         // Keeping the alpha: generic (565 has none to keep).
         assert_eq!(read_variant(f565, normal, true, true), ReadVariant::Generic);
+        // NFS UR's trail fade: one, one, reverse subtract, alpha written,
+        // untextured and undithered only.
+        let fade = BLEND_ENABLED | crate::blend::BLEND_WRITES_ALPHA | 1 | 1 << 4 | 2 << 8;
+        assert_eq!(fade, 0xA000_0211);
+        assert_eq!(read_variant(f565 | draw_flags::BLEND, fade, false, true), fast(ReadWay::Subtract, false));
+        assert_eq!(read_variant(dithered, fade, false, true), ReadVariant::Generic);
+        assert_eq!(read_variant(f565 | draw_flags::TEXTURED, fade, false, true), ReadVariant::Generic);
+        assert_eq!(read_variant(draw_flags::TARGET_5551 << draw_flags::TARGET_FORMAT_SHIFT, fade, false, true), ReadVariant::Generic);
+        // Plain subtract (source minus target): generic.
+        assert_eq!(read_variant(f565, BLEND_ENABLED | 1 | 1 << 4 | 1 << 8, false, true), ReadVariant::Generic);
+    }
+
+    /// ReadWay::Subtract: the GE's one, one, reverse subtract (terms with
+    /// factor 255, then the difference clamped) is max(d - s, 0), cut as
+    /// the 565 programs cut.
+    #[test]
+    fn a_reverse_subtract_of_one_one_is_the_difference() {
+        for target in 0..=255 {
+            for color in 0..=255 {
+                let ge = (ge_blend_term(target, 255) as i32 - ge_blend_term(color, 255) as i32).clamp(0, 255);
+                assert_eq!(ge, (target as i32 - color as i32).max(0), "colour {color}, target {target}");
+            }
+        }
     }
 
     /// The 565 programs' green cut: 6 bits widened = v & 0xFC | v >> 6, and

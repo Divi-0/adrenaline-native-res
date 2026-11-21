@@ -59,6 +59,8 @@ embed_gxp!(nativeres_color_read_off565_f);
 embed_gxp!(nativeres_color_read_off565dither_f);
 embed_gxp!(nativeres_color_read_invisible565_f);
 embed_gxp!(nativeres_color_read_invisible565dither_f);
+// One, one, reverse subtract, untextured 565 undithered (ReadWay::Subtract).
+embed_gxp!(nativeres_color_read_subtract565_f);
 embed_gxp!(nativeres_textured_read_normal565_f);
 embed_gxp!(nativeres_textured_read_normal565test_f);
 embed_gxp!(nativeres_textured_read_normal565dither_f);
