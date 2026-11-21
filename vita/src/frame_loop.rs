@@ -52,7 +52,9 @@ pub static DRAW_ONLY_COUNT: AtomicU32 = AtomicU32::new(0);
 /// its trail composites under an opaque full-screen layer). Only while the
 /// shown framebuffer is drawn in one scene (depth doesn't last from one
 /// scene to the next) and no `DRAW_ONLY_COUNT` prefix is set. Draws kept
-/// only for their depths are drawn depth-only (`draw::draw_depth_only`).
+/// only for their depths are drawn depth-only (`draw::draw_depth_only`),
+/// and so are those that change no colour (core
+/// `hidden_draws::colourless_depth_only`, in any frame).
 /// 1 = on (default), 2 = depth-only draws drawn in full, 0 = every draw
 /// drawn.
 pub static HIDE_DRAWS: AtomicI32 = AtomicI32::new(1);
@@ -740,7 +742,7 @@ impl FrameLoop {
             if skip & 16 != 0 {
                 continue;
             }
-            if self.hiding && self.depth_only && self.hidden.is_depth_only(i) {
+            if self.depth_only && ((self.hiding && self.hidden.is_depth_only(i)) || hidden_draws::colourless_depth_only(draw)) {
                 stats().depth_only_draws += 1;
                 draw::draw_depth_only(frame, draw, i);
                 continue;

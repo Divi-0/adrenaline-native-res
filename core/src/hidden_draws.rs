@@ -40,10 +40,16 @@
 //! hidden after all: NFS UR's title clears depth three times (draws 0, 4,
 //! 6); only the last one is drawn, depth-only.
 //!
+//! A draw that changes no colour at all (`colourless`: kept colour, no
+//! dither, no alpha that counts) and writes depth is drawn depth-only too,
+//! wherever it is (`colourless_depth_only`; NFS UR's title, draws 13 and
+//! 15: a depth mask drawn with every colour bit masked and a depth clear,
+//! ~5.5 ms of frame reads).
+//!
 //! The display skips hidden draws; the PC replay too, so the regression
 //! pictures check that the picture stays the same.
 
-use crate::blend::{BLEND_ALPHA_ONLY, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_WRITES_ALPHA};
+use crate::blend::{Blend, BLEND_ALPHA_ONLY, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_WRITES_ALPHA};
 use crate::frame::{draw_flags, test_flags, Draw, Frame, FrameVertex, MAX_DRAWS};
 use crate::opaque_source::samples_only_rows;
 
@@ -533,6 +539,32 @@ fn settle_before(frame: &Frame, settled: usize, occluder: usize, overwrites_dept
     }
 }
 
+/// True if `draw` leaves every colour as it is: the blend that keeps the
+/// colour (`Blend::KEEP_COLOR`: clears of depth or stencil alone, every
+/// colour bit masked) without dither (the recorder sets none for those),
+/// logic op or stencil test, and no alpha written that counts (none, or a
+/// 565 target: no alpha there).
+pub fn colourless(draw: &Draw) -> bool {
+    let target = (draw.flags & draw_flags::TARGET_FORMAT_MASK) >> draw_flags::TARGET_FORMAT_SHIFT;
+    draw.blend & !BLEND_WRITES_ALPHA == Blend::KEEP_COLOR.pack()
+        && draw.flags & draw_flags::DITHER == 0
+        && draw.tests & (test_flags::STENCIL_TEST | test_flags::LOGIC_OP) == 0
+        && (draw.blend & BLEND_WRITES_ALPHA == 0 || target == draw_flags::TARGET_565)
+}
+
+/// True if `draw` changes no colour (`colourless`) and writes depth, so
+/// that drawn depth-only it does the same: screen-space CPU vertices (the
+/// display draws their corners), no alpha or colour test that could
+/// discard fragments.
+pub fn colourless_depth_only(draw: &Draw) -> bool {
+    colourless(draw)
+        && writes_depth(draw)
+        && draw.flags & (draw_flags::RAW_VERTICES | draw_flags::CACHED_VERTICES) == 0
+        && draw.transform == 0
+        && draw.tests & test_flags::COLOR_TEST == 0
+        && (draw.tests & test_flags::ALPHA_TEST == 0 || alpha_test_passes_always(draw.tests))
+}
+
 /// True if the alpha test of `tests` passes every alpha ("always").
 fn alpha_test_passes_always(tests: u32) -> bool {
     (tests >> test_flags::ALPHA_FUNCTION_SHIFT) & 7 == 1
@@ -690,6 +722,40 @@ mod tests {
         push(&mut alpha_kept, full(0, 0, 0, 0, shown), &quad(0.0, 0.0, 480.0, 272.0, 0.0, 0xFFFF_FFFF));
         find(&alpha_kept, &|_| ALL_ROWS_OPAQUE, &mut hidden);
         assert_eq!(hidden.count(), 0);
+    }
+
+    /// NFS UR's title: draw 13 (every colour bit masked, depth "always" at
+    /// 0.0526, dithering off for it) and draw 15 (a clear of depth alone)
+    /// into the 565 framebuffer change no colour.
+    #[test]
+    fn colourless_draws() {
+        let keep = Blend::KEEP_COLOR.pack() | BLEND_WRITES_ALPHA;
+        let f565 = draw_flags::TARGET_565 << draw_flags::TARGET_FORMAT_SHIFT;
+        let f5551 = draw_flags::TARGET_5551 << draw_flags::TARGET_FORMAT_SHIFT;
+        let clear = test_flags::DEPTH_TEST | 1 << test_flags::DEPTH_FUNCTION_SHIFT;
+        let draw = |flags: u32, blend: u32, tests: u32| Draw { flags, blend, tests, ..Default::default() };
+        let mask = draw(f565 | draw_flags::BLEND | draw_flags::INDEX_RUNS, keep, clear);
+        assert_eq!(mask.blend, 0xa000_0010);
+        assert!(colourless(&mask) && colourless_depth_only(&mask));
+        assert!(colourless_depth_only(&draw(f565 | draw_flags::BLEND | draw_flags::RECTANGLES, keep, clear)));
+        // Dithered: the target changes.
+        assert!(!colourless(&draw(f565 | draw_flags::DITHER, keep, clear)));
+        // Alpha written into 5551 (the PSP's stencil); not written: fine.
+        assert!(!colourless(&draw(f5551, keep, clear)));
+        assert!(colourless(&draw(f5551, Blend::KEEP_COLOR.pack(), clear)));
+        // Another blend, a stencil test, a logic op.
+        assert!(!colourless(&draw(f565, BLEND_ENABLED | BLEND_WRITES_ALPHA | 4 | 5 << 4, clear)));
+        assert!(!colourless(&draw(f565, keep, clear | test_flags::STENCIL_TEST)));
+        assert!(!colourless(&draw(f565, keep, clear | test_flags::LOGIC_OP)));
+        // No depth written, GPU-transformed or raw vertices, an alpha test
+        // that may discard: not depth-only.
+        assert!(colourless(&draw(f565, keep, 0)) && !colourless_depth_only(&draw(f565, keep, 0)));
+        let no_write = clear | test_flags::DEPTH_WRITE_DISABLED;
+        assert!(!colourless_depth_only(&draw(f565, keep, no_write)));
+        assert!(!colourless_depth_only(&draw(f565 | draw_flags::RAW_VERTICES, keep, clear)));
+        assert!(!colourless_depth_only(&Draw { transform: 1, ..mask }));
+        assert!(!colourless_depth_only(&draw(f565, keep, clear | test_flags::ALPHA_TEST | 6 << test_flags::ALPHA_FUNCTION_SHIFT)));
+        assert!(colourless_depth_only(&draw(f565, keep, clear | test_flags::ALPHA_TEST | 1 << test_flags::ALPHA_FUNCTION_SHIFT)));
     }
 
     /// The fates of `frame`'s draws: '.' drawn, 'h' hidden, 'd' depth-only.

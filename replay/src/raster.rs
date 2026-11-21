@@ -155,10 +155,12 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
         .collect();
     // Draws a later draw paints over completely (core hidden_draws) are
     // left out, as on the Vita; the texels' opacity from our own decoding
-    // (textures reading a framebuffer: unknown). REPLAY_NO_HIDE=1 draws
-    // them all, for comparing.
+    // (textures reading a framebuffer: unknown). Depth-only draws (and
+    // those that change no colour) leave the colour. REPLAY_NO_HIDE=1 draws
+    // them all in full, for comparing.
     let mut hidden = Box::new(HiddenDraws::new());
-    if std::env::var_os("REPLAY_NO_HIDE").is_none() {
+    let hiding = std::env::var_os("REPLAY_NO_HIDE").is_none();
+    if hiding {
         let rows = |index: usize| -> u16 {
             let descriptor = &frame.textures()[index];
             let reads_framebuffer = other_framebuffer(descriptor, frame)
@@ -201,7 +203,8 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
             }
             None => &textures,
         };
-        if hidden.is_depth_only(index) {
+        let colourless = hiding && draw.framebuffer == frame.shown_framebuffer && hidden_draws::colourless_depth_only(draw);
+        if hidden.is_depth_only(index) || colourless {
             // Its depths alone, like the Vita's draw without a fragment
             // program (core hidden_draws: it keeps every fragment).
             let colour = screen.clone();
