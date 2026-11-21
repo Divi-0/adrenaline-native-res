@@ -2636,6 +2636,85 @@ pub(crate) fn convert_indices<const SIZE: usize>(
     true
 }
 
+/// `convert_indices` for indices whose bounds are their own (`lowest` the
+/// smallest of all of them, the largest at most `lowest + 65,535`:
+/// `frame_builder`'s indexed draws take the bounds from these very
+/// indices), so no index can lie outside and nothing is checked. Writes the
+/// same corners: `first + index - lowest` in 16 bits is the index's low 16
+/// bits plus one `delta`, so each corner is one load and one add. A loop
+/// per primitive type: strips two triangles per step (`a b c`, `c b d`: the
+/// odd one's first two swapped without a test), fans with their first
+/// index held. The shared loop of `convert_indices` worked out the swap and
+/// the largest value per triangle, ~22 instructions per triangle (MHF's
+/// intro: ~7,600 five-index strips per frame, ~1.1M cycles). False only if
+/// `indices` or `out` are too short for `calls`.
+pub(crate) fn convert_indices_in_bounds<const SIZE: usize>(indices: &[u8], calls: &[PrimCall], lowest: u32, first: u32, out: &mut [u16]) -> bool {
+    let delta = first.wrapping_sub(lowest) as u16;
+    // The index's low 16 bits (all of a 1- or 2-byte one) plus `delta`.
+    #[inline(always)]
+    fn corner<const SIZE: usize>(index: &[u8], delta: u16) -> u16 {
+        let low = if SIZE == 1 { index[0] as u16 } else { u16::from_le_bytes([index[0], index[1]]) };
+        low.wrapping_add(delta)
+    }
+    let mut written = 0;
+    let mut start = 0; // the PRIM's first index, counted from the job's first
+    for call in calls {
+        let count = call.count as usize;
+        let triangles = triangle_count(call.primitive_type, call.count) as usize;
+        let Some(source) = indices.get(start * SIZE..(start + count) * SIZE) else {
+            return false;
+        };
+        start += count;
+        let Some(target) = out.get_mut(written..written + 3 * triangles) else {
+            return false;
+        };
+        written += 3 * triangles;
+        if triangles == 0 {
+            continue;
+        }
+        match call.primitive_type {
+            primitive::TRIANGLES => {
+                for (out, index) in target.iter_mut().zip(source.chunks_exact(SIZE)) {
+                    *out = corner::<SIZE>(index, delta);
+                }
+            }
+            primitive::TRIANGLE_STRIP => {
+                // Triangles 2k and 2k + 1 of indices a b c d: a b c, c b d.
+                let (head, rest) = source.split_at(2 * SIZE);
+                let mut a = corner::<SIZE>(&head[..SIZE], delta);
+                let mut b = corner::<SIZE>(&head[SIZE..], delta);
+                let mut pairs = target.chunks_exact_mut(6);
+                let mut next = rest.chunks_exact(2 * SIZE);
+                for (six, cd) in (&mut pairs).zip(&mut next) {
+                    let c = corner::<SIZE>(&cd[..SIZE], delta);
+                    let d = corner::<SIZE>(&cd[SIZE..], delta);
+                    six.copy_from_slice(&[a, b, c, c, b, d]);
+                    a = c;
+                    b = d;
+                }
+                // An odd count of triangles: the last one, even, a b c.
+                let last = pairs.into_remainder();
+                if !last.is_empty() {
+                    let at = rest.len() - next.remainder().len();
+                    last.copy_from_slice(&[a, b, corner::<SIZE>(&rest[at..at + SIZE], delta)]);
+                }
+            }
+            _ => {
+                // Fans: triangle t is (0, t + 1, t + 2).
+                let (head, rest) = source.split_at(2 * SIZE);
+                let a = corner::<SIZE>(&head[..SIZE], delta);
+                let mut b = corner::<SIZE>(&head[SIZE..], delta);
+                for (three, index) in target.chunks_exact_mut(3).zip(rest.chunks_exact(SIZE)) {
+                    let c = corner::<SIZE>(index, delta);
+                    three.copy_from_slice(&[a, b, c]);
+                    b = c;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// `record_raw_gathered`'s copy: each index's vertex, in index order, into
 /// `out` (one stride each, a short last vertex filled with zeros). The
 /// number of bytes written; `None` if the indices or the span can't be read.
@@ -5041,6 +5120,59 @@ mod tests {
             }
         }
         let mut seed = 7;
+        check::<1>(&mut seed);
+        check::<2>(&mut seed);
+        check::<4>(&mut seed);
+    }
+
+    /// The unchecked conversion (`convert_indices_in_bounds`, bounds taken
+    /// from the indices themselves) writes exactly what the checked one
+    /// writes: random mixes of lists, strips and fans (counts 0..40, odd
+    /// and even strips, short PRIMs without triangles), every index size,
+    /// 4-byte indices above 65,535 too, `first` below and above `lowest`.
+    #[test]
+    fn in_bounds_conversion_matches_the_checked_one() {
+        fn check<const SIZE: usize>(seed: &mut u32) {
+            let mut next = |limit: u32| {
+                *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (*seed >> 8) % limit
+            };
+            for round in 0..600 {
+                let prims = 1 + next(8);
+                let mut calls = Vec::new();
+                let mut values = Vec::new();
+                let base = match SIZE {
+                    1 => next(100),
+                    2 => next(60_000),
+                    _ => next(200_000),
+                };
+                for _ in 0..prims {
+                    let primitive_type = [primitive::TRIANGLES, primitive::TRIANGLE_STRIP, primitive::TRIANGLE_FAN][next(3) as usize];
+                    let count = if next(3) == 0 { next(6) } else { next(40) };
+                    calls.push(PrimCall { primitive_type, count, vertex_address: 0, index_address: 0 });
+                    values.extend((0..count).map(|_| base + next(if SIZE == 1 { 150 } else { 5000 })));
+                }
+                if values.is_empty() {
+                    continue;
+                }
+                let (lowest, highest) = (*values.iter().min().unwrap(), *values.iter().max().unwrap());
+                let bytes: Vec<u8> = values.iter().flat_map(|value| value.to_le_bytes()[..SIZE].to_vec()).collect();
+                let corners: u32 = calls.iter().map(|call| 3 * triangle_count(call.primitive_type, call.count)).sum();
+                let first = next(70_000);
+                let mut wanted = vec![0u16; corners as usize];
+                let mut got = vec![0xAAAAu16; corners as usize];
+                assert!(convert_indices::<SIZE>(&bytes, &calls, (lowest, highest), first, &mut wanted), "size {SIZE} round {round}");
+                assert!(convert_indices_in_bounds::<SIZE>(&bytes, &calls, lowest, first, &mut got), "size {SIZE} round {round}");
+                assert_eq!(got, wanted, "size {SIZE} round {round}");
+                // Too little room: refused, not a panic.
+                if corners > 0 {
+                    let mut short = vec![0u16; corners as usize - 1];
+                    assert!(!convert_indices_in_bounds::<SIZE>(&bytes, &calls, lowest, first, &mut short));
+                    assert!(!convert_indices_in_bounds::<SIZE>(&bytes[..bytes.len() - SIZE], &calls, lowest, first, &mut got));
+                }
+            }
+        }
+        let mut seed = 5;
         check::<1>(&mut seed);
         check::<2>(&mut seed);
         check::<4>(&mut seed);

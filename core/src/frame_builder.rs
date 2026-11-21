@@ -830,12 +830,13 @@ impl<M: PspMemory> Writer<'_, '_, M> {
             (placed.window, placed.first_vertex(stride), Some(out.as_mut_ptr()))
         };
         let out = self.geometry.reserve_indices(corners as usize).ok_or(fallback::TABLES_FULL)?;
+        // The bounds are these indices' own: none can lie outside.
         let converted = in_phase(crate::phase::DIRECT_INDICES, || match index_format {
-            IndexFormat::U8 => crate::recorder::convert_indices::<1>(indices, calls, (lowest, highest), first, out),
-            IndexFormat::U16 => crate::recorder::convert_indices::<2>(indices, calls, (lowest, highest), first, out),
-            _ => crate::recorder::convert_indices::<4>(indices, calls, (lowest, highest), first, out),
+            IndexFormat::U8 => crate::recorder::convert_indices_in_bounds::<1>(indices, calls, lowest, first, out),
+            IndexFormat::U16 => crate::recorder::convert_indices_in_bounds::<2>(indices, calls, lowest, first, out),
+            _ => crate::recorder::convert_indices_in_bounds::<4>(indices, calls, lowest, first, out),
         });
-        debug_assert!(converted, "the bounds are these indices' own");
+        debug_assert!(converted, "room for every index and corner");
         if let Some(destination) = copy {
             if let Err(reason) = self.copy(span_start, span_length, destination, Layout::Plain) {
                 self.geometry.undo_draw(&draw);
@@ -997,8 +998,22 @@ fn run_vertices(calls: &[PrimCall]) -> Option<(u32, bool)> {
 }
 
 /// The lowest and highest of `indices` (`SIZE` bytes each, little-endian;
-/// at least one).
+/// at least one). One- and (aligned) two-byte indices as typed slices, so
+/// the loop is vectorized (NEON min / max, 8 or 16 indices per step); bytes
+/// paired up one index at a time were ~6 cycles per index (MHF's intro:
+/// ~41,000 indices per frame).
 fn bounds<const SIZE: usize>(indices: &[u8]) -> (u32, u32) {
+    if SIZE == 1 {
+        return min_max(indices);
+    }
+    // The PSP's indices are little-endian, as the Vita and the PC: as read.
+    if SIZE == 2 && cfg!(target_endian = "little") {
+        // Safe: every pair of bytes is a valid u16.
+        let (head, halves, tail) = unsafe { indices.align_to::<u16>() };
+        if head.is_empty() && tail.is_empty() {
+            return min_max(halves);
+        }
+    }
     let mut lowest = u32::MAX;
     let mut highest = 0;
     for index in indices.chunks_exact(SIZE) {
@@ -1011,4 +1026,61 @@ fn bounds<const SIZE: usize>(indices: &[u8]) -> (u32, u32) {
         highest = highest.max(value);
     }
     (lowest, highest)
+}
+
+/// The smallest and the largest of `values` (at least one), in a loop the
+/// compiler vectorizes.
+#[inline(always)]
+fn min_max<T: Copy + Ord + Into<u32>>(values: &[T]) -> (u32, u32) {
+    let Some(&first) = values.first() else {
+        return (u32::MAX, 0);
+    };
+    let (mut lowest, mut highest) = (first, first);
+    for &value in values {
+        lowest = lowest.min(value);
+        highest = highest.max(value);
+    }
+    (lowest.into(), highest.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The typed (vectorized) bounds give what one index at a time gives:
+    /// every index size, lengths 1..70, starts at every byte of a word (an
+    /// unaligned start takes the one-at-a-time way).
+    #[test]
+    fn bounds_match_one_index_at_a_time() {
+        fn one_by_one<const SIZE: usize>(indices: &[u8]) -> (u32, u32) {
+            let values = indices.chunks_exact(SIZE).map(|index| {
+                let mut bytes = [0u8; 4];
+                bytes[..SIZE].copy_from_slice(index);
+                u32::from_le_bytes(bytes)
+            });
+            values.fold((u32::MAX, 0), |(lowest, highest), value| (lowest.min(value), highest.max(value)))
+        }
+        fn check<const SIZE: usize>(seed: &mut u32) {
+            let mut next = || {
+                *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *seed >> 8
+            };
+            for round in 0..300 {
+                let count = 1 + (next() % 70) as usize;
+                let skew = (next() % 4) as usize;
+                let mut words = vec![0u32; (skew + count * SIZE).div_ceil(4) + 1];
+                // Safe: the words' bytes.
+                let bytes = unsafe { core::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, words.len() * 4) };
+                for byte in bytes.iter_mut() {
+                    *byte = next() as u8;
+                }
+                let indices = &bytes[skew..skew + count * SIZE];
+                assert_eq!(bounds::<SIZE>(indices), one_by_one::<SIZE>(indices), "size {SIZE} round {round}");
+            }
+        }
+        let mut seed = 11;
+        check::<1>(&mut seed);
+        check::<2>(&mut seed);
+        check::<4>(&mut seed);
+    }
 }
