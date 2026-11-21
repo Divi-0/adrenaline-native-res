@@ -163,9 +163,12 @@ pub mod fallback {
     pub const TABLES_FULL: usize = 8;
     /// The vertices or indices couldn't be read.
     pub const UNREADABLE: usize = 9;
-    pub const COUNT: usize = 10;
+    /// Texture coordinates from the transform (`Texgen`): only the CPU
+    /// works them out.
+    pub const TEXGEN: usize = 10;
+    pub const COUNT: usize = 11;
     pub const NAMES: [&str; COUNT] =
-        ["through", "raw_off", "morph", "untextured", "lights", "sprites", "refused", "arena_full", "tables_full", "unreadable"];
+        ["through", "raw_off", "morph", "untextured", "lights", "sprites", "refused", "arena_full", "tables_full", "unreadable", "texgen"];
 }
 
 /// Why a PRIM drawn with this state goes to the CPU (`fallback`), asked
@@ -184,12 +187,16 @@ fn fallback_reason(
     let Some(inputs) = inputs.filter(|_| !format.is_through()) else {
         return fallback::THROUGH;
     };
-    let enabled = crate::raw_arena::ENABLED.load(core::sync::atomic::Ordering::Relaxed);
-    let Some(refusal) = refused.or(raw.map(|raw| raw.refusal)).filter(|_| enabled) else {
+    if !crate::raw_arena::ENABLED.load(core::sync::atomic::Ordering::Relaxed) {
         return fallback::RAW_OFF;
-    };
+    }
+    // The draw's own reasons first: the capture thread's builder turns
+    // those down without naming one (NFS UR's menu: 375 draws counted as
+    // raw_off).
     if format.morph_count() != 1 {
         fallback::MORPH
+    } else if prepared.texgen.is_some() {
+        fallback::TEXGEN
     } else if !prepared.gpu_transform {
         fallback::UNTEXTURED
     } else if !may_go_raw(prepared, inputs.lighting().map(|lighting| lighting.gpu_ready()), format) {
@@ -197,7 +204,8 @@ fn fallback_reason(
     } else if primitive_type == primitive::RECTANGLES {
         fallback::SPRITES
     } else {
-        refusal
+        // No arena (or a builder that didn't try): raw_off.
+        refused.or(raw.map(|raw| raw.refusal)).unwrap_or(fallback::RAW_OFF)
     }
 }
 
