@@ -595,32 +595,66 @@ fn decode_dxt(
 /// DXT3 never (PPSSPP's alpha is the nibble << 28: 0xF0 at most); others
 /// not looked at (false).
 pub fn all_texels_opaque(data: &[u8], texture: &TextureDescriptor) -> bool {
+    opaque_rows(data, texture) == ALL_ROWS_OPAQUE
+}
+
+/// `opaque_rows`: every texel is opaque.
+pub const ALL_ROWS_OPAQUE: u16 = u16::MAX;
+
+/// How many rows of texels from the top `decode_texture` makes of `texture`
+/// from `data` all have alpha 255 (`ALL_ROWS_OPAQUE`: the whole texture,
+/// `all_texels_opaque`; 0 when unsure). A draw that samples only these rows
+/// (core opaque_source `samples_rows_below`) sees an opaque texture: NFS
+/// UR's title background is a 480x272 picture in a 512x512 DXT1 whose rows
+/// from 280 on hold transparent blocks. Same rules as `all_texels_opaque`;
+/// a DXT block row counts row by row, all four texels of each block.
+pub fn opaque_rows(data: &[u8], texture: &TextureDescriptor) -> u16 {
     if texture.flags & texture_flags::IGNORE_ALPHA != 0 || texture.format == format::BGR5650 {
-        return true;
+        return ALL_ROWS_OPAQUE;
     }
     let Some(layout) = DxtLayout::of(texture) else {
-        return false;
+        return 0;
     };
     if texture.format == format::DXT3 || (data.len() as u64) < layout.bytes() as u64 {
-        return false;
+        return 0;
     }
     let block_bytes = layout.block_bytes as usize;
-    (0..layout.rows as usize).all(|row| {
+    for row in 0..layout.rows as usize {
         let first = row * layout.per_row as usize;
-        (first..first + layout.row_blocks as usize).all(|index| {
+        // Bit r: the block row's texel row r has a transparent texel.
+        let mut transparent = 0u8;
+        for index in first..first + layout.row_blocks as usize {
             let block = &data[index * block_bytes..(index + 1) * block_bytes];
             if texture.format == format::DXT1 {
                 let (c1, c2) = (u16::from_le_bytes([block[4], block[5]]), u16::from_le_bytes([block[6], block[7]]));
                 // 3-colour mode: index 3 is transparent black.
-                c1 > c2 || block[..4].iter().all(|&line| (0..4).all(|texel| (line >> (2 * texel)) & 3 != 3))
+                if c1 <= c2 {
+                    for (r, &line) in block[..4].iter().enumerate() {
+                        if (0..4).any(|texel| (line >> (2 * texel)) & 3 == 3) {
+                            transparent |= 1 << r;
+                        }
+                    }
+                }
             } else {
                 let alphas = dxt5_alphas(block[14], block[15]);
                 let all = u64::from(u32::from_le_bytes([block[8], block[9], block[10], block[11]]))
                     | u64::from(u16::from_le_bytes([block[12], block[13]])) << 32;
-                (0..16).all(|texel| alphas[((all >> (3 * texel)) & 7) as usize] == 255)
+                for r in 0..4 {
+                    if (0..4).any(|texel| alphas[((all >> (3 * (4 * r + texel))) & 7) as usize] != 255) {
+                        transparent |= 1 << r;
+                    }
+                }
             }
-        })
-    })
+        }
+        if transparent != 0 {
+            let rows = 4 * row as u32 + transparent.trailing_zeros();
+            if rows >= texture.height as u32 {
+                break; // rows past the height aren't decoded
+            }
+            return rows as u16;
+        }
+    }
+    ALL_ROWS_OPAQUE
 }
 
 /// A DXT block's four colours (`0xAABBGGRR`), PPSSPP's DecodeColors.
@@ -1334,6 +1368,31 @@ mod dxt_tests {
         assert!(all_texels_opaque(&[], &TextureDescriptor { format: format::BGR5650, ..dxt(format::DXT1, 4, 4, 4) }));
         assert!(all_texels_opaque(&three_used, &TextureDescriptor { flags: texture_flags::IGNORE_ALPHA, ..dxt(format::DXT1, 4, 4, 4) }));
         assert!(!all_texels_opaque(&[0xFF; 64], &TextureDescriptor { format: format::ABGR8888, ..dxt(format::DXT1, 4, 4, 4) }));
+    }
+
+    #[test]
+    fn opaque_rows_from_the_top() {
+        let four = block1([0xFF; 4], 0xF800, 0x001F);
+        // Index 3 in 3-colour mode on the block's texel row 2.
+        let row2 = block1([0, 0, 0b11 << 4, 0], 0x001F, 0xF800);
+        // 8x12, buffer 8: three block rows of two blocks.
+        let texture = dxt(format::DXT1, 8, 12, 8);
+        let data = [&four[..], &four, &four, &row2, &four, &four].concat();
+        assert_eq!(opaque_rows(&data, &texture), 4 + 2);
+        let out = decode(&data, &texture);
+        assert_eq!(out.iter().position(|texel| texel >> 24 != 0xFF).unwrap() / 8, 6);
+        assert_eq!(opaque_rows(&four.repeat(6), &texture), ALL_ROWS_OPAQUE);
+        // Run-on: an 8 wide row of a 4 buffer reads the next row's block too.
+        let run_on = dxt(format::DXT1, 8, 8, 4);
+        assert_eq!(opaque_rows(&[&four[..], &row2, &four].concat(), &run_on), 2);
+        // DXT5: alpha index 6 (0) on texel row 3 of the second block row.
+        let six_on_row3 = block5(255, 255, 6u64 << (3 * 12));
+        let full = block5(255, 255, 0);
+        let data = [&full[..], &six_on_row3].concat();
+        assert_eq!(opaque_rows(&data, &dxt(format::DXT5, 4, 8, 4)), 4 + 3);
+        // Rows past the height aren't decoded: a 6 high texture is opaque.
+        assert_eq!(opaque_rows(&data, &dxt(format::DXT5, 4, 6, 4)), ALL_ROWS_OPAQUE);
+        assert_eq!(opaque_rows(&[0xFF; 16], &dxt(format::DXT3, 4, 4, 4)), 0);
     }
 
     #[test]

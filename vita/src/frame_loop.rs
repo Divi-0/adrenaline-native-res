@@ -21,6 +21,7 @@ use nativeres_core::display_loop::AfterQuit;
 use nativeres_core::frame::{draw_flags, Frame, MAX_TEXTURES};
 use nativeres_core::offscreen;
 use nativeres_core::opaque_source::palette_texture_opaque;
+use nativeres_core::texture::ALL_ROWS_OPAQUE;
 use nativeres_core::texture::format as texture_format;
 use nativeres_core::texture_cache::MAX_RENDER_TARGETS;
 
@@ -157,9 +158,12 @@ pub struct FrameLoop {
     palettes: [*const c_void; MAX_TEXTURES],
     waiting: [u8; MAX_TEXTURES],
     uv_scales: [[f32; 2]; MAX_TEXTURES],
-    /// Index textures whose every texel the GPU can sample is opaque (their
-    /// colour table's entries, core `opaque_source`); false for the others.
-    opaque_textures: [bool; MAX_TEXTURES],
+    /// How many rows from the top of each texture have only opaque texels
+    /// (`texture::ALL_ROWS_OPAQUE`: every texel the GPU can sample): index
+    /// textures by their colour table's entries (core `opaque_source`),
+    /// direct colour ones from the cache (`texture::opaque_rows`); 0 for the
+    /// others.
+    opaque_rows: [u16; MAX_TEXTURES],
     /// The game was quit: its frames still in the handover are never shown.
     after_quit: AfterQuit,
 }
@@ -180,7 +184,7 @@ static FRAME_LOOP: SingleThreaded<FrameLoop> = SingleThreaded::new(FrameLoop {
     palettes: [null(); MAX_TEXTURES],
     waiting: [0; MAX_TEXTURES],
     uv_scales: [[1.0; 2]; MAX_TEXTURES],
-    opaque_textures: [false; MAX_TEXTURES],
+    opaque_rows: [0; MAX_TEXTURES],
     after_quit: AfterQuit::new(),
 });
 
@@ -568,7 +572,7 @@ impl FrameLoop {
     fn find_palettes(&mut self, frame: &Frame, render_count: u32) {
         for (i, descriptor) in frame.textures().iter().enumerate() {
             self.palettes[i] = null();
-            self.opaque_textures[i] = false;
+            self.opaque_rows[i] = 0;
             // Safe: textures from the cache or targets, alive this frame.
             let Some(texture) = (unsafe { self.textures[i].as_ref() }) else {
                 continue;
@@ -576,9 +580,9 @@ impl FrameLoop {
             // Safe: a texture description of ours.
             if unsafe { gxm::sceGxmTextureGetFormat(&texture.gxm) } != gxm::TEXTURE_FORMAT_P8_ABGR {
                 // Direct colour (and DXT): the cache knows from the source
-                // (core texture::all_texels_opaque: 5650, DXT1 without
-                // transparent texels, ignored alpha).
-                self.opaque_textures[i] = textures::opaque(i);
+                // (core texture::opaque_rows: 5650, ignored alpha, DXT1/5
+                // rows without transparent texels).
+                self.opaque_rows[i] = textures::opaque_rows(i);
                 continue;
             }
             let (table, mut opaque_entries) = palettes::palette_for(frame, descriptor, render_count);
@@ -588,7 +592,7 @@ impl FrameLoop {
                 let own = unsafe { &mut *(gxm::sceGxmTextureGetPalette(&texture.gxm) as *mut [u32; 256]) };
                 opaque_entries = palettes::fill_table(frame, descriptor, own);
             }
-            self.opaque_textures[i] = palette_texture_opaque(descriptor.format, opaque_entries);
+            self.opaque_rows[i] = if palette_texture_opaque(descriptor.format, opaque_entries) { ALL_ROWS_OPAQUE } else { 0 };
         }
     }
 
@@ -697,7 +701,7 @@ impl FrameLoop {
                 if t < texture_count {
                     // Safe: textures from the cache or targets, alive this frame.
                     if let Some(texture) = unsafe { self.textures[t].as_ref() } {
-                        draw::draw_textured(frame, draw, i, texture, self.palettes[t], self.uv_scales[t], self.opaque_textures[t]);
+                        draw::draw_textured(frame, draw, i, texture, self.palettes[t], self.uv_scales[t], self.opaque_rows[t]);
                     }
                 }
             } else {

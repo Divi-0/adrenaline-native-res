@@ -134,6 +134,50 @@ pub fn alpha_test_is_one_sided(uniform: [f32; 4]) -> bool {
     uniform[2] > 0.0 && uniform[1] > 255.0
 }
 
+/// How far past its own value a texture coordinate may be taken as
+/// sampled, in texels: the GPU's rounding of interpolated coordinates
+/// (inside the triangle they lie between the vertices' values) and of its
+/// filter positions is far below this.
+const ROW_SLACK: f32 = 1.0 / 16.0;
+
+/// The last texel row (0..height-1) a draw with V clamped can sample when
+/// its largest texture coordinate v (0..1 across the texture) is `v_max`:
+/// nearest filtering takes row floor(t), bilinear rows floor(t - 0.5) and
+/// the next (t = v x height), each counted `ROW_SLACK` further.
+pub fn last_sampled_row(v_max: f32, height: u16, linear: bool) -> u32 {
+    let t = v_max * height as f32 + ROW_SLACK;
+    // floor (no_std): `as` truncates toward 0 and saturates.
+    let floor = |x: f32| {
+        let i = x as i32;
+        if (i as f32) > x { i - 1 } else { i }
+    };
+    let last = if linear { floor(t - 0.5) + 1 } else { floor(t) };
+    (last.max(0) as u32).min((height as u32).saturating_sub(1))
+}
+
+/// True if a draw with these `flags`, texture height and screen-space
+/// `vertices` samples only the texture's first `rows` rows (the ones
+/// `texture::opaque_rows` found opaque; `ALL_ROWS_OPAQUE`: all). Only for
+/// V clamped (repeating wraps to the bottom rows) and without mip levels
+/// (other levels aren't counted by rows). The fragments' coordinates lie
+/// between the vertices', so the largest v bounds them.
+pub fn samples_only_rows(vertices: &[crate::frame::FrameVertex], flags: u32, height: u16, rows: u16) -> bool {
+    if rows == crate::texture::ALL_ROWS_OPAQUE {
+        return true;
+    }
+    if rows == 0 || vertices.is_empty() || flags & draw_flags::CLAMP_V == 0 || flags & draw_flags::MIPS != 0 {
+        return false;
+    }
+    let mut v_max = f32::MIN;
+    for vertex in vertices {
+        if !vertex.v.is_finite() {
+            return false;
+        }
+        v_max = v_max.max(vertex.v);
+    }
+    last_sampled_row(v_max, height, flags & draw_flags::LINEAR_FILTER != 0) < rows as u32
+}
+
 /// The vertex numbers a raw draw (`draw_flags::RAW_VERTICES`) uses, as
 /// `first..end` counted from its window (`Draw::first_vertex`): from its
 /// index runs or its triangle list. None without any.
@@ -326,5 +370,38 @@ mod tests {
         // The strip: 20..30; the sprites: 4..8.
         assert_eq!(raw_vertex_span(&frame, &run_draw), Some((4, 30)));
         assert_eq!(raw_vertex_span(&frame, &Draw { index_count: 0, ..draw }), None);
+    }
+
+    #[test]
+    fn rows_a_draw_samples() {
+        use crate::frame::FrameVertex;
+        use crate::texture::ALL_ROWS_OPAQUE;
+        // NFS UR's title background: 512 high, v up to 271.493 texels,
+        // bilinear: rows 0..271 (the picture) and, counted with the slack,
+        // 272 (weight ~0); opaque rows 280.
+        let v_max = 0.530260f32;
+        assert_eq!(last_sampled_row(v_max, 512, true), 272);
+        assert_eq!(last_sampled_row(v_max, 512, false), 271);
+        // Bilinear: the row below a row's centre counts from the slack on.
+        assert_eq!(last_sampled_row(10.4 / 16.0, 16, true), 10);
+        assert_eq!(last_sampled_row(10.45 / 16.0, 16, true), 11);
+        assert_eq!(last_sampled_row(10.99 / 16.0, 16, false), 11);
+        // Clamped to the texture.
+        assert_eq!(last_sampled_row(2.0, 16, true), 15);
+        assert_eq!(last_sampled_row(-1.0, 16, true), 0);
+        let at = |v: f32| FrameVertex { v, ..Default::default() };
+        let vertices = [at(-0.000963), at(v_max), at(0.2)];
+        let clamped = draw_flags::TEXTURED | draw_flags::LINEAR_FILTER | draw_flags::CLAMP_U | draw_flags::CLAMP_V;
+        assert!(samples_only_rows(&vertices, clamped, 512, 280));
+        assert!(samples_only_rows(&vertices, clamped, 512, 273));
+        assert!(!samples_only_rows(&vertices, clamped, 512, 272));
+        // Repeating V, mip levels, no rows, no vertices, NaN: no.
+        assert!(!samples_only_rows(&vertices, clamped & !draw_flags::CLAMP_V, 512, 280));
+        assert!(!samples_only_rows(&vertices, clamped | draw_flags::MIPS, 512, 280));
+        assert!(!samples_only_rows(&vertices, clamped, 512, 0));
+        assert!(!samples_only_rows(&[], clamped, 512, 280));
+        assert!(!samples_only_rows(&[at(f32::NAN)], clamped, 512, 280));
+        // A whole opaque texture: any draw.
+        assert!(samples_only_rows(&[], 0, 512, ALL_ROWS_OPAQUE));
     }
 }

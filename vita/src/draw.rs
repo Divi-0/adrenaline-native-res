@@ -28,7 +28,10 @@ use nativeres_core::frame::{
     ReadWay, NO_RING_INDICES,
 };
 use nativeres_core::texture;
-use nativeres_core::opaque_source::{alpha_test_is_one_sided, alpha_test_lets_255_pass, for_opaque_source, lowest_vertex_alpha, raw_vertex_span};
+use nativeres_core::opaque_source::{
+    alpha_test_is_one_sided, alpha_test_lets_255_pass, for_opaque_source, lowest_vertex_alpha, raw_vertex_span, samples_only_rows,
+};
+use nativeres_core::texture::ALL_ROWS_OPAQUE;
 use nativeres_core::vertex::VertexFormat;
 
 use crate::arenas;
@@ -173,6 +176,32 @@ pub static FLAT_SHADING: AtomicI32 = AtomicI32::new(1);
 /// specular colour (the two parts it leaves out).
 fn flat_shading(frame: &Frame, draw: &Draw) -> bool {
     draw.flags & draw_flags::FOG == 0 && FLAT_SHADING.load(Ordering::Relaxed) != 0 && !separate_specular(frame, draw)
+}
+
+/// True if textured `draw` samples only the first `rows` rows of its
+/// texture (the opaque ones, `texture::opaque_rows`): any draw when all
+/// are; else screen-space vertices with V clamped, by their largest v (core
+/// `samples_only_rows`; NFS UR's title background). Counted in
+/// `opaque_rows_draws`.
+fn samples_opaque_rows(frame: &Frame, draw: &Draw, rows: u16) -> bool {
+    if rows == ALL_ROWS_OPAQUE {
+        return true;
+    }
+    if draw.flags & (draw_flags::RAW_VERTICES | draw_flags::CACHED_VERTICES) != 0 || draw.transform != 0 {
+        return false;
+    }
+    let Some(texture) = frame.textures().get(draw.texture as usize) else {
+        return false;
+    };
+    let first = draw.first_vertex as usize;
+    let only = first
+        .checked_add(draw.vertex_count as usize)
+        .and_then(|end| frame.vertices.get(first..end))
+        .is_some_and(|vertices| samples_only_rows(vertices, draw.flags, texture.height, rows));
+    if only {
+        stats().opaque_rows_draws += 1;
+    }
+    only
 }
 
 /// True if every vertex of textured `draw` ends up with alpha 255: raw
@@ -1288,8 +1317,9 @@ impl Draws {
 
     /// A textured draw. `palette`: the colour table of an index texture,
     /// else null. `uv_scale`: multiplies the texture coordinates (1, 1
-    /// except for render targets used as textures). `opaque_texture`: every
-    /// texel the GPU can sample is opaque (frame_loop.rs `opaque_textures`).
+    /// except for render targets used as textures). `opaque_rows`: rows from
+    /// the top of the texture with only opaque texels (frame_loop.rs
+    /// `opaque_rows`; `ALL_ROWS_OPAQUE`: every texel the GPU can sample).
     fn draw_textured(
         &mut self,
         frame: &Frame,
@@ -1298,7 +1328,7 @@ impl Draws {
         texture: &TextureObject,
         palette: *const c_void,
         uv_scale: [f32; 2],
-        opaque_texture: bool,
+        opaque_rows: u16,
     ) {
         let convert_start = draw_clock();
         let Some((indices, index_count)) = self.draw_indices(frame, draw, draw_index) else {
@@ -1327,9 +1357,9 @@ impl Draws {
         let unblend = choice.is_some_and(|variant| for_opaque_source(variant) != variant)
             && OPAQUE_SOURCES.load(Ordering::Relaxed) != 0;
         let untest = tested && alpha_test_lets_255_pass(alpha_range) && OPAQUE_UNTESTED.load(Ordering::Relaxed) != 0;
-        if opaque_texture && (unblend || untest) {
+        if opaque_rows != 0 && (unblend || untest) {
             let start = draw_clock();
-            if vertices_opaque(frame, draw) {
+            if vertices_opaque(frame, draw) && samples_opaque_rows(frame, draw, opaque_rows) {
                 if unblend {
                     choice = choice.map(for_opaque_source);
                     stats().opaque_draws += 1;
@@ -2273,9 +2303,9 @@ pub fn draw_textured(
     texture: &TextureObject,
     palette: *const c_void,
     uv_scale: [f32; 2],
-    opaque_texture: bool,
+    opaque_rows: u16,
 ) {
-    draws().draw_textured(frame, draw, draw_index, texture, palette, uv_scale, opaque_texture);
+    draws().draw_textured(frame, draw, draw_index, texture, palette, uv_scale, opaque_rows);
 }
 
 /// Untextured draw `draw_index` of `frame`. Inside a target scene.

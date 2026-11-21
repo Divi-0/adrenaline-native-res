@@ -82,6 +82,9 @@ pub struct RenderStats {
     /// Alpha-tested draws whose test was dropped: every fragment opaque
     /// (draw.rs `OPAQUE_UNTESTED`).
     pub opaque_untested_draws: u32,
+    /// Draws found opaque by the rows of the texture they sample (draw.rs
+    /// `samples_opaque_rows`), not the whole texture.
+    pub opaque_rows_draws: u32,
     /// Textured draws through the flat program (draw.rs `FLAT_SHADING`).
     pub flat_draws: u32,
     /// The display thread's time finding them (vertex alphas read).
@@ -139,6 +142,7 @@ impl RenderStats {
         cut_off_draws: 0,
         opaque_draws: 0,
         opaque_untested_draws: 0,
+        opaque_rows_draws: 0,
         flat_draws: 0,
         opaque_us: 0,
         lookup_us: 0,
@@ -226,7 +230,7 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
     );
     let _ = write!(
         text,
-        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} fixed_color_draws={} fix_b_draws={} cut_draws={} cut_fast_draws={} cut_off_draws={} opaque_draws={} opaque_untested_draws={} flat_draws={} opaque={}us ",
+        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} fixed_color_draws={} fix_b_draws={} cut_draws={} cut_fast_draws={} cut_off_draws={} opaque_draws={} opaque_untested_draws={} opaque_rows_draws={} flat_draws={} opaque={}us ",
         per_frame(s.begin_us),
         per_frame(s.loop_us),
         per_frame(s.convert_us),
@@ -246,6 +250,7 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
         s.cut_off_draws / frames,
         s.opaque_draws / frames,
         s.opaque_untested_draws / frames,
+        s.opaque_rows_draws / frames,
         s.flat_draws / frames,
         per_frame(s.opaque_us)
     );

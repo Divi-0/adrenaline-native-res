@@ -307,9 +307,10 @@ struct Entry {
     /// in by the worker), compared with the frame's capture-time sample
     /// (`lookup_sample`).
     quick: u32,
-    /// Every texel decoded has alpha 255 (`texture::all_texels_opaque`,
-    /// all levels): `TextureCache::opaque`.
-    opaque: bool,
+    /// Rows from the top whose decoded texels all have alpha 255
+    /// (`texture::opaque_rows`; with mip levels `ALL_ROWS_OPAQUE` or 0):
+    /// `TextureCache::opaque_rows`.
+    opaque_rows: u16,
 }
 
 const NO_DESCRIPTOR: TextureDescriptor = TextureDescriptor {
@@ -340,7 +341,7 @@ const FREE_ENTRY: Entry = Entry {
     unhashed: 0,
     sample_hash: 0,
     quick: 0,
-    opaque: false,
+    opaque_rows: 0,
 };
 
 const FREE_RETIRED: Retired = Retired { texture: None, shape: NO_SHAPE, ready_at: 0 };
@@ -393,11 +394,11 @@ pub struct TextureCache {
     pub lookup_sample: u32,
     /// See `moved_on`.
     moved_on: u32,
-    /// Per texture of the last `textures_for_frame`: `opaque`.
-    frame_opaque: [bool; MAX_TEXTURES],
-    /// The entry the last `look_up` returned `Lookup::Ready` from was
-    /// opaque (`ready`).
-    last_opaque: bool,
+    /// Per texture of the last `textures_for_frame`: `opaque_rows`.
+    frame_opaque_rows: [u16; MAX_TEXTURES],
+    /// The `opaque_rows` of the entry the last `look_up` returned
+    /// `Lookup::Ready` from (`ready`).
+    last_opaque_rows: u16,
     failed_next: usize,
     refresh: Option<PendingRefresh>,
     stats: TextureStats,
@@ -433,8 +434,8 @@ impl TextureCache {
             lookup_levels: crate::frame::TextureLevels { address: [0; 8], buffer_width: [0; 8], log2_size: [0; 8] },
             lookup_sample: 0,
             moved_on: 0,
-            frame_opaque: [false; MAX_TEXTURES],
-            last_opaque: false,
+            frame_opaque_rows: [0; MAX_TEXTURES],
+            last_opaque_rows: 0,
             failed_next: 0,
             refresh: None,
             stats: TextureStats {
@@ -474,7 +475,7 @@ impl TextureCache {
         for n in 0..count {
             let index = (n + self.render_count as usize) % count;
             let texture = &textures[index];
-            self.last_opaque = false;
+            self.last_opaque_rows = 0;
             out[index] = if is_render_target(&start, texture) {
                 Lookup::RenderTarget
             } else {
@@ -488,23 +489,23 @@ impl TextureCache {
                 }
                 lookup
             };
-            self.frame_opaque[index] = matches!(out[index], Lookup::Ready(_)) && self.last_opaque;
+            self.frame_opaque_rows[index] = if matches!(out[index], Lookup::Ready(_)) { self.last_opaque_rows } else { 0 };
         }
     }
 
-    /// True if every texel of the last `textures_for_frame`'s texture
-    /// `index` (ready) has alpha 255 (`texture::all_texels_opaque`): a
-    /// normal alpha blend of it under vertices of alpha 255 is the texture
-    /// itself (core opaque_source.rs).
-    pub fn opaque(&self, index: usize) -> bool {
-        self.frame_opaque.get(index).copied().unwrap_or(false)
+    /// How many rows from the top of the last `textures_for_frame`'s
+    /// texture `index` (ready) have only texels of alpha 255
+    /// (`texture::opaque_rows`, `ALL_ROWS_OPAQUE`: all; 0 if not ready): a
+    /// draw sampling only those rows sees an opaque texture.
+    pub fn opaque_rows(&self, index: usize) -> u16 {
+        self.frame_opaque_rows.get(index).copied().unwrap_or(0)
     }
 
     /// `Lookup::Ready` with entry `slot`'s texture, noting whether it is
     /// opaque (`opaque`).
     fn ready(&mut self, slot: usize) -> Lookup {
         let entry = &self.entries[slot];
-        self.last_opaque = entry.opaque;
+        self.last_opaque_rows = entry.opaque_rows;
         Lookup::Ready(entry.texture.unwrap())
     }
 
@@ -986,7 +987,7 @@ impl TextureCache {
         let decode_start = host.now_us();
         let mut result = Ok(());
         // Unswizzled on the GPU: not looked at (16-bit with alpha: rarely opaque).
-        let mut opaque = false;
+        let mut opaque_rows = 0;
         if !on_gpu || !self.unswizzle_on_gpu(host, wanted, texture, shape) {
             if staged_size == 0 {
                 // The hash came from an earlier copy this frame (or there was none).
@@ -999,7 +1000,7 @@ impl TextureCache {
             let data = &staging[..staged_size as usize];
             // Palette textures: their colours come per frame (palette tables).
             result = host.decode(texture, format, &layout.as_texture, data, palette, self.smooth, 0);
-            opaque = texture::all_texels_opaque(data, &layout.as_texture);
+            opaque_rows = texture::opaque_rows(data, &layout.as_texture);
             // Mip levels 1.. (menu "NativeRes Distant Textures"): each staged
             // from its own address and decoded into its place. Only level 0
             // is hashed: a game rewrites a texture's levels with it.
@@ -1014,7 +1015,12 @@ impl TextureCache {
                 result = if size == 0 {
                     Err(DecodeError::BadAddress)
                 } else {
-                    opaque &= texture::all_texels_opaque(&staging[..size], &level_layout.as_texture);
+                    // Levels: any level may be sampled, so all or nothing.
+                    if opaque_rows != texture::ALL_ROWS_OPAQUE
+                        || texture::opaque_rows(&staging[..size], &level_layout.as_texture) != texture::ALL_ROWS_OPAQUE
+                    {
+                        opaque_rows = 0;
+                    }
                     host.decode(texture, format, &level_layout.as_texture, &staging[..size], palette, self.smooth, level as u8)
                 };
             }
@@ -1064,7 +1070,7 @@ impl TextureCache {
             unhashed,
             sample_hash: new_sample_hash,
             quick,
-            opaque,
+            opaque_rows,
         };
         self.ready(slot)
     }
