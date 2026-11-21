@@ -1855,7 +1855,7 @@ impl Draws {
         let off = if tested && !alpha_test_is_one_sided(alpha_test) {
             ReadVariant::Generic
         } else {
-            ReadVariant::Fast { way: ReadWay::Off, keep_alpha: false, dither: false, green6: false }
+            ReadVariant::Fast { way: ReadWay::Off, keep_alpha: false, dither: false, green6: false, fogless: false }
         };
         let fragment = match program {
             ShadeProgram::EightBit => {

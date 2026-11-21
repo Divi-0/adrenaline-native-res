@@ -113,7 +113,9 @@
 // frame-read blends take them as they are). tools/shadetest.py checks it on
 // the Vita. NO_SPECULAR: the program is only used for draws without a
 // separate specular colour (4 instructions less). FOG_UNFLOORED: the rgb
-// comes back unfloored, for a caller that floors anyway (3 less).
+// comes back unfloored, for a caller that floors anyway (3 less). NO_FOG:
+// only for draws without fog (the frame-read 565 ones, `ReadVariant::Fast`
+// `fogless`): the fog part left out, exact (~14 instructions less).
 //
 // Cost (tools/gxpinfo.py, instructions per pixel): floor written as
 // x - frac(x) compiles shorter than floor(x); the fog is the dearest part
@@ -130,6 +132,10 @@ float4 GeShade(float4 texel, float4 vertexColor, float3 specular, float fog, flo
 	c.rgb = min(c.rgb, 255.0f);
 #else
 	c.rgb = min(c.rgb + FLOOR(specular * 255.0f + 0.5f) * fogAndScale.aaa, 255.0f);
+#endif
+#ifdef NO_FOG
+	// No fog: f = 255 leaves every colour 0..255 as it is ((255 c + 255) >> 8 = c).
+	return c;
 #endif
 	float f = min(FLOOR(saturate(fog) * 256.0f + 0.01f), 255.0f);
 #ifdef FOG_UNFLOORED
@@ -293,10 +299,14 @@ __nativecolor __regformat unsigned char4 main(
 	// 5 bits widened = v & 0xF8 | v >> 5 (core frame.rs `cut_to_5_bits`,
 	// the same as `quantize_like_the_ge`); value is whole, the cast exact.
 #ifdef READ_565
-	// 565: the float cut as READ_OFF's (green 6 bits); value is whole.
-	// The alpha (565 has none) written uncut, as the generic program
-	// writes it.
-	float4 h = FLOOR(value * float4(0.125f, 0.25f, 0.125f, 0.125f));
+	// 565: the float cut as READ_OFF's (green 6 bits). value is whole in
+	// theory, but the target's pixel arrives a hair below its whole value
+	// (12 read as 11.99..: the invisible and add ways then floored one step
+	// too low, NFS UR's title, 2026-11-21): floor((v + 0.5) x step), the
+	// same for whole values and safe for errors up to +-0.4. The bit
+	// operations of the 5551 programs round in their cast first. The alpha
+	// (565 has none) written uncut, as the generic program writes it.
+	float4 h = FLOOR(value * float4(0.125f, 0.25f, 0.125f, 0.125f) + float4(0.0625f, 0.125f, 0.0625f, 0.0625f));
 	unsigned char4 cut = (unsigned char4)(h * float4(8.25f, 4.0625f, 8.25f, 8.25f) - float4(0.375f, 0.46875f, 0.375f, 0.375f));
 	cut.a = (unsigned char)value.a;
 #else

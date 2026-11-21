@@ -266,8 +266,10 @@ pub enum ReadVariant {
     /// `dither` = the GE's dither value is added after the blend
     /// (`draw_flags::DITHER`); `green6` = a 565 target: green cut to 6 bits,
     /// the alpha written uncut as the generic program writes it (565 has no
-    /// alpha; never `keep_alpha`).
-    Fast { way: ReadWay, keep_alpha: bool, dither: bool, green6: bool },
+    /// alpha; never `keep_alpha`); `fogless` = a textured 565 draw without
+    /// fog: the program leaves the fog part out (exact: without fog the GE's
+    /// fog formula gives the colour back).
+    Fast { way: ReadWay, keep_alpha: bool, dither: bool, green6: bool, fogless: bool },
 }
 
 impl ReadVariant {
@@ -277,8 +279,8 @@ impl ReadVariant {
     /// else stays as it is.
     pub fn for_invisible_source(self) -> ReadVariant {
         match self {
-            ReadVariant::Fast { way: ReadWay::Normal, keep_alpha, dither, green6 } => {
-                ReadVariant::Fast { way: ReadWay::Invisible, keep_alpha, dither, green6 }
+            ReadVariant::Fast { way: ReadWay::Normal, keep_alpha, dither, green6, fogless } => {
+                ReadVariant::Fast { way: ReadWay::Invisible, keep_alpha, dither, green6, fogless }
             }
             other => other,
         }
@@ -329,7 +331,9 @@ pub fn read_variant(flags: u32, blend: u32, keep_target_alpha: bool, exact_norma
     if green6 && !writes_alpha {
         return ReadVariant::Generic; // no 565 programs keep the alpha
     }
-    ReadVariant::Fast { way, keep_alpha: !writes_alpha, dither, green6 }
+    // Textured 565 draws without fog: the fog-free programs.
+    let fogless = green6 && flags & draw_flags::TEXTURED != 0 && flags & draw_flags::FOG == 0;
+    ReadVariant::Fast { way, keep_alpha: !writes_alpha, dither, green6, fogless }
 }
 
 /// The corners of triangle `t` of a strip, counted from its first vertex:
@@ -2524,8 +2528,8 @@ mod tests {
         let target = |format: u32| format << draw_flags::TARGET_FORMAT_SHIFT;
         let normal = BLEND_ENABLED | 4 | 5 << 4;
         let add = BLEND_ENABLED | 4 | 1 << 4;
-        let fast = |way, keep_alpha| ReadVariant::Fast { way, keep_alpha, dither: false, green6: false };
-        let dithered = |way, keep_alpha| ReadVariant::Fast { way, keep_alpha, dither: true, green6: false };
+        let fast = |way, keep_alpha| ReadVariant::Fast { way, keep_alpha, dither: false, green6: false, fogless: false };
+        let dithered = |way, keep_alpha| ReadVariant::Fast { way, keep_alpha, dither: true, green6: false, fogless: false };
         let f5551 = target(draw_flags::TARGET_5551);
         // Nobody reads the alpha: every draw writes it.
         assert_eq!(read_variant(f5551, normal, false, true), fast(ReadWay::Normal, false));
@@ -2566,12 +2570,15 @@ mod tests {
         let normal = BLEND_ENABLED | 4 | 5 << 4;
         let add = BLEND_ENABLED | 4 | 1 << 4;
         let zero_one = BLEND_ENABLED | 1 << 4;
-        let fast = |way, dither| ReadVariant::Fast { way, keep_alpha: false, dither, green6: true };
+        let fast = |way, dither| ReadVariant::Fast { way, keep_alpha: false, dither, green6: true, fogless: false };
+        let fogless = |way, dither| ReadVariant::Fast { way, keep_alpha: false, dither, green6: true, fogless: true };
         // NFS UR's title: dithered normal (logo, cars), add (trail buffer),
         // zero/one (untextured).
         let dithered = f565 | draw_flags::DITHER;
-        assert_eq!(read_variant(dithered | draw_flags::TEXTURED, normal, false, true), fast(ReadWay::Normal, true));
-        assert_eq!(read_variant(dithered | draw_flags::TEXTURED, add, false, true), fast(ReadWay::Add, true));
+        // Textured without fog: the fog-free programs; with fog: the full ones.
+        assert_eq!(read_variant(dithered | draw_flags::TEXTURED, normal, false, true), fogless(ReadWay::Normal, true));
+        assert_eq!(read_variant(dithered | draw_flags::TEXTURED, add, false, true), fogless(ReadWay::Add, true));
+        assert_eq!(read_variant(dithered | draw_flags::TEXTURED | draw_flags::FOG, normal, false, true), fast(ReadWay::Normal, true));
         assert_eq!(read_variant(dithered, zero_one, false, true), fast(ReadWay::Invisible, true));
         assert_eq!(read_variant(f565, 0, false, true), fast(ReadWay::Off, false));
         assert_eq!(read_variant(f565, normal, false, false), fast(ReadWay::Precut, false));
@@ -2610,7 +2617,7 @@ mod tests {
 
     #[test]
     fn only_normal_blends_become_invisible() {
-        let fast = |way, keep_alpha, dither| ReadVariant::Fast { way, keep_alpha, dither, green6: false };
+        let fast = |way, keep_alpha, dither| ReadVariant::Fast { way, keep_alpha, dither, green6: false, fogless: false };
         for keep_alpha in [false, true] {
             for dither in [false, true] {
                 let normal = fast(ReadWay::Normal, keep_alpha, dither);

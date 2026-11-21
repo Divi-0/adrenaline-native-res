@@ -523,31 +523,31 @@ const READ_WAYS: usize = 5;
 
 /// Frame-read programs (`read_index`): untextured generic + the ways x
 /// alpha kept or not x dithered or not, then the 565 ones (ways x dithered
-/// or not; 565 keeps no alpha); textured the same, the fast ones also with
+/// or not x fogless or not (textured only); 565 keeps no alpha); textured the same, the fast ones also with
 /// and without the alpha test (`ReadWay::Invisible` is untextured only, its
 /// textured slots stay unused).
-const READ_PROGRAMS: usize = READ_TEXTURED + 1 + 2 * READ_WAYS * 4 + 2 * READ_WAYS * 2;
+const READ_PROGRAMS: usize = READ_TEXTURED + 1 + 2 * READ_WAYS * 4 + 2 * READ_WAYS * 4;
 
 /// The first textured one in `read_index` (the textured generic program).
-const READ_TEXTURED: usize = 1 + READ_WAYS * 4 + READ_WAYS * 2;
+const READ_TEXTURED: usize = 1 + READ_WAYS * 4 + READ_WAYS * 4;
 
 /// The place of a frame-read program in `Programs::read`; `tested`: with
 /// the alpha test (textured only; the generic one always has it).
 fn read_index(textured: bool, tested: bool, variant: ReadVariant) -> usize {
     // 5551: 0..READ_WAYS * 4; 565 after them (never keeping the alpha).
-    let fast = |way: ReadWay, keep_alpha: bool, dither: bool, green6: bool| {
+    let fast = |way: ReadWay, keep_alpha: bool, dither: bool, green6: bool, fogless: bool| {
         if green6 {
-            READ_WAYS * 4 + 2 * way as usize + dither as usize
+            READ_WAYS * 4 + (2 * way as usize + dither as usize) * 2 + fogless as usize
         } else {
             (2 * way as usize + keep_alpha as usize) * 2 + dither as usize
         }
     };
     match (textured, variant) {
         (false, ReadVariant::Generic) => 0,
-        (false, ReadVariant::Fast { way, keep_alpha, dither, green6 }) => 1 + fast(way, keep_alpha, dither, green6),
+        (false, ReadVariant::Fast { way, keep_alpha, dither, green6, fogless }) => 1 + fast(way, keep_alpha, dither, green6, fogless),
         (true, ReadVariant::Generic) => READ_TEXTURED,
-        (true, ReadVariant::Fast { way, keep_alpha, dither, green6 }) => {
-            READ_TEXTURED + 1 + 2 * fast(way, keep_alpha, dither, green6) + tested as usize
+        (true, ReadVariant::Fast { way, keep_alpha, dither, green6, fogless }) => {
+            READ_TEXTURED + 1 + 2 * fast(way, keep_alpha, dither, green6, fogless) + tested as usize
         }
     }
 }
@@ -558,9 +558,26 @@ fn read_index(textured: bool, tested: bool, variant: ReadVariant) -> usize {
 fn read_gxp(textured: bool, tested: bool, variant: ReadVariant) -> *const gxm::Program {
     use ReadWay::{Add, Invisible, Normal, Off, Precut};
     use shaders::*;
-    let ReadVariant::Fast { way, keep_alpha, dither, green6 } = variant else {
+    let ReadVariant::Fast { way, keep_alpha, dither, green6, fogless } = variant else {
         return if textured { gxp(&nativeres_textured_read_f) } else { gxp(&nativeres_color_read_f) };
     };
+    if green6 && fogless && textured {
+        // Textured 565 draws without fog.
+        return match (way, tested, dither) {
+            (Normal | Invisible, false, false) => gxp(&nativeres_textured_read_normal565nofog_f),
+            (Normal | Invisible, true, false) => gxp(&nativeres_textured_read_normal565nofogtest_f),
+            (Normal | Invisible, false, true) => gxp(&nativeres_textured_read_normal565nofogdither_f),
+            (Normal | Invisible, true, true) => gxp(&nativeres_textured_read_normal565nofogtestdither_f),
+            (Add, false, false) => gxp(&nativeres_textured_read_add565nofog_f),
+            (Add, true, false) => gxp(&nativeres_textured_read_add565nofogtest_f),
+            (Add, false, true) => gxp(&nativeres_textured_read_add565nofogdither_f),
+            (Add, true, true) => gxp(&nativeres_textured_read_add565nofogtestdither_f),
+            (Off | Precut, false, false) => gxp(&nativeres_textured_read_off565nofog_f),
+            (Off | Precut, true, false) => gxp(&nativeres_textured_read_off565nofogtest_f),
+            (Off | Precut, false, true) => gxp(&nativeres_textured_read_off565nofogdither_f),
+            (Off | Precut, true, true) => gxp(&nativeres_textured_read_off565nofogtestdither_f),
+        };
+    }
     if green6 {
         // 565 targets (no keep-alpha programs: `read_variant` never asks).
         return match (textured, way, tested, dither) {

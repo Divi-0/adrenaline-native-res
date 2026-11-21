@@ -38,6 +38,19 @@ embed_gxp!(nativeres_color_read_f);
 // Their fast variants for 5551 targets (one blend each; the keep ones
 // leave the target's alpha; "off" reads no frame).
 // Their fast variants for 565 targets (green cut to 6 bits, READ_565).
+// (textured, without fog: NO_FOG)
+embed_gxp!(nativeres_textured_read_normal565nofog_f);
+embed_gxp!(nativeres_textured_read_normal565nofogtest_f);
+embed_gxp!(nativeres_textured_read_normal565nofogdither_f);
+embed_gxp!(nativeres_textured_read_normal565nofogtestdither_f);
+embed_gxp!(nativeres_textured_read_add565nofog_f);
+embed_gxp!(nativeres_textured_read_add565nofogtest_f);
+embed_gxp!(nativeres_textured_read_add565nofogdither_f);
+embed_gxp!(nativeres_textured_read_add565nofogtestdither_f);
+embed_gxp!(nativeres_textured_read_off565nofog_f);
+embed_gxp!(nativeres_textured_read_off565nofogtest_f);
+embed_gxp!(nativeres_textured_read_off565nofogdither_f);
+embed_gxp!(nativeres_textured_read_off565nofogtestdither_f);
 embed_gxp!(nativeres_color_read_normal565_f);
 embed_gxp!(nativeres_color_read_normal565dither_f);
 embed_gxp!(nativeres_color_read_add565_f);
