@@ -746,7 +746,7 @@ impl<M: PspMemory> Writer<'_, '_, M> {
         }
         self.raw.stats.lit += (colors.rules[0] == crate::raw_vertex::lighting::LIGHTS) as u32;
         draw.transform = number;
-        draw.vertex_format = format.0;
+        draw.vertex_format = crate::raw_blocks::raw_vertex_format(format.0, colors);
         draw.raw_colors = colors_number;
         draw.bones = bones;
         in_phase(crate::phase::DIRECT_ARENA, || {
@@ -828,6 +828,8 @@ impl<M: PspMemory> Writer<'_, '_, M> {
         if !in_psp_ram && (highest - lowest + 1) > crate::recorder::SPARSE_SPAN * corners {
             // Copying the span would move more bytes than its corners need.
             let entries = (number, colors_number, bones);
+            // The texgen bit (`raw_vertex_format`) for `gathered`.
+            draw.vertex_format = crate::raw_blocks::raw_vertex_format(0, colors);
             match self.gathered(format, layout, calls, indices, (lowest, span_start), entries, draw) {
                 Err(None) => self.stats.sparse += 1, // no list room: copied whole below
                 written => return written.map_err(|reason| reason.unwrap_or(fallback::REFUSED)),
@@ -858,7 +860,7 @@ impl<M: PspMemory> Writer<'_, '_, M> {
         self.raw.stats.lit += (colors.rules[0] == crate::raw_vertex::lighting::LIGHTS) as u32;
         self.raw.stats.converted += 1;
         draw.transform = number;
-        draw.vertex_format = format.0 & !INDEX_FORMAT_BITS;
+        draw.vertex_format = crate::raw_blocks::raw_vertex_format(format.0 & !INDEX_FORMAT_BITS, colors);
         draw.raw_colors = colors_number;
         draw.bones = bones;
         in_phase(crate::phase::DIRECT_ARENA, || self.geometry.finish_raw_listed_draw(draw, place, in_psp_ram));
@@ -934,7 +936,7 @@ impl<M: PspMemory> Writer<'_, '_, M> {
         self.raw.stats.gathered += 1;
         self.stats.gathered += 1;
         draw.transform = number;
-        draw.vertex_format = format.0 & !INDEX_FORMAT_BITS;
+        draw.vertex_format = (format.0 & !INDEX_FORMAT_BITS) | (draw.vertex_format & crate::raw_blocks::TEXCOORDS_FROM_POSITION);
         draw.raw_colors = colors_number;
         draw.bones = bones;
         self.geometry.finish_raw_draw(draw, placed.window);
@@ -986,7 +988,7 @@ impl<M: PspMemory> Writer<'_, '_, M> {
             return Err(reason);
         }
         draw.transform = number;
-        draw.vertex_format = format.0;
+        draw.vertex_format = crate::raw_blocks::raw_vertex_format(format.0, colors);
         draw.raw_colors = colors_number;
         draw.bones = 0;
         draw.flags |= draw_flags::RAW_SPRITES;

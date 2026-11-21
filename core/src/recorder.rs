@@ -195,7 +195,7 @@ fn fallback_reason(
     // raw_off).
     if format.morph_count() != 1 {
         fallback::MORPH
-    } else if prepared.texgen.is_some() {
+    } else if prepared.texgen.is_some_and(|texgen| texgen.raw_form(format).is_none()) {
         fallback::TEXGEN
     } else if !prepared.gpu_transform {
         fallback::UNTEXTURED
@@ -1343,7 +1343,10 @@ fn prepare_now(
         // Separate specular: exact where the GPU lights the draw (its
         // shader adds the specular part after texturing) and for untextured
         // draws (clamped parts added, the same as clamping the sum).
-        let gpu_lit = draw_states.gpu_transform && textured && !format.is_through() && texgen.is_none();
+        // Texgen: only where raw draws do it (`Texgen::raw_form`); its draws
+        // never take the GPU transform runs (`record_3d_run`), only raw.
+        let raw_texgen = texgen.is_none_or(|texgen| texgen.raw_form(format).is_some());
+        let gpu_lit = draw_states.gpu_transform && textured && !format.is_through() && raw_texgen;
         match transform.lighting() {
             Some(lights) if lights.approximated() && textured && !(gpu_lit && lights.gpu_ready()) => {
                 approximations |= approx::SEPARATE_SPECULAR
@@ -1367,7 +1370,7 @@ fn prepare_now(
         double_source_alpha: state.double_source_alpha,
         function,
         uses_texture_alpha,
-        gpu_transform: draw_states.gpu_transform && textured && !format.is_through() && texgen.is_none(),
+        gpu_transform: draw_states.gpu_transform && textured && !format.is_through() && texgen.is_none_or(|texgen| texgen.raw_form(format).is_some()),
         ambient_lighting,
         texgen,
     })
@@ -2036,6 +2039,10 @@ fn raw_color_fields(
     if !may_go_raw(prepared, lights.map(|lights| lights.gpu_ready()), format) {
         return None;
     }
+    let (texgen, texgen_source) = match prepared.texgen.and_then(|texgen| texgen.raw_form(format)) {
+        Some((uv, source)) => (uv, [source, 0.0, 0.0, 0.0]),
+        None => ([0.0; 4], [0.0; 4]),
+    };
     if lights.is_some() {
         let opaque = prepared.gpu_lighting()?;
         // White without a vertex colour (the light set's materials are used
@@ -2046,6 +2053,8 @@ fn raw_color_fields(
             emissive: [0.0; 4],
             rules: [lighting::LIGHTS, if opaque { 1.0 } else { 0.0 }, replace::NONE, 0.0],
             scale: [0.0; 4],
+            texgen,
+            texgen_source,
         });
     }
     let textured = prepared.draw.flags & draw_flags::TEXTURED != 0;
@@ -2069,7 +2078,7 @@ fn raw_color_fields(
         let [r, g, b, _] = channels(scale);
         [r, g, b, 1.0]
     });
-    Some(RawColors { material, ambient, emissive, rules: [lit, opaque, replacing, doubled], scale })
+    Some(RawColors { material, ambient, emissive, rules: [lit, opaque, replacing, doubled], scale, texgen, texgen_source })
 }
 
 /// Whether a draw's runs can go raw (`raw_color_fields` gives colour rules),
@@ -2080,7 +2089,9 @@ fn raw_color_fields(
 /// `lights_gpu_ready`: `None` without lights, else whether the GPU can
 /// light with them (`Lights::gpu_ready`).
 fn may_go_raw(prepared: &Prepared, lights_gpu_ready: Option<bool>, format: VertexFormat) -> bool {
-    if format.morph_count() != 1 || prepared.texgen.is_some() {
+    // Texgen: only where the raw program's texture coordinates do it
+    // (`Texgen::raw_form`).
+    if format.morph_count() != 1 || prepared.texgen.is_some_and(|texgen| texgen.raw_form(format).is_none()) {
         return false;
     }
     match lights_gpu_ready {
@@ -2137,7 +2148,7 @@ fn record_raw_draw(
             // The vertices as the GPU reads them: plain vertices (an indexed
             // run's indices were converted or its vertices gathered), so no
             // index bits (one program per vertex layout).
-            draw.vertex_format = format.0 & !INDEX_FORMAT_BITS;
+            draw.vertex_format = crate::raw_blocks::raw_vertex_format(format.0 & !INDEX_FORMAT_BITS, colors);
             draw.raw_colors = placed.colors;
             draw.bones = placed.bones;
             match (placed.window, placed.listed) {
@@ -2235,7 +2246,7 @@ fn record_raw_sprites(
     };
     record.copy_from_slice(&[primitive::RECTANGLES as u16, sprites as u16, first_corner as u16]);
     draw.transform = number;
-    draw.vertex_format = format.0;
+    draw.vertex_format = crate::raw_blocks::raw_vertex_format(format.0, &colors);
     draw.raw_colors = colors_number;
     draw.bones = 0;
     draw.flags |= draw_flags::RAW_SPRITES;

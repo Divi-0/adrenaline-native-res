@@ -1162,7 +1162,8 @@ impl Draws {
             let buffer = reserve_vertex_uniforms();
             let format = VertexFormat(draw.vertex_format);
             let format_uniform = [format.position_scale(), ((draw.vertex_format >> 2) & 7) as f32, 0.0, 0.0];
-            let raw_uv = nativeres_core::raw_blocks::raw_uv(camera, format);
+            // Texgen draws: their own (RawColors::texgen).
+            let raw_uv = nativeres_core::raw_blocks::raw_uv_of(camera, format, colors);
             set_raw_uniforms(buffer, &uniforms, matrix, (transform, camera), uv_scale, &format_uniform, &raw_uv, colors);
             if let Some(skinning) = skinning {
                 set_uniform(buffer, skinning.scale, 4, floats(&colors.scale));

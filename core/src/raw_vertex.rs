@@ -227,6 +227,8 @@ pub struct RawCorners<'a, I: Iterator<Item = u16>> {
     pending: [FrameVertex; 6],
     pending_count: usize,
     next: usize,
+    /// `raw_blocks::TEXCOORDS_FROM_POSITION`.
+    from_position: bool,
 }
 
 impl<'a, I: Iterator<Item = u16>> RawCorners<'a, I> {
@@ -241,7 +243,8 @@ impl<'a, I: Iterator<Item = u16>> RawCorners<'a, I> {
         indices: I,
         sprites: bool,
     ) -> Self {
-        let format = VertexFormat(vertex_format);
+        let from_position = vertex_format & raw_blocks::TEXCOORDS_FROM_POSITION != 0;
+        let format = VertexFormat(vertex_format & !raw_blocks::TEXCOORDS_FROM_POSITION);
         let layout = format.layout();
         let lights = (colors.rules[0] == lighting::LIGHTS)
             .then(|| frame.light_sets[..frame.light_set_count as usize].get((transform.light_set as usize).checked_sub(1)?).copied())
@@ -259,7 +262,8 @@ impl<'a, I: Iterator<Item = u16>> RawCorners<'a, I> {
             layout,
             transform,
             camera,
-            uv: raw_blocks::raw_uv(&camera, format),
+            uv: raw_blocks::raw_uv_of(&camera, format, &colors),
+            from_position,
             sprites,
             pending: [FrameVertex::default(); 6],
             pending_count: 0,
@@ -267,11 +271,21 @@ impl<'a, I: Iterator<Item = u16>> RawCorners<'a, I> {
         }
     }
 
+    /// The raw texture coordinates the program reads: the raw position's x
+    /// and y for texgen from the position (`raw_blocks::TEXCOORDS_FROM_POSITION`).
+    fn texcoord(&self, fields: &RawFields) -> [f32; 2] {
+        if self.from_position {
+            [fields.position[0], fields.position[1]]
+        } else {
+            fields.texcoord
+        }
+    }
+
     fn clip_vertex(&self, index: u16) -> Option<ClipVertex> {
         let offset = self.window + index as usize * self.stride;
         let fields = decode_raw(self.bytes, offset, self.format, &self.layout)?;
         let (model, normal) = raw_blocks::model_space(self.format, self.bones, fields.position, &fields.weights, fields.normal);
-        let mut vertex = raw_blocks::clip_vertex(&self.transform, &self.camera, &self.colors, &self.uv, model, fields.texcoord, fields.color);
+        let mut vertex = raw_blocks::clip_vertex(&self.transform, &self.camera, &self.colors, &self.uv, model, self.texcoord(&fields), fields.color);
         if let Some((lights, normal_rows)) = &self.lights {
             vertex.color = self.colors.lit_color(lights, normal_rows, fields.color, normal);
         }
@@ -289,7 +303,7 @@ impl<'a, I: Iterator<Item = u16>> RawCorners<'a, I> {
         let corner = |offset: usize| -> Option<FrameVertex> {
             let fields = decode_raw(self.bytes, offset, self.format, &self.layout)?;
             let (model, _) = raw_blocks::model_space(self.format, &[], fields.position, &[], fields.normal);
-            let clip = raw_blocks::clip_vertex(&self.transform, &self.camera, &self.colors, &self.uv, model, fields.texcoord, fields.color);
+            let clip = raw_blocks::clip_vertex(&self.transform, &self.camera, &self.colors, &self.uv, model, self.texcoord(&fields), fields.color);
             (clip.z >= -clip.w && clip.w > 0.0).then(|| raw_blocks::clip_to_screen(&self.camera, &clip))
         };
         let (a, b) = (corner(offset)?, corner(offset + self.stride)?);

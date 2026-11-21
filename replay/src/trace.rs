@@ -151,6 +151,12 @@ impl DrawTracer {
             float(op::TEXTURE_SCALE_U), float(op::TEXTURE_SCALE_V), float(op::TEXTURE_OFFSET_U), float(op::TEXTURE_OFFSET_V),
             ge.register(op::LIGHTING_ENABLE) & 1, ge.register(op::TEXTURE_MAP_MODE) & 3,
         );
+        // Texgen (map mode 1): its source (bits 8-9) and matrix.
+        let inputs = if ge.register(op::TEXTURE_MAP_MODE) & 3 == 1 {
+            format!("{inputs}, texgen source {} matrix {:?}", (ge.register(op::TEXTURE_MAP_MODE) >> 8) & 3, ge.matrices.texgen)
+        } else {
+            inputs
+        };
         if inputs != self.transform_shown {
             println!("{inputs}");
             self.transform_shown = inputs;

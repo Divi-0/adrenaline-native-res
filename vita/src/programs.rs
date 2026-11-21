@@ -23,6 +23,7 @@
 //!
 //! Display thread only (draw.rs owns the one `Programs`).
 
+use nativeres_core::raw_blocks::TEXCOORDS_FROM_POSITION;
 use core::ffi::c_void;
 use core::mem::offset_of;
 use core::ptr::{null, null_mut};
@@ -875,8 +876,8 @@ impl RawSet {
         if !self.ready() || self.count == RAW_PROGRAMS {
             return null_mut();
         }
-        let layout = VertexFormat(format).layout();
-        let texcoord_offset = layout.texcoord_offset.unwrap_or(0);
+        let layout = VertexFormat(format & !TEXCOORDS_FROM_POSITION).layout();
+        let (texcoord_offset, texcoord_format) = texcoord_attribute(format, &layout);
         let color_offset = layout.color_offset.unwrap_or(0);
         let normal_offset = layout.normal_offset.unwrap_or(0);
         debug_assert!(self.color == RawColor::Any || self.color == RawColor::of_format(format));
@@ -890,7 +891,7 @@ impl RawSet {
         let weights1_format = if weights > 4 { WEIGHT_FORMATS[weight_type] } else { gxm::ATTRIBUTE_FORMAT_U8 };
         let position = attribute(0, layout.position_offset, POSITION_FORMATS[((format >> 7) & 3) as usize], 3, self.position);
         let mut attributes = [position; 7];
-        attributes[1] = attribute(0, texcoord_offset, TEXCOORD_FORMATS[(format & 3) as usize], 2, self.texcoord);
+        attributes[1] = attribute(0, texcoord_offset, texcoord_format, 2, self.texcoord);
         let mut used = 2;
         if self.color.reads_bytes() {
             attributes[used] = attribute(0, color_offset, gxm::ATTRIBUTE_FORMAT_U8, 2, self.color_bytes);
@@ -1015,11 +1016,10 @@ impl SpriteSet {
         if !self.ready() || self.count == RAW_PROGRAMS {
             return null_mut();
         }
-        let layout = VertexFormat(format).layout();
-        let texcoord_offset = layout.texcoord_offset.unwrap_or(0);
+        let layout = VertexFormat(format & !TEXCOORDS_FROM_POSITION).layout();
+        let (texcoord_offset, texcoord_format) = texcoord_attribute(format, &layout);
         let color_offset = layout.color_offset.unwrap_or(0);
         let position_format = POSITION_FORMATS[((format >> 7) & 3) as usize];
-        let texcoord_format = TEXCOORD_FORMATS[(format & 3) as usize];
         let attributes = [
             attribute(0, layout.position_offset, position_format, 3, self.position),
             attribute(0, texcoord_offset, texcoord_format, 2, self.texcoord),
@@ -1375,5 +1375,16 @@ impl Programs {
             self.blend_count += 1;
         }
         program
+    }
+}
+
+/// Where a raw program reads aTexcoord for `format`: the texture
+/// coordinates, or the position's x and y (raw numbers, as aPosition) for
+/// texgen from the position (core `raw_blocks::TEXCOORDS_FROM_POSITION`).
+fn texcoord_attribute(format: u32, layout: &nativeres_core::vertex::VertexLayout) -> (u32, u8) {
+    if format & TEXCOORDS_FROM_POSITION != 0 {
+        (layout.position_offset, POSITION_FORMATS[((format >> 7) & 3) as usize])
+    } else {
+        (layout.texcoord_offset.unwrap_or(0), TEXCOORD_FORMATS[(format & 3) as usize])
     }
 }
