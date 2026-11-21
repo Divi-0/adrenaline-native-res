@@ -10,4 +10,5 @@ name = "replay"
 path = "src/main.rs"
 
 [dependencies]
-nativeres-core = { path = "../core" }
+# The measuring hooks on: NATIVERES_EXPERIMENT A/Bs of the same frame.
+nativeres-core = { path = "../core", features = ["instrument"] }

@@ -9,7 +9,8 @@
 //! recorder thread (the draw stream's consumer) notes its own phases in
 //! [`RECORDER`] the same way ([`recorder::enter`] / [`recorder::leave`]).
 //!
-//! Only while a profile runs ([`ENABLED`]): with the capture in two stages
+//! Only in builds with the `instrument` feature, and there only while a
+//! profile runs ([`ENABLED`]): with the capture in two stages
 //! (`walk_stream`) both threads passed here, and two cores storing to one
 //! cache line all the time slowed both down. For the same reason the two
 //! words lie on cache lines of their own ([`PhaseWord`]).
@@ -111,7 +112,7 @@ pub const NAMES: [&str; 21] = [
 /// Enters `phase`; returns the phase to go back to (`leave`).
 #[inline(always)]
 pub fn enter(phase: u8) -> u8 {
-    if !ENABLED.load(Ordering::Relaxed) {
+    if !(crate::bench::INSTRUMENTED && ENABLED.load(Ordering::Relaxed)) {
         return OTHER;
     }
     CURRENT.switch(phase)
@@ -120,7 +121,7 @@ pub fn enter(phase: u8) -> u8 {
 /// Goes back to `previous` (what `enter` returned).
 #[inline(always)]
 pub fn leave(previous: u8) {
-    if ENABLED.load(Ordering::Relaxed) {
+    if crate::bench::INSTRUMENTED && ENABLED.load(Ordering::Relaxed) {
         CURRENT.0.store(previous, Ordering::Relaxed);
     }
 }
@@ -172,7 +173,7 @@ pub mod recorder {
     /// Enters `phase`; returns the phase to go back to (`leave`).
     #[inline(always)]
     pub fn enter(phase: u8) -> u8 {
-        if !ENABLED.load(Ordering::Relaxed) {
+        if !(crate::bench::INSTRUMENTED && ENABLED.load(Ordering::Relaxed)) {
             return OTHER;
         }
         RECORDER.switch(phase)
@@ -181,7 +182,7 @@ pub mod recorder {
     /// Goes back to `previous` (what `enter` returned).
     #[inline(always)]
     pub fn leave(previous: u8) {
-        if ENABLED.load(Ordering::Relaxed) {
+        if crate::bench::INSTRUMENTED && ENABLED.load(Ordering::Relaxed) {
             RECORDER.0.store(previous, Ordering::Relaxed);
         }
     }

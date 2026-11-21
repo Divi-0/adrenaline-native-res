@@ -79,10 +79,16 @@ pub const NO_VISIT_RUNS: u32 = 524288;
 /// (`recorder::record_prims`).
 pub const ZEROED_CALLS: u32 = 1048576;
 
-/// True if experiment `bit` is on.
+/// Whether this build has the measuring hooks (the `instrument` feature):
+/// experiment bits, phase markers and cycle points. Without them
+/// `EXPERIMENT`, `phase::ENABLED` and `cycles::MEASURED` are read by
+/// nothing.
+pub const INSTRUMENTED: bool = cfg!(feature = "instrument");
+
+/// True if experiment `bit` is on (never without the `instrument` feature).
 #[inline]
 pub fn experiment(bit: u32) -> bool {
-    EXPERIMENT.load(Ordering::Relaxed) & bit != 0
+    INSTRUMENTED && EXPERIMENT.load(Ordering::Relaxed) & bit != 0
 }
 use crate::capture::{Capture, Event};
 use crate::dump::{DumpBlocks, DumpView};

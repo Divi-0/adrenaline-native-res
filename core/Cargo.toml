@@ -5,5 +5,15 @@ edition = "2021"
 license = "GPL-3.0-or-later"
 description = "PSP graphics engine (GE) display list handling, independent of the Vita"
 
+[features]
+# The measuring hooks on the capture's hot paths: phase markers (phase.rs,
+# for `liveprofile`), cycle points (cycles.rs, `livecycles`) and experiment
+# bits (bench.rs, `benchexp`). Off, each hook is a constant and compiles to
+# nothing: on, their ~85 checks per PRIM batch (a load and a branch each,
+# from a cold branch predictor) cost MTX's race start ~2.2 ms of walk per
+# frame (2026-11-21). The development plugin's profiling build and the PC
+# replay tool turn it on.
+instrument = []
+
 [lib]
 name = "nativeres_core"

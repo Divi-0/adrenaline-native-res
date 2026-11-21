@@ -10,7 +10,7 @@
 //! [`MEASURED`] are read: live, reading all of them (~13,000 capture-thread
 //! parts per race frame) slowed the capture until it skipped frames, so
 //! live, measure one thread's parts. Not measuring, a part costs
-//! one load of that mask.
+//! one load of that mask; without the `instrument` feature, nothing.
 
 use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
@@ -165,7 +165,7 @@ fn now() -> u32 {
 /// Whether `part` is being measured.
 #[inline(always)]
 fn measured(part: usize) -> bool {
-    MEASURED.load(Ordering::Relaxed) & (1 << part) != 0
+    crate::bench::INSTRUMENTED && MEASURED.load(Ordering::Relaxed) & (1 << part) != 0
 }
 
 /// The counter now if `part` is measured, else 0. (Parts measured by
