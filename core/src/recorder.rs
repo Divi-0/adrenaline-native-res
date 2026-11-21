@@ -3336,7 +3336,8 @@ fn work_out_draw_state(catalog: &mut Catalog, stats: &mut FrameStats, palette: &
     (draw.scissor_left, draw.scissor_top, draw.scissor_right, draw.scissor_bottom) = ge.scissor();
     // 16-bit targets: the display cuts colours as the GE does
     // (`draw_flags::TARGET_FORMAT_SHIFT`); dithering not in clear mode
-    // (PPSSPP neither).
+    // (PPSSPP neither), nor with every colour bit masked (the mask keeps
+    // the colour the dither would change).
     let target = match ge.register(op::FRAMEBUFFER_PIXEL_FORMAT) & 3 {
         0 => draw_flags::TARGET_565,
         1 => draw_flags::TARGET_5551,
@@ -3344,7 +3345,8 @@ fn work_out_draw_state(catalog: &mut Catalog, stats: &mut FrameStats, palette: &
         _ => 0,
     };
     draw.flags |= target << draw_flags::TARGET_FORMAT_SHIFT;
-    if target != 0 && ge.register(op::DITHER_ENABLE) & 1 != 0 && !ge.is_clear_mode() {
+    let colour_masked = ge.register(op::COLOR_MASK) & 0x00FF_FFFF == 0x00FF_FFFF;
+    if target != 0 && ge.register(op::DITHER_ENABLE) & 1 != 0 && !ge.is_clear_mode() && !colour_masked {
         draw.flags |= draw_flags::DITHER;
         let row = |index: u8| (ge.register(op::DITHER_ROW_0 + index) & 0xFFFF) as u64;
         catalog.set_dither_matrix(row(0) | row(1) << 16 | row(2) << 32 | row(3) << 48);
@@ -3723,6 +3725,17 @@ mod tests {
         let state = work_out_draw_state(&mut catalog, &mut stats, &mut palette, &ge).unwrap();
         assert_eq!(state.draw.flags & draw_flags::DITHER, 0);
         assert_ne!(state.draw.flags & draw_flags::TARGET_FORMAT_MASK, 0, "clears are still cut");
+        // Nor with every colour bit masked (NFS UR's title, draw 13: a depth
+        // mask drawn with dithering on): the GE adds the dither before the
+        // write, and the mask keeps every colour bit (PPSSPP DrawPixel.cpp).
+        ge.set_register(cmd(op::CLEAR_MODE, 0));
+        ge.set_register(cmd(op::COLOR_MASK, 0xFF_FFFF));
+        let state = work_out_draw_state(&mut catalog, &mut stats, &mut palette, &ge).unwrap();
+        assert_eq!(state.draw.flags & draw_flags::DITHER, 0);
+        // Part of the colour written: dithered.
+        ge.set_register(cmd(op::COLOR_MASK, 0xFF_FF00));
+        let state = work_out_draw_state(&mut catalog, &mut stats, &mut palette, &ge).unwrap();
+        assert_ne!(state.draw.flags & draw_flags::DITHER, 0);
     }
 
     #[test]
