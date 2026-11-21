@@ -990,6 +990,39 @@ fn a_full_arena_falls_back_to_own_blocks_and_frees_idle_textures() {
     assert!(texture.arena_offset.is_some(), "room in the arena again");
 }
 
+/// NFS UR's attract movie (2026-11-21, black with the renderer on): two
+/// 1 MiB video buffers drawn every frame, one of them new each frame, while
+/// the title's textures (~2.5 MiB) still filled the 6 MiB arena. Each new
+/// movie frame needs a fresh texture while the last frames' ones wait as
+/// retired (the GPU may read them): the arena ran full, main memory was
+/// short, and as the retired pages counted as free the arena never counted
+/// as short, so the title's idle textures never left. A full arena now
+/// frees textures no frame used for ARENA_IDLE_FRAMES (the GPU is long done
+/// with them) to make room. Scaled: 512 KiB textures, a 3 MiB arena.
+#[test]
+fn a_movie_finds_arena_room_from_idle_textures() {
+    let mut test = Test::new();
+    test.host.arena_bytes = 3 * 1024 * 1024;
+    test.host.memory = 2 * 1024 * 1024; // no room for blocks of their own
+    let unit = |offset: u32| texture(RAM_START + offset, 512, 256, format::ABGR8888);
+    let title = [unit(0), unit(0x8_0000)];
+    let movie = [unit(0x10_0000), unit(0x18_0000)];
+    test.frame(&title);
+    assert_eq!(test.host.in_arena.len(), 2);
+    for frame in 0..120u32 {
+        // The video decoder writes one buffer per frame (the first word is
+        // sampled), both are drawn.
+        test.host.write(movie[(frame % 2) as usize].address, frame + 1);
+        let lookups = test.frame(&movie);
+        if frame >= ARENA_IDLE_FRAMES + RETIRE_FRAMES + 2 {
+            for (k, lookup) in lookups.iter().enumerate() {
+                assert!(matches!(lookup, Lookup::Ready(_)), "movie frame {frame}, buffer {k}: {lookup:?}");
+                assert_eq!(test.host.shows(*lookup), test.host.data_hash(&movie[k]), "movie frame {frame}, buffer {k}");
+            }
+        }
+    }
+}
+
 /// Freed textures give their arena pages back: churning through far more
 /// textures than the arena holds never runs it out of pages, and the
 /// arena's count matches the live arena textures.

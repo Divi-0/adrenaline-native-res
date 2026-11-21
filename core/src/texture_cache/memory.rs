@@ -165,6 +165,24 @@ impl TextureCache {
         self.evict_old(oldest)
     }
 
+    /// Frees the least recently used texture in `memory` that no frame used
+    /// for `idle_frames` frames (at least `RETIRE_FRAMES`: the GPU is done
+    /// with it) right away, for room now (`evict_idle` retires it, for room
+    /// a few frames on). False if there is none.
+    fn free_idle<H: Host>(&mut self, host: &mut H, memory: Memory, idle_frames: u32) -> bool {
+        let Some(oldest) = self.least_recently_used(memory) else {
+            return false;
+        };
+        let entry = self.entries[oldest];
+        let (Some(texture), true) = (entry.texture, entry.last_used + idle_frames.max(RETIRE_FRAMES) < self.render_count) else {
+            return false;
+        };
+        self.entries[oldest].texture = None;
+        self.release(host, texture, entry.shape);
+        self.stats.evictions += 1;
+        true
+    }
+
     /// True if the arena has less than `ARENA_SLACK` free, counting the
     /// pages of retired arena textures as free (they are, a few frames on).
     fn arena_short(&self) -> bool {
@@ -242,7 +260,10 @@ impl TextureCache {
                     self.arena.free(offset, bytes);
                     break;
                 }
-                if !self.free_one_retired(host, Memory::Arena) {
+                // No room: retired arena textures the GPU is done with,
+                // then ones no frame used for a while (NFS UR's attract
+                // movie found the arena full of the title's textures).
+                if !self.free_one_retired(host, Memory::Arena) && !self.free_idle(host, Memory::Arena, ARENA_IDLE_FRAMES) {
                     break;
                 }
             }
