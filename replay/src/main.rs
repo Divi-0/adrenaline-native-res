@@ -395,8 +395,8 @@ fn run(dump_path: &str, png_path: &str, trace: bool) -> Result<(), String> {
         for (index, draw) in frame.draws().iter().enumerate() {
             let corners: Vec<String> = frame.screen_corners(draw).take(3).map(|v| format!("({:.1},{:.1} uv {:.3},{:.3})", v.x, v.y, v.u, v.v)).collect();
             println!(
-                "draw {index:3}: fb {:08x} tex {} flags {:x} scissor {},{}-{},{} {} vertices {}",
-                draw.framebuffer, draw.texture, draw.flags, draw.scissor_left, draw.scissor_top, draw.scissor_right,
+                "draw {index:3}: fb {:08x} tex {} flags {:x} blend {:08x} tests {:x} scissor {},{}-{},{} {} vertices {}",
+                draw.framebuffer, draw.texture, draw.flags, draw.blend, draw.tests, draw.scissor_left, draw.scissor_top, draw.scissor_right,
                 draw.scissor_bottom, frame.draw_index_count(draw), corners.join(" ")
             );
         }
