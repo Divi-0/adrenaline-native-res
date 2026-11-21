@@ -75,6 +75,7 @@ impl<'a> Reader<'a> {
 /// matrices added; 4: the loaded palette's address instead of its words
 /// (`recorder::LoadedPalette`); 5: each list's own offset
 /// (`DisplayList::offset`); 6: each list's context (`ge_context`; the
-/// saved states themselves are not in the snapshot). Dumps of older
+/// saved states themselves are not in the snapshot); 7: the texture
+/// generation matrix (`ge_state::Matrices::texgen`). Dumps of older
 /// versions still load.
-pub const SNAPSHOT_VERSION: u32 = 6;
+pub const SNAPSHOT_VERSION: u32 = 7;

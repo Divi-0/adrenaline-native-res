@@ -1771,3 +1771,136 @@ mod tests {
         assert_eq!(out[3].u, 0.5);
     }
 }
+
+/// Generated texture coordinates, TEXTURE_MAP_MODE 1 ("texture matrix",
+/// projection mapping), as PPSSPP's software transform makes them
+/// (SoftwareTransformCommon.cpp, GE_TEXMAP_TEXTURE_MATRIX): u, v, w = the
+/// texture generation matrix (4x3, column by column) x a source vector, and
+/// the texture scale and offset don't apply. Sources (TEXTURE_MAP_MODE
+/// bits 8-9): 0 the model-space position, 1 the vertex's texture
+/// coordinates (unscaled, z 0), 2 its normal normalized, 3 its normal.
+/// Need for Speed Underground Rivals draws its title logo, cars and menus
+/// this way (vertices with only a position).
+///
+/// Worked out per draw from the GE state (`of`), never cached with the
+/// transform: draws with it take the per-corner path (recorder.rs), which
+/// sets each vertex's u, v from it (`uv`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Texgen {
+    source: u32,
+    matrix: [f32; 12],
+    position_scale: f32,
+    texcoord_scale: f32,
+    /// PPSSPP's MatrixNeedsProjection: u and v are divided by w (per pixel
+    /// on the PSP; per vertex here, so only exact while w is the same
+    /// across a triangle).
+    pub projective: bool,
+}
+
+impl Texgen {
+    /// The texgen of a textured 3D draw with `format` in GE state `ge`;
+    /// `None` unless TEXTURE_MAP_MODE is 1.
+    pub fn of(ge: &GeState, format: VertexFormat) -> Option<Texgen> {
+        let mode = ge.register(op::TEXTURE_MAP_MODE);
+        if mode & 3 != 1 {
+            return None;
+        }
+        let source = (mode >> 8) & 3;
+        let m = ge.matrices.texgen;
+        // For the texture coordinates as source, m[8] multiplies 0.
+        let projective = m[2] != 0.0 || m[5] != 0.0 || (m[8] != 0.0 && source != 1) || m[11] != 1.0;
+        Some(Texgen { source, matrix: m, position_scale: format.position_scale(), texcoord_scale: format.texcoord_scale(), projective })
+    }
+
+    /// Whether the source is the normal (lit draws decode it; others don't).
+    pub fn needs_normal(&self) -> bool {
+        self.source >= 2
+    }
+
+    /// The texture coordinates of a vertex from its raw fields and its
+    /// normal (scaled, `VertexFormat::decode_normal`; `None`: none decoded,
+    /// taken as (0, 0, 1) like PPSSPP's default source).
+    pub fn uv(&self, raw: &Raw3d, normal: Option<[f32; 3]>) -> (f32, f32) {
+        let source = match self.source {
+            0 => raw.position.map(|value| value * self.position_scale),
+            1 => [raw.texcoord[0] * self.texcoord_scale, raw.texcoord[1] * self.texcoord_scale, 0.0],
+            2 => crate::lighting::normalize_or_001(normal.unwrap_or([0.0, 0.0, 1.0])),
+            _ => normal.unwrap_or([0.0, 0.0, 1.0]),
+        };
+        let m = &self.matrix;
+        let row = |i: usize| source[0] * m[i] + source[1] * m[3 + i] + source[2] * m[6 + i] + m[9 + i];
+        let (u, v) = (row(0), row(1));
+        if self.projective {
+            let w = row(2);
+            if w != 0.0 {
+                return (u / w, v / w);
+            }
+        }
+        (u, v)
+    }
+}
+
+#[cfg(test)]
+mod texgen_tests {
+    use super::*;
+    use crate::command::Command;
+
+    fn ge_with(mode: u32, matrix: [f32; 12]) -> GeState {
+        let mut ge = GeState::new();
+        ge.set_register(Command(((op::TEXTURE_MAP_MODE as u32) << 24) | mode));
+        ge.set_register(Command((op::TEXGEN_MATRIX_NUMBER as u32) << 24));
+        for value in matrix {
+            ge.set_register(Command(((op::TEXGEN_MATRIX_DATA as u32) << 24) | (value.to_bits() >> 8)));
+        }
+        ge
+    }
+
+    fn raw(position: [f32; 3], texcoord: [f32; 2]) -> Raw3d {
+        Raw3d { position, texcoord, color: None, weights: [0.0; MAX_WEIGHTS] }
+    }
+
+    /// 16-bit positions, no texture coordinates (NFS UR's title quads).
+    const POSITION_16: VertexFormat = VertexFormat(2 << 7);
+
+    #[test]
+    fn only_mode_1_is_texgen() {
+        let matrix = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0];
+        assert!(Texgen::of(&ge_with(0, matrix), POSITION_16).is_none());
+        assert!(Texgen::of(&ge_with(2, matrix), POSITION_16).is_none());
+        assert!(Texgen::of(&ge_with(1, matrix), POSITION_16).is_some());
+    }
+
+    #[test]
+    fn position_source_maps_the_model_position() {
+        // u = x / 2 + 0.5, v = -y / 2 + 0.5 (columns: x, y, z, translation).
+        let matrix = [0.5, 0.0, 0.0, 0.0, -0.5, 0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 1.0];
+        let texgen = Texgen::of(&ge_with(1, matrix), POSITION_16).unwrap();
+        assert!(!texgen.projective);
+        // Raw 16-bit positions: 16384 = 0.5.
+        assert_eq!(texgen.uv(&raw([16384.0, -32768.0, 0.0], [0.0; 2]), None), (0.75, 1.0));
+    }
+
+    #[test]
+    fn texcoord_source_ignores_the_third_column() {
+        // u8 texture coordinates (1/128); m[8] multiplies z = 0.
+        let format = VertexFormat(1 | 2 << 7);
+        let matrix = [2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 5.0, 0.25, 0.0, 1.0];
+        let texgen = Texgen::of(&ge_with(1 | 1 << 8, matrix), format).unwrap();
+        assert!(!texgen.projective);
+        assert_eq!(texgen.uv(&raw([0.0; 3], [64.0, 32.0]), None), (1.25, 0.5));
+    }
+
+    #[test]
+    fn normal_sources_and_projection() {
+        let matrix = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0];
+        let normalized = Texgen::of(&ge_with(1 | 2 << 8, matrix), POSITION_16).unwrap();
+        // w = z + 1 = 1.8 for the normalized (0.6, 0, 0.8).
+        assert!(normalized.projective);
+        let (u, v) = normalized.uv(&raw([0.0; 3], [0.0; 2]), Some([3.0, 0.0, 4.0]));
+        assert!((u - 0.6 / 1.8).abs() < 1e-6 && v == 0.0, "{u} {v}");
+        let plain = Texgen::of(&ge_with(1 | 3 << 8, matrix), POSITION_16).unwrap();
+        let (u, _) = plain.uv(&raw([0.0; 3], [0.0; 2]), Some([3.0, 0.0, 4.0]));
+        assert!((u - 3.0 / 5.0).abs() < 1e-6, "{u}");
+        assert!(plain.needs_normal() && !Texgen::of(&ge_with(1, matrix), POSITION_16).unwrap().needs_normal());
+    }
+}

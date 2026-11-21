@@ -84,6 +84,10 @@ pub mod op {
     /// like the others. A skinned vertex's position is the sum of its
     /// weights times each bone matrix applied to it (before the world matrix).
     pub const BONE_MATRIX_NUMBER: u8 = 0x2A;
+    /// Texture generation matrix (TEXTURE_MAP_MODE 1, "texture matrix"):
+    /// 4x3 like the world matrix, uploaded the same way.
+    pub const TEXGEN_MATRIX_NUMBER: u8 = 0x40;
+    pub const TEXGEN_MATRIX_DATA: u8 = 0x41;
     pub const BONE_MATRIX_DATA: u8 = 0x2B;
     /// Viewport (24-bit floats): screen = center + scale * clip / w.
     pub const VIEWPORT_X_SCALE: u8 = 0x42;

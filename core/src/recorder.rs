@@ -29,7 +29,7 @@ use crate::memory::{physical, PspMemory};
 use crate::snapshot::{Reader, Writer};
 use crate::stats::FrameStats;
 use crate::texture::{describe_current_texture, is_palette_format};
-use crate::transform::{clip_triangle, RowTransform, Transform, TransformCache};
+use crate::transform::{clip_triangle, RowTransform, Texgen, Transform, TransformCache};
 use crate::vertex::{CommonLayout, IndexFormat, Raw3d, Vertex, VertexBytes, VertexFormat, VertexLayout, MAX_WEIGHTS};
 
 /// Palettes are up to 1 KiB; allow 2 KiB like PPSSPP for odd games.
@@ -1063,7 +1063,12 @@ fn record_batch_vertices(
         let gpu = GpuRun { wanted: prepared.gpu_transform, cache: cache.as_deref_mut(), colors, lighting: prepared.gpu_lighting() };
         let transform = job_transform.built();
         let previous = crate::phase::recorder::enter(crate::phase::recorder::CPU_DECODE);
-        let run = record_3d_run(geometry, memory, format, layout, transform, chunk, draw.first_vertex, &color_of, gpu);
+        // Texgen draws: per PRIM below (`record_vertices_now`'s corner path).
+        let run = if prepared.texgen.is_some() {
+            Run::NotHandled
+        } else {
+            record_3d_run(geometry, memory, format, layout, transform, chunk, draw.first_vertex, &color_of, gpu)
+        };
         crate::phase::recorder::leave(previous);
         match run {
             Run::Recorded { transform, cached } => {
@@ -1124,6 +1129,10 @@ pub(crate) struct Prepared {
     gpu_transform: bool,
     /// Lit 3D draws without lights: their colours (`AmbientLighting`).
     ambient_lighting: Option<AmbientLighting>,
+    /// Generated texture coordinates (TEXTURE_MAP_MODE 1, `Texgen`): the
+    /// draw takes neither the GPU transform nor the run path, and the
+    /// per-corner path sets each vertex's u, v from it.
+    texgen: Option<Texgen>,
 }
 
 /// The colour of a lit 3D vertex when no light is on (MTX's whole world,
@@ -1198,6 +1207,7 @@ impl Prepared {
         uses_texture_alpha: false,
         gpu_transform: false,
         ambient_lighting: None,
+        texgen: None,
     };
 
     /// Whether the GPU may light this draw's lit vertices (nativeres_3d_v.cg):
@@ -1305,6 +1315,7 @@ fn prepare_now(
     let format = ge.vertex_format();
     let texel_scale = if format.is_through() { state.texel_scale } else { (1.0, 1.0) };
     let mut ambient_lighting = None;
+    let texgen = if textured && !format.is_through() { Texgen::of(ge, format) } else { None };
     if !format.is_through() && !crate::bench::experiment(crate::bench::SKIP_TRANSFORM_LOOKUP) {
         let transform = draw_states.transforms.get(ge, format);
         if transform.has_fog() {
@@ -1324,7 +1335,7 @@ fn prepare_now(
         // Separate specular: exact where the GPU lights the draw (its
         // shader adds the specular part after texturing) and for untextured
         // draws (clamped parts added, the same as clamping the sum).
-        let gpu_lit = draw_states.gpu_transform && textured && !format.is_through();
+        let gpu_lit = draw_states.gpu_transform && textured && !format.is_through() && texgen.is_none();
         match transform.lighting() {
             Some(lights) if lights.approximated() && textured && !(gpu_lit && lights.gpu_ready()) => {
                 approximations |= approx::SEPARATE_SPECULAR
@@ -1332,7 +1343,9 @@ fn prepare_now(
             None if lit && ambient_lighting.is_none() => approximations |= approx::LIGHTS_LEFT_OUT,
             _ => {}
         }
-        if textured && ge.register(op::TEXTURE_MAP_MODE) & 3 != 0 {
+        // Texgen: exact for mode 1 (`Texgen`) unless projective (divided
+        // per vertex); mode 2 (shade mapping) not done yet.
+        if textured && ge.register(op::TEXTURE_MAP_MODE) & 3 != 0 && texgen.is_none_or(|texgen| texgen.projective) {
             approximations |= approx::TEXGEN;
         }
     }
@@ -1346,8 +1359,9 @@ fn prepare_now(
         double_source_alpha: state.double_source_alpha,
         function,
         uses_texture_alpha,
-        gpu_transform: draw_states.gpu_transform && textured && !format.is_through(),
+        gpu_transform: draw_states.gpu_transform && textured && !format.is_through() && texgen.is_none(),
         ambient_lighting,
+        texgen,
     })
 }
 
@@ -1453,7 +1467,7 @@ fn record_on_cpu(
     // 3D strips, fans and triangle lists of consecutive vertices: read and
     // transform the whole run at once.
     if let Some(transform) = transform {
-        if primitive_type != primitive::RECTANGLES && format.index_format() == IndexFormat::None {
+        if primitive_type != primitive::RECTANGLES && format.index_format() == IndexFormat::None && prepared.texgen.is_none() {
             let run_color = |color: Option<u32>| frame_color(prepared.base_color(color, material_color));
             let gpu = GpuRun { wanted: prepared.gpu_transform, cache, colors: prepared.color_key(material_color), lighting: prepared.gpu_lighting() };
             match record_3d_run(geometry, memory, format, layout, transform, &[call], first_vertex, &run_color, gpu) {
@@ -1555,10 +1569,16 @@ fn record_on_cpu(
                             };
                             let color = frame_color(base);
                             match transform.frame_vertex(&raw, color) {
-                                Some(vertex) => match geometry.add_vertex(first_vertex, vertex) {
-                                    Some(number) => Corner::OnScreen(number),
-                                    None => Corner::FrameFull,
-                                },
+                                Some(mut vertex) => {
+                                    if let Some(texgen) = &prepared.texgen {
+                                        let normal = if texgen.needs_normal() { corners.get_3d_lit(index).and_then(|(_, normal)| normal) } else { None };
+                                        (vertex.u, vertex.v) = texgen.uv(&raw, normal);
+                                    }
+                                    match geometry.add_vertex(first_vertex, vertex) {
+                                        Some(number) => Corner::OnScreen(number),
+                                        None => Corner::FrameFull,
+                                    }
+                                }
                                 None => Corner::BehindNearPlane,
                             }
                         });
@@ -2052,7 +2072,7 @@ fn raw_color_fields(
 /// `lights_gpu_ready`: `None` without lights, else whether the GPU can
 /// light with them (`Lights::gpu_ready`).
 fn may_go_raw(prepared: &Prepared, lights_gpu_ready: Option<bool>, format: VertexFormat) -> bool {
-    if format.morph_count() != 1 {
+    if format.morph_count() != 1 || prepared.texgen.is_some() {
         return false;
     }
     match lights_gpu_ready {

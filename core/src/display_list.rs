@@ -793,7 +793,10 @@ fn is_address(opcode: u8) -> bool {
 }
 
 fn is_matrix_data(opcode: u8) -> bool {
-    matches!(opcode, op::WORLD_MATRIX_DATA | op::VIEW_MATRIX_DATA | op::PROJECTION_MATRIX_DATA | op::BONE_MATRIX_DATA)
+    matches!(
+        opcode,
+        op::WORLD_MATRIX_DATA | op::VIEW_MATRIX_DATA | op::PROJECTION_MATRIX_DATA | op::BONE_MATRIX_DATA | op::TEXGEN_MATRIX_DATA
+    )
 }
 
 /// One side of a block transfer, from its address, width and position

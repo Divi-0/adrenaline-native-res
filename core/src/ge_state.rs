@@ -96,7 +96,7 @@ const COMMAND_FLAGS: [u8; 256] = command_flag_table();
 /// `GeState::upload_matrix_run` sets a DATA register without the state
 /// counters: none may count in them.
 const MATRIX_DATA_FLAGS_ARE_MATRIX_ONLY: () = {
-    let data = [op::WORLD_MATRIX_DATA, op::VIEW_MATRIX_DATA, op::PROJECTION_MATRIX_DATA, op::BONE_MATRIX_DATA];
+    let data = [op::WORLD_MATRIX_DATA, op::VIEW_MATRIX_DATA, op::PROJECTION_MATRIX_DATA, op::BONE_MATRIX_DATA, op::TEXGEN_MATRIX_DATA];
     let mut index = 0;
     while index < data.len() {
         assert!(COMMAND_FLAGS[data[index] as usize] == command_flags::MATRIX);
@@ -134,6 +134,8 @@ const fn command_flag_table() -> [u8; 256] {
         op::PROJECTION_MATRIX_DATA,
         op::BONE_MATRIX_NUMBER,
         op::BONE_MATRIX_DATA,
+        op::TEXGEN_MATRIX_NUMBER,
+        op::TEXGEN_MATRIX_DATA,
     ];
     let mut index = 0;
     while index < matrix_commands.len() {
@@ -181,7 +183,7 @@ fn take_matrix(matrix: &mut [f32], words: &[u32]) -> u32 {
 /// Number of skinning bone matrices.
 pub const BONE_COUNT: usize = 8;
 
-/// The world, view, projection and bone matrices, as uploaded element by
+/// The world, view, projection, bone and texture generation matrices, as uploaded element by
 /// element (`op::WORLD_MATRIX_NUMBER` and friends). Column by column: the
 /// world, view and bone matrices have 4 columns of 3 rows, the projection 4
 /// of 4. The bones are 8 such matrices back to back (element 12 is the first
@@ -192,11 +194,15 @@ pub struct Matrices {
     pub view: [f32; 12],
     pub projection: [f32; 16],
     pub bones: [f32; 12 * BONE_COUNT],
+    /// Texture generation (`op::TEXGEN_MATRIX_DATA`), 4x3: the texture
+    /// coordinates of TEXTURE_MAP_MODE 1 (`transform::Texgen`).
+    pub texgen: [f32; 12],
     /// The element the next DATA command of each matrix writes.
     world_next: u32,
     view_next: u32,
     projection_next: u32,
     bone_next: u32,
+    texgen_next: u32,
 }
 
 impl Matrices {
@@ -206,10 +212,12 @@ impl Matrices {
             view: [0.0; 12],
             projection: [0.0; 16],
             bones: [0.0; 12 * BONE_COUNT],
+            texgen: [0.0; 12],
             world_next: 0,
             view_next: 0,
             projection_next: 0,
             bone_next: 0,
+            texgen_next: 0,
         }
     }
 
@@ -254,10 +262,15 @@ impl Matrices {
                 self.bone_next = data & 0x7F;
                 return Uploaded::Nothing;
             }
+            op::TEXGEN_MATRIX_NUMBER => {
+                self.texgen_next = data & 0xF;
+                return Uploaded::Nothing;
+            }
             op::WORLD_MATRIX_DATA => (write(&mut self.world, &mut self.world_next, data), Uploaded::Matrix),
             op::VIEW_MATRIX_DATA => (write(&mut self.view, &mut self.view_next, data), Uploaded::Matrix),
             op::PROJECTION_MATRIX_DATA => (write(&mut self.projection, &mut self.projection_next, data), Uploaded::Matrix),
             op::BONE_MATRIX_DATA => (write(&mut self.bones, &mut self.bone_next, data), Uploaded::Bone),
+            op::TEXGEN_MATRIX_DATA => (write(&mut self.texgen, &mut self.texgen_next, data), Uploaded::Matrix),
             _ => return Uploaded::Nothing,
         };
         if changed {
@@ -277,6 +290,7 @@ impl Matrices {
             op::VIEW_MATRIX_DATA => (&mut self.view, &mut self.view_next),
             op::PROJECTION_MATRIX_DATA => (&mut self.projection, &mut self.projection_next),
             op::BONE_MATRIX_DATA => (&mut self.bones, &mut self.bone_next),
+            op::TEXGEN_MATRIX_DATA => (&mut self.texgen, &mut self.texgen_next),
             _ => return (0, 0),
         };
         // The position in a local, written back once: through `next` the
@@ -317,6 +331,10 @@ impl Matrices {
             out.u32(value.to_bits());
         }
         out.u32(self.bone_next);
+        for value in &self.texgen {
+            out.u32(value.to_bits());
+        }
+        out.u32(self.texgen_next);
     }
 
     /// `version` of the snapshot: bones since version 3 (older dumps keep
@@ -334,6 +352,12 @@ impl Matrices {
                 *value = f32::from_bits(input.u32()?);
             }
             self.bone_next = input.u32()?;
+        }
+        if version >= 7 {
+            for value in self.texgen.iter_mut() {
+                *value = f32::from_bits(input.u32()?);
+            }
+            self.texgen_next = input.u32()?;
         }
         Some(())
     }
@@ -501,12 +525,14 @@ impl GeState {
         let matrix_differences = take_matrix(&mut matrices.bones, &block[GE_STATE_BONES..GE_STATE_WORLD])
             + take_matrix(&mut matrices.world, &block[GE_STATE_WORLD..GE_STATE_VIEW])
             + take_matrix(&mut matrices.view, &block[GE_STATE_VIEW..GE_STATE_PROJECTION])
-            + take_matrix(&mut matrices.projection, &block[GE_STATE_PROJECTION..GE_STATE_TEXGEN]);
+            + take_matrix(&mut matrices.projection, &block[GE_STATE_PROJECTION..GE_STATE_TEXGEN])
+            + take_matrix(&mut matrices.texgen, &block[GE_STATE_TEXGEN..GE_STATE_WORDS]);
         // The game sends a NUMBER command before its DATA commands.
         matrices.world_next = 0;
         matrices.view_next = 0;
         matrices.projection_next = 0;
         matrices.bone_next = 0;
+        matrices.texgen_next = 0;
         self.matrix_generation = self.matrix_generation.wrapping_add(1);
         self.bone_generation = self.bone_generation.wrapping_add(1);
         (register_differences, matrix_differences)
@@ -847,10 +873,11 @@ mod tests {
             seed ^= seed << 5;
             seed
         };
-        let numbers = [op::WORLD_MATRIX_NUMBER, op::VIEW_MATRIX_NUMBER, op::PROJECTION_MATRIX_NUMBER, op::BONE_MATRIX_NUMBER];
-        let data = [op::WORLD_MATRIX_DATA, op::VIEW_MATRIX_DATA, op::PROJECTION_MATRIX_DATA, op::BONE_MATRIX_DATA];
+        let numbers =
+            [op::WORLD_MATRIX_NUMBER, op::VIEW_MATRIX_NUMBER, op::PROJECTION_MATRIX_NUMBER, op::BONE_MATRIX_NUMBER, op::TEXGEN_MATRIX_NUMBER];
+        let data = [op::WORLD_MATRIX_DATA, op::VIEW_MATRIX_DATA, op::PROJECTION_MATRIX_DATA, op::BONE_MATRIX_DATA, op::TEXGEN_MATRIX_DATA];
         for _ in 0..2000 {
-            let kind = (random() % 4) as usize;
+            let kind = (random() % 5) as usize;
             let start = cmd(numbers[kind], random() % 20);
             slow.set_register(start);
             fast.set_register(start);

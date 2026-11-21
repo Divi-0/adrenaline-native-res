@@ -19,7 +19,8 @@
 
 use nativeres_core::blend::{channel_mask, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_FIX_B_SHIFT, BLEND_PREMULTIPLY_SHIFT};
 use nativeres_core::frame::{draw_flags, test_flags, texture_flags, Draw, Frame, FrameVertex, TextureDescriptor};
-use nativeres_core::texture::{data_size, decode_texture};
+use nativeres_core::offscreen;
+use nativeres_core::texture::{data_size, decode_texture, format};
 
 use crate::dump_file::{DumpMemory, OriginalPicture};
 
@@ -142,9 +143,40 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
         let (x, y) = (x.trim().parse::<usize>().ok()?, y.trim().parse::<usize>().ok()?);
         (x < WIDTH && y < HEIGHT).then_some(y * WIDTH + x)
     });
+    // Off-screen framebuffers the frame samples (core offscreen.rs): a
+    // picture of their own, cleared to opaque black like a new target on the
+    // Vita; their draws go there in the frame's order.
+    let offscreen_framebuffers = offscreen::sampled(frame.draws(), frame.textures(), frame.shown_framebuffer);
+    let mut offscreen: Vec<(u32, Vec<u32>, Vec<f32>)> = offscreen_framebuffers
+        .iter()
+        .filter(|&&framebuffer| framebuffer != 0)
+        .map(|&framebuffer| (framebuffer, vec![0xFF00_0000u32; WIDTH * HEIGHT], vec![0.0f32; WIDTH * HEIGHT]))
+        .collect();
     for (index, draw) in frame.draws().iter().enumerate().take(max_draws) {
         let before = watched.map(|at| screen[at]);
-        draw_one(&mut screen, &mut depth, frame, &textures, draw);
+        // A texture reading an off-screen picture: that picture as drawn so far.
+        let from_target = (draw.flags & draw_flags::TEXTURED != 0)
+            .then(|| frame.textures().get(draw.texture as usize))
+            .flatten()
+            .and_then(|texture| {
+                let (_, picture, _) = offscreen.iter().find(|(framebuffer, _, _)| offscreen::reads_framebuffer(texture, *framebuffer))?;
+                Some(target_texture(texture, picture))
+            });
+        let mut drawn_textures;
+        let draw_textures: &[Option<Texture>] = match from_target {
+            Some(texture) => {
+                drawn_textures = Vec::with_capacity(textures.len());
+                drawn_textures.extend(textures.iter().map(|_| None));
+                drawn_textures[draw.texture as usize] = Some(texture);
+                &drawn_textures
+            }
+            None => &textures,
+        };
+        if draw.framebuffer == frame.shown_framebuffer {
+            draw_one(&mut screen, &mut depth, frame, draw_textures, draw);
+        } else if let Some((_, picture, picture_depth)) = offscreen.iter_mut().find(|(framebuffer, _, _)| *framebuffer == draw.framebuffer) {
+            draw_one(picture, picture_depth, frame, draw_textures, draw);
+        }
         if let (Some(at), Some(before)) = (watched, before) {
             if screen[at] != before {
                 println!("pixel: draw {index} {before:08x} -> {:08x} texture {} {:x?}", screen[at], draw.texture, frame.textures().get(draw.texture as usize));
@@ -159,12 +191,26 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
     screen
 }
 
-/// Draws one of the frame's draws into `screen`.
-fn draw_one(screen: &mut [u32], depth: &mut [f32], frame: &Frame, textures: &[Option<Texture>], draw: &Draw) {
-    // Off-screen rendering isn't supported yet (same as on the Vita).
-    if draw.framebuffer != frame.shown_framebuffer {
-        return;
+/// `texture` read from an off-screen picture (960x544, PSP pixels doubled):
+/// its texel (x, y) is the picture's pixel (2x, 2y); outside the PSP's
+/// 480x272 black. A 16-bit 565 framebuffer has no alpha: read opaque, as
+/// with the texture's alpha ignored.
+fn target_texture(texture: &TextureDescriptor, picture: &[u32]) -> Texture {
+    let (width, height) = (texture.width as usize, texture.height as usize);
+    let opaque = texture.format == format::BGR5650 || texture.flags & texture_flags::IGNORE_ALPHA != 0;
+    let mut pixels = vec![0u32; width * height];
+    for y in 0..height.min(HEIGHT / 2) {
+        for x in 0..width.min(WIDTH / 2) {
+            let pixel = picture[2 * y * WIDTH + 2 * x];
+            pixels[y * width + x] = if opaque { pixel | 0xFF00_0000 } else { pixel };
+        }
     }
+    Texture { width, height, pixels }
+}
+
+/// Draws one of the frame's draws into `screen` (the shown framebuffer's
+/// picture or an off-screen one).
+fn draw_one(screen: &mut [u32], depth: &mut [f32], frame: &Frame, textures: &[Option<Texture>], draw: &Draw) {
     let texture = if draw.flags & draw_flags::TEXTURED != 0 {
         match textures.get(draw.texture as usize) {
             Some(Some(texture)) => Some(texture),
@@ -295,7 +341,11 @@ fn draw_triangle(screen: &mut [u32], depth: &mut [f32], draw: &Draw, texture: Op
             let linear = [w0 / area, w1 / area, w2 / area];
             // Depth is z / w, which is linear on the screen.
             let index = y as usize * WIDTH + x as usize;
-            let z = linear[0] * corners[0].z + linear[1] * corners[1].z + linear[2] * corners[2].z;
+            // The PSP's depth buffer holds 16-bit values: compared as such,
+            // a draw over another at the same depth passes "<=" everywhere
+            // (in floats the interpolation's rounding made every other pixel
+            // fail: NFS UR's title cars over its black quad).
+            let z = ((linear[0] * corners[0].z + linear[1] * corners[1].z + linear[2] * corners[2].z) * 65535.0).round() / 65535.0;
             if depth_test && !passes(depth_function, z, depth[index]) {
                 continue;
             }

@@ -129,7 +129,7 @@ fn inverse_sqrt(x: f32) -> f32 {
 }
 
 /// `v` normalized; (0, 0, 1) for the zero vector (PPSSPP's normalizeOr001).
-fn normalize_or_001(v: [f32; 3]) -> [f32; 3] {
+pub(crate) fn normalize_or_001(v: [f32; 3]) -> [f32; 3] {
     let length2 = dot(v, v);
     if !(length2 > 0.0) || !length2.is_finite() {
         return [0.0, 0.0, 1.0];
