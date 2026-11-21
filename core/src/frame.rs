@@ -898,6 +898,14 @@ pub struct Frame {
     /// `draw_flags::DITHER`: the one of the frame's last draw whose state was
     /// worked out with dithering on. Part of the catalog.
     pub dither_matrix: u64,
+    /// 1 + the last draw index a draw that may paint over everything before
+    /// it can have (core `hidden_draws::maybe_occluder`, checked when each
+    /// draw is finished, while its state and vertices are at hand; 0: none):
+    /// `hidden_draws::find` looks no further (MHF: only the clear at draw
+    /// 0; looking through all draws cost its intro ~0.25 ms on the display
+    /// thread, a cache miss per draw). Part of the geometry. At the end: the
+    /// offsets above stay.
+    pub occluders_end: u32,
 }
 
 /// `Frame::draw_ring_index` of a draw whose list isn't in the ring.
@@ -948,6 +956,7 @@ impl Frame {
         self.raw_camera_last = [0, 0];
         self.light_set_last = [0; 4];
         self.draw_merge_floor = 0;
+        self.occluders_end = 0;
         self.palette_count = 0;
         self.palette_slots = [0; PALETTE_SLOTS];
     }
@@ -1015,6 +1024,7 @@ impl Frame {
             raw_camera_last,
             light_set_last,
             draw_merge_floor,
+            occluders_end,
             ..
         } = self;
         (
@@ -1024,6 +1034,7 @@ impl Frame {
                 draw_count,
                 overflowed: geometry_overflowed,
                 merge_floor: draw_merge_floor,
+                occluders_end,
                 vertices,
                 indices,
                 draws,
@@ -1081,6 +1092,7 @@ impl Frame {
             draw_count: &mut *addr_of_mut!((*frame).draw_count),
             overflowed: &mut *addr_of_mut!((*frame).geometry_overflowed),
             merge_floor: &mut *addr_of_mut!((*frame).draw_merge_floor),
+            occluders_end: &mut *addr_of_mut!((*frame).occluders_end),
             vertices: &mut *addr_of_mut!((*frame).vertices),
             indices: &mut *addr_of_mut!((*frame).indices),
             draws: &mut *addr_of_mut!((*frame).draws),
@@ -1652,6 +1664,8 @@ pub struct Geometry<'a> {
     overflowed: &'a mut u32,
     /// `Frame::draw_merge_floor`: draws below it are never merged with.
     merge_floor: &'a mut u32,
+    /// `Frame::occluders_end`.
+    occluders_end: &'a mut u32,
     vertices: &'a mut [FrameVertex],
     indices: &'a mut [u16],
     draws: &'a mut [Draw],
@@ -1700,13 +1714,14 @@ impl<'a> Geometry<'a> {
         indices: &'a mut [u16],
         raw: Option<RawTables<'a>>,
     ) -> Geometry<'a> {
-        let ListCounts { vertex_count, index_count, draw_count, overflowed, merge_floor, transform_count } = counts;
+        let ListCounts { vertex_count, index_count, draw_count, overflowed, merge_floor, transform_count, occluders_end } = counts;
         Geometry {
             vertex_count,
             index_count,
             draw_count,
             overflowed,
             merge_floor,
+            occluders_end,
             vertices: &mut [],
             indices,
             draws,
@@ -1770,11 +1785,20 @@ pub struct ListCounts {
     pub overflowed: u32,
     pub merge_floor: u32,
     pub transform_count: u32,
+    /// Unused: such a geometry holds raw draws only, never occluders.
+    pub occluders_end: u32,
 }
 
 impl ListCounts {
-    pub const EMPTY: ListCounts =
-        ListCounts { vertex_count: 0, index_count: 0, draw_count: 0, overflowed: 0, merge_floor: 0, transform_count: 0 };
+    pub const EMPTY: ListCounts = ListCounts {
+        vertex_count: 0,
+        index_count: 0,
+        draw_count: 0,
+        overflowed: 0,
+        merge_floor: 0,
+        transform_count: 0,
+        occluders_end: 0,
+    };
 }
 
 impl RawTables<'_> {
@@ -2190,6 +2214,11 @@ impl Geometry<'_> {
         if draw.index_count == 0 {
             self.undo_draw(&draw);
             return;
+        }
+        let vertices = &self.vertices[draw.first_vertex as usize..*self.vertex_count as usize];
+        if crate::hidden_draws::maybe_occluder(&draw, vertices) {
+            // Its index if it stays a draw of its own (merged: one less).
+            *self.occluders_end = *self.draw_count + 1;
         }
 
         if let Some(previous) = mergeable(self.draws, *self.merge_floor, *self.draw_count) {

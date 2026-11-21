@@ -393,7 +393,7 @@ fn run(dump_path: &str, png_path: &str, trace: bool) -> Result<(), String> {
         }
         // The recorded draws, as the Vita gets them.
         for (index, draw) in frame.draws().iter().enumerate() {
-            let corners: Vec<String> = frame.screen_corners(draw).take(3).map(|v| format!("({:.1},{:.1} uv {:.3},{:.3})", v.x, v.y, v.u, v.v)).collect();
+            let corners: Vec<String> = frame.screen_corners(draw).take(3).map(|v| format!("({:.1},{:.1} z {:.6} uv {:.3},{:.3} c {:08x})", v.x, v.y, v.z, v.u, v.v, v.color)).collect();
             println!(
                 "draw {index:3}: fb {:08x} tex {} flags {:x} blend {:08x} tests {:x} scissor {},{}-{},{} {} vertices {}",
                 draw.framebuffer, draw.texture, draw.flags, draw.blend, draw.tests, draw.scissor_left, draw.scissor_top, draw.scissor_right,

@@ -19,8 +19,9 @@
 
 use nativeres_core::blend::{channel_mask, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_FIX_B_SHIFT, BLEND_PREMULTIPLY_SHIFT};
 use nativeres_core::frame::{draw_flags, test_flags, texture_flags, Draw, Frame, FrameVertex, TextureDescriptor};
+use nativeres_core::hidden_draws::{self, HiddenDraws};
 use nativeres_core::offscreen;
-use nativeres_core::texture::{data_size, decode_texture, format};
+use nativeres_core::texture::{data_size, decode_texture, format, ALL_ROWS_OPAQUE};
 
 use crate::dump_file::{DumpMemory, OriginalPicture};
 
@@ -152,7 +153,31 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
         .filter(|&&framebuffer| framebuffer != 0)
         .map(|&framebuffer| (framebuffer, vec![0xFF00_0000u32; WIDTH * HEIGHT], vec![0.0f32; WIDTH * HEIGHT]))
         .collect();
+    // Draws a later draw paints over completely (core hidden_draws) are
+    // left out, as on the Vita; the texels' opacity from our own decoding
+    // (textures reading a framebuffer: unknown). REPLAY_NO_HIDE=1 draws
+    // them all, for comparing.
+    let mut hidden = Box::new(HiddenDraws::new());
+    if std::env::var_os("REPLAY_NO_HIDE").is_none() {
+        let rows = |index: usize| -> u16 {
+            let descriptor = &frame.textures()[index];
+            let reads_framebuffer = other_framebuffer(descriptor, frame)
+                || frame.draws().iter().any(|draw| offscreen::reads_framebuffer(descriptor, draw.framebuffer));
+            match textures.get(index) {
+                Some(Some(texture)) if !reads_framebuffer => opaque_rows(texture),
+                _ => 0,
+            }
+        };
+        hidden_draws::find(frame, &rows, &mut hidden);
+        if hidden.count() > 0 {
+            let list: Vec<usize> = (0..frame.draws().len()).filter(|&index| hidden.is_hidden(index)).collect();
+            println!("hidden draws: {} (painted over by a later draw): {list:?}", hidden.count());
+        }
+    }
     for (index, draw) in frame.draws().iter().enumerate().take(max_draws) {
+        if hidden.is_hidden(index) {
+            continue;
+        }
         let before = watched.map(|at| screen[at]);
         // A texture reading an off-screen picture: that picture as drawn so far.
         let from_target = (draw.flags & draw_flags::TEXTURED != 0)
@@ -189,6 +214,16 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
         *pixel |= 0xFF00_0000;
     }
     screen
+}
+
+/// How many rows from the top of `texture` have only texels of alpha 255
+/// (`ALL_ROWS_OPAQUE`: all), as core `texture::opaque_rows` says from the
+/// source.
+fn opaque_rows(texture: &Texture) -> u16 {
+    match texture.pixels.chunks(texture.width.max(1)).position(|row| row.iter().any(|texel| texel >> 24 != 0xFF)) {
+        Some(row) => row.min(u16::MAX as usize - 1) as u16,
+        None => ALL_ROWS_OPAQUE,
+    }
 }
 
 /// `texture` read from an off-screen picture (960x544, PSP pixels doubled):

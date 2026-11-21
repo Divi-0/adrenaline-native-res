@@ -19,6 +19,7 @@ use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, Ordering};
 use nativeres_core::blend::{self, BLEND_ENABLED};
 use nativeres_core::display_loop::AfterQuit;
 use nativeres_core::frame::{draw_flags, Frame, MAX_TEXTURES};
+use nativeres_core::hidden_draws::{self, HiddenDraws};
 use nativeres_core::offscreen;
 use nativeres_core::opaque_source::palette_texture_opaque;
 use nativeres_core::texture::ALL_ROWS_OPAQUE;
@@ -44,6 +45,15 @@ pub static SMOOTH_TEXTURES: AtomicU8 = AtomicU8::new(0);
 /// the game: the frame is redrawn).
 pub static DRAW_ONLY_FIRST: AtomicU32 = AtomicU32::new(0);
 pub static DRAW_ONLY_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Draws into the shown framebuffer that a later draw paints over
+/// completely (core `hidden_draws`: colour, alpha and the depths that
+/// matter) are left out: the same picture, less GPU work (NFS UR's title:
+/// its trail composites under an opaque full-screen layer). Only while the
+/// shown framebuffer is drawn in one scene (depth doesn't last from one
+/// scene to the next) and no `DRAW_ONLY_COUNT` prefix is set. 1 = on
+/// (default), 0 = every draw drawn.
+pub static HIDE_DRAWS: AtomicI32 = AtomicI32::new(1);
 
 /// Our targets' alpha holds the PSP's stencil values only while draws keep
 /// it (colour mask RGB, `blend::BLEND_WRITES_ALPHA`), which costs the GPU
@@ -164,6 +174,10 @@ pub struct FrameLoop {
     /// direct colour ones from the cache (`texture::opaque_rows`); 0 for the
     /// others.
     opaque_rows: [u16; MAX_TEXTURES],
+    /// This frame's draws a later one paints over (`HIDE_DRAWS`), and
+    /// whether they are left out (`hiding`: not in a frame drawn in runs).
+    hidden: HiddenDraws,
+    hiding: bool,
     /// The game was quit: its frames still in the handover are never shown.
     after_quit: AfterQuit,
 }
@@ -185,6 +199,8 @@ static FRAME_LOOP: SingleThreaded<FrameLoop> = SingleThreaded::new(FrameLoop {
     waiting: [0; MAX_TEXTURES],
     uv_scales: [[1.0; 2]; MAX_TEXTURES],
     opaque_rows: [0; MAX_TEXTURES],
+    hidden: HiddenDraws::new(),
+    hiding: false,
     after_quit: AfterQuit::new(),
 });
 
@@ -412,6 +428,9 @@ impl FrameLoop {
             stats().fallback_frames += 1;
             return Outcome::NotYet;
         }
+        // Right after `waits_for_textures`, which brought the draws into the
+        // cache (read cold, they cost MHF's intro ~0.25 ms here).
+        self.find_hidden(frame);
         // Textures the game rewrote after the GE drew this frame (MTX's
         // menus load the next screen's pictures while the old screen's last
         // frame is on its way; decoded now they showed as noise or wrong
@@ -565,6 +584,20 @@ impl FrameLoop {
         }
     }
 
+    /// The frame's draws a later draw paints over completely (core
+    /// `hidden_draws`, `HIDE_DRAWS`), from the textures' opaque rows.
+    fn find_hidden(&mut self, frame: &Frame) {
+        self.hiding = HIDE_DRAWS.load(Ordering::Relaxed) != 0 && DRAW_ONLY_COUNT.load(Ordering::Relaxed) == 0;
+        if !self.hiding {
+            return;
+        }
+        // Timed only with per-draw timing on (two clock reads cost ~10 us).
+        let start = draw::draw_clock();
+        let rows = &self.opaque_rows;
+        hidden_draws::find(frame, &|texture| rows.get(texture).copied().unwrap_or(0), &mut self.hidden);
+        stats().hidden_us += draw::draw_clock().wrapping_sub(start);
+    }
+
     /// The colour tables of the frame's index textures: a palette table
     /// (palettes.rs) or, without a free one, the texture's own table (as
     /// before: if the palette changes, a frame still on the GPU may see the
@@ -689,6 +722,10 @@ impl FrameLoop {
             if draw.framebuffer != framebuffer || skip & 32 != 0 {
                 continue;
             }
+            if self.hiding && self.hidden.is_hidden(i) {
+                stats().hidden_draws += 1;
+                continue;
+            }
             if only_count != 0 && (i < only_first as usize || i - only_first as usize >= only_count as usize) {
                 continue;
             }
@@ -740,6 +777,9 @@ impl FrameLoop {
             }
             end_result = self.draw_scene(targets, frame, target, shown, 0..draws.len(), true).min(end_result);
         } else {
+            // The shown framebuffer in several scenes: depths don't last
+            // from one to the next, so nothing is left out.
+            self.hiding = false;
             let drawn = |framebuffer: u32| framebuffer == shown || has_target(framebuffer);
             let last = offscreen::runs(draws).filter(|(framebuffer, _)| drawn(*framebuffer)).count();
             for (number, (framebuffer, range)) in offscreen::runs(draws).filter(|(framebuffer, _)| drawn(*framebuffer)).enumerate() {

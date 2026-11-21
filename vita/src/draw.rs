@@ -490,7 +490,7 @@ fn skip(bit: u32) -> bool {
 }
 
 /// The clock for per-draw timing, or 0 when it is off.
-fn draw_clock() -> u64 {
+pub(crate) fn draw_clock() -> u64 {
     if DRAW_TIMING.load(Ordering::Relaxed) != 0 {
         sys::now_us()
     } else {

@@ -49,6 +49,7 @@ pub mod ge_context;
 pub mod ge_state;
 pub mod ge_writes;
 pub mod heap;
+pub mod hidden_draws;
 pub mod lighting;
 pub mod log_ring;
 pub mod memory;

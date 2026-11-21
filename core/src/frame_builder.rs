@@ -574,6 +574,14 @@ impl FrameBuilder {
         // From the back: the recorder's draws only move up (direct draws go
         // in before some of them), so none is overwritten before it moved.
         let mut end = fallback_draws + direct_draws;
+        // `Frame::occluders_end` names a recorder draw (direct draws are
+        // raw, never occluders): it moves with it; past them (a merged
+        // last draw), every draw.
+        let occluder = (frame.occluders_end as usize).checked_sub(1);
+        let mut occluders_end = match occluder {
+            Some(index) if index >= fallback_draws => fallback_draws + direct_draws,
+            _ => frame.occluders_end as usize,
+        };
         for stretch in lists.order[..self.order_count].iter().rev() {
             match *stretch {
                 Stretch::Direct { first, end: last } => {
@@ -588,12 +596,16 @@ impl FrameBuilder {
                     let count = segment_end(segment) as usize - start;
                     end -= count;
                     frame.draws.copy_within(start..start + count, end);
+                    if let Some(index) = occluder.filter(|index| (start..start + count).contains(index)) {
+                        occluders_end = end + (index - start) + 1;
+                    }
                 }
             }
         }
         debug_assert_eq!(end, 0, "every draw placed");
         frame.draw_count = (fallback_draws + direct_draws) as u32;
         frame.index_count = (index_offset + direct_indices) as u32;
+        frame.occluders_end = occluders_end as u32;
     }
 }
 
