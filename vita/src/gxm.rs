@@ -254,6 +254,9 @@ pub const DEPTH_FUNC_ALWAYS: u32 = 0x01C0_0000;
 /// SceGxmDepthWriteMode.
 pub const DEPTH_WRITE_ENABLED: u32 = 0x0000_0000;
 pub const DEPTH_WRITE_DISABLED: u32 = 0x0010_0000;
+/// SceGxmFragmentProgramMode.
+pub const FRAGMENT_PROGRAM_ENABLED: u32 = 0x0000_0000;
+pub const FRAGMENT_PROGRAM_DISABLED: u32 = 0x0020_0000;
 /// SceGxmCullMode.
 pub const CULL_NONE: u32 = 0;
 pub const CULL_CW: u32 = 1;
@@ -344,6 +347,7 @@ extern "C" {
     ) -> i32;
     pub fn sceGxmSetFrontDepthFunc(context: *mut Context, function: u32);
     pub fn sceGxmSetFrontDepthWriteEnable(context: *mut Context, mode: u32);
+    pub fn sceGxmSetFrontFragmentProgramEnable(context: *mut Context, mode: u32);
     pub fn sceGxmSetCullMode(context: *mut Context, mode: u32);
     pub fn sceGxmSetViewport(context: *mut Context, x_offset: f32, x_scale: f32, y_offset: f32, y_scale: f32, z_offset: f32, z_scale: f32);
     pub fn sceGxmSetFragmentTexture(context: *mut Context, index: u32, texture: *const Texture) -> i32;

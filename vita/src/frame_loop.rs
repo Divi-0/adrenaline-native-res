@@ -51,8 +51,10 @@ pub static DRAW_ONLY_COUNT: AtomicU32 = AtomicU32::new(0);
 /// matter) are left out: the same picture, less GPU work (NFS UR's title:
 /// its trail composites under an opaque full-screen layer). Only while the
 /// shown framebuffer is drawn in one scene (depth doesn't last from one
-/// scene to the next) and no `DRAW_ONLY_COUNT` prefix is set. 1 = on
-/// (default), 0 = every draw drawn.
+/// scene to the next) and no `DRAW_ONLY_COUNT` prefix is set. Draws kept
+/// only for their depths are drawn depth-only (`draw::draw_depth_only`).
+/// 1 = on (default), 2 = depth-only draws drawn in full, 0 = every draw
+/// drawn.
 pub static HIDE_DRAWS: AtomicI32 = AtomicI32::new(1);
 
 /// Our targets' alpha holds the PSP's stencil values only while draws keep
@@ -175,9 +177,11 @@ pub struct FrameLoop {
     /// others.
     opaque_rows: [u16; MAX_TEXTURES],
     /// This frame's draws a later one paints over (`HIDE_DRAWS`), and
-    /// whether they are left out (`hiding`: not in a frame drawn in runs).
+    /// whether they are left out (`hiding`: not in a frame drawn in runs)
+    /// and depth-only ones drawn so (`depth_only`).
     hidden: HiddenDraws,
     hiding: bool,
+    depth_only: bool,
     /// The game was quit: its frames still in the handover are never shown.
     after_quit: AfterQuit,
 }
@@ -201,6 +205,7 @@ static FRAME_LOOP: SingleThreaded<FrameLoop> = SingleThreaded::new(FrameLoop {
     opaque_rows: [0; MAX_TEXTURES],
     hidden: HiddenDraws::new(),
     hiding: false,
+    depth_only: false,
     after_quit: AfterQuit::new(),
 });
 
@@ -587,7 +592,9 @@ impl FrameLoop {
     /// The frame's draws a later draw paints over completely (core
     /// `hidden_draws`, `HIDE_DRAWS`), from the textures' opaque rows.
     fn find_hidden(&mut self, frame: &Frame) {
-        self.hiding = HIDE_DRAWS.load(Ordering::Relaxed) != 0 && DRAW_ONLY_COUNT.load(Ordering::Relaxed) == 0;
+        let hide = HIDE_DRAWS.load(Ordering::Relaxed);
+        self.hiding = hide != 0 && DRAW_ONLY_COUNT.load(Ordering::Relaxed) == 0;
+        self.depth_only = hide == 1;
         if !self.hiding {
             return;
         }
@@ -731,6 +738,11 @@ impl FrameLoop {
             }
             draw::draw_state(draw); // scissor, depth, cull
             if skip & 16 != 0 {
+                continue;
+            }
+            if self.hiding && self.depth_only && self.hidden.is_depth_only(i) {
+                stats().depth_only_draws += 1;
+                draw::draw_depth_only(frame, draw, i);
                 continue;
             }
             if draw.flags & draw_flags::TEXTURED != 0 {

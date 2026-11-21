@@ -31,6 +31,15 @@
 //! the colour's). Draws into other framebuffers
 //! (off-screen targets, drawn in scenes of their own) are never hidden.
 //!
+//! An earlier draw kept for its depth alone (the occluder's depth test reads
+//! it) is drawn *depth-only* instead (`is_depth_only`: no colour, no frame
+//! read), if it is sure to write the same depths that way: screen-space
+//! vertices and no fragment it would discard (alpha test passed by every
+//! fragment, no colour test). And one whose depths a later draw overwrites
+//! before anything drawn reads them (a full-screen "always" depth write) is
+//! hidden after all: NFS UR's title clears depth three times (draws 0, 4,
+//! 6); only the last one is drawn, depth-only.
+//!
 //! The display skips hidden draws; the PC replay too, so the regression
 //! pictures check that the picture stays the same.
 
@@ -38,19 +47,57 @@ use crate::blend::{BLEND_ALPHA_ONLY, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_WRI
 use crate::frame::{draw_flags, test_flags, Draw, Frame, FrameVertex, MAX_DRAWS};
 use crate::opaque_source::samples_only_rows;
 
-/// One bit per draw of a frame: hidden (`find`).
+/// What becomes of a draw (`find`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Fate {
+    Drawn,
+    Hidden,
+    /// Drawn for its depth alone.
+    DepthOnly,
+}
+
+/// Two bits per draw of a frame: hidden, depth-only (`find`).
 pub struct HiddenDraws {
-    words: [u64; MAX_DRAWS / 64],
+    hidden: [u64; MAX_DRAWS / 64],
+    depth_only: [u64; MAX_DRAWS / 64],
     count: u32,
+    depth_only_count: u32,
+}
+
+/// Sets bit `index` of `words` to `on`; returns how the count of set bits
+/// changed (-1, 0, 1).
+fn set_bit(words: &mut [u64], index: usize, on: bool) -> i32 {
+    let Some(word) = words.get_mut(index / 64) else {
+        return 0;
+    };
+    let bit = 1u64 << (index % 64);
+    let was = *word & bit != 0;
+    if on {
+        *word |= bit;
+    } else {
+        *word &= !bit;
+    }
+    on as i32 - was as i32
+}
+
+fn bit(words: &[u64], index: usize) -> bool {
+    words.get(index / 64).is_some_and(|word| word >> (index % 64) & 1 != 0)
 }
 
 impl HiddenDraws {
     pub const fn new() -> HiddenDraws {
-        HiddenDraws { words: [0; MAX_DRAWS / 64], count: 0 }
+        HiddenDraws { hidden: [0; MAX_DRAWS / 64], depth_only: [0; MAX_DRAWS / 64], count: 0, depth_only_count: 0 }
     }
 
     pub fn is_hidden(&self, draw_index: usize) -> bool {
-        self.words.get(draw_index / 64).is_some_and(|word| word >> (draw_index % 64) & 1 != 0)
+        bit(&self.hidden, draw_index)
+    }
+
+    /// Draw `draw_index` is drawn for its depth alone: depth test and
+    /// depth writes as given, no colour or alpha written, every fragment
+    /// kept (module comment).
+    pub fn is_depth_only(&self, draw_index: usize) -> bool {
+        bit(&self.depth_only, draw_index)
     }
 
     /// Hidden draws in the frame.
@@ -58,19 +105,23 @@ impl HiddenDraws {
         self.count
     }
 
-    fn hide(&mut self, draw_index: usize) {
-        if let Some(word) = self.words.get_mut(draw_index / 64) {
-            if *word >> (draw_index % 64) & 1 == 0 {
-                *word |= 1 << (draw_index % 64);
-                self.count += 1;
-            }
-        }
+    /// Depth-only draws in the frame.
+    pub fn depth_only_count(&self) -> u32 {
+        self.depth_only_count
+    }
+
+    fn set(&mut self, draw_index: usize, fate: Fate) {
+        self.count = self.count.wrapping_add_signed(set_bit(&mut self.hidden, draw_index, fate == Fate::Hidden));
+        self.depth_only_count =
+            self.depth_only_count.wrapping_add_signed(set_bit(&mut self.depth_only, draw_index, fate == Fate::DepthOnly));
     }
 
     fn clear(&mut self, draw_count: usize) {
-        let words = draw_count.div_ceil(64).min(self.words.len());
-        self.words[..words].fill(0);
+        let words = draw_count.div_ceil(64).min(self.hidden.len());
+        self.hidden[..words].fill(0);
+        self.depth_only[..words].fill(0);
         self.count = 0;
+        self.depth_only_count = 0;
     }
 }
 
@@ -240,6 +291,47 @@ fn writes_depth(draw: &Draw) -> bool {
     draw.tests & test_flags::DEPTH_TEST != 0 && draw.tests & test_flags::DEPTH_WRITE_DISABLED == 0
 }
 
+/// True if `draw` tests depth with "always" (and so writes it, if it
+/// writes, whatever was there).
+fn depth_always(draw: &Draw) -> bool {
+    draw.tests & test_flags::DEPTH_TEST != 0 && (draw.tests >> test_flags::DEPTH_FUNCTION_SHIFT) & 7 == 1
+}
+
+/// True if a draw writes every depth of the screen whatever was there:
+/// depth "always" written, no fragment discarded (`keeps_every_fragment`),
+/// the full scissor, no culling, `corners` covering the screen.
+fn overwrites_every_depth(draw: &Draw, corners: Option<&[FrameVertex]>, keeps_every_fragment: bool) -> bool {
+    writes_depth(draw)
+        && depth_always(draw)
+        && keeps_every_fragment
+        && draw.flags & draw_flags::CULL == 0
+        && draw.scissor_left == 0
+        && draw.scissor_top == 0
+        && draw.scissor_right >= 479
+        && draw.scissor_bottom >= 271
+        && corners.is_some_and(covers_screen)
+}
+
+/// If depth writer `draw` (into the shown framebuffer, no stencil test) can
+/// be drawn depth-only with the same depths (module comment): whether it
+/// then overwrites every depth whatever was there.
+fn depth_only_way(frame: &Frame, draw: &Draw, texture_rows: &dyn Fn(usize) -> u16) -> Option<bool> {
+    // Screen-space CPU vertices: the display draws their corners.
+    if draw.flags & (draw_flags::RAW_VERTICES | draw_flags::CACHED_VERTICES) != 0 || draw.transform != 0 {
+        return None;
+    }
+    if draw.tests & test_flags::COLOR_TEST != 0 {
+        return None;
+    }
+    let mut corners = [FrameVertex::default(); MAX_CORNERS];
+    let count = screen_space_corners(frame, draw, &mut corners);
+    let corners = count.map(|count| &corners[..count]);
+    let keeps_every_fragment = draw.tests & test_flags::ALPHA_TEST == 0
+        || alpha_test_passes_always(draw.tests)
+        || (alpha_test_passes_255(draw.tests) && corners.is_some_and(|corners| every_fragment_opaque(frame, draw, corners, texture_rows)));
+    keeps_every_fragment.then(|| overwrites_every_depth(draw, corners, keeps_every_fragment))
+}
+
 /// True if a draw at one depth `z` (None: varying) surely passes its depth
 /// test at every pixel, given `depths`.
 fn depth_passes_everywhere(draw: &Draw, z: Option<f32>, depths: &Depths) -> bool {
@@ -285,8 +377,7 @@ fn occluder(frame: &Frame, draw: &Draw, corners: &[FrameVertex], depths: &Depths
         return None;
     }
     let z = single_depth(corners);
-    let always = draw.tests & test_flags::DEPTH_TEST != 0 && (draw.tests >> test_flags::DEPTH_FUNCTION_SHIFT) & 7 == 1;
-    depth_passes_everywhere(draw, z, depths).then(|| always && writes_depth(draw))
+    depth_passes_everywhere(draw, z, depths).then(|| depth_always(draw) && writes_depth(draw))
 }
 
 /// True if `draw`'s state lets it occlude the screen (`occluder` checks
@@ -346,7 +437,7 @@ fn around_screen(vertices: &[FrameVertex]) -> bool {
 }
 
 /// Marks in `out` the draws of `frame` that a later draw paints over
-/// completely (module comment). `texture_rows(t)`: how many rows from the
+/// completely, hidden or depth-only (module comment). `texture_rows(t)`: how many rows from the
 /// top of frame texture `t` have only opaque texels (`texture::opaque_rows`,
 /// `ALL_ROWS_OPAQUE`: all; 0 when not known).
 pub fn find(frame: &Frame, texture_rows: &dyn Fn(usize) -> u16, out: &mut HiddenDraws) {
@@ -381,14 +472,7 @@ pub fn find(frame: &Frame, texture_rows: &dyn Fn(usize) -> u16, out: &mut Hidden
         let corners = &corners[..count.unwrap_or(0)];
         if candidate && count.is_some() {
             if let Some(overwrites_depth) = occluder(frame, draw, corners, &depths, texture_rows) {
-                for (earlier, hidden) in draws[..index].iter().enumerate().skip(settled) {
-                    let keep = hidden.framebuffer != shown
-                        || hidden.tests & test_flags::STENCIL_TEST != 0
-                        || (!overwrites_depth && writes_depth(hidden));
-                    if !keep {
-                        out.hide(earlier);
-                    }
-                }
+                settle_before(frame, settled, index, overwrites_depth, texture_rows, out);
                 if overwrites_depth {
                     settled = index;
                 }
@@ -409,6 +493,43 @@ pub fn find(frame: &Frame, texture_rows: &dyn Fn(usize) -> u16, out: &mut Hidden
                 depths.add(z);
             }
         }
+    }
+}
+
+/// The fate of the draws `settled..occluder`, painted over by draw
+/// `occluder` (it writes every depth whatever was there:
+/// `overwrites_depth`). Each occluder decides that whole range anew,
+/// from the occluder back, tracking whether the depths right after each
+/// draw are still read by a later draw that is drawn (`depth_read`). The
+/// colour is the occluder's everywhere; a depth writer is hidden where its
+/// depths aren't read, else drawn depth-only (in full where depth-only
+/// could change its depths). Draws into other framebuffers and
+/// stencil-tested ones are drawn.
+fn settle_before(frame: &Frame, settled: usize, occluder: usize, overwrites_depth: bool, texture_rows: &dyn Fn(usize) -> u16, out: &mut HiddenDraws) {
+    let draws = frame.draws();
+    let shown = frame.shown_framebuffer;
+    let mut depth_read = !overwrites_depth;
+    for index in (settled..occluder).rev() {
+        let draw = &draws[index];
+        let fate = if draw.framebuffer != shown {
+            Fate::Drawn
+        } else if draw.tests & test_flags::STENCIL_TEST != 0 {
+            // Drawn in full: what it does to depth depends on the stencil.
+            depth_read |= draw.tests & test_flags::DEPTH_TEST != 0;
+            Fate::Drawn
+        } else if !writes_depth(draw) || !depth_read {
+            Fate::Hidden
+        } else {
+            match depth_only_way(frame, draw, texture_rows) {
+                Some(overwrites_every_depth) => {
+                    // Earlier depths matter only through its depth test.
+                    depth_read = !overwrites_every_depth;
+                    Fate::DepthOnly
+                }
+                None => Fate::Drawn, // reads and writes depth: depth_read stays
+            }
+        };
+        out.set(index, fate);
     }
 }
 
@@ -531,12 +652,14 @@ mod tests {
         push(&mut frame, full(layer_tests, normal, textured, logo, shown), &quad(15.0, 3.0, 200.0, 150.0, 0.5, 0x8FFF_FFFF));
         let mut hidden = HiddenDraws::new();
         find(&frame, &|_| ALL_ROWS_OPAQUE, &mut hidden);
-        // The clear stays: the layer's "<=" passes only over its depth.
+        // The clear stays for its depth: the layer's "<=" passes only over
+        // its depth. Depth-only: no colour.
         assert_eq!((0..5).map(|i| hidden.is_hidden(i)).collect::<Vec<_>>(), [false, true, false, false, false]);
-        assert_eq!(hidden.count(), 1);
+        assert_eq!((0..5).map(|i| hidden.is_depth_only(i)).collect::<Vec<_>>(), [true, false, false, false, false]);
+        assert_eq!((hidden.count(), hidden.depth_only_count()), (1, 1));
         // A texture with transparent texels: no occluder.
         find(&frame, &|_| 0, &mut hidden);
-        assert_eq!(hidden.count(), 0);
+        assert_eq!((hidden.count(), hidden.depth_only_count()), (0, 0));
         // The clear left out: the screen's depth is unknown, "<=" may fail.
         let mut no_clear = new_test_frame();
         no_clear.shown_framebuffer = shown;
@@ -553,11 +676,13 @@ mod tests {
         push(&mut keeps, full(0, BLEND_WRITES_ALPHA, 0, 0, shown), &quad(0.0, 0.0, 480.0, 272.0, 0.0, 0x00FF_FFFF));
         find(&keeps, &|_| ALL_ROWS_OPAQUE, &mut hidden);
         assert_eq!((0..3).map(|i| hidden.is_hidden(i)).collect::<Vec<_>>(), [false, true, false]);
+        assert_eq!((0..3).map(|i| hidden.is_depth_only(i)).collect::<Vec<_>>(), [true, false, false]);
         // A second clear ("always", writing depth) overwrites every depth:
         // the first clear and everything before it are hidden.
         push(&mut keeps, full(depth_always_write, BLEND_WRITES_ALPHA, 0, 0, shown), &quad(0.0, 0.0, 480.0, 272.0, 0.25, 0xFF10_2030));
         find(&keeps, &|_| ALL_ROWS_OPAQUE, &mut hidden);
         assert_eq!((0..4).map(|i| hidden.is_hidden(i)).collect::<Vec<_>>(), [true, true, true, false]);
+        assert_eq!(hidden.depth_only_count(), 0);
         // An occluder keeping the alpha (the PSP's stencil): nothing hidden.
         let mut alpha_kept = new_test_frame();
         alpha_kept.shown_framebuffer = shown;
@@ -565,5 +690,104 @@ mod tests {
         push(&mut alpha_kept, full(0, 0, 0, 0, shown), &quad(0.0, 0.0, 480.0, 272.0, 0.0, 0xFFFF_FFFF));
         find(&alpha_kept, &|_| ALL_ROWS_OPAQUE, &mut hidden);
         assert_eq!(hidden.count(), 0);
+    }
+
+    /// The fates of `frame`'s draws: '.' drawn, 'h' hidden, 'd' depth-only.
+    fn fates(frame: &Frame) -> String {
+        let mut hidden = HiddenDraws::new();
+        find(frame, &|_| ALL_ROWS_OPAQUE, &mut hidden);
+        let fates: String = (0..frame.draws().len())
+            .map(|i| match (hidden.is_hidden(i), hidden.is_depth_only(i)) {
+                (true, false) => 'h',
+                (false, true) => 'd',
+                (false, false) => '.',
+                _ => '?',
+            })
+            .collect();
+        assert_eq!(hidden.count() as usize, fates.matches('h').count());
+        assert_eq!(hidden.depth_only_count() as usize, fates.matches('d').count());
+        fates
+    }
+
+    /// NFS UR's title: three full-screen depth clears ("always", 1.0)
+    /// between blended layers, then two opaque layers with "<=": only the
+    /// last clear's depths are read (depth-only), the first two are
+    /// overwritten before (hidden); the first layer is painted over by the
+    /// second but its depths are read (depth-only).
+    #[test]
+    fn depth_clears() {
+        use crate::frame::new_boxed_frame as new_test_frame;
+        let shown = 0x0400_0000;
+        let full = |tests: u32, blend: u32, flags: u32, texture: u32| Draw {
+            flags,
+            tests,
+            blend,
+            texture,
+            framebuffer: shown,
+            scissor_right: 479,
+            scissor_bottom: 271,
+            ..Default::default()
+        };
+        let clear = test_flags::DEPTH_TEST | 1 << test_flags::DEPTH_FUNCTION_SHIFT;
+        let normal = BLEND_ENABLED | BLEND_WRITES_ALPHA | 4 | 5 << 4;
+        let zero_one = BLEND_ENABLED | BLEND_WRITES_ALPHA | 1 << 4; // the target kept
+        let layer_tests = 0xff10_6503;
+        let textured = draw_flags::TEXTURED | draw_flags::BLEND | draw_flags::CLAMP_U | draw_flags::CLAMP_V;
+        let screen = |z: f32, color: u32| quad(0.0, 0.0, 480.0, 272.0, z, color);
+        let mut frame = new_test_frame();
+        frame.shown_framebuffer = shown;
+        // Different textures: draws of the same state in a row are merged.
+        let (layer, second, logo) = (texture(&mut frame, 16), texture(&mut frame, 16), texture(&mut frame, 16));
+        push(&mut frame, full(clear, BLEND_WRITES_ALPHA, 0, 0), &screen(1.0, 0xFF00_0000));
+        push(&mut frame, full(0, normal, draw_flags::BLEND, 0), &screen(0.0, 0x80FF_FFFF));
+        push(&mut frame, full(clear, zero_one, draw_flags::BLEND, 0), &screen(1.0, 0));
+        push(&mut frame, full(0, normal, draw_flags::BLEND, 0), &screen(0.15, 0xFF00_0000));
+        push(&mut frame, full(clear, zero_one, draw_flags::BLEND, 0), &screen(1.0, 0));
+        push(&mut frame, full(layer_tests, normal, textured, layer), &quad(0.0, 0.0, 481.0, 273.0, 0.5, 0xFFFF_FFFF));
+        push(&mut frame, full(layer_tests, normal, textured, second), &quad(0.0, 0.0, 481.0, 273.0, 0.5, 0xFFFF_FFFF));
+        push(&mut frame, full(layer_tests, normal, textured, logo), &quad(15.0, 3.0, 200.0, 150.0, 0.5, 0x8FFF_FFFF));
+        assert_eq!(frame.draws().len(), 8);
+        assert_eq!(fates(&frame), "hhhhdd..");
+
+        // A stencil-tested draw reading depth between the clears: the first
+        // clear's depths are read, so it is drawn depth-only too.
+        let mut stencil = new_test_frame();
+        stencil.shown_framebuffer = shown;
+        let layer = texture(&mut stencil, 16);
+        let stencil_tests = test_flags::STENCIL_TEST | test_flags::DEPTH_TEST | 5 << test_flags::DEPTH_FUNCTION_SHIFT;
+        push(&mut stencil, full(clear, BLEND_WRITES_ALPHA, 0, 0), &screen(1.0, 0xFF00_0000));
+        push(&mut stencil, full(stencil_tests, normal, draw_flags::BLEND, 0), &screen(0.2, 0x80FF_FFFF));
+        push(&mut stencil, full(clear, zero_one, draw_flags::BLEND, 0), &screen(1.0, 0));
+        push(&mut stencil, full(layer_tests, normal, textured, layer), &quad(0.0, 0.0, 481.0, 273.0, 0.5, 0xFFFF_FFFF));
+        assert_eq!(fates(&stencil), "d.d.");
+
+        // A depth writer that may discard (alpha test, alpha 0x80 below
+        // 0xFF): depth-only would write more depths, so it is drawn.
+        let mut discards = new_test_frame();
+        discards.shown_framebuffer = shown;
+        let layer = texture(&mut discards, 16);
+        let tested_clear = clear | test_flags::ALPHA_TEST | 0xFF << test_flags::ALPHA_MASK_SHIFT | 0xFE << test_flags::ALPHA_REFERENCE_SHIFT | 6 << test_flags::ALPHA_FUNCTION_SHIFT;
+        push(&mut discards, full(clear, BLEND_WRITES_ALPHA, 0, 0), &screen(1.0, 0xFF00_0000));
+        push(&mut discards, full(tested_clear, normal, draw_flags::BLEND, 0), &screen(1.0, 0x80FF_FFFF));
+        push(&mut discards, full(layer_tests, normal, textured, layer), &quad(0.0, 0.0, 481.0, 273.0, 0.5, 0xFFFF_FFFF));
+        assert_eq!(fates(&discards), "d..");
+        // The same with alpha 255: every fragment passes, its depths overwrite
+        // the clear's.
+        let mut passes = new_test_frame();
+        passes.shown_framebuffer = shown;
+        let layer = texture(&mut passes, 16);
+        push(&mut passes, full(clear, BLEND_WRITES_ALPHA, 0, 0), &screen(1.0, 0xFF00_0000));
+        push(&mut passes, full(tested_clear, normal, draw_flags::BLEND, 0), &screen(1.0, 0xFFFF_FFFF));
+        push(&mut passes, full(layer_tests, normal, textured, layer), &quad(0.0, 0.0, 481.0, 273.0, 0.5, 0xFFFF_FFFF));
+        assert_eq!(fates(&passes), "hd.");
+
+        // A partial depth write after the full clear: both are read.
+        let mut partial = new_test_frame();
+        partial.shown_framebuffer = shown;
+        let layer = texture(&mut partial, 16);
+        push(&mut partial, full(clear, BLEND_WRITES_ALPHA, 0, 0), &screen(1.0, 0xFF00_0000));
+        push(&mut partial, full(clear, zero_one, draw_flags::BLEND, 0), &quad(10.0, 10.0, 100.0, 100.0, 0.75, 0));
+        push(&mut partial, full(layer_tests, normal, textured, layer), &quad(0.0, 0.0, 481.0, 273.0, 0.5, 0xFFFF_FFFF));
+        assert_eq!(fates(&partial), "dd.");
     }
 }

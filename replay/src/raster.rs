@@ -173,6 +173,10 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
             let list: Vec<usize> = (0..frame.draws().len()).filter(|&index| hidden.is_hidden(index)).collect();
             println!("hidden draws: {} (painted over by a later draw): {list:?}", hidden.count());
         }
+        if hidden.depth_only_count() > 0 {
+            let list: Vec<usize> = (0..frame.draws().len()).filter(|&index| hidden.is_depth_only(index)).collect();
+            println!("depth-only draws: {}: {list:?}", hidden.depth_only_count());
+        }
     }
     for (index, draw) in frame.draws().iter().enumerate().take(max_draws) {
         if hidden.is_hidden(index) {
@@ -197,7 +201,13 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
             }
             None => &textures,
         };
-        if draw.framebuffer == frame.shown_framebuffer {
+        if hidden.is_depth_only(index) {
+            // Its depths alone, like the Vita's draw without a fragment
+            // program (core hidden_draws: it keeps every fragment).
+            let colour = screen.clone();
+            draw_one(&mut screen, &mut depth, frame, draw_textures, draw);
+            screen.copy_from_slice(&colour);
+        } else if draw.framebuffer == frame.shown_framebuffer {
             draw_one(&mut screen, &mut depth, frame, draw_textures, draw);
         } else if let Some((_, picture, picture_depth)) = offscreen.iter_mut().find(|(framebuffer, _, _)| *framebuffer == draw.framebuffer) {
             draw_one(picture, picture_depth, frame, draw_textures, draw);

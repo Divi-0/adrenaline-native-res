@@ -414,6 +414,8 @@ pub static INDEX_TEST_FRAMES: AtomicI32 = AtomicI32::new(0);
 pub static MIP_TEST_FRAMES: AtomicI32 = AtomicI32::new(0);
 /// "shadetest <frames>": `draw_shade_test` after each of the next frames.
 pub static SHADE_TEST_FRAMES: AtomicI32 = AtomicI32::new(0);
+/// "depthtest <frames>": `draw_depth_only_test` after each of the next frames.
+pub static DEPTH_ONLY_TEST_FRAMES: AtomicI32 = AtomicI32::new(0);
 
 /// Which of our programs a shade-test quad goes through.
 #[derive(Clone, Copy)]
@@ -1726,6 +1728,42 @@ impl Draws {
         }
     }
 
+    /// Draw `draw_index` for its depths alone (core `hidden_draws`
+    /// depth-only: screen-space CPU vertices, no fragment it would
+    /// discard): the basic colour program's vertices with the fragment
+    /// program disabled, so depth test and writes as set (`draw_state`),
+    /// no colour, no alpha, no frame read.
+    fn draw_depth_only(&mut self, frame: &Frame, draw: &Draw, draw_index: usize) {
+        let indices = self.draw_indices(frame, draw, draw_index);
+        let first = draw.first_vertex as usize;
+        let Some(vertices) = first.checked_add(draw.vertex_count as usize).and_then(|end| frame.vertices.get(first..end)) else {
+            return;
+        };
+        let out = frame_pool_alloc(draw.vertex_count * core::mem::size_of::<basic_programs::ColorVertex>() as u32, 16)
+            as *mut basic_programs::ColorVertex;
+        let (Some((indices, index_count)), Some(basic)) = (indices, basic_programs::get()) else {
+            return;
+        };
+        if out.is_null() {
+            return;
+        }
+        // Safe: the pool gave room for them.
+        let out_slice = unsafe { core::slice::from_raw_parts_mut(out, vertices.len()) };
+        for (out, vertex) in out_slice.iter_mut().zip(vertices) {
+            *out = basic_programs::ColorVertex { x: vertex.x * SCALE, y: vertex.y * SCALE, z: gpu_depth(vertex.z), color: 0 };
+        }
+        self.use_default_viewport();
+        // A fragment program must be set; disabled, it doesn't run.
+        self.use_programs(basic.color_vertex, basic.color_wvp, basic_programs::ORTHO.as_ptr(), basic.color_fragment);
+        // Safe: vertices and indices in the frame pool, the programs set.
+        unsafe {
+            gxm::sceGxmSetFrontFragmentProgramEnable(context(), gxm::FRAGMENT_PROGRAM_DISABLED);
+            gxm::sceGxmSetVertexStream(context(), 0, out as *const c_void);
+            note_draw_result(gxm::sceGxmDraw(context(), gxm::PRIMITIVE_TRIANGLES, gxm::INDEX_FORMAT_U16, indices as *const c_void, index_count));
+            gxm::sceGxmSetFrontFragmentProgramEnable(context(), gxm::FRAGMENT_PROGRAM_ENABLED);
+        }
+    }
+
     /// The GPU-readable block of the GPU tests (index, mip): 1 MiB
     /// phycont, non-cached (no stale CPU cache lines for the GPU), made at
     /// the first test and kept. Null if there is no memory.
@@ -1805,6 +1843,58 @@ impl Draws {
                     render_log::line(format_args!("indextest: draw from index {} failed: {:08x}\n", first, result));
                 }
             }
+        }
+    }
+
+    /// Do draws with the fragment program disabled (`draw_depth_only`)
+    /// write depth and nothing else? After the frame's draws, in target
+    /// pixels, window depths (`ORTHO` turns z around: z 0.05 -> 0.95): a
+    /// black box (200..520 x 180..380, depth 0.95 written), a depth-only
+    /// box inside it (280..440 x 240..320, depth 0.1, "always"), then a
+    /// white box over all at depth 0.5 with "less" (no depth write).
+    /// Right: a white frame around a black middle. All white: the
+    /// depth-only draw wrote no depth; another colour in the middle: it
+    /// wrote colour.
+    fn draw_depth_only_test(&mut self) {
+        let Some(basic) = basic_programs::get() else {
+            return;
+        };
+        let vertices = frame_pool_alloc(12 * core::mem::size_of::<basic_programs::ColorVertex>() as u32, 16) as *mut basic_programs::ColorVertex;
+        let indices = frame_pool_alloc(18 * 2, 2) as *mut u16;
+        if vertices.is_null() || indices.is_null() {
+            return;
+        }
+        // Safe: the pool gave room for 12 vertices and 18 indices.
+        let (vertices, indices) = unsafe { (core::slice::from_raw_parts_mut(vertices, 12), core::slice::from_raw_parts_mut(indices, 18)) };
+        let boxes = [
+            (200.0, 180.0, 520.0, 380.0, 0.05, 0xFF00_0000u32),
+            (280.0, 240.0, 440.0, 320.0, 0.9, 0xFF00_FF00),
+            (200.0, 180.0, 520.0, 380.0, 0.5, 0xFFFF_FFFF),
+        ];
+        for (k, &(left, top, right, bottom, z, color)) in boxes.iter().enumerate() {
+            let corners = [(left, top), (right, top), (left, bottom), (right, bottom)];
+            for (corner, &(x, y)) in corners.iter().enumerate() {
+                vertices[4 * k + corner] = basic_programs::ColorVertex { x, y, z, color };
+            }
+            let first = 4 * k as u16;
+            indices[6 * k..6 * k + 6].copy_from_slice(&[first, first + 1, first + 2, first + 1, first + 3, first + 2]);
+        }
+        self.prepare_test();
+        self.use_programs(basic.color_vertex, basic.color_wvp, basic_programs::ORTHO.as_ptr(), basic.color_fragment);
+        let steps = [
+            (gxm::DEPTH_FUNC_ALWAYS, gxm::DEPTH_WRITE_ENABLED, gxm::FRAGMENT_PROGRAM_ENABLED),
+            (gxm::DEPTH_FUNC_ALWAYS, gxm::DEPTH_WRITE_ENABLED, gxm::FRAGMENT_PROGRAM_DISABLED),
+            (gxm::DEPTH_FUNC_LESS, gxm::DEPTH_WRITE_DISABLED, gxm::FRAGMENT_PROGRAM_ENABLED),
+        ];
+        // Safe: vertices and indices in the frame pool, the programs set.
+        unsafe {
+            gxm::sceGxmSetVertexStream(context(), 0, vertices.as_ptr() as *const c_void);
+            for (k, &(function, write, fragment)) in steps.iter().enumerate() {
+                self.set_depth(function, write);
+                gxm::sceGxmSetFrontFragmentProgramEnable(context(), fragment);
+                note_draw_result(gxm::sceGxmDraw(context(), gxm::PRIMITIVE_TRIANGLES, gxm::INDEX_FORMAT_U16, indices[6 * k..].as_ptr() as *const c_void, 6));
+            }
+            gxm::sceGxmSetFrontFragmentProgramEnable(context(), gxm::FRAGMENT_PROGRAM_ENABLED);
         }
     }
 
@@ -2313,6 +2403,12 @@ pub fn draw_colored(frame: &Frame, draw: &Draw, draw_index: usize) {
     draws().draw_colored(frame, draw, draw_index);
 }
 
+/// Draw `draw_index` of `frame` for its depths alone (core `hidden_draws`
+/// depth-only), after `draw_state`. Inside a target scene.
+pub fn draw_depth_only(frame: &Frame, draw: &Draw, draw_index: usize) {
+    draws().draw_depth_only(frame, draw, draw_index);
+}
+
 /// After a frame's draws: the GPU tests (index, mip) and the
 /// alpha log.
 pub fn draw_tests() {
@@ -2328,6 +2424,10 @@ pub fn draw_tests() {
     if SHADE_TEST_FRAMES.load(Ordering::Relaxed) > 0 {
         SHADE_TEST_FRAMES.fetch_sub(1, Ordering::Relaxed);
         draws.draw_shade_test();
+    }
+    if DEPTH_ONLY_TEST_FRAMES.load(Ordering::Relaxed) > 0 {
+        DEPTH_ONLY_TEST_FRAMES.fetch_sub(1, Ordering::Relaxed);
+        draws.draw_depth_only_test();
     }
     if ALPHA_LOG.load(Ordering::Relaxed) != 0 {
         draws.write_alpha_log();
