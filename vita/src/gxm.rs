@@ -74,6 +74,7 @@ pub struct DepthStencilSurface {
 
 /// SceGxmRenderTargetParams (0x14 bytes).
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct RenderTargetParams {
     pub flags: u32,
     pub width: u16,
@@ -149,6 +150,7 @@ extern "C" {
         data: *mut c_void,
     ) -> i32;
     pub fn sceGxmCreateRenderTarget(params: *const RenderTargetParams, target: *mut *mut RenderTarget) -> i32;
+    pub fn sceGxmDestroyRenderTarget(target: *mut RenderTarget) -> i32;
 }
 
 // ------------------------------------------------------------------------

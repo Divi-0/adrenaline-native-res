@@ -53,6 +53,23 @@ impl Iterator for Runs<'_> {
     }
 }
 
+/// How many runs (`runs`: one GXM scene each when drawn in GE order) go
+/// into each of `framebuffers`: `counts[i]` for `framebuffers[i]` (the
+/// first `framebuffers.len()` places). A render target drawn in more scenes
+/// per frame than it was made for makes the second wait until the GPU has
+/// finished the first (God of War's bloom chain: ~26 ms per frame), so the
+/// display makes such targets with room for more (2026-11-22).
+pub fn runs_into(draws: &[Draw], framebuffers: &[u32], counts: &mut [u32]) {
+    counts.iter_mut().for_each(|count| *count = 0);
+    for (framebuffer, _) in runs(draws) {
+        if let Some(index) = framebuffers.iter().position(|&known| known == framebuffer) {
+            if let Some(count) = counts.get_mut(index) {
+                *count += 1;
+            }
+        }
+    }
+}
+
 /// True if `texture` reads framebuffer `framebuffer` as its colours (VRAM
 /// mirrors folded). Index and DXT formats don't: a framebuffer read as
 /// palette indices or blocks means something else than its colours (as
@@ -226,6 +243,13 @@ mod tests {
         assert_eq!(sampled(&draws, &textures, SCREEN), slots(&[BLUR_A, BLUR_B, LEVEL_0, LEVEL_1, LEVEL_2]));
         // The chain samples the screen mid-frame: drawn in GE order.
         assert!(!offscreen_first(&draws, &textures, SCREEN, |framebuffer| framebuffer != SCREEN));
+        // Drawn so, the screen, BLUR_A and two levels get two scenes each:
+        // their targets need room for two scenes per frame, or the second
+        // waits for the GPU to finish the first (~26 ms per frame).
+        let framebuffers = [SCREEN, BLUR_A, BLUR_B, LEVEL_0, LEVEL_1, LEVEL_2, 0x0411_0000];
+        let mut counts = [0u32; 7];
+        runs_into(&draws, &framebuffers, &mut counts);
+        assert_eq!(counts, [2, 2, 1, 2, 2, 1, 0]);
     }
 
     #[test]

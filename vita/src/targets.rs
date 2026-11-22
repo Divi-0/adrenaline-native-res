@@ -40,6 +40,26 @@ use crate::{draw, gxm, render_log, sys, SingleThreaded};
 /// framebuffers makes us reuse a target it used just before: counted in
 /// the render statistics (target_evictions) and logged.
 pub const TARGET_COUNT: usize = 2;
+/// The most scenes per frame a target's render target is made for
+/// (`Target::ensure_scenes`); more scenes than that wait for the GPU.
+const MAX_SCENES_PER_FRAME: u16 = 4;
+
+/// Makes a GXM render target of `width` x `height` for `scenes` scenes per
+/// frame (GXM allocates its driver memory) into `out`; returns
+/// sceGxmCreateRenderTarget's result.
+fn make_render_target(width: u32, height: u32, scenes: u16, out: &mut *mut gxm::RenderTarget) -> i32 {
+    let params = gxm::RenderTargetParams {
+        flags: 0,
+        width: width as u16,
+        height: height as u16,
+        scenes_per_frame: scenes,
+        multisample_mode: gxm::MULTISAMPLE_NONE,
+        multisample_locations: 0,
+        driver_mem_block: -1,
+    };
+    // Safe: valid parameters and out pointer.
+    unsafe { gxm::sceGxmCreateRenderTarget(&params, out) }
+}
 pub const TARGET_WIDTH: u32 = 960;
 pub const TARGET_HEIGHT: u32 = 544;
 const TARGET_BYTES: u32 = sys::pages((TARGET_WIDTH * TARGET_HEIGHT * 4) as usize);
@@ -109,6 +129,8 @@ pub struct Target {
     pixels: *mut u32,
     surface: gxm::ColorSurface,
     render_target: *mut gxm::RenderTarget,
+    /// Scenes per frame its render target was made for (`ensure_scenes`).
+    scenes: u16,
     /// Only `gxm` is used: for drawing with it.
     pub texture: TextureObject,
     /// The same picture sampled with alpha 1 (format X8U8U8U8_1BGR), for
@@ -130,6 +152,7 @@ const UNUSED_TARGET: Target = Target {
     pixels: null_mut(),
     surface: gxm::ColorSurface { words: [0; 12] },
     render_target: null_mut(),
+    scenes: 0,
     texture: TextureObject::view(NO_TEXTURE),
     opaque_view: TextureObject::view(NO_TEXTURE),
 };
@@ -155,15 +178,6 @@ impl Target {
         let Some(GpuBlock { uid, base }) = block else {
             return false;
         };
-        let params = gxm::RenderTargetParams {
-            flags: 0,
-            width: width as u16,
-            height: height as u16,
-            scenes_per_frame: 1,
-            multisample_mode: gxm::MULTISAMPLE_NONE,
-            multisample_locations: 0,
-            driver_mem_block: -1,
-        };
         let mut result = 0;
         // Safe: our fresh block, valid parameters and out pointers.
         let made = unsafe {
@@ -179,7 +193,7 @@ impl Target {
                 base as *mut _,
             ) >= 0
                 && {
-                    result = gxm::sceGxmCreateRenderTarget(&params, &mut self.render_target);
+                    result = make_render_target(width, height, 1, &mut self.render_target);
                     result >= 0
                 }
         };
@@ -199,7 +213,50 @@ impl Target {
         self.pixels = base as *mut u32;
         self.width = width;
         self.height = height;
+        self.scenes = 1;
         true
+    }
+
+    /// Makes its render target take `scenes` scenes per frame (at most
+    /// `MAX_SCENES_PER_FRAME`) if it was made for fewer. A render target
+    /// drawn in more scenes per frame than it was made for makes each scene
+    /// past those wait in sceGxmEndScene until the GPU has finished the
+    /// earlier one: God of War's bloom chain draws four targets in two
+    /// scenes each, and the display thread waited ~26 ms per frame for the
+    /// GPU (2026-11-22). Made for one scene first, because each one more
+    /// costs GXM's driver memory (main memory: 480x272 84 -> 124 -> 216 KiB
+    /// for 1/2/4 scenes, 960x544 180 -> 284 -> 504 KiB), and most games
+    /// draw each target once. The GPU is drained first (the old render
+    /// target may be in use); the colour memory stays.
+    pub fn ensure_scenes(&mut self, scenes: u32) {
+        let wanted = scenes.min(MAX_SCENES_PER_FRAME as u32) as u16;
+        if !self.exists() || wanted <= self.scenes {
+            return;
+        }
+        let mut bigger = null_mut();
+        let result = make_render_target(self.width, self.height, wanted, &mut bigger);
+        if result < 0 {
+            render_log::line(format_args!(
+                "render target {:08x}: {} scenes per frame can't be made: {:08x}
+",
+                self.psp_address, wanted, result
+            ));
+            self.scenes = MAX_SCENES_PER_FRAME; // not tried again
+            return;
+        }
+        // Safe: the display thread's context; nothing uses the old render
+        // target once the GPU is done.
+        unsafe {
+            gxm::sceGxmFinish(gxm::context());
+            gxm::sceGxmDestroyRenderTarget(self.render_target);
+        }
+        self.render_target = bigger;
+        render_log::line(format_args!(
+            "render target {:08x} ({}x{}): {} scenes per frame (was {})
+",
+            self.psp_address, self.width, self.height, wanted, self.scenes
+        ));
+        self.scenes = wanted;
     }
 
     /// Its pixel at Vita screen position (x, y); 0 if it has no memory.
