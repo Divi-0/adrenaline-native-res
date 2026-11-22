@@ -70,7 +70,7 @@ make new savestates; loading an old one runs the old PSP side.
 ```
 mip=0        # distant textures: 0 sharp (default), 1 blurry like the PSP, 2 mipmapped
 smooth=0     # texture filter: 0 the game's own (default), 1 always smooth
-gamefps=1    # 1 (default): the game's own frame rate in the top left corner, 0: off
+gamefps=0    # 0 (default): off, 1: diagnostics (game fps, drawn/held frames, timings) top right
 ```
 
 ### Troubleshooting

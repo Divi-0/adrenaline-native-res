@@ -36,7 +36,7 @@ use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering::Relaxed};
 
 use nativeres_core::display_loop;
-use nativeres_core::game_fps::{self, DrawStats, GameFps, LABEL_HEIGHT, LABEL_WIDTH, STATS_HEIGHT, STATS_WIDTH};
+use nativeres_core::game_fps::{self, DrawStats, STATS_HEIGHT, STATS_WIDTH};
 
 use crate::basic_programs::TextureVertex;
 use crate::capture::COMPLETED_FRAME_COUNT;
@@ -172,8 +172,8 @@ pub mod timings {
     /// drawing, end scene + swap, the LCD sync.
     pub const DRAW_PROFILE_PARTS: usize = 4;
 
-    /// 0 off, 1 the GAME label, 2 the diagnostics (game_fps::DrawStats).
-    pub(super) static GAME_FPS_LABEL: AtomicU8 = AtomicU8::new(1);
+    /// 0 off (default), 1 the diagnostics (game_fps::DrawStats).
+    pub(super) static GAME_FPS_LABEL: AtomicU8 = AtomicU8::new(0);
     pub(super) static SONY_COPY_EARLY: AtomicBool = AtomicBool::new(true);
     pub(super) static LAST_LCD_SYNC_US: AtomicU64 = AtomicU64::new(0);
     pub(super) static SONY_COPY_AFTER_SYNC: [AtomicU32; SONY_TIMING_BUCKETS] = [const { AtomicU32::new(0) }; SONY_TIMING_BUCKETS];
@@ -181,9 +181,9 @@ pub mod timings {
     pub(super) static DRAW_PROFILE_US: [AtomicU64; DRAW_PROFILE_PARTS] = [const { AtomicU64::new(0) }; DRAW_PROFILE_PARTS];
     pub(super) static DRAW_PROFILE_LOOPS: AtomicU32 = AtomicU32::new(0);
 
-    /// 0 off, 1 the GAME label (top left), 2 the diagnostics (top right).
+    /// 0 off, 1 the diagnostics (top right).
     pub fn set_game_fps_label(mode: u8) {
-        GAME_FPS_LABEL.store(mode.min(2), Relaxed);
+        GAME_FPS_LABEL.store(mode.min(1), Relaxed);
     }
 
     pub fn set_sony_copy_early(on: bool) {
@@ -336,8 +336,7 @@ unsafe extern "C" fn draw_hooked(context: *mut Context, primitive: u32, index_fo
     if SONY_TEXTURE_SET.swap(false, Relaxed) && SHOWING_OURS.load(Relaxed) {
         targets::present_frame();
         match GAME_FPS_LABEL.load(Relaxed) {
-            1 => draw_game_fps(),
-            2 => draw_stats(),
+            1 => draw_stats(),
             _ => {}
         }
         return 0;
@@ -548,8 +547,7 @@ pub fn install() -> (usize, usize) {
 
 /// Two label pictures and their quads, used in turn: the one written is
 /// never the one the GPU may still read from the last pass.
-/// Room for the diagnostics (STATS_WIDTH x STATS_HEIGHT); the GAME label
-/// uses its top-left LABEL_WIDTH x LABEL_HEIGHT.
+/// Room for the diagnostics (STATS_WIDTH x STATS_HEIGHT).
 const LABEL_TEXTURE_BYTES: usize = STATS_WIDTH * STATS_HEIGHT * 4;
 const LABEL_QUAD_BYTES: usize = 4 * core::mem::size_of::<TextureVertex>();
 const LABEL_BLOCK_BYTES: usize = 2 * (LABEL_TEXTURE_BYTES + LABEL_QUAD_BYTES);
@@ -557,9 +555,7 @@ const LABEL_BLOCK_BYTES: usize = 2 * (LABEL_TEXTURE_BYTES + LABEL_QUAD_BYTES);
 #[used]
 pub static nativeres_plan_fixed_game_fps_label: u32 = sys::pages(LABEL_BLOCK_BYTES);
 
-/// Right of VitaCam's "60.0 FPS  RENDER 30" box, as menu.c drew it: at
-/// (252, 4), 2x, white on black.
-const LABEL_X: f32 = 252.0;
+/// The label: 2x, white on black, 4 pixels from the top.
 const LABEL_Y: f32 = 4.0;
 const LABEL_SCALE: f32 = 2.0;
 /// The diagnostics: top right, 4 pixels in.
@@ -571,7 +567,6 @@ struct Label {
     textures: [gxm::Texture; 2],
     /// The picture/quad in use (0 or 1), None before the first value.
     current: Option<usize>,
-    fps: GameFps,
     stats: DrawStats,
 }
 
@@ -580,7 +575,6 @@ static LABEL: SingleThreaded<Label> = SingleThreaded::new(Label {
     base: null_mut(),
     textures: [gxm::Texture { control_words: [0; 4] }; 2],
     current: None,
-    fps: GameFps::new(),
     stats: DrawStats::new(),
 });
 
@@ -616,13 +610,6 @@ impl Label {
             }
         }
         !self.base.is_null()
-    }
-
-    /// Draws the value into the other picture and quad, then uses those.
-    fn write(&mut self, fps: u32) {
-        let mut pixels = [0u32; LABEL_WIDTH * LABEL_HEIGHT];
-        let used = game_fps::draw_label(fps, &mut pixels);
-        self.show(&pixels, LABEL_WIDTH, LABEL_HEIGHT, used, LABEL_X);
     }
 
     /// Draws the diagnostics into the other picture and quad, then uses those.
@@ -661,27 +648,6 @@ impl Label {
         }
         self.current = Some(index);
     }
-}
-
-/// Display thread, inside the display's scene, right after our picture:
-/// "GAME <fps>" (the value measured once a second; drawn again only when it
-/// changed).
-fn draw_game_fps() {
-    // Safe: display thread only.
-    let label = unsafe { LABEL.get() };
-    if !label.make() {
-        return;
-    }
-    if label.fps.update(now(), COMPLETED_FRAME_COUNT.load(Relaxed)) {
-        if let Some(fps) = label.fps.fps() {
-            label.write(fps);
-        }
-    }
-    let Some(current) = label.current else {
-        return;
-    };
-    // Safe: inside the display's scene; our texture and quad.
-    unsafe { targets::draw_quad(&label.textures[current], label.quad(current)) };
 }
 
 /// Display thread, inside the display's scene, right after our picture:
