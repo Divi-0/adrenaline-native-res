@@ -416,8 +416,15 @@ impl FrameLoop {
         targets.publish_addresses();
         // God of War's bloom chain samples the screen mid-frame, in scenes
         // of its own: from our target of it, not decoded from VRAM (~9 ms).
-        self.screen_from_target = targets.find(frame.shown_framebuffer).is_some()
-            && offscreen::screen_read_only_by_other_runs(frame.draws(), frame.textures(), frame.shown_framebuffer);
+        // The screen's target is made first if it isn't there yet (renderer
+        // just switched on, the paused redraw of `vita.py compare`): else
+        // this frame's bloom read Sony's finished, already bloomed picture
+        // from VRAM, glow on glow (2026-11-22).
+        let screen_read = offscreen::screen_read_only_by_other_runs(frame.draws(), frame.textures(), frame.shown_framebuffer);
+        if screen_read && targets.find(frame.shown_framebuffer).is_none() {
+            targets.target_for(frame.shown_framebuffer, render_count);
+        }
+        self.screen_from_target = screen_read && targets.find(frame.shown_framebuffer).is_some();
 
         // Decode (or find in the cache) every texture of the frame once.
         let lookup_start = now();

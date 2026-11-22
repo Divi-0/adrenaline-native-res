@@ -737,8 +737,10 @@ pub fn present_frame() {
     let target = &targets.targets[shown];
     let copy_program = draw::copy_program();
     let fragment = if copy_program.is_null() { basic_programs::get().map_or(null_mut(), |basic| basic.texture_tint_fragment) } else { copy_program };
+    let mut view = target.texture.gxm;
+    crate::ext::present_view(targets, &mut view);
     // Safe: inside the display's scene.
-    if !unsafe { draw_full_quad(&target.texture.gxm, fragment) } {
+    if !unsafe { draw_full_quad(&view, fragment) } {
         return;
     }
     FRAME_DRAWN.store(1, Ordering::Relaxed);

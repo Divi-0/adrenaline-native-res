@@ -340,9 +340,31 @@ const ALPHA_ALL_PASS: [f32; 4] = alpha_test_uniform(0.0, 255.0, false);
 /// The fragment programs' alpha-test uniform (uAlphaTest,
 /// nativeres_textured_test_f.cg) for alpha values `lo..=hi` passing, or with
 /// `outside` the ones outside: the bounds half a step out, z the sign that
-/// makes a passing alpha's (alpha - x)(y - alpha) z positive.
+/// makes a passing alpha's (alpha - x)(y - alpha) z positive; w the GE's
+/// alpha-test mask, 255 (only the generic frame-read program applies it,
+/// `masked_alpha_test_uniform`).
 const fn alpha_test_uniform(lo: f32, hi: f32, outside: bool) -> [f32; 4] {
-    [lo - 0.5, hi + 0.5, if outside { -1.0 } else { 1.0 }, 0.0]
+    [lo - 0.5, hi + 0.5, if outside { -1.0 } else { 1.0 }, 255.0]
+}
+
+/// Whether alpha-test uniform `uniform` masks the alpha (w below 255).
+fn is_masked(uniform: [f32; 4]) -> bool {
+    uniform[3] < 255.0
+}
+
+/// `alpha_test_uniform` for a test with mask `mask` (not 0xFF): the bounds
+/// are for the masked alpha against the masked reference, as the GE (and
+/// PPSSPP's fragment shader) compares `(alpha & mask) <op> (ref & mask)`;
+/// only the generic frame-read program applies the mask (God of War's bright
+/// pass: alpha == 0x20 under mask 0x20, the PSP's stencil mark sampled).
+fn masked_alpha_test_uniform(function: u32, reference: u32, mask: u32) -> [f32; 4] {
+    match alpha_test_bounds(function, reference & mask) {
+        Some((lo, hi, outside)) => {
+            let [x, y, z, _] = alpha_test_uniform(lo, hi, outside);
+            [x, y, z, mask as f32]
+        }
+        None => ALPHA_ALL_PASS, // always
+    }
 }
 
 /// The frame-read program for `draw` if it goes to a 16-bit PSP target
@@ -986,13 +1008,18 @@ impl Draws {
     /// for those, blend.rs), no test program, a test every alpha passes, or
     /// one that only rejects alpha 0 where that changes nothing.
     fn alpha_test_range(&mut self, draw: &Draw) -> Option<[f32; 4]> {
-        if draw.tests & test_flags::ALPHA_TEST == 0
-            || !self.programs.textured.have_test
-            || (draw.tests >> test_flags::ALPHA_MASK_SHIFT) & 0xFF != 0xFF
-        {
+        if draw.tests & test_flags::ALPHA_TEST == 0 || !self.programs.textured.have_test {
             return None;
         }
         let reference = (draw.tests >> test_flags::ALPHA_REFERENCE_SHIFT) & 0xFF;
+        let mask = (draw.tests >> test_flags::ALPHA_MASK_SHIFT) & 0xFF;
+        if mask != 0xFF {
+            // Only the generic frame-read program masks (the caller sends
+            // the draw there, `is_masked`).
+            stats().alpha_tested += 1;
+            stats().masked_alpha_tests += 1;
+            return Some(masked_alpha_test_uniform(draw.tests >> test_flags::ALPHA_FUNCTION_SHIFT, reference, mask));
+        }
         let (lo, hi, outside) = alpha_test_bounds(draw.tests >> test_flags::ALPHA_FUNCTION_SHIFT, reference)?;
         let stats = stats();
         stats.alpha_tested += 1;
@@ -1457,9 +1484,16 @@ impl Draws {
         // alpha 255 (core `opaque_source`; MHF's ground). A normal blend of
         // it is the source itself: drawn unblended, no frame read. An alpha
         // test that lets 255 pass passes everywhere: dropped (no discard).
-        let unblend = choice.is_some_and(|variant| for_opaque_source(variant) != variant)
+        // A masked alpha test (`masked_alpha_test_uniform`): the generic
+        // frame-read program only, also into 8-bit targets.
+        let masked = tested && is_masked(alpha_range);
+        if masked {
+            choice = Some(ReadVariant::Generic);
+        }
+        let unblend = !masked
+            && choice.is_some_and(|variant| for_opaque_source(variant) != variant)
             && OPAQUE_SOURCES.load(Ordering::Relaxed) != 0;
-        let untest = tested && alpha_test_lets_255_pass(alpha_range) && OPAQUE_UNTESTED.load(Ordering::Relaxed) != 0;
+        let untest = tested && !masked && alpha_test_lets_255_pass(alpha_range) && OPAQUE_UNTESTED.load(Ordering::Relaxed) != 0;
         if opaque_rows != 0 && (unblend || untest) {
             let start = draw_clock();
             if vertices_opaque(frame, draw) && samples_opaque_rows(frame, draw, opaque_rows) {

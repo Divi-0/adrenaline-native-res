@@ -190,6 +190,18 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
         }
     }
     for (index, draw) in frame.draws().iter().enumerate().take(max_draws) {
+        // Debugging: REPLAY_STENCIL_LIST=1 lists the draws with an exact
+        // stencil state and the way the Vita does it (core `stencil_way`).
+        if std::env::var_os("REPLAY_STENCIL_LIST").is_some() {
+            if let Some(state) = frame.stencil_state_of(draw) {
+                let textured = draw.flags & draw_flags::TEXTURED != 0;
+                println!(
+                    "stencil draw {index}: fb {:08x} blend {:08x} textured {textured} hidden {} write {:?} test {:?} way {:?} verts {}",
+                    draw.framebuffer, draw.blend, hidden.is_hidden(index), state.write(), state.test(),
+                    nativeres_core::blend::stencil_way(Some(state), draw.blend, textured), draw.vertex_count
+                );
+            }
+        }
         if hidden.is_hidden(index) {
             continue;
         }
@@ -231,6 +243,17 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
             if screen[at] != before {
                 println!("pixel: draw {index} {before:08x} -> {:08x} texture {} {:x?}", screen[at], draw.texture, frame.textures().get(draw.texture as usize));
             }
+        }
+    }
+    // Debugging: REPLAY_SAVE_OFFSCREEN=<hex address>:<png> saves that
+    // off-screen picture (as the Vita's debug `showtarget` shows its target).
+    if let Some((address, path)) = std::env::var("REPLAY_SAVE_OFFSCREEN").ok().and_then(|value| {
+        let (address, path) = value.split_once(':')?;
+        Some((u32::from_str_radix(address, 16).ok()?, path.to_string()))
+    }) {
+        if let Some((_, picture, _)) = offscreen.iter().find(|(framebuffer, _, _)| *framebuffer == address) {
+            let opaque: Vec<u32> = picture.iter().map(|pixel| pixel | 0xFF00_0000).collect();
+            let _ = crate::png::write_rgba(&path, WIDTH, HEIGHT, &opaque);
         }
     }
     // Shown opaque, as NativeResPresentFrame does: the alpha is the game's
@@ -282,9 +305,18 @@ fn draw_one(screen: &mut [u32], depth: &mut [f32], frame: &Frame, textures: &[Op
     } else {
         None
     };
+    let index = (draw as *const Draw as usize - frame.draws().as_ptr() as usize) / core::mem::size_of::<Draw>();
     let mut corners = frame.screen_corners(draw);
     while let (Some(a), Some(b), Some(c)) = (corners.next(), corners.next(), corners.next()) {
-        draw_triangle(screen, depth, draw, texture, [a, b, c], frame.dither_matrix, frame.stencil_state_of(draw));
+        draw_triangle(screen, depth, draw, texture, [a, b, c], frame.dither_matrix, frame.stencil_state_of(draw).filter(|_| {
+            // Debugging: REPLAY_NO_STENCIL=<first>-<last> draws those draws
+            // without their stencil state (which marks or tests matter).
+            let range = std::env::var("REPLAY_NO_STENCIL").ok().and_then(|value| {
+                let (a, b) = value.split_once('-')?;
+                Some(a.parse::<usize>().ok()?..=b.parse::<usize>().ok()?)
+            });
+            !range.is_some_and(|range| range.contains(&index))
+        }));
     }
 }
 

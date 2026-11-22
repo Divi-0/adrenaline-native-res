@@ -23,8 +23,9 @@
 //!   PSP's values.
 //! - the alpha test: textured draws are alpha-tested in the Vita's fragment
 //!   shader (nativeres_textured_test_f.cg, once the display has it:
-//!   `ALPHA_TEST_IN_SHADER`). Where it can't (untextured, a mask other than
-//!   0xFF), a draw with blending off and the alpha test on is drawn with
+//!   `ALPHA_TEST_IN_SHADER`; a mask other than 0xFF by the generic
+//!   frame-read program, as PPSSPP masks in its shader). Where it can't
+//!   (untextured), a draw with blending off and the alpha test on is drawn with
 //!   normal blending instead: exact for fully transparent and opaque texels,
 //!   but transparent texels still write depth. Approximated.
 //!
@@ -42,7 +43,9 @@ use crate::ge_state::GeState;
 pub static ALPHA_TEST_IN_SHADER: AtomicBool = AtomicBool::new(false);
 
 /// Whether the current draw's alpha test is done by the display's fragment
-/// shader: textured (not clear mode), all alpha bits compared (mask 0xFF).
+/// shader: textured (not clear mode), any mask (the Vita sends masked tests
+/// to its generic frame-read program; God of War's bright pass tests
+/// alpha == 0x20 under mask 0x20 and was drawn untested, 2026-11-22).
 pub fn alpha_test_in_shader(ge: &GeState) -> bool {
     shader_can_alpha_test(ge, ALPHA_TEST_IN_SHADER.load(Ordering::Relaxed))
 }
@@ -53,7 +56,6 @@ fn shader_can_alpha_test(ge: &GeState, ready: bool) -> bool {
         && ready
         && ge.is_texture_enabled()
         && !ge.is_clear_mode()
-        && (ge.register(op::ALPHA_TEST) >> 16) & 0xFF == 0xFF
 }
 
 /// GPU blend factors (the C side maps them to `SceGxmBlendFactor`).
@@ -876,14 +878,16 @@ mod tests {
     }
 
     #[test]
-    fn the_shader_alpha_tests_textured_draws_with_a_full_mask() {
+    fn the_shader_alpha_tests_textured_draws_with_any_mask() {
         let textured = ge_with(&[(op::ALPHA_TEST_ENABLE, 1), (op::ALPHA_TEST, 0xFF_00_06), (op::TEXTURE_MAP_ENABLE, 1)]);
         assert!(shader_can_alpha_test(&textured, true));
         assert!(!shader_can_alpha_test(&textured, false), "no program yet");
         let untextured = ge_with(&[(op::ALPHA_TEST_ENABLE, 1), (op::ALPHA_TEST, 0xFF_00_06)]);
         assert!(!shader_can_alpha_test(&untextured, true));
-        let masked = ge_with(&[(op::ALPHA_TEST_ENABLE, 1), (op::ALPHA_TEST, 0xF0_00_06), (op::TEXTURE_MAP_ENABLE, 1)]);
-        assert!(!shader_can_alpha_test(&masked, true));
+        // God of War's bright pass: alpha == 0x20 under mask 0x20 (the
+        // Vita's generic frame-read program masks; untested before).
+        let masked = ge_with(&[(op::ALPHA_TEST_ENABLE, 1), (op::ALPHA_TEST, 0x20_20_02), (op::TEXTURE_MAP_ENABLE, 1)]);
+        assert!(shader_can_alpha_test(&masked, true));
         let untested = ge_with(&[(op::ALPHA_TEST, 0xFF_00_06), (op::TEXTURE_MAP_ENABLE, 1)]);
         assert!(!shader_can_alpha_test(&untested, true));
     }

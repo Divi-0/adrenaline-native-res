@@ -60,7 +60,8 @@
 //
 // Uniforms of the generic program:
 //   uFogAndScale  rgb = fog colour (0..255), a = colour scale (1 or 2)
-//   uAlphaTest    as nativeres_textured_test_f.cg (-0.5, 255.5, 1: all pass)
+//   uAlphaTest    as nativeres_textured_test_f.cg (-0.5, 255.5, 1: all pass),
+//                 w = the GE's alpha-test mask (255: the whole alpha)
 //   uBlendFix     BLEND_FIX: rgb times x + y * source alpha (1, 0 without);
 //                 alpha = lerp(alpha, w, z) (z = 1: alpha = FIX B)
 //   uSource       a blend factor as k0 + k1 s + k2 s.a + k3 d + k4 d.a:
@@ -266,10 +267,13 @@ __nativecolor __regformat unsigned char4 main(
 	if (c.a < uAlphaTest.x)
 		discard;
 #elif !defined(READ_FAST)
-	// The alpha test on the whole alpha, as nativeres_textured_test_f.cg
-	// (uAlphaTest: x = lo - 0.5, y = hi + 0.5, z = 1 or -1 for NOTEQUAL),
-	// and the stencil test: one discard for both.
-	if (min((c.a - uAlphaTest.x) * (uAlphaTest.y - c.a) * uAlphaTest.z, stencilPasses) < 0.0f)
+	// The alpha test on the whole alpha ANDed with the GE's mask (w; 255
+	// for most tests; God of War's bright pass: alpha == 0x20 under mask
+	// 0x20, as PPSSPP's `(roundAndScaleTo255i(v.a) & mask) op ref`), as
+	// nativeres_textured_test_f.cg (uAlphaTest: x = lo - 0.5, y = hi + 0.5,
+	// z = 1 or -1 for NOTEQUAL), and the stencil test: one discard for both.
+	float tested = (float)((unsigned char)c.a & (unsigned char)uAlphaTest.w);
+	if (min((tested - uAlphaTest.x) * (uAlphaTest.y - tested) * uAlphaTest.z, stencilPasses) < 0.0f)
 		discard;
 #endif
 	float4 color = c * (1.0f / 255.0f);

@@ -8,7 +8,8 @@
 //!
 //! All hooks are called on the renderer's own threads, in places where they
 //! must not block for long: the display thread (`after_swap`,
-//! `before_render`, `before_draw`, `frame_draw_started`, `frame_drawn`), the
+//! `before_render`, `before_draw`, `frame_draw_started`, `frame_drawn`,
+//! `present_view`), the
 //! capture thread (`dump_*`), the log writer (`log_send`).
 
 use core::sync::atomic::{AtomicPtr, Ordering};
@@ -18,6 +19,7 @@ use nativeres_core::frame::Frame;
 use crate::capture::CaptureState;
 use crate::frame_loop::FrameLoop;
 use crate::sys::SceUID;
+use crate::gxm;
 use crate::targets::Targets;
 
 /// The hooks of an extension. Every one is required; one that has nothing
@@ -44,6 +46,9 @@ pub struct Extensions {
     pub frame_draw_started: fn(frame: &Frame),
     /// Display thread, once a frame's render target is chosen.
     pub frame_drawn: fn(frame: &Frame),
+    /// Display thread, as the shown target is put on the screen: may
+    /// change the texture description it is drawn from (`view`, a copy).
+    pub present_view: fn(targets: &Targets, view: &mut gxm::Texture),
     /// Capture thread: whether the next frame must be recorded whole.
     pub dump_requested: fn() -> bool,
     /// Capture thread, right after a frame ended (`recording`: the next
@@ -121,6 +126,12 @@ pub fn frame_draw_started(frame: &Frame) {
 pub fn frame_drawn(frame: &Frame) {
     if let Some(ext) = get() {
         (ext.frame_drawn)(frame);
+    }
+}
+
+pub fn present_view(targets: &Targets, view: &mut gxm::Texture) {
+    if let Some(ext) = get() {
+        (ext.present_view)(targets, view);
     }
 }
 
