@@ -687,12 +687,12 @@ impl<M: PspMemory> Writer<'_, '_, M> {
         }
     }
 
-    /// Whether `bytes` at `address` stay in PSP RAM for the GPU (zero copy,
-    /// `raw_arena::zero_copy_wanted`): only where a copier could have read
-    /// them now (as for jobs: not while a dump records them).
-    fn zero_copy(&mut self, address: u32, bytes: u32, format: VertexFormat) -> bool {
-        crate::raw_arena::zero_copy_wanted(address, bytes, format)
-            && in_phase(crate::phase::DIRECT_COPY, || self.memory.defer(address & !3, (bytes + (address & 3)).next_multiple_of(4)))
+    /// Where the GPU reads `bytes` at `address` straight from PSP RAM (zero
+    /// copy), if they stay there (`zero_copy_place`).
+    fn zero_copy(&mut self, address: u32, bytes: u32, format: VertexFormat) -> Option<u32> {
+        let plain = crate::raw_arena::zero_copy_wanted(address, bytes, format);
+        let memory = &mut *self.memory;
+        in_phase(crate::phase::DIRECT_COPY, || zero_copy_place(memory, address, bytes, plain, crate::raw_arena::zero_copy_upload_wanted))
     }
 
     /// 3D lists, strips and fans without indices as one raw draw with index
@@ -713,11 +713,12 @@ impl<M: PspMemory> Writer<'_, '_, M> {
         let address = calls[0].vertex_address;
         let length = stride * (used - 1) + format.bytes_used(layout);
         let (number, colors_number, bones) = self.entries(format, inputs, colors)?;
-        let in_psp_ram = self.zero_copy(address, length, format);
-        let (window, offset, mut first, copy) = if in_psp_ram {
+        let place = self.zero_copy(address, length, format);
+        let in_psp_ram = place.is_some();
+        let (window, offset, mut first, copy) = if let Some(place) = place {
             self.raw.stats.psp_ram += 1;
             self.raw.stats.psp_ram_bytes += length;
-            (address, 0, 0, None)
+            (place, 0, 0, None)
         } else {
             let (placed, out) = in_phase(crate::phase::DIRECT_ARENA, || timed(crate::cycles::DIRECT_RESERVE, || self.raw.reserve(length, stride)))
                 .ok_or(fallback::ARENA_FULL)?;
@@ -824,7 +825,8 @@ impl<M: PspMemory> Writer<'_, '_, M> {
         let span_start = calls[0].vertex_address.wrapping_add(lowest.wrapping_mul(stride));
         let span_length = (highest - lowest) * stride + format.bytes_used(layout);
         let (number, colors_number, bones) = self.entries(format, inputs, colors)?;
-        let in_psp_ram = self.zero_copy(span_start, span_length, format);
+        let place = self.zero_copy(span_start, span_length, format);
+        let in_psp_ram = place.is_some();
         if !in_psp_ram && (highest - lowest + 1) > crate::recorder::SPARSE_SPAN * corners {
             // Copying the span would move more bytes than its corners need.
             let entries = (number, colors_number, bones);
@@ -835,10 +837,10 @@ impl<M: PspMemory> Writer<'_, '_, M> {
                 written => return written.map_err(|reason| reason.unwrap_or(fallback::REFUSED)),
             }
         }
-        let (place, first, copy) = if in_psp_ram {
+        let (place, first, copy) = if let Some(place) = place {
             self.raw.stats.psp_ram += 1;
             self.raw.stats.psp_ram_bytes += span_length;
-            (span_start, 0, None)
+            (place, 0, None)
         } else {
             let (placed, out) = self.raw.reserve(span_length, stride).ok_or(fallback::ARENA_FULL)?;
             (placed.window, placed.first_vertex(stride), Some(out.as_mut_ptr()))
@@ -1057,9 +1059,63 @@ fn min_max<T: Copy + Ord + Into<u32>>(values: &[T]) -> (u32, u32) {
     (lowest.into(), highest.into())
 }
 
+/// Where the GPU reads the `bytes` bytes at `address` straight from PSP RAM
+/// (zero copy), or None if they are copied: at `address` itself where
+/// `plain` (`raw_arena::zero_copy_wanted`) and a copier could read them now
+/// (`PspMemory::defer`: as for jobs, not while a dump records them); else,
+/// where a GE block transfer from main RAM uploaded them this frame
+/// (`PspMemory::redirect_source`), at the transfer's source if `upload`
+/// wants it (`raw_arena::zero_copy_upload_wanted`).
+fn zero_copy_place<M: PspMemory>(memory: &mut M, address: u32, bytes: u32, plain: bool, upload: impl Fn(u32, u32) -> bool) -> Option<u32> {
+    let deferrable = |memory: &mut M, address: u32| memory.defer(address & !3, (bytes + (address & 3)).next_multiple_of(4));
+    if plain && deferrable(memory, address) {
+        return Some(address);
+    }
+    let source = memory.redirect_source(address, bytes)?;
+    (upload(source, bytes) && deferrable(memory, source)).then_some(source)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Main RAM may be read later (as the copier may), the rest not.
+    struct RamDeferrable(crate::memory::test_memory::TestMemory);
+
+    impl PspMemory for RamDeferrable {
+        fn read_u32(&mut self, address: u32) -> Option<u32> {
+            self.0.read_u32(address)
+        }
+        fn defer(&mut self, address: u32, _bytes: u32) -> bool {
+            (0x0800_0000..0x0A00_0000).contains(&(address & 0x1FFF_FFFF))
+        }
+    }
+
+    #[test]
+    fn uploaded_runs_are_drawn_from_the_uploads_source() {
+        // God of War: a transfer uploads 2 KiB of a model's sub-list and
+        // vertices from RAM to 0x0418A000; its 150-byte runs are then read
+        // from the RAM source, not copied into the arena.
+        let (area, source) = (0x0418_A000, 0x08F5_0050);
+        let mut inner = RamDeferrable(crate::memory::test_memory::TestMemory::default());
+        let mut writes = crate::ge_writes::GeWrites::new();
+        // Uploaded the frame before too (a steady source: `ge_writes`).
+        let mut memory = crate::ge_writes::Overlaid { writes: &mut writes, inner: &mut inner };
+        assert!(memory.redirect_write(area, source, 2048));
+        assert_eq!(zero_copy_place(&mut memory, area + 0x100, 150, false, |_, _| true), None, "first upload: not known steady");
+        memory.writes.clear();
+        let mut memory = crate::ge_writes::Overlaid { writes: &mut writes, inner: &mut inner };
+        assert!(memory.redirect_write(area, source, 2048));
+        let upload = |source: u32, _bytes: u32| (0x0800_0000..0x0A00_0000).contains(&source);
+        let never = |_: u32, _: u32| false;
+        assert_eq!(zero_copy_place(&mut memory, area + 0x100, 150, false, upload), Some(source + 0x100));
+        assert_eq!(zero_copy_place(&mut memory, area + 0x100, 150, false, never), None, "switched off");
+        assert_eq!(zero_copy_place(&mut memory, area + 2000, 150, false, upload), None, "past the upload's end");
+        assert_eq!(zero_copy_place(&mut memory, 0x0419_0000, 150, false, upload), None, "VRAM nobody uploaded");
+        // Plain main RAM as before (where `plain` says so).
+        assert_eq!(zero_copy_place(&mut memory, 0x0890_0000, 4096, true, never), Some(0x0890_0000));
+        assert_eq!(zero_copy_place(&mut memory, 0x0890_0000, 4096, false, never), None);
+    }
 
     /// The typed (vectorized) bounds give what one index at a time gives:
     /// every index size, lengths 1..70, starts at every byte of a word (an

@@ -36,6 +36,25 @@ struct Redirect {
     start: u32,
     end: u32,
     source: u32,
+    /// Its source read the same when uploaded in an earlier frame
+    /// (`SourceSample`): model data, not rewritten every frame.
+    steady: bool,
+}
+
+/// Upload sources remembered across frames (`GeWrites::sources`).
+pub const SOURCE_SAMPLES: usize = 512;
+
+/// An upload's source with a sample of its words when last uploaded. God of
+/// War uploads ~340 sources per frame; over a second all but one read the
+/// same (models), one 2.5 KiB source changed every frame (2026-11-22). Only
+/// a steady source may be drawn from directly (`PspMemory::redirect_source`,
+/// zero copy): the GPU draws a frame later, when the game may have written
+/// a changing one again.
+#[derive(Clone, Copy)]
+struct SourceSample {
+    source: u32,
+    bytes: u32,
+    sample: u32,
 }
 
 /// The blocks written by block transfers in the current frame.
@@ -62,6 +81,9 @@ pub struct GeWrites {
     /// Byte range all redirects lie in (reads outside need no search).
     redirect_low: u32,
     redirect_high: u32,
+    /// Upload sources of earlier frames (kept over `clear`), placed by
+    /// address (`sample_slot`).
+    sources: [SourceSample; SOURCE_SAMPLES],
 }
 
 impl GeWrites {
@@ -74,11 +96,26 @@ impl GeWrites {
             high: 0,
             transfers_done: 0,
             transfers_skipped: 0,
-            redirects: [Redirect { start: 0, end: 0, source: 0 }; MAX_REDIRECTS],
+            redirects: [Redirect { start: 0, end: 0, source: 0, steady: false }; MAX_REDIRECTS],
             redirect_count: 0,
             redirect_low: u32::MAX,
             redirect_high: 0,
+            sources: [SourceSample { source: 0, bytes: 0, sample: 0 }; SOURCE_SAMPLES],
         }
+    }
+
+    /// Notes `sample` for the upload source `source` of `bytes`; true if the
+    /// same source was noted before with the same size and sample.
+    fn note_source(&mut self, source: u32, bytes: u32, sample: u32) -> bool {
+        const PROBES: usize = 8;
+        let home = ((source >> 4) as usize).wrapping_mul(0x9E37_79B1) >> 7;
+        let slot = (0..PROBES)
+            .map(|probe| (home + probe) % SOURCE_SAMPLES)
+            .find(|&slot| self.sources[slot].source == source || self.sources[slot].source == 0)
+            .unwrap_or(home % SOURCE_SAMPLES);
+        let known = self.sources[slot];
+        self.sources[slot] = SourceSample { source, bytes, sample };
+        known.source == source && known.bytes == bytes && known.sample == sample
     }
 
     /// Forgets all writes and counts (frame end, reset).
@@ -115,6 +152,11 @@ impl GeWrites {
     /// newest covering each of them, and no written block: then they read
     /// as the source's bytes in one go.
     fn redirected_run(&self, address: u32, bytes: u32) -> Option<u32> {
+        self.redirected_run_at(address, bytes).map(|(_, source)| source)
+    }
+
+    /// `redirected_run` with the redirect's index.
+    fn redirected_run_at(&self, address: u32, bytes: u32) -> Option<(usize, u32)> {
         let end = address.checked_add(bytes)?;
         let index = self.redirects[..self.redirect_count]
             .iter()
@@ -124,7 +166,7 @@ impl GeWrites {
             .iter()
             .any(|newer| newer.start < end && newer.end > address);
         (end <= redirect.end && !newer_overlap && !self.blocks_overlap(address, bytes))
-            .then(|| redirect.source + (address - redirect.start))
+            .then(|| (index, redirect.source + (address - redirect.start)))
     }
 
     /// Blocks not written yet.
@@ -295,6 +337,15 @@ impl<M: PspMemory> PspMemory for Overlaid<'_, M> {
         Some(&self.writes.blocks[slot][first..first + count])
     }
 
+    /// Only from a steady source (`SourceSample`).
+    fn redirect_source(&mut self, address: u32, bytes: u32) -> Option<u32> {
+        if bytes == 0 {
+            return None;
+        }
+        let (index, source) = self.writes.redirected_run_at(physical(address), bytes)?;
+        self.writes.redirects[index].steady.then_some(source)
+    }
+
     /// Not where a transfer wrote: PSP memory doesn't hold that yet.
     fn defer(&mut self, address: u32, bytes: u32) -> bool {
         !self.writes.overlaps(physical(address), bytes) && self.inner.defer(address, bytes)
@@ -365,8 +416,15 @@ impl<M: PspMemory> PspMemory for Overlaid<'_, M> {
                 }
             }
         }
+        // Eight words spread over the source, for `note_source`.
+        let mut sample = 0x811C_9DC5u32;
+        for k in 0..8 {
+            let word = self.inner.read_u32(source + ((bytes / 4) * k / 8) * 4).unwrap_or(0);
+            sample = (sample ^ word).wrapping_mul(0x0100_0193);
+        }
         let writes = &mut *self.writes;
-        writes.redirects[writes.redirect_count] = Redirect { start: destination, end: destination_end, source };
+        let steady = writes.note_source(source, bytes, sample);
+        writes.redirects[writes.redirect_count] = Redirect { start: destination, end: destination_end, source, steady };
         writes.redirect_count += 1;
         writes.redirect_low = writes.redirect_low.min(destination);
         writes.redirect_high = writes.redirect_high.max(destination_end);
@@ -504,5 +562,26 @@ mod tests {
         assert!(!memory.redirect_write(VRAM, RAM_A, 64));
         assert!(!memory.redirect_write(RAM_B, RAM_B + 32, 64)); // overlapping sides
         assert_eq!(memory.writes.transfers_done, 0);
+    }
+
+    #[test]
+    fn only_steady_upload_sources_are_offered_for_direct_reads() {
+        // God of War uploads its models' data every frame from the same
+        // RAM; one source is rewritten every frame instead.
+        let (model, changing) = (0x08F5_0000, 0x09E3_D1E0);
+        let mut inner = TestMemory::default();
+        inner.write(model, &[7; 64]);
+        inner.write(changing, &[1; 64]);
+        let mut writes = GeWrites::new();
+        for frame in 0..3u32 {
+            inner.write(changing + 4 * 32, &[frame]);
+            let mut memory = Overlaid { writes: &mut writes, inner: &mut inner };
+            assert!(memory.redirect_write(VRAM, model, 256));
+            assert!(memory.redirect_write(VRAM + 0x1000, changing, 256));
+            let first_time = frame == 0;
+            assert_eq!(memory.redirect_source(VRAM + 16, 32), (!first_time).then_some(model + 16), "frame {frame}");
+            assert_eq!(memory.redirect_source(VRAM + 0x1000, 32), None, "rewritten every frame");
+            memory.writes.clear();
+        }
     }
 }

@@ -74,8 +74,23 @@ pub fn zero_copy_wanted(address: u32, bytes: u32, _format: crate::vertex::Vertex
 
 /// `zero_copy_wanted` without the switch.
 fn zero_copy_suits(address: u32, bytes: u32) -> bool {
+    in_main_ram(address, bytes) && bytes >= ZERO_COPY_MIN_BYTES
+}
+
+fn in_main_ram(address: u32, bytes: u32) -> bool {
     let physical = address & 0x1FFF_FFFF;
-    (0x0800_0000..0x0A00_0000).contains(&physical) && bytes >= ZERO_COPY_MIN_BYTES
+    (0x0800_0000..0x0A00_0000).contains(&physical) && physical.checked_add(bytes).is_some_and(|end| end <= 0x0A00_0000)
+}
+
+/// Whether a raw run that a GE block transfer uploaded this frame is drawn
+/// from the transfer's source in main RAM (`ZERO_COPY`), whatever its size:
+/// God of War streams its models' sub-lists and vertices from RAM into VRAM
+/// (~1.4 MiB of 150-byte runs per frame in the game, 2026-11-22), which
+/// filled the arena (6 frames x 1.4 MiB) and sent thousands of draws to the
+/// CPU. Small runs stay copied elsewhere because games rewrite small RAM
+/// ranges (HUD text); an upload's source is the data the GE copied from.
+pub fn zero_copy_upload_wanted(source: u32, bytes: u32) -> bool {
+    ZERO_COPY.load(core::sync::atomic::Ordering::Relaxed) && in_main_ram(source, bytes)
 }
 
 /// Bytes per window: 65,536 vertices of the smallest PSP vertex (an 8-bit

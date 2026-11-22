@@ -69,6 +69,14 @@ pub trait PspMemory {
         false
     }
 
+    /// Where the `bytes` bytes at `address` came from if a GE block transfer
+    /// from main RAM wrote them this frame, all of them from one source
+    /// (`ge_writes::Overlaid`, its redirects): reading the source gives the
+    /// same bytes. Default: none.
+    fn redirect_source(&mut self, _address: u32, _bytes: u32) -> Option<u32> {
+        None
+    }
+
     /// Whether the `bytes` bytes at `address` are left in PSP RAM for the GPU
     /// (`raw_arena::ZERO_COPY`): nobody copied them, and a raw run of them
     /// is drawn from PSP RAM. Reading them still works (copied then).
