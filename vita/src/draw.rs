@@ -570,9 +570,13 @@ pub struct Draws {
     /// The mip/index test block (`test_block`); null until made.
     test_block: *mut u8,
     test_block_tried: bool,
-    /// The scene's render target in Vita pixels (`set_target_size`): our
-    /// 960x544 targets, or a 480x272 off-screen one (targets.rs).
+    /// The PSP screen's size in the scene's target in Vita pixels
+    /// (`set_target_size`): 960x544 on our targets, 480x272 off-screen
+    /// (targets.rs).
     target_size: (u32, u32),
+    /// The target's own size (an off-screen one may be smaller): the
+    /// scissor stays inside it.
+    surface_size: (u32, u32),
 }
 
 static DRAWS: SingleThreaded<Draws> = SingleThreaded::new(Draws {
@@ -587,22 +591,27 @@ static DRAWS: SingleThreaded<Draws> = SingleThreaded::new(Draws {
     test_block: null_mut(),
     test_block_tried: false,
     target_size: (TARGET_WIDTH, TARGET_HEIGHT),
+    surface_size: (TARGET_WIDTH, TARGET_HEIGHT),
 });
 
 /// The 960x544 targets' size (targets.rs `TARGET_WIDTH` / `TARGET_HEIGHT`).
 const TARGET_WIDTH: u32 = 960;
 const TARGET_HEIGHT: u32 = 544;
 
-/// The scene draws into a target of `width` x `height` Vita pixels showing
-/// the PSP's 480x272 (960x544: doubled; 480x272: the off-screen targets,
-/// PSP pixels 1:1). Sets the viewport for it (GXM's default for such a
-/// target: x width / 2, y -height / 2, z 0.5) and the scissor's scale.
+/// The scene draws into a target showing the PSP's 480x272 as `width` x
+/// `height` Vita pixels (960x544: doubled; 480x272: the off-screen targets,
+/// PSP pixels 1:1), of which the target itself has `surface_width` x
+/// `surface_height` (an off-screen target only the top left part the game
+/// samples). Sets the viewport for it (GXM's default for a target of
+/// `width` x `height`: x width / 2, y -height / 2, z 0.5) and the
+/// scissor's scale and bounds.
 /// Only off-screen scenes call it, at their start and (back to 960x544,
 /// for whatever draws next: our display scenes, vita2d) before their end;
 /// the display targets' scenes keep GXM's default as before.
-pub fn set_target_size(width: u32, height: u32) {
+pub fn set_target_size(width: u32, height: u32, surface_width: u32, surface_height: u32) {
     let draws = draws();
     draws.target_size = (width, height);
+    draws.surface_size = (surface_width.min(width), surface_height.min(height));
     let (half_width, half_height) = (width as f32 / 2.0, height as f32 / 2.0);
     // Safe: the display thread's context.
     unsafe { gxm::sceGxmSetViewport(context(), half_width, half_width, half_height, -half_height, 0.5, 0.5) };
@@ -823,10 +832,10 @@ impl Draws {
     /// Limits drawing to the PSP scissor rectangle (inclusive PSP pixels).
     fn set_scissor(&mut self, draw: &Draw) {
         // Vita pixels per PSP pixel: 2 on our targets, 1 off-screen.
-        let (width, height) = self.target_size;
-        let scale = width / 480;
-        let mut top = draw.scissor_top as u32 * scale;
-        let left = draw.scissor_left as u32 * scale;
+        let scale = self.target_size.0 / 480;
+        let (width, height) = self.surface_size;
+        let mut top = (draw.scissor_top as u32 * scale).min(height - 1);
+        let left = (draw.scissor_left as u32 * scale).min(width - 1);
         let right = (draw.scissor_right as u32 * scale + scale - 1).min(width - 1);
         let mut bottom = (draw.scissor_bottom as u32 * scale + scale - 1).min(height - 1);
         let clip = GPU_CLIP_ROWS.load(Ordering::Relaxed);

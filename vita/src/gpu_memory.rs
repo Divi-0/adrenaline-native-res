@@ -53,18 +53,25 @@ pub fn for_gpu(name: &'static [u8], bytes: u32) -> Option<GpuBlock> {
 
 /// CDRAM (the GPU's own memory) the GPU reads and writes: the off-screen
 /// targets (targets.rs), which main memory has no room for. Whole 256 KiB
-/// units (the kernel's rule for CDRAM blocks).
+/// units (the kernel's rule for CDRAM blocks). None if that would leave
+/// less than `CDRAM_RESERVE` free.
 pub fn for_gpu_cdram(name: &'static [u8], bytes: u32) -> Option<GpuBlock> {
-    allocate(
-        name,
-        sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW,
-        bytes.next_multiple_of(CDRAM_UNIT),
-        gxm::MEMORY_ATTRIB_READ | gxm::MEMORY_ATTRIB_WRITE,
-    )
+    let bytes = bytes.next_multiple_of(CDRAM_UNIT);
+    if crate::blocks::free_cdram() < bytes + CDRAM_RESERVE {
+        return None;
+    }
+    allocate(name, sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, bytes, gxm::MEMORY_ATTRIB_READ | gxm::MEMORY_ATTRIB_WRITE)
 }
 
 /// CDRAM blocks come in whole 256 KiB.
 pub const CDRAM_UNIT: u32 = 256 * 1024;
+
+/// CDRAM left free for Sony's emulator: it takes CDRAM when a PSP game
+/// starts a movie, and without it the game hangs for good (black screen, no
+/// error). God of War's intro movie after "New Game" (2026-11-22): runs
+/// with 2 MiB of CDRAM free, hangs with 1 MiB (our five 768 KiB off-screen
+/// targets of its title had taken 3 of the 4 MiB free).
+pub const CDRAM_RESERVE: u32 = 2 * 1024 * 1024;
 
 /// Cached main memory the CPU fills and the GPU reads (see the module's head).
 #[allow(dead_code)] // for the unswizzle quads and sprite corners, still C

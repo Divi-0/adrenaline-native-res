@@ -212,6 +212,11 @@ pub unsafe fn free_block(uid: SceUID) -> i32 {
     sys::sceKernelFreeMemBlock(uid)
 }
 
+/// Free CDRAM in bytes (`gpu_memory::for_gpu_cdram` keeps a reserve).
+pub fn free_cdram() -> u32 {
+    free_memory().size_cdram.max(0) as u32
+}
+
 fn free_memory() -> sys::SceKernelFreeMemorySizeInfo {
     let mut info = sys::SceKernelFreeMemorySizeInfo {
         size: core::mem::size_of::<sys::SceKernelFreeMemorySizeInfo>() as i32,

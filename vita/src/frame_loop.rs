@@ -397,7 +397,7 @@ impl FrameLoop {
         // targets of their own, so their textures come from there.
         for &framebuffer in offscreen::sampled(frame.draws(), frame.textures(), frame.shown_framebuffer).iter() {
             if framebuffer != 0 && targets.find(framebuffer).is_none() {
-                targets.offscreen_for(framebuffer, render_count);
+                targets.offscreen_for(framebuffer, render_count, offscreen::sampled_size(frame.textures(), framebuffer));
             }
         }
         targets.publish_addresses();
@@ -593,9 +593,11 @@ impl FrameLoop {
                 unsafe { gxm::sceGxmTextureSetFormat(&mut target.opaque_view.gxm, gxm::TEXTURE_FORMAT_X8U8U8U8_1BGR) };
                 self.textures[i] = &target.opaque_view;
             }
-            // Our target holds the PSP's 480x272 screen; the PSP texture
-            // coordinates run across width x height PSP pixels.
-            self.uv_scales[i] = [wanted.width as f32 / 480.0, wanted.height as f32 / 272.0];
+            // Our target holds the PSP's 480x272 screen (an off-screen one
+            // its top left part); the PSP texture coordinates run across
+            // width x height PSP pixels.
+            let (psp_width, psp_height) = target.psp_size();
+            self.uv_scales[i] = [wanted.width as f32 / psp_width as f32, wanted.height as f32 / psp_height as f32];
             stats().target_textures += 1;
         }
     }
@@ -844,7 +846,7 @@ impl FrameLoop {
         }
         if offscreen_target.is_some() {
             // Back to our targets' size for whatever draws next.
-            draw::set_target_size(TARGET_WIDTH, TARGET_HEIGHT);
+            draw::set_target_size(TARGET_WIDTH, TARGET_HEIGHT, TARGET_WIDTH, TARGET_HEIGHT);
         }
         let end_start = now();
         stats().loop_us += end_start - loop_start;

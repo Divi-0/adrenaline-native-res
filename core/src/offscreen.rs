@@ -25,7 +25,9 @@ use crate::texture::{is_dxt_format, is_palette_format};
 /// Off-screen framebuffers that can have targets at once. 6 since
 /// 2026-11-22 (was 2): God of War's title samples five (a blur pre-pass and
 /// a three-level bloom chain); the targets are made in CDRAM only when a
-/// game samples that many (512 KiB each; GoW leaves 3 MiB of CDRAM free).
+/// game samples that many, each as big as the frame samples (`sampled_size`;
+/// GoW's five: 1.25 MiB), and only while CDRAM keeps its reserve for Sony's
+/// emulator (the Vita crate's `gpu_memory::CDRAM_RESERVE`).
 pub const MAX_OFFSCREEN: usize = 6;
 
 /// Consecutive draws into the same framebuffer: (framebuffer, draw range),
@@ -79,6 +81,18 @@ pub fn reads_framebuffer(texture: &TextureDescriptor, framebuffer: u32) -> bool 
         && !is_palette_format(texture.format)
         && !is_dxt_format(texture.format)
         && fold_vram_mirror(texture.address) == fold_vram_mirror(framebuffer)
+}
+
+/// How much of off-screen framebuffer `framebuffer` the frame's textures
+/// read, in PSP pixels: the widest and the highest of them (0 x 0 if none).
+/// Its target needs no more: God of War's title samples five off-screen
+/// framebuffers of 256x256 down to 32x32, which took 768 KiB of CDRAM each
+/// as 480x272 targets (2026-11-22, `CDRAM_RESERVE` in the Vita crate).
+pub fn sampled_size(textures: &[TextureDescriptor], framebuffer: u32) -> (u32, u32) {
+    textures
+        .iter()
+        .filter(|texture| reads_framebuffer(texture, framebuffer))
+        .fold((0, 0), |(width, height), texture| (width.max(texture.width as u32), height.max(texture.height as u32)))
 }
 
 /// The off-screen framebuffers (not `shown`) this frame draws into AND
@@ -159,6 +173,22 @@ mod tests {
 
     fn texture(address: u32, format: u8) -> TextureDescriptor {
         TextureDescriptor { address, format, width: 512, height: 512, buffer_width: 512, ..Default::default() }
+    }
+
+    #[test]
+    fn sampled_size_is_the_largest_texture_at_the_framebuffer() {
+        // God of War's bloom level at 0x04162400: read as 128x64 and 128x128.
+        let level = 0x0416_2400;
+        let sized = |address, width, height| TextureDescriptor { width, height, ..texture(address, format::ABGR8888) };
+        let textures = [
+            sized(level, 128, 64),
+            sized(SHOWN, 512, 512),
+            sized(level, 128, 128),
+            sized(0x0436_2400, 64, 256), // a VRAM mirror of the same address
+            TextureDescriptor { width: 512, height: 512, ..texture(level, format::CLUT8) }, // not a framebuffer read
+        ];
+        assert_eq!(sampled_size(&textures, level), (128, 256));
+        assert_eq!(sampled_size(&textures, TRAIL), (0, 0));
     }
 
     /// NFS UR's title: clear the screen, fade the trail buffer, a quad into

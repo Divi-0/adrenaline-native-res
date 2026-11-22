@@ -20,9 +20,12 @@
 //!
 //! Off-screen framebuffers (core offscreen.rs: drawn into and sampled as a
 //! texture by the same frame, NFS UR's trail buffer) get targets of their
-//! own (`Targets::offscreen`): the PSP's 480x272 at 1:1 (0.5 MiB), in CDRAM,
-//! made on first use. Main memory has no room for more 960x544 targets
-//! (2 MiB each; memcheck), and such buffers are blurred glows and trails.
+//! own (`Targets::offscreen`): PSP pixels at 1:1, as many as the frame
+//! samples (core `offscreen::sampled_size`, at most 480x272), in CDRAM, made
+//! on first use and made again bigger when a frame samples more. Main memory
+//! has no room for more 960x544 targets (2 MiB each; memcheck), and such
+//! buffers are blurred glows and trails. CDRAM keeps a reserve for Sony's
+//! emulator (`gpu_memory::CDRAM_RESERVE`): without it a game's movie hangs.
 //! A frame using one is drawn in several scenes, one per run of draws into
 //! the same framebuffer (frame_loop.rs).
 
@@ -70,11 +73,20 @@ const TARGET_BYTES: u32 = sys::pages((TARGET_WIDTH * TARGET_HEIGHT * 4) as usize
 #[allow(non_upper_case_globals)]
 pub static nativeres_plan_fixed_render_targets: u32 = (TARGET_COUNT as u32 + 1) * TARGET_BYTES;
 
-/// Off-screen targets: the PSP's 480x272, 1:1 (`Target::create`).
+/// Off-screen targets: PSP pixels 1:1, at most the PSP's 480x272
+/// (`Targets::offscreen_for`). Their draws are mapped onto 480x272 as ever
+/// (`draw::set_target_size`); a smaller target holds its top left part.
 pub const OFFSCREEN_WIDTH: u32 = 480;
 pub const OFFSCREEN_HEIGHT: u32 = 272;
 pub const OFFSCREEN_COUNT: usize = nativeres_core::offscreen::MAX_OFFSCREEN;
 const OFFSCREEN_BYTES: u32 = (OFFSCREEN_WIDTH * OFFSCREEN_HEIGHT * 4).next_multiple_of(gpu_memory::CDRAM_UNIT);
+
+/// An off-screen target's size for `sampled` (width, height) PSP pixels:
+/// whole 32-pixel steps, at least 32, at most 480x272.
+fn offscreen_size(sampled: (u32, u32)) -> (u32, u32) {
+    let step = |pixels: u32, most: u32| pixels.max(1).next_multiple_of(32).min(most);
+    (step(sampled.0, OFFSCREEN_WIDTH), step(sampled.1, OFFSCREEN_HEIGHT))
+}
 
 /// The off-screen targets, made only for games that use them, in CDRAM (a
 /// pool of its own: memcheck's `cdram` kind).
@@ -122,9 +134,14 @@ pub struct Target {
     pub frame_number: u32,
     /// New: cleared before the first frame.
     pub needs_clear: bool,
-    /// Its size in Vita pixels: 960x544, or 480x272 off-screen; 0 until made.
+    /// Its size in Vita pixels: 960x544, or up to 480x272 off-screen; 0
+    /// until made.
     pub width: u32,
     pub height: u32,
+    /// Vita pixels per PSP pixel: 2 on our 960x544 targets, 1 off-screen.
+    pixel_scale: u32,
+    /// Its memory block (-1 until made).
+    block: sys::SceUID,
     /// Its RGBA pixels (uncached); null until made.
     pixels: *mut u32,
     surface: gxm::ColorSurface,
@@ -149,6 +166,8 @@ const UNUSED_TARGET: Target = Target {
     needs_clear: false,
     width: 0,
     height: 0,
+    pixel_scale: 1,
+    block: -1,
     pixels: null_mut(),
     surface: gxm::ColorSurface { words: [0; 12] },
     render_target: null_mut(),
@@ -163,15 +182,15 @@ impl Target {
         !self.render_target.is_null()
     }
 
-    /// Makes its memory (`cdram`: in CDRAM, else main memory), colour
-    /// surface and render target, `width` x `height`; false if it can't be
-    /// made.
-    fn create(&mut self, width: u32, height: u32, cdram: bool) -> bool {
+    /// Makes its memory, colour surface and render target, `width` x
+    /// `height`: `offscreen` 1:1 in CDRAM, else one of our 960x544 targets
+    /// in main memory; false if it can't be made.
+    fn create(&mut self, width: u32, height: u32, offscreen: bool) -> bool {
         if shared_depth().is_null() {
             return false;
         }
-        let block = if cdram {
-            gpu_memory::for_gpu_cdram(b"NativeResOffscreenTarget\0", OFFSCREEN_BYTES)
+        let block = if offscreen {
+            gpu_memory::for_gpu_cdram(b"NativeResOffscreenTarget\0", width * height * 4)
         } else {
             gpu_memory::for_gpu(b"NativeResTarget\0", TARGET_BYTES)
         };
@@ -211,10 +230,41 @@ impl Target {
         // Safe: our block of width x height texels.
         unsafe { gxm::sceGxmTextureInitLinear(&mut self.texture.gxm, base as *const _, gxm::TEXTURE_FORMAT_U8U8U8U8_ABGR, width, height, 0) };
         self.pixels = base as *mut u32;
+        self.block = uid;
         self.width = width;
         self.height = height;
+        self.pixel_scale = if offscreen { 1 } else { 2 };
         self.scenes = 1;
         true
+    }
+
+    /// The PSP pixels it holds (width, height).
+    pub fn psp_size(&self) -> (u32, u32) {
+        (self.width / self.pixel_scale, self.height / self.pixel_scale)
+    }
+
+    /// Frees its render target and memory, to be made again at another size
+    /// (the GPU is drained first: earlier scenes may still use them).
+    fn destroy(&mut self) {
+        if !self.exists() {
+            return;
+        }
+        // Safe: the display thread's context; nothing uses the render target
+        // or the memory once the GPU is done, and this target forgets them.
+        unsafe {
+            gxm::sceGxmFinish(gxm::context());
+            gxm::sceGxmDestroyRenderTarget(self.render_target);
+            gxm::sceGxmUnmapMemory(self.pixels as *mut _);
+            sys::free_block(self.block);
+        }
+        self.render_target = null_mut();
+        self.pixels = null_mut();
+        self.block = -1;
+        self.width = 0;
+        self.height = 0;
+        self.scenes = 0;
+        self.texture = TextureObject::view(NO_TEXTURE);
+        self.opaque_view = TextureObject::view(NO_TEXTURE);
     }
 
     /// Makes its render target take `scenes` scenes per frame (at most
@@ -479,28 +529,46 @@ impl Targets {
         self.offscreen.iter().position(|target| target.exists() && target.psp_address == psp_address)
     }
 
-    /// The off-screen target for `psp_address`: its own, else a free or the
-    /// least recently used one (cleared first), made in CDRAM when first
-    /// needed. None if none can be made.
-    pub fn offscreen_for(&mut self, psp_address: u32, render_count: u32) -> Option<usize> {
-        if let Some(index) = self.find_offscreen(psp_address) {
-            self.offscreen[index].last_used = render_count;
+    /// The off-screen target for `psp_address`, holding at least `sampled`
+    /// (width, height) PSP pixels (core `offscreen::sampled_size`): its own,
+    /// else a free or the least recently used one (cleared first), made in
+    /// CDRAM when first needed and made again when too small. None if none
+    /// can be made.
+    pub fn offscreen_for(&mut self, psp_address: u32, render_count: u32, sampled: (u32, u32)) -> Option<usize> {
+        let (width, height) = offscreen_size(sampled);
+        let own = self.find_offscreen(psp_address);
+        let index = own.unwrap_or_else(|| {
+            (0..OFFSCREEN_COUNT)
+                .find(|&k| self.offscreen[k].psp_address == 0)
+                .unwrap_or_else(|| (0..OFFSCREEN_COUNT).min_by_key(|&k| self.offscreen[k].last_used).unwrap_or(0))
+        });
+        let target = &mut self.offscreen[index];
+        target.last_used = render_count;
+        let fits = target.exists() && target.width >= width && target.height >= height;
+        if own.is_some() && fits {
             return Some(index);
         }
-        let index = (0..OFFSCREEN_COUNT)
-            .find(|&k| self.offscreen[k].psp_address == 0)
-            .unwrap_or_else(|| (0..OFFSCREEN_COUNT).min_by_key(|&k| self.offscreen[k].last_used).unwrap_or(0));
-        let target = &mut self.offscreen[index];
-        if !target.exists() && !target.create(OFFSCREEN_WIDTH, OFFSCREEN_HEIGHT, true) {
-            if self.begin_logs > 0 {
-                self.begin_logs -= 1;
-                render_log::line(format_args!("off-screen target for {:08x}: can't be made (CDRAM)\n", psp_address));
+        if !fits {
+            // Made again at the larger of both sizes (its picture is lost).
+            let (width, height) = (width.max(target.width), height.max(target.height));
+            target.destroy();
+            if !target.create(width, height, true) {
+                target.psp_address = 0;
+                if self.begin_logs > 0 {
+                    self.begin_logs -= 1;
+                    render_log::line(format_args!(
+                        "off-screen target for {:08x} ({}x{}): can't be made (CDRAM: {} KiB free)\n",
+                        psp_address,
+                        width,
+                        height,
+                        crate::blocks::free_cdram() / 1024
+                    ));
+                }
+                return None;
             }
-            return None;
         }
         target.psp_address = psp_address;
         target.needs_clear = true;
-        target.last_used = render_count;
         Some(index)
     }
 
@@ -531,7 +599,7 @@ impl Targets {
             render_log::line(format_args!("sceGxmBeginScene (off-screen {:08x}) failed: {:08x}\n", target.psp_address, result));
         }
         draw::forget_gxm_state();
-        draw::set_target_size(OFFSCREEN_WIDTH, OFFSCREEN_HEIGHT);
+        draw::set_target_size(OFFSCREEN_WIDTH, OFFSCREEN_HEIGHT, target.width, target.height);
         if target.needs_clear {
             // Safe: inside the scene.
             unsafe { basic_programs::clear_screen() };
