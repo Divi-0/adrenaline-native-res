@@ -387,6 +387,11 @@ pub fn config_write(data: *const c_void, size: u32) -> Option<[u8; CONFIG_BYTES]
     Some(copy)
 }
 
+/// Whether the switch is in Adrenaline's Settings.
+pub fn installed() -> bool {
+    INSTALLED.load(Relaxed)
+}
+
 /// Our settings thread: adds the switch to the menu and keeps the filter
 /// in line (`sync`). Returns once the menu is ours.
 pub fn try_install() -> bool {

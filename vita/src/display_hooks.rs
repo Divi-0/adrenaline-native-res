@@ -494,7 +494,8 @@ unsafe extern "C" fn user_create_thread_hooked(
 }
 
 /// Sets all hooks (once; AdrenalineUser must be loaded) and logs their ids.
-pub fn install() {
+/// Returns (hooks set, hooks tried); each failed one goes to the user log.
+pub fn install() -> (usize, usize) {
     // Safe: each hook function has the hooked function's signature and
     // passes the call on through its Hook.
     let ids = unsafe {
@@ -531,9 +532,16 @@ pub fn install() {
             ),
         ]
     };
+    let mut set = 0;
     for (name, id) in ids {
         render_log::line(format_args!("hook {}: {:08x}\n", name, id));
+        if id >= 0 {
+            set += 1;
+        } else {
+            crate::user_log::line(format_args!("ERROR: hook on {} failed ({:08x})", name, id as u32));
+        }
     }
+    (set, ids.len())
 }
 
 // ------------------------------------------------------------ the GAME fps label

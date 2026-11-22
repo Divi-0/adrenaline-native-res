@@ -180,7 +180,8 @@ unsafe extern "C" fn io_chstat_hooked(path: *const u8, stat: *mut c_void, bits: 
 const _: () = assert!(DIRENT_BYTES <= STRUCT_BYTES && STAT_BYTES <= STRUCT_BYTES);
 
 /// Sets the hooks (once; AdrenalineUser must be loaded) and logs their ids.
-pub fn install() {
+/// Returns (hooks set, hooks tried); each failed one goes to the user log.
+pub fn install() -> (usize, usize) {
     const USER: &[u8] = b"AdrenalineUser\0";
     // Safe: each hook has the hooked function's signature and passes the
     // call on.
@@ -193,7 +194,14 @@ pub fn install() {
             ("sceIoChstat", IO_CHSTAT.hook_import(USER, SCE_LIBKERNEL_NID, SCE_IO_CHSTAT_NID, io_chstat_hooked as *const c_void)),
         ]
     };
+    let mut set = 0;
     for (name, id) in ids {
         render_log::line(format_args!("hook {}: {:08x}\n", name, id));
+        if id >= 0 {
+            set += 1;
+        } else {
+            crate::user_log::line(format_args!("ERROR: hook on {} failed ({:08x})", name, id as u32));
+        }
     }
+    (set, ids.len())
 }

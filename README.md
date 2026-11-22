@@ -73,10 +73,24 @@ smooth=0     # texture filter: 0 the game's own (default), 1 always smooth
 gamefps=1    # 1 (default): the game's own frame rate in the top left corner, 0: off
 ```
 
+### Troubleshooting
+
+At every start of Adrenaline the plugin writes `ux0:data/nativeres/log.txt`: a few lines, each
+`OK`, `WARNING` or `ERROR`, from loading through finding Adrenaline, setting its hooks and installing
+the PSP side to the PSP side running with a game. The last line shows how far it got.
+
+- **No `log.txt` at all** (delete it, reboot, start Adrenaline): taiHEN never loaded the plugin.
+  Check the `config.txt` line, that the file is `ur0:tai/adrenaline-native-res.suprx`, and whether a
+  `ux0:tai/config.txt` exists (taiHEN then reads only that one).
+- **`ERROR` about AdrenalineUser, settings or hooks**: a different Adrenaline than Adrenaline 8 (isage).
+- **Ends at "waiting for the PSP side"** after a game started: the PSP side didn't start. The
+  `psp plugin` line shows where `nativeres.prx` and `plugins.txt` were written: the `seplugins`
+  folder of the Memory Stick location set in Adrenaline's settings.
+
 ### Uninstalling
 
 Remove the line from `ur0:tai/config.txt` (or `ux0:tai/config.txt`) and reboot. Then delete
-`ur0:tai/adrenaline-native-res.suprx`, `ux0:data/nativeres/` (if you made a settings file),
+`ur0:tai/adrenaline-native-res.suprx`, `ux0:data/nativeres/` (its log, and your settings file),
 `<Memory Stick>/seplugins/nativeres.prx` and its line in `seplugins/plugins.txt`.
 
 ## Building

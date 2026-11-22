@@ -126,6 +126,8 @@ fn load() {
 unsafe extern "C" fn options_thread(_args: u32, _argp: *mut core::ffi::c_void) -> i32 {
     load();
     let mut menu_installed = false;
+    // Menu tries left before the user log says the entry wasn't found.
+    let mut menu_tries_left = 200;
     loop {
         if skipped(start_skip::MENU) {
             // Left out (`startskip=`).
@@ -133,7 +135,24 @@ unsafe extern "C" fn options_thread(_args: u32, _argp: *mut core::ffi::c_void) -
             menu::sync();
         } else {
             menu_installed = menu::try_install();
+            if menu_installed {
+                if menu::installed() {
+                    crate::user_log::line(format_args!("OK: \"NativeRes Renderer\" added to Adrenaline's Settings"));
+                } else {
+                    crate::user_log::line(format_args!("WARNING: no room for \"NativeRes Renderer\" in Adrenaline's Settings"));
+                }
+            } else if menu_tries_left > 0 {
+                menu_tries_left -= 1;
+                if menu_tries_left == 0 {
+                    crate::user_log::line(format_args!(
+                        "WARNING: Adrenaline's Settings menu not found after 10 s: no \"NativeRes Renderer\" switch (Adrenaline version?)"
+                    ));
+                }
+            }
         }
+        // Lines other threads kept (the capture's at a game's start): the
+        // file is written here, off the capture and display loops.
+        crate::user_log::save();
         crate::blocks::note_free_user_memory();
         let mhz = ARM_CLOCK.load(Relaxed);
         if sys::scePowerGetArmClockFrequency() != mhz {

@@ -17,6 +17,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          # History and tags: the plugin names its version from `git describe`.
+          fetch-depth: 0
 
       - name: Build the SDK image
         run: docker build -t nativeres-sdk docker

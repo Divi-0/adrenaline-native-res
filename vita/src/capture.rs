@@ -1285,12 +1285,19 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
     if !state.capture.allocate() {
         log::append(b"capture: no phycont memory for it, not capturing\n");
         log::flush();
+        crate::user_log::line(format_args!("ERROR: not enough memory for the capture: NativeRes is off"));
+        crate::user_log::save();
         return 0;
     }
     let have_frames = frames::allocate();
     log::append(if have_frames { b"capture: frames ready\n" } else { b"capture: no memory for frames, not recording\n" });
     log::append(b"capture: waiting for the PSP plugin's event ring\n");
     log::flush();
+    if !have_frames {
+        crate::user_log::line(format_args!("ERROR: not enough memory for frames: NativeRes draws nothing"));
+    }
+    crate::user_log::line(format_args!("OK: renderer ready, waiting for the PSP side (nativeres.prx) to start with a game"));
+    crate::user_log::save();
     nativeres_core::copy_watch::set_clock(Some(clock_us));
     // Whether the draws' vertices are recorded on another core
     // (recorder_thread.rs; can be switched at run time).
@@ -1390,6 +1397,11 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
                 let length = text.len();
                 log::append(&line[..length]);
                 log::flush();
+                crate::user_log::line(format_args!(
+                    "ERROR: the PSP side (nativeres.prx) is another version ({}, expected {}): an old copy in seplugins, or a savestate from an older version",
+                    header.version,
+                    event_ring::VERSION
+                ));
             }
             if capturing {
                 log::flush();
@@ -1405,6 +1417,18 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
             let title = crate::adrenaline::title_id();
             let length = title.iter().position(|&byte| byte == 0).unwrap_or(title.len());
             log::open(&title[..length], session);
+            // The user log's last line: nothing is logged after the game's
+            // start (saved by the settings thread, no file write here).
+            // Adrenaline's title ID is often still empty here.
+            if length == 0 {
+                crate::user_log::line(format_args!("OK: PSP side running, a game started"));
+            } else {
+                crate::user_log::line(format_args!(
+                    "OK: PSP side running, game {}",
+                    core::str::from_utf8(&title[..length]).unwrap_or("?")
+                ));
+            }
+            crate::user_log::finish();
             state.reader.restart();
             // Keeps the GE registers: a savestate load is a new session too
             // (Capture::start_session); the GE's own come when the plugin

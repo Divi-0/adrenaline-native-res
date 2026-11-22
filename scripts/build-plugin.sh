@@ -9,6 +9,12 @@ mkdir -p "$OUT"
 # The PSP side first: the plugin carries it (vita/src/psp_plugin.rs).
 sh scripts/build-psp-plugin.sh
 
+# The version the user log names (vita/src/user_log.rs): the git tag
+# (e.g. v0.3.0, or v0.3.0-2-gabc1234 two commits after it). safe.directory:
+# in the SDK container the checkout belongs to another user.
+NATIVERES_VERSION=$(git -c safe.directory='*' describe --tags --always --dirty 2>/dev/null || echo unknown)
+export NATIVERES_VERSION
+
 # core from source (the Vita is a tier-3 target); compiler_builtins brings
 # memcpy/memset/memcmp/strlen, since no C library is linked.
 cargo $NIGHTLY build --release -p nativeres-plugin --target $VITA_TARGET \
@@ -42,7 +48,7 @@ arm-vita-eabi-gcc -Wl,-q -nostartfiles -nostdlib \
   -ltaihen_stub -lSceLibKernel_stub -lSceKernelThreadMgr_stub -lSceSysmem_stub \
   -lSceKernelModulemgr_stub -lSceProcessmgr_stub \
   -lSceGxm_stub_weak -lSceDisplay_stub_weak -lSceCompat_stub_weak -lSceKernelDmacMgr_stub_weak \
-  -lSceIofilemgr_stub_weak -lSceSysmodule_stub_weak -lScePower_stub_weak -lSceNet_stub_weak \
+  -lSceIofilemgr_stub_weak -lSceSysmodule_stub_weak -lScePower_stub_weak -lSceNet_stub_weak -lSceRtc_stub_weak \
   -Wl,--end-group
 vita-elf-create -e vita/exports.yml "$OUT/nativeres.elf" "$OUT/nativeres.velf"
 vita-make-fself -c "$OUT/nativeres.velf" target/adrenaline-native-res.suprx

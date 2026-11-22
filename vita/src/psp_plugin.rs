@@ -168,6 +168,16 @@ pub fn install_prx(prx_bytes: &[u8], file: &[u8], entry: &PluginsTxtEntry, label
         Some(Some(length)) if write_file(list, &buffers.updated[..length]) => "line added",
         Some(Some(_)) => "line NOT added",
     };
+    let failed = plugin == "NOT written" || line == "line NOT added" || existing.is_none();
+    crate::user_log::line(format_args!(
+        "{} {}: {} {}, {} {}",
+        if failed { "ERROR:" } else { "OK:" },
+        label,
+        shown(prx),
+        plugin,
+        shown(list),
+        line
+    ));
     render_log::line(format_args!(
         "{}: {} {} bytes {}, {}, {} us\n",
         label,
