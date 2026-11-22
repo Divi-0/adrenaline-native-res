@@ -22,8 +22,11 @@ use crate::frame::{Draw, TextureDescriptor};
 use crate::memory::fold_vram_mirror;
 use crate::texture::{is_dxt_format, is_palette_format};
 
-/// Off-screen framebuffers that can have targets at once.
-pub const MAX_OFFSCREEN: usize = 2;
+/// Off-screen framebuffers that can have targets at once. 6 since
+/// 2026-11-22 (was 2): God of War's title samples five (a blur pre-pass and
+/// a three-level bloom chain); the targets are made in CDRAM only when a
+/// game samples that many (512 KiB each; GoW leaves 3 MiB of CDRAM free).
+pub const MAX_OFFSCREEN: usize = 6;
 
 /// Consecutive draws into the same framebuffer: (framebuffer, draw range),
 /// in the frame's order.
@@ -126,6 +129,13 @@ mod tests {
     const TRAIL: u32 = 0x040C_C000;
     const QUAD: u32 = 0x0411_0000;
 
+    /// `first` then zeros, as `sampled` returns them.
+    fn slots(first: &[u32]) -> [u32; MAX_OFFSCREEN] {
+        let mut slots = [0; MAX_OFFSCREEN];
+        slots[..first.len()].copy_from_slice(first);
+        slots
+    }
+
     fn draw(framebuffer: u32) -> Draw {
         Draw { framebuffer, ..Default::default() }
     }
@@ -154,7 +164,7 @@ mod tests {
     fn only_sampled_off_screen_framebuffers_get_targets() {
         let (draws, textures) = nfs_title();
         // The trail buffer is read back; the quad's buffer isn't.
-        assert_eq!(sampled(&draws, &textures, SHOWN), [TRAIL, 0]);
+        assert_eq!(sampled(&draws, &textures, SHOWN), slots(&[TRAIL]));
     }
 
     #[test]
@@ -163,20 +173,59 @@ mod tests {
         // shown one: nothing off-screen.
         let draws = vec![draw(SHOWN), draw(SHOWN)];
         let textures = vec![texture(0x0408_8000, format::ABGR8888), texture(SHOWN, format::ABGR8888)];
-        assert_eq!(sampled(&draws, &textures, SHOWN), [0, 0]);
+        assert_eq!(sampled(&draws, &textures, SHOWN), slots(&[]));
     }
 
     #[test]
     fn mirrors_count_and_index_or_dxt_reads_do_not() {
         let draws = vec![draw(TRAIL), draw(SHOWN)];
         // The trail buffer sampled through a VRAM mirror.
-        assert_eq!(sampled(&draws, &[texture(TRAIL | 0x0020_0000, format::BGR5650)], SHOWN), [TRAIL, 0]);
-        assert_eq!(sampled(&draws, &[texture(TRAIL, format::CLUT8)], SHOWN), [0, 0]);
-        assert_eq!(sampled(&draws, &[texture(TRAIL, format::DXT1)], SHOWN), [0, 0]);
+        assert_eq!(sampled(&draws, &[texture(TRAIL | 0x0020_0000, format::BGR5650)], SHOWN), slots(&[TRAIL]));
+        assert_eq!(sampled(&draws, &[texture(TRAIL, format::CLUT8)], SHOWN), slots(&[]));
+        assert_eq!(sampled(&draws, &[texture(TRAIL, format::DXT1)], SHOWN), slots(&[]));
     }
 
     fn textured(framebuffer: u32, texture: u32) -> Draw {
         Draw { framebuffer, texture, flags: crate::frame::draw_flags::TEXTURED, ..Default::default() }
+    }
+
+    #[test]
+    fn god_of_war_bloom_chain_gets_a_target_per_framebuffer() {
+        // God of War's title (2026-11-22): a blur pre-pass ping-pongs two
+        // 565 buffers, the scene goes to the screen, then a bloom chain
+        // samples the screen into 0x04162000 (256x256), 0x04162400 (128),
+        // 0x04162600 (64) and back up, and the screen samples 0x04162000.
+        // Each of the five must get a target, else the chain reads VRAM
+        // nobody drew (a band of noise across the title).
+        const SCREEN: u32 = 0x0408_C000;
+        const BLUR_A: u32 = 0x0416_1800;
+        const BLUR_B: u32 = 0x0418_1800;
+        const LEVEL_0: u32 = 0x0416_2000;
+        const LEVEL_1: u32 = 0x0416_2400;
+        const LEVEL_2: u32 = 0x0416_2600;
+        let textures = vec![
+            texture(BLUR_A, format::BGR5650),
+            texture(BLUR_B, format::BGR5650),
+            texture(SCREEN, format::ABGR8888),
+            texture(LEVEL_0, format::ABGR8888),
+            texture(LEVEL_1, format::ABGR8888),
+            texture(LEVEL_2, format::ABGR8888),
+        ];
+        let draws = vec![
+            draw(BLUR_A),
+            textured(BLUR_B, 0),
+            textured(BLUR_A, 1),
+            draw(SCREEN),
+            textured(LEVEL_0, 2),
+            textured(LEVEL_1, 3),
+            textured(LEVEL_2, 4),
+            textured(LEVEL_1, 5),
+            textured(LEVEL_0, 4),
+            textured(SCREEN, 3),
+        ];
+        assert_eq!(sampled(&draws, &textures, SCREEN), slots(&[BLUR_A, BLUR_B, LEVEL_0, LEVEL_1, LEVEL_2]));
+        // The chain samples the screen mid-frame: drawn in GE order.
+        assert!(!offscreen_first(&draws, &textures, SCREEN, |framebuffer| framebuffer != SCREEN));
     }
 
     #[test]
@@ -206,11 +255,12 @@ mod tests {
 
     #[test]
     fn at_most_max_offscreen_each_once() {
-        let a = 0x0410_0000;
-        let b = 0x0412_0000;
-        let c = 0x0414_0000;
-        let draws = vec![draw(a), draw(SHOWN), draw(a), draw(b), draw(c), draw(SHOWN)];
-        let textures: Vec<_> = [a, b, c].iter().map(|&address| texture(address, format::ABGR8888)).collect();
-        assert_eq!(sampled(&draws, &textures, SHOWN), [a, b]);
+        // One framebuffer more than there are places, the first drawn twice.
+        let framebuffers: Vec<u32> = (0..=MAX_OFFSCREEN as u32).map(|n| 0x0410_0000 + n * 0x2_0000).collect();
+        let mut draws = vec![draw(framebuffers[0]), draw(SHOWN)];
+        draws.extend(framebuffers.iter().map(|&framebuffer| draw(framebuffer)));
+        draws.push(draw(SHOWN));
+        let textures: Vec<_> = framebuffers.iter().map(|&address| texture(address, format::ABGR8888)).collect();
+        assert_eq!(sampled(&draws, &textures, SHOWN), slots(&framebuffers[..MAX_OFFSCREEN]));
     }
 }
