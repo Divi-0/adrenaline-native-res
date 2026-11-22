@@ -65,6 +65,21 @@ fn main() -> ExitCode {
     if let Some(mode) = std::env::var("NATIVERES_TEXGEN_RUNS").ok().and_then(|value| value.parse::<u8>().ok()) {
         nativeres_core::recorder::TEXGEN_RUNS.store(mode, std::sync::atomic::Ordering::Relaxed);
     }
+    // NATIVERES_CYCLES=<mask>: the core's cycle parts (`cycles::MEASURED`,
+    // bit = part; 0 = all) timed with the PC's time stamp counter, printed
+    // per frame after --bench (x86 cycles: they only locate, the Vita judges).
+    if let Some(mask) = std::env::var("NATIVERES_CYCLES").ok().and_then(|value| value.parse::<u32>().ok()) {
+        fn tsc() -> u32 {
+            #[cfg(target_arch = "x86_64")]
+            // Safe: reads the time stamp counter.
+            return unsafe { core::arch::x86_64::_rdtsc() } as u32;
+            #[cfg(not(target_arch = "x86_64"))]
+            return 0;
+        }
+        nativeres_core::cycles::set_clock(Some(tsc));
+        let mask = if mask == 0 { nativeres_core::cycles::ALL_PARTS } else { mask };
+        nativeres_core::cycles::MEASURED.store(mask, std::sync::atomic::Ordering::Relaxed);
+    }
     // NATIVERES_EXPERIMENT=<mask>: the debug server's `benchexp` bits
     // (`bench::EXPERIMENT`), for A/Bs of the same frame.
     if let Some(mask) = std::env::var("NATIVERES_EXPERIMENT").ok().and_then(|value| value.parse::<u32>().ok()) {
@@ -528,6 +543,15 @@ fn bench(dump_path: &str, runs: u32, only: Option<&str>) -> Result<(), String> {
         if mode == Mode::Full {
             // The hashes the Vita's capture of this dump must give too.
             println!("{:>12}  hashes {:016x} {:016x}", "", frame.description_hash(), frame.vertex_hash());
+        }
+    }
+    if nativeres_core::cycles::MEASURED.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+        use nativeres_core::cycles::{ENTRIES, NAMES, TOTALS};
+        for (part, name) in NAMES.iter().enumerate() {
+            let (total, entries) = (TOTALS[part].load(std::sync::atomic::Ordering::Relaxed), ENTRIES[part].load(std::sync::atomic::Ordering::Relaxed));
+            if entries > 0 {
+                println!("cycles {name:>12}: {:>10} per frame, {:>6} entries per frame", total / runs, entries / runs);
+            }
         }
     }
     if nativeres_core::recorder::TEXGEN_RUNS.load(std::sync::atomic::Ordering::Relaxed) == 2 {

@@ -1506,18 +1506,21 @@ fn record_on_cpu(
     // out only here: most lit runs took the run path above.
     let lit = transform.and_then(Transform::vertex_lighting);
 
-    // Unlit texgen draws (from the position or texture coordinates) of
-    // consecutive vertices: four vertices at a time (`record_texgen_run`),
+    // Unskinned texgen draws of consecutive vertices (lit or not, any
+    // source): four vertices at a time (`record_texgen_run`),
     // the same vertices and triangles as below. Checking (TEXGEN_RUNS 2):
     // recorded both ways, the results compared (`texgen_check`).
     let mut texgen_check_hash = None;
-    if let (Some(transform), Some(texgen), None) = (transform, prepared.texgen.as_ref(), lit.as_ref()) {
+    if let (Some(transform), Some(texgen)) = (transform, prepared.texgen.as_ref()) {
         let shape = primitive_type != primitive::RECTANGLES && format.index_format() == IndexFormat::None;
         let mode = TEXGEN_RUNS.load(core::sync::atomic::Ordering::Relaxed);
         if shape && mode != 0 {
             if let Some(kernel) = transform.texgen_kernel(texgen) {
-                let run = TexgenRun::new(kernel, prepared, material_color, format, layout, call, first_vertex);
-                match record_texgen_run(geometry, memory, run, transform, &color_of, &to_frame, call) {
+                let run = TexgenRun::new(kernel, prepared, material_color, lit.as_ref(), *texgen, format, layout, call, first_vertex);
+                let started = crate::cycles::start(crate::cycles::TEXGEN_RUN);
+                let recorded = record_texgen_run(geometry, memory, run, transform, &color_of, &to_frame, call);
+                crate::cycles::add(crate::cycles::TEXGEN_RUN, started);
+                match recorded {
                     Some(recorded) if mode == 1 => return finish_on_cpu(geometry, stats, call, &draw, recorded),
                     Some(recorded) => {
                         texgen_check_hash = Some(recorded_hash(geometry, &draw, &recorded));
@@ -1530,6 +1533,10 @@ fn record_on_cpu(
     }
 
     // Read the vertices.
+    let general_phase = crate::phase::recorder::enter(match prepared.texgen {
+        Some(_) => crate::phase::recorder::TEXGEN_GENERAL,
+        None => crate::phase::recorder::CPU_DECODE,
+    });
     let mut corners = VertexReader::new(format, layout, memory, call.vertex_address, call.index_address);
     let mut screen_corners = CornerCache::new();
 
@@ -1634,6 +1641,7 @@ fn record_on_cpu(
             Ok(())
         }),
     };
+    crate::phase::recorder::leave(general_phase);
     if let Some(fast) = texgen_check_hash {
         texgen_check(fast, recorded_hash(geometry, &draw, &recorded), geometry.vertex_count() - draw.first_vertex);
     }
@@ -1719,7 +1727,7 @@ fn cut_triangle<M: PspMemory>(
     Ok(())
 }
 
-/// Unlit texgen draws four vertices at a time (`record_texgen_run`): 1
+/// Texgen draws four vertices at a time (`record_texgen_run`): 1
 /// (default), or each vertex on its own as before (0, for A/Bs), or both
 /// and compared (2, `TEXGEN_CHECKS`); debug `texgenruns`, replay
 /// NATIVERES_TEXGEN_RUNS. Same frames either way.
@@ -1752,6 +1760,9 @@ struct TexgenRun<'a> {
     kernel: crate::texgen_run::TexgenKernel,
     prepared: &'a Prepared,
     material_color: u32,
+    /// Lit draws: the lighting (`Transform::vertex_lighting`).
+    lit: Option<&'a VertexLighting<'a>>,
+    texgen: Texgen,
     format: VertexFormat,
     layout: &'a VertexLayout,
     primitive_type: u32,
@@ -1763,16 +1774,23 @@ struct TexgenRun<'a> {
     first: Numbered,
     previous: [Numbered; 2],
     /// `pass` put the chunk's vertices into the frame's spare room (else
-    /// into `scratch`).
+    /// into the scratch vertices).
     in_place: bool,
-    scratch: [FrameVertex; TEXGEN_CHUNK as usize],
 }
 
+/// Room for a chunk's vertices where the frame has none or they are
+/// numbered triangle by triangle (`TexgenRun::pass` and `emit`): filled
+/// in only when first needed (no 2 KiB to clear for every draw).
+type TexgenScratch = Option<[FrameVertex; TEXGEN_CHUNK as usize]>;
+
 impl<'a> TexgenRun<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         kernel: crate::texgen_run::TexgenKernel,
         prepared: &'a Prepared,
         material_color: u32,
+        lit: Option<&'a VertexLighting<'a>>,
+        texgen: Texgen,
         format: VertexFormat,
         layout: &'a VertexLayout,
         call: PrimCall,
@@ -1784,6 +1802,8 @@ impl<'a> TexgenRun<'a> {
             kernel,
             prepared,
             material_color,
+            lit,
+            texgen,
             format,
             layout,
             primitive_type: call.primitive_type,
@@ -1792,7 +1812,6 @@ impl<'a> TexgenRun<'a> {
             first: Numbered::Unset,
             previous: [Numbered::Unset; 2],
             in_place: false,
-            scratch: [FrameVertex::default(); TEXGEN_CHUNK as usize],
         }
     }
 
@@ -1801,22 +1820,51 @@ impl<'a> TexgenRun<'a> {
     /// `scratch`. The vertices behind the near plane (bit k: vertex k);
     /// `None` if one can't be decoded.
     #[inline(never)]
-    fn pass(&mut self, geometry: &mut Geometry, words: &[u32], skew: u32, n: u32) -> Option<u64> {
+    fn pass(&mut self, geometry: &mut Geometry, scratch: &mut TexgenScratch, words: &[u32], skew: u32, n: u32) -> Option<u64> {
         let spare = geometry.spare_vertices(self.first_vertex, n);
         self.in_place = spare.is_some();
         let out = match spare {
             Some(spare) => spare,
-            None => &mut self.scratch[..n as usize],
+            None => &mut scratch.get_or_insert([FrameVertex::default(); TEXGEN_CHUNK as usize])[..n as usize],
         };
-        let (prepared, material_color) = (self.prepared, self.material_color);
-        let of_raw = |color: Option<u32>| prepared.frame_color(prepared.base_color(color, material_color));
         let (format, layout, stride) = (self.format, self.layout, self.layout.size);
+        let mut finish = TexgenFinish {
+            prepared: self.prepared,
+            material_color: self.material_color,
+            lit: self.lit,
+            texgen: self.texgen,
+            last_color: None,
+            last_finished: self.prepared.frame_color(self.prepared.base_color(None, self.material_color)),
+        };
+        // The normal where lighting or the texgen needs it, as the general
+        // path reads it (`VertexReader::get_3d_lit`).
+        let shaded = self.lit.is_some() || self.texgen.needs_normal();
+        let normals = shaded && layout.normal_offset.is_some();
         match &self.direct {
-            Some(common) => texgen_pass_direct(&self.kernel, words, skew, stride, n, format, common, &of_raw, out),
-            None => texgen_pass(&self.kernel, n, out, |vertex| {
-                let raw = format.decode_3d(&VertexBytes::new(words, skew + vertex * stride), layout)?;
-                Some((raw.position, raw.texcoord, raw.color))
-            }, &of_raw),
+            // Unlit, no normals (NFS UR's menu: ~85 % of the texgen
+            // vertices): per vertex only its colour on the ARM side.
+            Some(common) if !shaded => texgen_pass_direct(&self.kernel, words, skew, n, format, layout, common, &mut finish, out),
+            _ => texgen_pass(&self.kernel, n, out, |k, count| {
+                // Any format: each vertex decoded on its own.
+                let mut lanes = [[0.0f32; 4]; 5];
+                let (mut colors, mut sources) = ([0u32; 4], [[0.0f32; 4]; 3]);
+                for lane in 0..4 {
+                    let bytes = VertexBytes::new(words, skew + (k + lane.min(count - 1)) * stride);
+                    let raw = format.decode_3d(&bytes, layout)?;
+                    let normal = if normals { Some(format.decode_normal(&bytes, layout)?) } else { None };
+                    let (color, source) = finish.finish(raw.color, || raw, normal);
+                    let lane = lane as usize;
+                    for (field, value) in lanes.iter_mut().zip([raw.position[0], raw.position[1], raw.position[2], raw.texcoord[0], raw.texcoord[1]]) {
+                        field[lane] = value;
+                    }
+                    colors[lane] = color;
+                    for (row, value) in sources.iter_mut().zip(source) {
+                        row[lane] = value;
+                    }
+                }
+                let [x, y, z, u, v] = lanes;
+                Some((crate::texgen_run::Fields4::from_lanes(x, y, z, u, v), colors, sources))
+            }),
         }
     }
 
@@ -1825,7 +1873,15 @@ impl<'a> TexgenRun<'a> {
     /// the general path's order; `cut` cuts a triangle at the near plane
     /// (`cut_triangle`).
     #[inline(never)]
-    fn emit(&mut self, geometry: &mut Geometry, chunk: u32, n: u32, behind: u64, cut: &mut dyn FnMut(&mut Geometry, [u32; 3]) -> Result<(), Failure>) -> Result<(), Failure> {
+    fn emit(
+        &mut self,
+        geometry: &mut Geometry,
+        scratch: &mut TexgenScratch,
+        chunk: u32,
+        n: u32,
+        behind: u64,
+        cut: &mut dyn FnMut(&mut Geometry, [u32; 3]) -> Result<(), Failure>,
+    ) -> Result<(), Failure> {
         let (primitive_type, first_vertex) = (self.primitive_type, self.first_vertex);
         let (first, previous) = (self.first, self.previous);
         let triangles = match primitive_type {
@@ -1869,9 +1925,11 @@ impl<'a> TexgenRun<'a> {
             }
         } else {
             // Triangle by triangle, as the general path.
+            crate::phase::recorder::enter(crate::phase::recorder::TEXGEN_SLOW);
+            let scratch = scratch.get_or_insert([FrameVertex::default(); TEXGEN_CHUNK as usize]);
             if self.in_place {
                 let spare = geometry.spare_vertices(first_vertex, n).expect("room seen by pass");
-                self.scratch[..n as usize].copy_from_slice(spare);
+                scratch[..n as usize].copy_from_slice(spare);
             }
             for t in triangles {
                 let corners = corners_of(t);
@@ -1883,7 +1941,7 @@ impl<'a> TexgenRun<'a> {
                             numbered[k] = if behind & (1 << k) != 0 {
                                 Numbered::Behind
                             } else {
-                                Numbered::On(geometry.add_vertex(first_vertex, self.scratch[k]).ok_or(Failure::FrameFull)?)
+                                Numbered::On(geometry.add_vertex(first_vertex, scratch[k]).ok_or(Failure::FrameFull)?)
                             };
                         }
                         *slot = numbered[k];
@@ -1911,8 +1969,8 @@ impl<'a> TexgenRun<'a> {
     }
 }
 
-/// `record_on_cpu` for an unlit texgen draw (texgen from the position or
-/// the texture coordinates, `Transform::texgen_kernel`), a non-indexed
+/// `record_on_cpu` for an unskinned texgen draw, lit or not, any texgen
+/// source (`Transform::texgen_kernel`, `TexgenFinish`), a non-indexed
 /// list, strip or fan: per chunk of TEXGEN_CHUNK vertices, all of them
 /// worked out four at a time (`TexgenRun::pass`, `TexgenKernel::transform4`,
 /// straight into the frame where it has room), then the chunk's triangles
@@ -1943,29 +2001,36 @@ fn record_texgen_run<M: PspMemory>(
         _ if count >= 3 => count,
         _ => 0,
     };
-    let (format, layout, first_vertex) = (run.format, run.layout, run.first_vertex);
+    let (format, layout, first_vertex, lit) = (run.format, run.layout, run.first_vertex, run.lit);
     let stride = layout.size;
     let bytes_used = format.bytes_used(layout);
-    let mut copy = [0u32; TEXGEN_WORDS];
+    // Filled in only when first needed (as `TexgenScratch`).
+    let mut copy: Option<[u32; TEXGEN_WORDS]> = None;
+    let mut scratch: TexgenScratch = None;
     let mut chunk = 0;
     while chunk < used {
         let n = (used - chunk).min(TEXGEN_CHUNK);
         let address = vertex_address.wrapping_add(chunk * stride);
         let skew = address & 3;
         let word_count = (skew + stride * (n - 1) + bytes_used).div_ceil(4) as usize;
+        let started = crate::cycles::start(crate::cycles::TEXGEN_PASS);
         let behind = match memory.borrow_words(address & !3, word_count) {
-            Some(words) => run.pass(geometry, words, skew, n)?,
+            Some(words) => run.pass(geometry, &mut scratch, words, skew, n)?,
             None => {
-                let words = copy.get_mut(..word_count)?;
+                let words = copy.get_or_insert([0; TEXGEN_WORDS]).get_mut(..word_count)?;
                 memory.read_words(address & !3, words)?;
-                run.pass(geometry, words, skew, n)?
+                run.pass(geometry, &mut scratch, words, skew, n)?
             }
         };
+        crate::cycles::add(crate::cycles::TEXGEN_PASS, started);
         let mut cut = |geometry: &mut Geometry, corners: [u32; 3]| {
             let mut reader = VertexReader::new(format, layout, memory, vertex_address, index_address);
-            cut_triangle(geometry, &mut reader, transform, None, corners, color_of, to_frame, first_vertex)
+            cut_triangle(geometry, &mut reader, transform, lit, corners, color_of, to_frame, first_vertex)
         };
-        if let Err(failure) = run.emit(geometry, chunk, n, behind, &mut cut) {
+        let outer = crate::phase::recorder::enter(crate::phase::recorder::TEXGEN_EMIT);
+        let emitted = run.emit(geometry, &mut scratch, chunk, n, behind, &mut cut);
+        crate::phase::recorder::leave(outer);
+        if let Err(failure) = emitted {
             return Some(Err(failure));
         }
         chunk += n;
@@ -1974,65 +2039,126 @@ fn record_texgen_run<M: PspMemory>(
 }
 
 /// Pass 1 of `record_texgen_run` for one chunk: `n` vertices into `out`,
-/// four at a time; `read(k)` gives vertex k's raw position, texture
-/// coordinates and colour (`None`: unreadable, then so is the chunk);
-/// `of_raw` the finished colour (worked out again only when the colour
-/// changes). The vertices behind the near plane (bit k: vertex k).
+/// four at a time; `read4(k, count)` gives vertices k.. k + count - 1 (the
+/// lanes after them: the last again) as lanes: raw position and texture
+/// coordinates, finished colours, texgen normal sources (`None`:
+/// unreadable, then so is the chunk). The vertices behind the near plane
+/// (bit k: vertex k), from the kernel's flags read once at the end.
 #[inline(always)]
 fn texgen_pass(
     kernel: &crate::texgen_run::TexgenKernel,
     n: u32,
     out: &mut [FrameVertex],
-    mut read: impl FnMut(u32) -> Option<([f32; 3], [f32; 2], Option<u32>)>,
-    of_raw: &impl Fn(Option<u32>) -> u32,
+    mut read4: impl FnMut(u32, u32) -> Option<(crate::texgen_run::Fields4, [u32; 4], [[f32; 4]; 3])>,
 ) -> Option<u64> {
-    let mut behind = 0u64;
-    let mut last_color = None;
-    let mut last_finished = of_raw(None);
-    let mut lanes = crate::texgen_run::Lanes4::default();
+    let mut front = [0u16; TEXGEN_CHUNK as usize + 4];
     let mut k = 0;
+    let outer = crate::phase::recorder::enter(crate::phase::recorder::TEXGEN_READ);
     while k < n {
         let count = (n - k).min(4);
-        for lane in 0..4 {
-            // Past the end: the last vertex again (not stored).
-            let ([x, y, z], [u, v], color) = read(k + lane.min(count - 1))?;
-            if color != last_color {
-                last_color = color;
-                last_finished = of_raw(color);
-            }
-            let lane = lane as usize;
-            (lanes.x[lane], lanes.y[lane], lanes.z[lane]) = (x, y, z);
-            (lanes.u[lane], lanes.v[lane]) = (u, v);
-            lanes.color[lane] = last_finished;
-        }
+        crate::phase::recorder::enter(crate::phase::recorder::TEXGEN_READ);
+        let Some((fields, colors, sources)) = read4(k, count) else {
+            crate::phase::recorder::leave(outer);
+            return None;
+        };
         let stored = &mut out[k as usize..(k + count) as usize];
-        behind |= (kernel.transform4(&lanes, stored) as u64) << k;
+        crate::phase::recorder::enter(crate::phase::recorder::TEXGEN_KERNEL);
+        let flags: &mut [u16; 4] = (&mut front[k as usize..k as usize + 4]).try_into().expect("four flags");
+        kernel.transform4(&fields, colors, &sources, stored, flags);
         k += 4;
     }
+    crate::phase::recorder::leave(outer);
+    let behind = front[..n as usize].iter().enumerate().fold(0u64, |mask, (k, &flag)| mask | ((flag == 0) as u64) << k);
     Some(behind)
 }
 
-/// `texgen_pass` for an unskinned `CommonLayout` at an even address (each
-/// field read with one load), per colour format.
+/// How `TexgenRun::pass` finishes a decoded vertex: its colour (lit by
+/// `lit`, else `Prepared::base_color`, worked out again only when the
+/// vertex colour changes; then `frame_color`) and, for texgen from the
+/// normal, the source vector (`Texgen::normal_source`), from the vertex
+/// colour, the raw fields (asked for only to light) and the normal
+/// (`None`: the format has none).
+struct TexgenFinish<'a> {
+    prepared: &'a Prepared,
+    material_color: u32,
+    lit: Option<&'a VertexLighting<'a>>,
+    texgen: Texgen,
+    last_color: Option<u32>,
+    last_finished: u32,
+}
+
+impl TexgenFinish<'_> {
+    /// `finish`'s colour of an unlit vertex.
+    #[inline(always)]
+    fn finish_unlit(&mut self, vertex_color: Option<u32>) -> u32 {
+        if vertex_color != self.last_color {
+            self.last_color = vertex_color;
+            self.last_finished = self.finished(vertex_color);
+        }
+        self.last_finished
+    }
+
+    #[inline(never)]
+    fn finished(&self, vertex_color: Option<u32>) -> u32 {
+        self.prepared.frame_color(self.prepared.base_color(vertex_color, self.material_color))
+    }
+
+    #[inline(always)]
+    fn finish(&mut self, vertex_color: Option<u32>, raw: impl FnOnce() -> Raw3d, normal: Option<[f32; 3]>) -> (u32, [f32; 3]) {
+        let color = match self.lit {
+            Some(lighting) => {
+                let outer = crate::phase::recorder::enter(crate::phase::recorder::TEXGEN_LIGHT);
+                let color = self.prepared.frame_color(lighting.color(&raw(), normal));
+                crate::phase::recorder::leave(outer);
+                color
+            }
+            None => {
+                if vertex_color != self.last_color {
+                    self.last_color = vertex_color;
+                    self.last_finished = self.prepared.frame_color(self.prepared.base_color(vertex_color, self.material_color));
+                }
+                self.last_finished
+            }
+        };
+        let source = if self.texgen.needs_normal() { self.texgen.normal_source(normal) } else { [0.0; 3] };
+        (color, source)
+    }
+}
+
+/// `texgen_pass` for an unlit draw without normals of an unskinned
+/// `CommonLayout` at an even address: positions and texture coordinates
+/// straight into lanes (`Fields4::gather`), the colour with one load per
+/// vertex (`VertexFormat::read_common_color`, per colour format) and
+/// finished only when it changes (`TexgenFinish::finish_unlit`).
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn texgen_pass_direct(
     kernel: &crate::texgen_run::TexgenKernel,
     words: &[u32],
     skew: u32,
-    stride: u32,
     n: u32,
     format: VertexFormat,
+    layout: &VertexLayout,
     common: &CommonLayout,
-    of_raw: &impl Fn(Option<u32>) -> u32,
+    finish: &mut TexgenFinish,
     out: &mut [FrameVertex],
 ) -> Option<u64> {
     let start = words.as_ptr() as *const u8;
+    let stride = layout.size;
+    let (position_offset, texcoord_offset) = (common.position_offset as usize, common.texcoord_offset as usize);
     // Safe: `words` covers every field of the chunk's `n` vertices (its
     // span), the first starts at an even address and the stride is even.
     macro_rules! pass {
         ($color:literal) => {
-            texgen_pass(kernel, n, out, |k| Some(unsafe { VertexFormat::read_common_unskinned::<$color>(start.add((skew + stride * k) as usize), common) }), of_raw)
+            texgen_pass(kernel, n, out, |k, count| {
+                let first = unsafe { start.add((skew + stride * k) as usize) };
+                let fields = unsafe { crate::texgen_run::Fields4::gather(first, stride as usize, count as usize, position_offset, texcoord_offset) };
+                let colors = [0u32, 1, 2, 3].map(|lane| {
+                    let vertex = unsafe { first.add(lane.min(count - 1) as usize * stride as usize) };
+                    finish.finish_unlit(unsafe { VertexFormat::read_common_color::<$color>(vertex, common) })
+                });
+                Some((fields, colors, [[0.0; 4]; 3]))
+            })
         };
     }
     match format.color_format_bits() {

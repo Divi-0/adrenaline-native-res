@@ -83,7 +83,11 @@ pub const SAMPLE: usize = 27;
 /// set (`gpu_lights_cached`, `add_light_set`).
 pub const DIRECT_CAMERA: usize = 28;
 pub const DIRECT_LIGHTS: usize = 29;
-pub const COUNT: usize = 30;
+/// A texgen run (`recorder::record_texgen_run`) as a whole, and its
+/// chunks' pass 1 in it (`TexgenRun::pass`).
+pub const TEXGEN_RUN: usize = 30;
+pub const TEXGEN_PASS: usize = 31;
+pub const COUNT: usize = 32;
 pub const NAMES: [&str; COUNT] = [
     "jobs",
     "copies",
@@ -115,6 +119,8 @@ pub const NAMES: [&str; COUNT] = [
     "sample",
     "d_camera",
     "d_lights",
+    "texgen_run",
+    "texgen_pass",
 ];
 
 /// Readings left out because they came out implausibly large (from 2^30
@@ -129,7 +135,7 @@ pub static TOTALS: [AtomicU32; COUNT] = [const { AtomicU32::new(0) }; COUNT];
 pub static ENTRIES: [AtomicU32; COUNT] = [const { AtomicU32::new(0) }; COUNT];
 
 /// Every part (`MEASURED`).
-pub const ALL_PARTS: u32 = (1 << COUNT) - 1;
+pub const ALL_PARTS: u32 = if COUNT == 32 { u32::MAX } else { (1 << COUNT) - 1 };
 /// The recorder thread's parts, and the capture thread's (with the
 /// calibration in both).
 pub const RECORDER_PARTS: u32 = 1 << JOBS
@@ -143,6 +149,8 @@ pub const RECORDER_PARTS: u32 = 1 << JOBS
     | 1 << GENERAL
     | 1 << HASH
     | 1 << INDICES
+    | 1 << TEXGEN_RUN
+    | 1 << TEXGEN_PASS
     | 1 << CALIBRATION;
 pub const CAPTURE_PARTS: u32 = (ALL_PARTS & !RECORDER_PARTS) | 1 << CALIBRATION;
 

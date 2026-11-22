@@ -9,11 +9,18 @@
 //!
 //! On the Vita with NEON (PPSSPP's ARM vertex decoder does its matrix work
 //! with NEON too): ARMv7 NEON rounds after each multiply and add (VMLA is
-//! not fused) and always to nearest, as the VFP does here; it flushes
-//! denormals to zero, which the VFP does too only with FPSCR.FZ (debug
-//! command `fpscr`; `RowTransform::clip` relies on the same). 1 / w and the
-//! projective texgen's divides are VFP divides per vertex (NEON has no
-//! exact divide). On the PC the same steps lane by lane.
+//! not fused) and always to nearest, flushing denormals to zero; the
+//! Vita's threads run the VFP that way too (FPSCR 0x03000000: FZ, DN,
+//! round to nearest; debug command `fpscr`). 1 / w and the projective
+//! texgen's divides are VFP divides per lane (NEON has no exact divide). On
+//! the PC the same steps lane by lane.
+//!
+//! The Cortex-A9 stalls when NEON results go to the ARM side through
+//! memory (and the lanes of a vector built in memory by ARM stores): the
+//! fields are loaded into lanes directly (`Fields4::gather`), colours and
+//! normals moved into lanes register to register, lanes taken out for the
+//! divides the same way (the VFP's registers are NEON's), and the lanes'
+//! "in front" flags stored for the caller to read a chunk later.
 //!
 //! NFS Underground Rivals' main menu draws ~32,000 such vertices per frame
 //! (strips of ~160 vertices, s16 positions, u16 texture coordinates, 565
@@ -23,8 +30,7 @@
 use crate::frame::FrameVertex;
 
 /// `Transform::frame_vertex` with `Texgen::uv`'s texture coordinates, for
-/// an unskinned draw whose texgen comes from the position or the texture
-/// coordinates (`Transform::texgen_kernel`).
+/// an unskinned draw (`Transform::texgen_kernel`).
 #[derive(Clone, Copy, Debug)]
 pub struct TexgenKernel {
     /// Clip = rows x (raw x, y, z, 1), row by row (`FastPath::rows`).
@@ -34,43 +40,73 @@ pub struct TexgenKernel {
     pub(crate) viewport_scale: (f32, f32),
     pub(crate) depth_center: f32,
     pub(crate) depth_scale: f32,
-    /// Texgen source: the texture coordinates (true) or the position.
-    pub(crate) from_texcoords: bool,
-    /// The source's format scale (texture coordinates or position).
+    /// Texgen source (`Texgen::source`): 0 the position, 1 the texture
+    /// coordinates (each times `source_scale`, its format scale), 2 and 3
+    /// the normal, normalized or not: `transform4`'s `normal` as it is.
+    pub(crate) source: u32,
     pub(crate) source_scale: f32,
     /// The texgen matrix, 4x3, column by column (`Texgen::matrix`).
     pub(crate) matrix: [f32; 12],
     pub(crate) projective: bool,
 }
 
-/// Four vertices' raw fields lane by lane, as `VertexFormat::decode_3d`
-/// gives them, and their finished colours (`frame_color`).
-#[derive(Clone, Copy, Default)]
-pub struct Lanes4 {
-    pub x: [f32; 4],
-    pub y: [f32; 4],
-    pub z: [f32; 4],
-    pub u: [f32; 4],
-    pub v: [f32; 4],
-    pub color: [u32; 4],
+/// Four vertices' raw position and texture coordinates, lane by lane, as
+/// `VertexFormat::decode_3d` gives them.
+#[derive(Clone, Copy)]
+pub struct Fields4 {
+    x: F4,
+    y: F4,
+    z: F4,
+    u: F4,
+    v: F4,
+}
+
+impl Fields4 {
+    /// From the four vertices' values.
+    #[inline(always)]
+    pub fn from_lanes(x: [f32; 4], y: [f32; 4], z: [f32; 4], u: [f32; 4], v: [f32; 4]) -> Fields4 {
+        Fields4 { x: F4::from_lanes(x), y: F4::from_lanes(y), z: F4::from_lanes(z), u: F4::from_lanes(u), v: F4::from_lanes(v) }
+    }
+
+    /// s16 positions at `position_offset` and u16 texture coordinates at
+    /// `texcoord_offset` of the vertices at `first + lane x stride` (lanes
+    /// from `count` on: the last vertex again), each value as `as f32`
+    /// makes it (exact).
+    ///
+    /// # Safety
+    /// The `count` vertices' fields must be readable, at even addresses.
+    #[inline(always)]
+    pub unsafe fn gather(first: *const u8, stride: usize, count: usize, position_offset: usize, texcoord_offset: usize) -> Fields4 {
+        let vertex = |lane: usize| first.add(lane.min(count - 1) * stride);
+        let p = [0, 1, 2, 3].map(|lane| vertex(lane).add(position_offset).cast::<i16>());
+        let t = [0, 1, 2, 3].map(|lane| vertex(lane).add(texcoord_offset).cast::<u16>());
+        Fields4 {
+            x: F4::gather_i16(p),
+            y: F4::gather_i16(p.map(|at| at.add(1))),
+            z: F4::gather_i16(p.map(|at| at.add(2))),
+            u: F4::gather_u16(t),
+            v: F4::gather_u16(t.map(|at| at.add(1))),
+        }
+    }
 }
 
 impl TexgenKernel {
-    /// Four vertices to the frame: `out[n]` for lanes n < out.len() (1..=4;
-    /// the other lanes are worked out but not stored). Returns the lanes
-    /// behind the near plane (bit n: lane n), where `frame_vertex` gives
-    /// `None`; their `out` entries are garbage.
+    /// Four vertices to the frame, with their finished colours and (texgen
+    /// from the normal) source vectors: `out[n]` for lanes n < out.len()
+    /// (1..=4; the other lanes are worked out but not stored). `front[n]`:
+    /// 0xFFFF if lane n is in front of the near plane, 0 if behind (where
+    /// `frame_vertex` gives `None`; its `out` entry is garbage then).
     #[inline(always)]
-    pub fn transform4(&self, input: &Lanes4, out: &mut [FrameVertex]) -> u32 {
-        let (x, y, z) = (F4::load(&input.x), F4::load(&input.y), F4::load(&input.z));
+    pub fn transform4(&self, fields: &Fields4, colors: [u32; 4], normal: &[[f32; 4]; 3], out: &mut [FrameVertex], front: &mut [u16; 4]) {
+        let Fields4 { x, y, z, u: raw_u, v: raw_v } = *fields;
         // ((r0 x + r1 y) + r2 z) + r3 per row, as `frame_vertex`'s dot.
         let dot = |r: &[f32; 4]| x.mul_n(r[0]).mla_n(y, r[1]).mla_n(z, r[2]).add(F4::splat(r[3]));
         let clip_w = dot(&self.rows[3]);
         let clip_z = dot(&self.rows[2]);
-        let behind = F4::behind(clip_z, clip_w);
+        F4::store_front(clip_z, clip_w, front);
         // 1 / w per lane on the VFP (exact; NEON's estimate isn't).
-        let w = clip_w.to_array();
-        let over_w = F4::load(&[1.0 / w[0], 1.0 / w[1], 1.0 / w[2], 1.0 / w[3]]);
+        let w = clip_w.lanes();
+        let over_w = F4::from_lanes([1.0 / w[0], 1.0 / w[1], 1.0 / w[2], 1.0 / w[3]]);
         // origin + (scale x clip) x (1 / w).
         let screen_x = F4::splat(self.viewport_origin.0).add(dot(&self.rows[0]).mul_n(self.viewport_scale.0).mul(over_w));
         let screen_y = F4::splat(self.viewport_origin.1).add(dot(&self.rows[1]).mul_n(self.viewport_scale.1).mul(over_w));
@@ -82,27 +118,25 @@ impl TexgenKernel {
         // `Texgen::uv`: source x matrix, row i as
         // ((s0 m[i] + s1 m[3 + i]) + s2 m[6 + i]) + m[9 + i].
         let s = self.source_scale;
-        let source = if self.from_texcoords {
-            [F4::load(&input.u).mul_n(s), F4::load(&input.v).mul_n(s), F4::splat(0.0)]
-        } else {
-            [x.mul_n(s), y.mul_n(s), z.mul_n(s)]
+        let source = match self.source {
+            0 => [x.mul_n(s), y.mul_n(s), z.mul_n(s)],
+            1 => [raw_u.mul_n(s), raw_v.mul_n(s), F4::splat(0.0)],
+            _ => normal.map(F4::from_lanes),
         };
         let m = &self.matrix;
         let row = |i: usize| source[0].mul_n(m[i]).mla_n(source[1], m[3 + i]).mla_n(source[2], m[6 + i]).add(F4::splat(m[9 + i]));
         let (mut u, mut v) = (row(0), row(1));
         if self.projective {
-            let (mut us, mut vs, ws) = (u.to_array(), v.to_array(), row(2).to_array());
+            let (mut us, mut vs, ws) = (u.lanes(), v.lanes(), row(2).lanes());
             for lane in 0..4 {
                 if ws[lane] != 0.0 {
                     us[lane] /= ws[lane];
                     vs[lane] /= ws[lane];
                 }
             }
-            (u, v) = (F4::load(&us), F4::load(&vs));
+            (u, v) = (F4::from_lanes(us), F4::from_lanes(vs));
         }
-        let count = out.len().min(4);
-        F4::store(out, [screen_x, screen_y, depth, clip_w, u, v, F4::from_bits(&input.color), fog]);
-        behind & ((1 << count) - 1)
+        F4::store(out, [screen_x, screen_y, depth, clip_w, u, v, F4::from_bits(colors), fog]);
     }
 }
 
@@ -112,30 +146,65 @@ impl TexgenKernel {
 struct F4(core::arch::arm::float32x4_t);
 
 // Safe throughout: the Vita's Cortex-A9 has NEON (the target enables it);
-// loads and stores touch exactly the four lanes' memory.
+// loads and stores touch exactly the lanes' memory.
 #[cfg(target_arch = "arm")]
 impl F4 {
+    /// Register to register (VMOV into the lanes).
     #[inline(always)]
-    fn load(lanes: &[f32; 4]) -> F4 {
-        unsafe { F4(core::arch::arm::vld1q_f32(lanes.as_ptr())) }
+    fn from_lanes(lanes: [f32; 4]) -> F4 {
+        use core::arch::arm::{vdupq_n_f32, vsetq_lane_f32};
+        unsafe {
+            let v = vsetq_lane_f32::<0>(lanes[0], vdupq_n_f32(0.0));
+            let v = vsetq_lane_f32::<1>(lanes[1], v);
+            let v = vsetq_lane_f32::<2>(lanes[2], v);
+            F4(vsetq_lane_f32::<3>(lanes[3], v))
+        }
     }
 
+    /// The bits as lanes (ARM registers into NEON).
     #[inline(always)]
-    fn from_bits(lanes: &[u32; 4]) -> F4 {
-        use core::arch::arm::{vld1q_u32, vreinterpretq_f32_u32};
-        unsafe { F4(vreinterpretq_f32_u32(vld1q_u32(lanes.as_ptr()))) }
+    fn from_bits(lanes: [u32; 4]) -> F4 {
+        use core::arch::arm::{vdupq_n_u32, vreinterpretq_f32_u32, vsetq_lane_u32};
+        unsafe {
+            let v = vsetq_lane_u32::<0>(lanes[0], vdupq_n_u32(0));
+            let v = vsetq_lane_u32::<1>(lanes[1], v);
+            let v = vsetq_lane_u32::<2>(lanes[2], v);
+            F4(vreinterpretq_f32_u32(vsetq_lane_u32::<3>(lanes[3], v)))
+        }
+    }
+
+    /// The lanes as VFP values (the same registers: no memory).
+    #[inline(always)]
+    fn lanes(self) -> [f32; 4] {
+        use core::arch::arm::vgetq_lane_f32;
+        unsafe { [vgetq_lane_f32::<0>(self.0), vgetq_lane_f32::<1>(self.0), vgetq_lane_f32::<2>(self.0), vgetq_lane_f32::<3>(self.0)] }
+    }
+
+    /// The i16s at `at` (2-byte aligned), each `as f32`.
+    #[inline(always)]
+    unsafe fn gather_i16(at: [*const i16; 4]) -> F4 {
+        use core::arch::arm::{vcvtq_f32_s32, vdup_n_s16, vld1_lane_s16, vmovl_s16};
+        let v = vld1_lane_s16::<0>(at[0], vdup_n_s16(0));
+        let v = vld1_lane_s16::<1>(at[1], v);
+        let v = vld1_lane_s16::<2>(at[2], v);
+        let v = vld1_lane_s16::<3>(at[3], v);
+        F4(vcvtq_f32_s32(vmovl_s16(v)))
+    }
+
+    /// The u16s at `at` (2-byte aligned), each `as f32`.
+    #[inline(always)]
+    unsafe fn gather_u16(at: [*const u16; 4]) -> F4 {
+        use core::arch::arm::{vcvtq_f32_u32, vdup_n_u16, vld1_lane_u16, vmovl_u16};
+        let v = vld1_lane_u16::<0>(at[0], vdup_n_u16(0));
+        let v = vld1_lane_u16::<1>(at[1], v);
+        let v = vld1_lane_u16::<2>(at[2], v);
+        let v = vld1_lane_u16::<3>(at[3], v);
+        F4(vcvtq_f32_u32(vmovl_u16(v)))
     }
 
     #[inline(always)]
     fn splat(value: f32) -> F4 {
         unsafe { F4(core::arch::arm::vdupq_n_f32(value)) }
-    }
-
-    #[inline(always)]
-    fn to_array(self) -> [f32; 4] {
-        let mut lanes = [0.0; 4];
-        unsafe { core::arch::arm::vst1q_f32(lanes.as_mut_ptr(), self.0) };
-        lanes
     }
 
     #[inline(always)]
@@ -172,21 +241,20 @@ impl F4 {
         }
     }
 
-    /// Lanes where !(z >= -w && w > 0): behind the near plane.
+    /// `front[n]` = 0xFFFF where z >= -w && w > 0 (in front of the near
+    /// plane), else 0; one NEON store, read by the caller later.
     #[inline(always)]
-    fn behind(z: F4, w: F4) -> u32 {
-        use core::arch::arm::{vandq_u32, vcgeq_f32, vcgtq_f32, vdupq_n_f32, vnegq_f32, vst1q_u32};
-        let mut lanes = [0u32; 4];
+    fn store_front(z: F4, w: F4, front: &mut [u16; 4]) {
+        use core::arch::arm::{vandq_u32, vcgeq_f32, vcgtq_f32, vdupq_n_f32, vmovn_u32, vnegq_f32, vst1_u16};
         unsafe {
-            let front = vandq_u32(vcgeq_f32(z.0, vnegq_f32(w.0)), vcgtq_f32(w.0, vdupq_n_f32(0.0)));
-            vst1q_u32(lanes.as_mut_ptr(), front);
+            let ahead = vandq_u32(vcgeq_f32(z.0, vnegq_f32(w.0)), vcgtq_f32(w.0, vdupq_n_f32(0.0)));
+            vst1_u16(front.as_mut_ptr(), vmovn_u32(ahead));
         }
-        lanes.iter().enumerate().fold(0, |mask, (lane, &front)| mask | ((front == 0) as u32) << lane)
     }
 
     /// `out[n]` = lane n of the eight fields (x, y, z, w, u, v, colour,
-    /// fog: `FrameVertex`'s order) for n < out.len(). Four vertices: two
-    /// 4x4 transposes in registers and eight 16-byte stores.
+    /// fog: `FrameVertex`'s order) for n < out.len(): two 4x4 transposes
+    /// in registers and two 16-byte stores per vertex.
     #[inline(always)]
     fn store(out: &mut [FrameVertex], fields: [F4; 8]) {
         use core::arch::arm::{float32x4_t, vcombine_f32, vget_high_f32, vget_low_f32, vst1q_f32, vtrnq_f32};
@@ -224,23 +292,33 @@ struct F4([f32; 4]);
 #[cfg(not(target_arch = "arm"))]
 impl F4 {
     #[inline(always)]
-    fn load(lanes: &[f32; 4]) -> F4 {
-        F4(*lanes)
+    fn from_lanes(lanes: [f32; 4]) -> F4 {
+        F4(lanes)
     }
 
     #[inline(always)]
-    fn from_bits(lanes: &[u32; 4]) -> F4 {
+    fn from_bits(lanes: [u32; 4]) -> F4 {
         F4(lanes.map(f32::from_bits))
+    }
+
+    #[inline(always)]
+    fn lanes(self) -> [f32; 4] {
+        self.0
+    }
+
+    #[inline(always)]
+    unsafe fn gather_i16(at: [*const i16; 4]) -> F4 {
+        F4(at.map(|at| at.read_unaligned() as f32))
+    }
+
+    #[inline(always)]
+    unsafe fn gather_u16(at: [*const u16; 4]) -> F4 {
+        F4(at.map(|at| at.read_unaligned() as f32))
     }
 
     #[inline(always)]
     fn splat(value: f32) -> F4 {
         F4([value; 4])
-    }
-
-    #[inline(always)]
-    fn to_array(self) -> [f32; 4] {
-        self.0
     }
 
     #[inline(always)]
@@ -274,8 +352,10 @@ impl F4 {
     }
 
     #[inline(always)]
-    fn behind(z: F4, w: F4) -> u32 {
-        (0..4).fold(0, |mask, lane| mask | (!(z.0[lane] >= -w.0[lane] && w.0[lane] > 0.0) as u32) << lane)
+    fn store_front(z: F4, w: F4, front: &mut [u16; 4]) {
+        for (lane, flag) in front.iter_mut().enumerate() {
+            *flag = if z.0[lane] >= -w.0[lane] && w.0[lane] > 0.0 { 0xFFFF } else { 0 };
+        }
     }
 
     #[inline(always)]

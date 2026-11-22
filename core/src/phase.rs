@@ -164,10 +164,23 @@ pub mod recorder {
     pub const WAIT: u8 = 10;
     /// Nothing to record: asleep until the capture thread wakes it.
     pub const IDLE: u8 = 11;
+    /// Texgen runs (`recorder::record_texgen_run`): reading and finishing
+    /// the vertices (fields, colours, normals), the four-vertex transform
+    /// (`TexgenKernel::transform4`), the triangles (`TexgenRun::emit`).
+    pub const TEXGEN_READ: u8 = 12;
+    pub const TEXGEN_KERNEL: u8 = 13;
+    pub const TEXGEN_EMIT: u8 = 14;
+    /// Texgen draws on `record_on_cpu`'s general path (vertex by vertex).
+    pub const TEXGEN_GENERAL: u8 = 15;
+    /// Texgen runs: lit colours (`VertexLighting::color`, inside
+    /// TEXGEN_READ), and chunks emitted triangle by triangle (near plane;
+    /// inside TEXGEN_EMIT).
+    pub const TEXGEN_LIGHT: u8 = 16;
+    pub const TEXGEN_SLOW: u8 = 17;
 
-    pub const NAMES: [&str; 12] = [
+    pub const NAMES: [&str; 18] = [
         "other", "transform", "raw_entry", "gather", "convert", "indices", "arena", "cpu_decode", "palette", "copy", "wait",
-        "idle",
+        "idle", "texgen_read", "texgen_kernel", "texgen_emit", "texgen_general", "texgen_light", "texgen_slow",
     ];
 
     /// Enters `phase`; returns the phase to go back to (`leave`).

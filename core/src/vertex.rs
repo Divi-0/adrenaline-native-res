@@ -494,6 +494,21 @@ impl VertexFormat {
         (position, texcoord, color)
     }
 
+    /// The colour `read_common_unskinned` gives, with one load.
+    ///
+    /// # Safety
+    /// As `read_common_unskinned`.
+    #[inline(always)]
+    pub unsafe fn read_common_color<const COLOR: u32>(vertex: *const u8, layout: &CommonLayout) -> Option<u32> {
+        let at = || vertex.add(layout.color_offset as usize).cast::<u16>().read_unaligned();
+        match COLOR {
+            4 => Some(rgba_from_5650(at())),
+            5 => Some(rgba_from_5551(at())),
+            6 => Some(rgba_from_4444(at())),
+            _ => None,
+        }
+    }
+
     /// The raw 8-bit skinning weight of a single-weight vertex (the first
     /// byte: weights are the first field); 128 = 1.0.
     ///

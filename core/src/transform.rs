@@ -997,14 +997,12 @@ impl Transform {
 
     /// `frame_vertex` with `texgen`'s texture coordinates (`Texgen::uv`)
     /// for a vertex loop that works four vertices at once
-    /// (`texgen_run::TexgenKernel`). `None` for skinned draws and texgen
-    /// from the normal.
+    /// (`texgen_run::TexgenKernel`). `None` for skinned draws.
     pub fn texgen_kernel(&self, texgen: &Texgen) -> Option<crate::texgen_run::TexgenKernel> {
-        if self.bone_count != 0 || texgen.source >= 2 {
+        if self.bone_count != 0 {
             return None;
         }
         let fast = &self.fast;
-        let from_texcoords = texgen.source == 1;
         Some(crate::texgen_run::TexgenKernel {
             rows: fast.rows,
             fog_row: fast.fog_row,
@@ -1012,8 +1010,8 @@ impl Transform {
             viewport_scale: self.viewport_scale,
             depth_center: fast.depth_center,
             depth_scale: fast.depth_scale,
-            from_texcoords,
-            source_scale: if from_texcoords { texgen.texcoord_scale } else { texgen.position_scale },
+            source: texgen.source,
+            source_scale: if texgen.source == 1 { texgen.texcoord_scale } else { texgen.position_scale },
             matrix: texgen.matrix,
             projective: texgen.projective,
         })
@@ -1870,6 +1868,18 @@ impl Texgen {
         self.source >= 2
     }
 
+    /// The source vector of texgen from the normal (sources 2 and 3): the
+    /// normal normalized or as it is; (0, 0, 1) for `None`.
+    #[inline]
+    pub fn normal_source(&self, normal: Option<[f32; 3]>) -> [f32; 3] {
+        let normal = normal.unwrap_or([0.0, 0.0, 1.0]);
+        if self.source == 2 {
+            crate::lighting::normalize_or_001(normal)
+        } else {
+            normal
+        }
+    }
+
     /// The texture coordinates of a vertex from its raw fields and its
     /// normal (scaled, `VertexFormat::decode_normal`; `None`: none decoded,
     /// taken as (0, 0, 1) like PPSSPP's default source).
@@ -1877,8 +1887,7 @@ impl Texgen {
         let source = match self.source {
             0 => raw.position.map(|value| value * self.position_scale),
             1 => [raw.texcoord[0] * self.texcoord_scale, raw.texcoord[1] * self.texcoord_scale, 0.0],
-            2 => crate::lighting::normalize_or_001(normal.unwrap_or([0.0, 0.0, 1.0])),
-            _ => normal.unwrap_or([0.0, 0.0, 1.0]),
+            _ => self.normal_source(normal),
         };
         let m = &self.matrix;
         let row = |i: usize| source[0] * m[i] + source[1] * m[3 + i] + source[2] * m[6 + i] + m[9 + i];
@@ -1988,8 +1997,8 @@ mod texgen_tests {
     }
 
     /// `TexgenKernel::transform4` gives what `frame_vertex` and `uv` give,
-    /// bit for bit, and `None` lanes as its behind mask: both sources, a
-    /// projective texgen, fog, vertices on both sides of the near plane.
+    /// bit for bit, and `None` lanes as its behind mask: every source,
+    /// projective texgens, fog, vertices on both sides of the near plane.
     #[test]
     fn texgen_kernel_matches_frame_vertex_and_uv() {
         let set = |ge: &mut GeState, opcode: u8, data: u32| ge.set_register(Command(((opcode as u32) << 24) | data));
@@ -2005,6 +2014,9 @@ mod texgen_tests {
             (1, [1.37, 0.21, 0.5, -0.33, 0.91, 0.25, 7.0, 3.0, 1.0, 0.125, -0.75, 1.0]),
             (0, [1.0999756, 0.0, 0.0, 0.0, 0.8937378, 0.0, 0.0, 0.0, 0.0, 0.4921875, 0.390625, 1.0]),
             (0, [0.3, -0.7, 0.01, 0.2, 0.6, -0.02, -0.4, 0.1, 0.003, 0.5, 0.25, 1.5]),
+            (2, [0.5, 0.0, 0.0, 0.0, -0.5, 0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 1.0]),
+            (2, [0.31, 0.12, 0.4, -0.2, 0.45, 0.1, 0.05, -0.3, 0.7, 0.5, 0.5, 1.0]),
+            (3, [0.5, 0.25, 0.0, 0.1, -0.5, 0.0, 0.2, 0.0, 0.0, 0.5, 0.5, 1.0]),
         ];
         // s16 positions, u16 texture coordinates, 565 colours (NFS UR's 0x112).
         let format = VertexFormat(2 | 4 << 2 | 2 << 7);
@@ -2033,32 +2045,47 @@ mod texgen_tests {
             set_float(&mut ge, op::FOG_SCALE, 0.05);
             let transform = Transform::new(&ge, format);
             let texgen = Texgen::of(&ge, format).unwrap();
-            let kernel = transform.texgen_kernel(&texgen).expect("unskinned, source 0 or 1");
+            let kernel = transform.texgen_kernel(&texgen).expect("unskinned");
             let (mut behind_seen, mut front_seen) = (0, 0);
             for _ in 0..2000 {
-                let mut lanes = crate::texgen_run::Lanes4::default();
+                let mut lanes = [[0.0f32; 4]; 5];
+                let mut colors = [0u32; 4];
+                let mut sources = [[0.0f32; 4]; 3];
                 let mut raws = [raw([0.0; 3], [0.0; 2]); 4];
+                let mut normals = [[0.0f32; 3]; 4];
                 for lane in 0..4 {
                     // Positions up to 1.5 units (x 32768), many in front of
                     // the near plane, some behind it.
                     let p = [next() as u16 as i16 as f32 * 1.5, next() as u16 as i16 as f32 * 1.5, next() as u16 as i16 as f32];
                     let t = [(next() >> 16) as f32, (next() >> 16) as f32];
                     raws[lane] = raw(p, t);
-                    (lanes.x[lane], lanes.y[lane], lanes.z[lane]) = (p[0], p[1], p[2]);
-                    (lanes.u[lane], lanes.v[lane]) = (t[0], t[1]);
-                    lanes.color[lane] = next();
+                    for (field, value) in lanes.iter_mut().zip([p[0], p[1], p[2], t[0], t[1]]) {
+                        field[lane] = value;
+                    }
+                    colors[lane] = next();
+                    // s16 normals (x 1/32768), now and then zero.
+                    let n = [next() as u16 as i16 as f32, next() as u16 as i16 as f32, next() as u16 as i16 as f32].map(|value| if next() % 16 == 0 { 0.0 } else { value / 32768.0 });
+                    normals[lane] = n;
+                    for (row, value) in sources.iter_mut().zip(texgen.normal_source(Some(n))) {
+                        row[lane] = value;
+                    }
                 }
+                let [x, y, z, u, v] = lanes;
+                let fields = crate::texgen_run::Fields4::from_lanes(x, y, z, u, v);
                 for count in [4usize, 3, 1] {
                     let mut out = [FrameVertex::default(); 4];
-                    let behind = kernel.transform4(&lanes, &mut out[..count]);
+                    let mut front = [0x1234u16; 4];
+                    kernel.transform4(&fields, colors, &sources, &mut out[..count], &mut front);
+                    assert!(front.iter().all(|&flag| flag == 0 || flag == 0xFFFF));
+                    let behind = front.iter().enumerate().fold(0u32, |mask, (lane, &flag)| mask | ((flag == 0) as u32) << lane) & ((1 << count) - 1);
                     for lane in 0..count {
-                        match transform.frame_vertex(&raws[lane], lanes.color[lane]) {
+                        match transform.frame_vertex(&raws[lane], colors[lane]) {
                             None => {
                                 assert!(behind & (1 << lane) != 0, "lane {lane} should be behind");
                                 behind_seen += 1;
                             }
                             Some(mut expected) => {
-                                (expected.u, expected.v) = texgen.uv(&raws[lane], None);
+                                (expected.u, expected.v) = texgen.uv(&raws[lane], Some(normals[lane]));
                                 assert!(behind & (1 << lane) == 0, "lane {lane} should be in front");
                                 let bits = |v: &FrameVertex| [v.x, v.y, v.z, v.w, v.u, v.v, f32::from_bits(v.color), v.fog].map(f32::to_bits);
                                 assert_eq!(bits(&out[lane]), bits(&expected), "source {source} {:?}", raws[lane]);
