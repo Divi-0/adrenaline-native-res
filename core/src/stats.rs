@@ -7,7 +7,7 @@
 use crate::command::{op, Command};
 use crate::display_list::CommandVisitor;
 use crate::ge_state::GeState;
-use crate::memory::PspMemory;
+use crate::memory::{is_valid_address, PspMemory};
 
 /// A small set of addresses without heap allocation. Addresses beyond the
 /// capacity are only counted in `overflow`.
@@ -239,8 +239,13 @@ impl FrameStats {
     /// missing from ours, maybe for good if the game sets them once (MHF's
     /// field upside down after a stop at a VRAM sub-list, 2026-11-18). The
     /// Vita side then asks for the GE's own state (`EVENT_GE_STATE`).
+    /// Also when a draw's vertices lie where the PSP has no memory at all:
+    /// our registers are wrong already, though the walk went through (God
+    /// of War after its intro movie, BASE off: 2026-11-22).
     pub fn walk_stopped_early(&self) -> bool {
-        self.bad_addresses > 0 || self.endless_lists > 0
+        self.bad_addresses > 0
+            || self.endless_lists > 0
+            || (self.unreadable_draws > 0 && !is_valid_address(self.last_unreadable_address))
     }
 
     pub const fn new() -> FrameStats {
@@ -363,6 +368,21 @@ impl CommandVisitor for FrameStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vertices_outside_psp_memory_make_the_registers_suspect() {
+        // God of War after its intro movie (2026-11-22): every frame's walk
+        // ran to the end, but its draws read vertices at 0x056BF550, where
+        // the PSP has no memory: a wrong BASE that no stop ever repaired.
+        let mut stats = FrameStats::new();
+        assert!(!stats.walk_stopped_early());
+        stats.unreadable_draws = 18;
+        stats.last_unreadable_address = 0x056B_F550;
+        assert!(stats.walk_stopped_early());
+        // VRAM not copied yet (MHF's village): the registers are fine.
+        stats.last_unreadable_address = 0x041A_3D1C;
+        assert!(!stats.walk_stopped_early());
+    }
 
     #[test]
     fn a_batch_of_prims_counts_what_the_prims_one_by_one_count() {
