@@ -22,9 +22,12 @@ use crate::memory::{physical, PspMemory, RAM_END, RAM_START};
 /// following its writes. MTX's start gate: 4 transfers of ~1 KiB each.
 pub const MAX_WRITTEN_BLOCKS: usize = 32;
 
-/// How many transfers per frame may be taken as redirects (`Redirect`).
-/// God of War's title: 84 transfers per frame.
-pub const MAX_REDIRECTS: usize = 192;
+/// How many redirects (`Redirect`) a frame may hold at once. A new one
+/// drops the older ones it covers whole (`redirect_write`), so uploads
+/// over one area again and again take one each only while they live.
+/// God of War: 84 transfers per frame at the title, 351 in the game
+/// (2026-11-22), most of them into one scratch area its next CALL runs.
+pub const MAX_REDIRECTS: usize = 384;
 
 /// A transfer taken without copying: `bytes` bytes at `start` read as the
 /// same bytes at `source` (main RAM, which the GE writes never touch).
@@ -329,11 +332,26 @@ impl<M: PspMemory> PspMemory for Overlaid<'_, M> {
             && source >= RAM_START
             && source_end <= RAM_END
             && (source_end <= destination || destination_end <= source)
-            && self.writes.redirect_count < MAX_REDIRECTS
             && !self.writes.overlaps(source, bytes);
         if !takes {
             return false;
         }
+        // Older redirects inside the destination are never read again (the
+        // newest covering an address supplies it): their places are freed.
+        let covered = |redirect: &Redirect| redirect.start >= destination && redirect.end <= destination_end;
+        let live = &self.writes.redirects[..self.writes.redirect_count];
+        if self.writes.redirect_count - live.iter().filter(|redirect| covered(redirect)).count() >= MAX_REDIRECTS {
+            return false;
+        }
+        let mut kept = 0;
+        for index in 0..self.writes.redirect_count {
+            let redirect = self.writes.redirects[index];
+            if !covered(&redirect) {
+                self.writes.redirects[kept] = redirect;
+                kept += 1;
+            }
+        }
+        self.writes.redirect_count = kept;
         if self.writes.blocks_overlap(destination, bytes) {
             for slot in 0..self.writes.used {
                 let block_address = self.writes.addresses[slot];

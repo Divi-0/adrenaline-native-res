@@ -1536,6 +1536,53 @@ mod tests {
     }
 
     #[test]
+    fn gameplay_uploads_past_the_titles_count_are_followed() {
+        // God of War in the game (2026-11-22): 351 uploads per frame, most of
+        // them 512-byte rows into one scratch area (0x0418A000) the next CALL
+        // runs, object after object. After the 192nd the redirects ran out,
+        // the uploads were skipped and the CALLs walked stale VRAM: vertex
+        // floats as commands, 1.1M "vertices", ~120 ms walks.
+        let mut memory = TestMemory::default();
+        let list = 0x0890_0000;
+        let area = 0x0418_A000;
+        let uploads = 400u32;
+        // Row counts (512 bytes each) as in the frame's first uploads.
+        let row_counts = [38u32, 8, 5, 17, 4, 2, 105, 1, 43, 127];
+        let mut commands = vec![cmd(op::BASE, 0x04_0000)];
+        let mut vertices = 0;
+        let mut next_source = 0x0900_0000;
+        for index in 0..uploads {
+            // Each object's sub-list in RAM: one PRIM with its own count.
+            let rows = row_counts[index as usize % row_counts.len()];
+            let source = next_source;
+            next_source += rows * 512;
+            let count = 3 + index % 5;
+            vertices += count;
+            memory.write(source, &[cmd(op::PRIM, (3 << 16) | count), cmd(op::RET, 0)]);
+            memory.write(source + 8, &vec![0; (rows * 512 / 4 - 2) as usize]);
+            commands.extend([
+                cmd(op::TRANSFER_SOURCE, source & 0xFF_FFF0),
+                cmd(op::TRANSFER_SOURCE_WIDTH, ((source >> 8) & 0xFF_0000) | 128),
+                cmd(op::TRANSFER_DESTINATION, area & 0xFF_FFF0),
+                cmd(op::TRANSFER_DESTINATION_WIDTH, ((area >> 8) & 0xFF_0000) | 128),
+                cmd(op::TRANSFER_SOURCE_POSITION, 0),
+                cmd(op::TRANSFER_DESTINATION_POSITION, 0),
+                cmd(op::TRANSFER_SIZE, ((rows - 1) << 10) | 127),
+                cmd(op::TRANSFER_START, 1),
+                cmd(op::CALL, area & 0xFF_FFFF),
+            ]);
+        }
+        commands.extend([cmd(op::FINISH, 0), cmd(op::END, 0)]);
+        memory.write(list, &commands);
+
+        let mut capture = Capture::new();
+        capture.handle(Event::ListEnqueued { list, stall: 0, id: 0, context: 0 }, &mut memory, None);
+        let stats = capture.handle(shown(), &mut memory, None).unwrap();
+        assert_eq!(stats.transfers_skipped, 0);
+        assert_eq!((stats.block_transfers, stats.draws, stats.vertices), (uploads, uploads, vertices));
+    }
+
+    #[test]
     fn a_transfer_too_big_to_follow_is_skipped_whole() {
         let mut memory = TestMemory::default();
         let list = 0x0890_0000;
