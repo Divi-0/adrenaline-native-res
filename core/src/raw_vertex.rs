@@ -108,8 +108,16 @@ impl RawColors {
     /// base colour (`color`) lit with `lights`, the raw normal and the
     /// transform's normal rows (the normal's scale doesn't matter: the GPU
     /// normalizes), then made opaque if the draw is.
-    pub fn lit_color(&self, lights: &GpuLights, normal_rows: &[[f32; 4]; 3], vertex: Option<u32>, normal: [f32; 3]) -> u32 {
-        let lit = lights.color(self.color(vertex), normal, normal_rows);
+    /// `world_position`: the vertex's, for point lights.
+    pub fn lit_color(
+        &self,
+        lights: &GpuLights,
+        normal_rows: &[[f32; 4]; 3],
+        vertex: Option<u32>,
+        normal: [f32; 3],
+        world_position: [f32; 3],
+    ) -> u32 {
+        let lit = lights.color(self.color(vertex), normal, normal_rows, world_position);
         if self.rules[1] != 0.0 {
             lit | 0xFF00_0000
         } else {
@@ -287,7 +295,9 @@ impl<'a, I: Iterator<Item = u16>> RawCorners<'a, I> {
         let (model, normal) = raw_blocks::model_space(self.format, self.bones, fields.position, &fields.weights, fields.normal);
         let mut vertex = raw_blocks::clip_vertex(&self.transform, &self.camera, &self.colors, &self.uv, model, self.texcoord(&fields), fields.color);
         if let Some((lights, normal_rows)) = &self.lights {
-            vertex.color = self.colors.lit_color(lights, normal_rows, fields.color, normal);
+            // World space as the program's: uWorld's rows times (model, 1).
+            let world = self.transform.world.map(|row| row[0] * model[0] + row[1] * model[1] + row[2] * model[2] + row[3]);
+            vertex.color = self.colors.lit_color(lights, normal_rows, fields.color, normal, world);
         }
         Some(vertex)
     }

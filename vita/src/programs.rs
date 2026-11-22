@@ -15,7 +15,7 @@
 //! - the 3D program (nativeres_3d_v.cg): the same outputs for vertices in
 //!   model space (the GPU transform and lighting);
 //! - the raw programs (nativeres_raw_v.cg and its variants _raw_plain_v,
-//!   _raw_lit1_v, _raw_lit4_v, _raw_lit1flat_v, _raw_lit4flat_v): raw PSP vertices, one patched program per
+//!   _raw_lit1_v, _raw_lit4_v, _raw_lit1flat_v, _raw_lit4flat_v, _raw_lit1point_v, _raw_lit4point_v): raw PSP vertices, one patched program per
 //!   PSP vertex format;
 //! - the raw sprite programs (nativeres_raw_sprite_v.cg);
 //! - blend programs: GXM bakes blending into the fragment program, so every
@@ -147,6 +147,11 @@ pub enum RawVariant {
     /// draw.rs `flat_lights`).
     Lit1Flat,
     Lit4Flat,
+    /// `Lit1` / `Lit4` for light sets with point lights
+    /// (nativeres_raw_lit1point_v.cg, _lit4point_v.cg: uLights[26]; generic
+    /// colour only, no fixed-colour programs: few vertices, little memory).
+    Lit1Point,
+    Lit4Point,
 }
 
 impl RawVariant {
@@ -154,8 +159,8 @@ impl RawVariant {
     pub fn bones(self) -> u32 {
         match self {
             RawVariant::Full => 8,
-            RawVariant::Plain4 | RawVariant::Lit4 | RawVariant::Lit4Flat => 4,
-            RawVariant::Plain | RawVariant::Lit1 | RawVariant::Lit1Flat => 1,
+            RawVariant::Plain4 | RawVariant::Lit4 | RawVariant::Lit4Flat | RawVariant::Lit4Point => 4,
+            RawVariant::Plain | RawVariant::Lit1 | RawVariant::Lit1Flat | RawVariant::Lit1Point => 1,
         }
     }
 
@@ -180,6 +185,8 @@ impl RawVariant {
             RawVariant::Lit4 => " (lit, four bones)",
             RawVariant::Lit1Flat => " (flat lights, one bone)",
             RawVariant::Lit4Flat => " (flat lights, four bones)",
+            RawVariant::Lit1Point => " (point lights, one bone)",
+            RawVariant::Lit4Point => " (point lights, four bones)",
         }
     }
 
@@ -187,7 +194,7 @@ impl RawVariant {
     /// (`fixed_raw_sets`); None for the full program.
     fn fixed_index(self) -> Option<usize> {
         match self {
-            RawVariant::Full => None,
+            RawVariant::Full | RawVariant::Lit1Point | RawVariant::Lit4Point => None,
             RawVariant::Plain => Some(0),
             RawVariant::Plain4 => Some(1),
             RawVariant::Lit1 => Some(2),
@@ -205,6 +212,24 @@ impl RawVariant {
             RawVariant::Lit4 => RawVariant::Lit4Flat,
             other => other,
         }
+    }
+
+    /// The program for a light set with point lights (`Lit1Point` /
+    /// `Lit4Point`) of a lit variant (core `LightingRegisters::raw_ready`
+    /// lets only draws of up to four bones have them); the others as they are.
+    pub fn point(self) -> RawVariant {
+        match self {
+            RawVariant::Lit1 | RawVariant::Lit1Flat => RawVariant::Lit1Point,
+            RawVariant::Lit4 | RawVariant::Lit4Flat | RawVariant::Full => RawVariant::Lit4Point,
+            other => other,
+        }
+    }
+
+    /// Whether the program reads the point lights' part of a light set
+    /// (`GpuLights::light_ambient`: all of it; the others read
+    /// `DIRECTIONAL_LIGHT_FLOATS`).
+    pub fn point_lights(self) -> bool {
+        matches!(self, RawVariant::Lit1Point | RawVariant::Lit4Point)
     }
 }
 
@@ -288,6 +313,8 @@ fn raw_gxp(variant: RawVariant, color: RawColor) -> *const gxm::Program {
     use RawVariant::*;
     match (variant, color) {
         (Full, _) => gxp(&shaders::nativeres_raw_v),
+        (Lit1Point, _) => gxp(&shaders::nativeres_raw_lit1point_v),
+        (Lit4Point, _) => gxp(&shaders::nativeres_raw_lit4point_v),
         (Plain, Any) => gxp(&shaders::nativeres_raw_plain_v),
         (Plain, Material) => gxp(&shaders::nativeres_raw_plain_none_v),
         (Plain, Bits5650) => gxp(&shaders::nativeres_raw_plain_5650_v),
@@ -768,6 +795,8 @@ pub struct Programs {
     pub raw_lit4: RawSet,
     pub raw_lit1_flat: RawSet,
     pub raw_lit4_flat: RawSet,
+    pub raw_lit1_point: RawSet,
+    pub raw_lit4_point: RawSet,
     /// The variants with a fixed colour format (`fixed_raw_sets`).
     raw_fixed: [RawSet; FIXED_VARIANTS * FIXED_COLORS],
     pub sprites: SpriteSet,
@@ -1084,6 +1113,8 @@ impl Programs {
             raw_lit4: RawSet::new(RawVariant::Lit4, RawColor::Any),
             raw_lit1_flat: RawSet::new(RawVariant::Lit1Flat, RawColor::Any),
             raw_lit4_flat: RawSet::new(RawVariant::Lit4Flat, RawColor::Any),
+            raw_lit1_point: RawSet::new(RawVariant::Lit1Point, RawColor::Any),
+            raw_lit4_point: RawSet::new(RawVariant::Lit4Point, RawColor::Any),
             raw_fixed: fixed_raw_sets(),
             sprites: SpriteSet::new(),
             blend: [NO_BLEND_PROGRAM; MAX_BLEND_PROGRAMS],
@@ -1119,6 +1150,8 @@ impl Programs {
             RawVariant::Lit4 => &mut self.raw_lit4,
             RawVariant::Lit1Flat => &mut self.raw_lit1_flat,
             RawVariant::Lit4Flat => &mut self.raw_lit4_flat,
+            RawVariant::Lit1Point => &mut self.raw_lit1_point,
+            RawVariant::Lit4Point => &mut self.raw_lit4_point,
         }
     }
 

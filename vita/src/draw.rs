@@ -24,7 +24,7 @@ use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, Ordering};
 
 use nativeres_core::blend::{BLEND_ALPHA_ONLY, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_WRITES_ALPHA};
 use nativeres_core::frame::{
-    draw_flags, read_variant, test_flags, Draw, Frame, FrameVertex, GpuLights, GpuTransform, RawCamera, RawColors, RawTransform, ReadVariant,
+    draw_flags, read_variant, test_flags, Draw, Frame, DIRECTIONAL_LIGHT_FLOATS, FrameVertex, GpuLights, GpuTransform, RawCamera, RawColors, RawTransform, ReadVariant,
     ReadWay, NO_RING_INDICES,
 };
 use nativeres_core::texture;
@@ -1106,7 +1106,7 @@ impl Draws {
             // `light_set`, which follows them), the lights only for lit draws.
             set_uniform(buffer, textured.normal_rows_3d, 16, floats(&transform.normal_rows));
             if let Some(lights) = light_set(frame, transform) {
-                set_uniform(buffer, textured.lights_3d, LIGHT_FLOATS, floats(lights));
+                set_uniform(buffer, textured.lights_3d, DIRECTIONAL_LIGHT_FLOATS, floats(lights));
             }
             self.state.transform = transform;
             self.state.uv_scale = uv_scale;
@@ -1186,7 +1186,10 @@ impl Draws {
                 set_uniform(buffer, skinning.scale, 4, floats(&colors.scale));
                 if skinning.variant.lights() {
                     if let Some(lights) = raw_light_set(frame, transform) {
-                        set_uniform(buffer, skinning.lights, LIGHT_FLOATS, floats(lights));
+                        // The point-light programs read the whole set, the others
+                        // their uLights[22].
+                        let count = if skinning.variant.point_lights() { LIGHT_FLOATS } else { DIRECTIONAL_LIGHT_FLOATS };
+                        set_uniform(buffer, skinning.lights, count, floats(lights));
                     }
                 }
                 self.set_raw_bones(frame, draw, buffer, &skinning);
@@ -1468,7 +1471,14 @@ impl Draws {
                 let plain = RAW_PLAIN.load(Ordering::Relaxed) != 0;
                 let variants = RAW_VARIANTS.load(Ordering::Relaxed) != 0;
                 let mut variant = raw_variant(weights, lit_with_lights, plain, variants);
-                if variant != variant.flat() && RAW_FLAT_LIGHTS.load(Ordering::Relaxed) != 0 {
+                // Point lights: only the point-light programs take them (core
+                // `LightingRegisters::raw_ready`: at most four bones; recorded
+                // so only while they exist, `make_arenas`).
+                let point = lit_with_lights
+                    && frame.raw_transform_of(draw).and_then(|(transform, _)| raw_light_set(frame, transform)).is_some_and(has_point_lights);
+                if point {
+                    variant = variant.point();
+                } else if variant != variant.flat() && RAW_FLAT_LIGHTS.load(Ordering::Relaxed) != 0 {
                     let flat = frame.raw_transform_of(draw).and_then(|(transform, _)| raw_light_set(frame, transform)).is_some_and(flat_lights);
                     if flat && self.programs.raw_set(variant.flat(), RawColor::Any).ready() {
                         variant = variant.flat();
@@ -1479,7 +1489,7 @@ impl Draws {
                 }
                 // The program for the draw's colour format, if there is one.
                 let mut color = RawColor::Any;
-                if variant != RawVariant::Full && RAW_FIXED_COLOR.load(Ordering::Relaxed) != 0 {
+                if variant != RawVariant::Full && !variant.point_lights() && RAW_FIXED_COLOR.load(Ordering::Relaxed) != 0 {
                     let fixed = RawColor::of_format(draw.vertex_format);
                     if self.programs.raw_set(variant, fixed).ready() {
                         color = fixed;
@@ -1492,6 +1502,10 @@ impl Draws {
                     RawVariant::Lit1Flat | RawVariant::Lit4Flat => {
                         stats().lit_variant_draws += 1;
                         stats().flat_light_draws += 1;
+                    }
+                    RawVariant::Lit1Point | RawVariant::Lit4Point => {
+                        stats().lit_variant_draws += 1;
+                        stats().point_light_draws += 1;
                     }
                     RawVariant::Full => {}
                 }
@@ -2211,6 +2225,12 @@ fn flat_lights(lights: &GpuLights) -> bool {
     coefficient <= 0.0 && zeros(&lights.to_light[3]) && zeros(&lights.diffuse[3]) && zeros(&lights.specular[3])
 }
 
+/// Whether a light set has point lights (`GpuLights::to_light` w 1): only
+/// the point-light programs light with it.
+fn has_point_lights(lights: &GpuLights) -> bool {
+    lights.to_light.iter().any(|light| light[3] > 0.5)
+}
+
 /// The raw programs' uniforms beyond the ones the sprite program shares
 /// (the plain program has no lights).
 #[derive(Clone, Copy)]
@@ -2494,6 +2514,10 @@ pub fn make_arenas(phycont: bool) {
             render_log::line(format_args!("raw arena: no raw vertex program\n"));
         } else if arenas::make_raw_arena() != 0 {
             crate::capture::set_raw_sprites(draws.programs.sprites.ready() as u32);
+            // Point lights go raw only with their programs (else the CPU lights them).
+            let point = draws.programs.raw_set(RawVariant::Lit1Point, RawColor::Any).ready()
+                && draws.programs.raw_set(RawVariant::Lit4Point, RawColor::Any).ready();
+            nativeres_core::lighting::POINT_LIGHTS_GPU.store(point, Ordering::Relaxed);
             crate::capture::set_zero_copy(arenas::map_psp_ram_for_gpu() as u32);
         }
     }

@@ -87,6 +87,16 @@
 //   fourth light, which adds exactly 0, is left out: the same sums, bit for
 //   bit. MTX's riders: three lights with specular, coefficient 0 (2026-11-17,
 //   every lit draw of the four dumps).
+// - RAW_LIT1_POINT, RAW_LIT4_POINT (nativeres_raw_lit1point_v.cg,
+//   _lit4point_v; generic colour only): as RAW_LIT1 / RAW_LIT4 for light
+//   sets with point lights (RAW_POINT_LIGHTS, uLights[26]: a light whose
+//   uLights[i].w is 1 is a point light at uLights[i].xyz, its attenuation
+//   in uLights[4 + i].xyz, its ambient colour in uLights[22 + i]), lit as
+//   PPSSPP's vertex shader does (VertexShaderGenerator.cpp: toLight times
+//   inversesqrt(distance^2), clamp(1 / (a + b d + c d^2), 0, 1) on its
+//   ambient and diffuse parts); no specular for point lights (core
+//   `LightingRegisters::raw_ready`). God of War: ~700 draws a frame
+//   (2026-11-22).
 // - RAW_COLOR_NONE, _5650, _5551, _4444, _8888 (nativeres_raw_<variant>_<colour>_v.cg,
 //   with each of the variants above): the vertex colour format fixed
 //   (VERTEX_TYPE bits 2-4; none = the material colour), so the program
@@ -123,6 +133,16 @@
 #ifdef RAW_LIT4_FLAT
 #define RAW_FOUR_BONES 1
 #define RAW_FLAT_LIGHTS 1
+#define RAW_LIGHTS_ONLY 1
+#endif
+#ifdef RAW_LIT1_POINT
+#define RAW_ONE_BONE 1
+#define RAW_POINT_LIGHTS 1
+#define RAW_LIGHTS_ONLY 1
+#endif
+#ifdef RAW_LIT4_POINT
+#define RAW_FOUR_BONES 1
+#define RAW_POINT_LIGHTS 1
 #define RAW_LIGHTS_ONLY 1
 #endif
 // The fixed colour format: RAW_MODE the colour field's value (uFormat.y of
@@ -237,8 +257,12 @@ void main(
 	uniform float4 uColors,
 	uniform float4 uScale,
 	uniform float4 uSkin,
+#ifdef RAW_POINT_LIGHTS
+	uniform float4 uLights[26],
+#else
 #ifndef RAW_NO_LIGHTS
 	uniform float4 uLights[22],
+#endif
 #endif
 #ifdef RAW_ONE_BONE
 	uniform float4 uBones[3],
@@ -340,6 +364,30 @@ void main(
 		float coefficient = uLights[17].a;
 		float3 diffuse = float3(0.0f, 0.0f, 0.0f);
 		float3 specular = float3(0.0f, 0.0f, 0.0f);
+#ifdef RAW_POINT_LIGHTS
+		float3 pointAmbient = float3(0.0f, 0.0f, 0.0f);
+		for (int i = 0; i < 4; i++) {
+			float3 toLight = uLights[i].xyz;
+			float lightScale = 1.0f;
+			if (uLights[i].w > 0.5f) {
+				// A point light (core GpuLights::color).
+				toLight = uLights[i].xyz - world.xyz;
+				float distSq = dot(toLight, toLight);
+				float invDist = rsqrt(distSq);
+				float dist = distSq * invDist;
+				toLight *= invDist;
+				lightScale = saturate(1.0f / dot(uLights[4 + i].xyz, float3(1.0f, dist, distSq)));
+				pointAmbient += uLights[22 + i].rgb * lightScale;
+			}
+			float lightDot = dot(toLight, n);
+			if (uLights[8 + i].a > 0.5f)
+				lightDot = PspPow(lightDot, coefficient);
+			diffuse += uLights[8 + i].rgb * max(lightDot, 0.0f) * lightScale;
+			// Directional lights only (point lights have no specular here).
+			if (uLights[12 + i].a > 0.5f && lightDot >= 0.0f)
+				specular += uLights[12 + i].rgb * PspPow(dot(uLights[4 + i].xyz, n), coefficient);
+		}
+#else
 #ifdef RAW_FLAT_LIGHTS
 		// Coefficient <= 0: PspPow gives 1 (powered diffuse 1, specular
 		// factor 1); the fourth light is zeros (see the variants above).
@@ -361,6 +409,7 @@ void main(
 				specular += uLights[12 + i].rgb * PspPow(dot(uLights[4 + i].xyz, n), coefficient);
 		}
 #endif
+#endif
 		float4 lit;
 		float3 specularPart = specular * specularColor;
 		if (uLights[20].a > 0.5f) {
@@ -368,7 +417,11 @@ void main(
 			vSpecular = saturate(specularPart) * clip.w;
 			specularPart = float3(0.0f, 0.0f, 0.0f);
 		}
+#ifdef RAW_POINT_LIGHTS
+		lit.rgb = saturate(uLights[17].rgb + (uLights[16].rgb + pointAmbient) * ambientColor.rgb + diffuse * diffuseColor + specularPart);
+#else
 		lit.rgb = saturate(uLights[17].rgb + uLights[16].rgb * ambientColor.rgb + diffuse * diffuseColor + specularPart);
+#endif
 		lit.a = uLights[19].a > 0.5f ? 1.0f : saturate(uLights[16].a * ambientColor.a);
 		if (uColors.y > 0.5f)
 			lit.a = 1.0f;

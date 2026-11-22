@@ -64,6 +64,8 @@ pub struct RenderStats {
     pub lit_variant_draws: u32,
     /// Of those, with the flat-light programs (RAW_LIT1_FLAT, RAW_LIT4_FLAT).
     pub flat_light_draws: u32,
+    /// Of those, with the point-light programs (RAW_LIT1_POINT, RAW_LIT4_POINT).
+    pub point_light_draws: u32,
     /// Raw draws with a fixed-colour program (draw.rs `RAW_FIXED_COLOR`).
     pub fixed_color_draws: u32,
     /// Draws blended with FIX B through the alpha (BLEND_FIX programs).
@@ -140,6 +142,7 @@ impl RenderStats {
         plain_draws: 0,
         lit_variant_draws: 0,
         flat_light_draws: 0,
+        point_light_draws: 0,
         fixed_color_draws: 0,
         raw_no_program: 0,
         fix_b_draws: 0,
@@ -239,7 +242,7 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
     );
     let _ = write!(
         text,
-        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} fixed_color_draws={} fix_b_draws={} cut_draws={} cut_fast_draws={} cut_off_draws={} opaque_draws={} opaque_untested_draws={} opaque_rows_draws={} hidden_draws={} depth_only_draws={} hidden={}us flat_draws={} opaque={}us ",
+        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} point_light_draws={} fixed_color_draws={} fix_b_draws={} cut_draws={} cut_fast_draws={} cut_off_draws={} opaque_draws={} opaque_untested_draws={} opaque_rows_draws={} hidden_draws={} depth_only_draws={} hidden={}us flat_draws={} opaque={}us ",
         per_frame(s.begin_us),
         per_frame(s.loop_us),
         per_frame(s.convert_us),
@@ -252,6 +255,7 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
         s.plain_draws / frames,
         s.lit_variant_draws / frames,
         s.flat_light_draws / frames,
+        s.point_light_draws / frames,
         s.fixed_color_draws / frames,
         s.fix_b_draws / frames,
         s.cut_draws / frames,

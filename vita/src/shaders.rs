@@ -126,6 +126,9 @@ embed_gxp!(nativeres_raw_lit1_v);
 embed_gxp!(nativeres_raw_lit4_v);
 embed_gxp!(nativeres_raw_lit1flat_v);
 embed_gxp!(nativeres_raw_lit4flat_v);
+// The lit ones for light sets with point lights (generic colour only).
+embed_gxp!(nativeres_raw_lit1point_v);
+embed_gxp!(nativeres_raw_lit4point_v);
 // Each of those six with the vertex colour format fixed (programs.rs
 // `RawColor`): without colour (the material), 5650, 5551, 4444, 8888.
 embed_gxp!(nativeres_raw_plain_none_v);

@@ -42,10 +42,12 @@ pub const MAX_RAW_TRANSFORMS: usize = 1024;
 /// Entries of `Frame::raw_cameras` (11 KiB): view, projection, viewport and
 /// the other registers raw draws share; a frame mostly has one or two.
 pub const MAX_RAW_CAMERAS: usize = 64;
-/// Entries of `Frame::light_sets` (44 KiB; every frame slot has them): the
+/// Entries of `Frame::light_sets` (42 KiB; every frame slot has them): the
 /// lighting of GPU-lit draws (`GpuLights`), consecutive equal ones stored
-/// once. When the table is full, the CPU lights the vertices.
-pub const MAX_LIGHT_SETS: usize = 128;
+/// once. When the table is full, the CPU lights the vertices. 104 since the
+/// point lights' fields (2026-11-22; was 128 of 352 bytes, the same memory):
+/// the regression dumps use at most 32 (MHF's intro).
+pub const MAX_LIGHT_SETS: usize = 104;
 /// Entries of `Frame::raw_colors` (5 KiB; every frame slot has them): the
 /// colour rules of raw draws, consecutive equal ones stored once. When the
 /// table is full, runs go the old way. MTX's race start uses 3.
@@ -610,16 +612,20 @@ pub struct RawColors {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct GpuLights {
-    /// Per light: towards it (normalized), w 0.
+    /// Per light: towards it (normalized), w 0 (directional lights); a
+    /// point light's position (world space), w 1.
     pub to_light: [[f32; 4]; 4],
-    /// Per light: the specular half vector (normalized; 0 if none), w 0.
+    /// Per light: the specular half vector (normalized; 0 if none), w 0
+    /// (directional lights); a point light's constant, linear and quadratic
+    /// attenuation, w 0 (its lights have no specular on the GPU: the half
+    /// vector would depend on the vertex).
     pub half: [[f32; 4]; 4],
     /// Per light: its diffuse colour (0..1); a: 1 = powered diffuse.
     pub diffuse: [[f32; 4]; 4],
     /// Per light: its specular colour (0..1); a: 1 = it has specular.
     pub specular: [[f32; 4]; 4],
-    /// The global ambient light plus every light's ambient colour (RGB),
-    /// AMBIENT_ALPHA (a).
+    /// The global ambient light plus every directional light's ambient
+    /// colour (RGB), AMBIENT_ALPHA (a).
     pub ambient: [f32; 4],
     /// MATERIAL_EMISSIVE (RGB); a: the specular coefficient.
     pub emissive: [f32; 4],
@@ -636,7 +642,18 @@ pub struct GpuLights {
     /// REVERSE_NORMAL: raw draws turn their normals around (the 3D program
     /// has its normal rows negated instead and doesn't read w).
     pub from_vertex: [f32; 4],
+    /// Per point light: its ambient colour (RGB, attenuated with its
+    /// diffuse part, as PPSSPP's shader does), w 0; zeros for directional
+    /// lights (theirs is in `ambient`). Only the point-light raw programs
+    /// read it (`DIRECTIONAL_LIGHT_FLOATS` is what the others get).
+    pub light_ambient: [[f32; 4]; 4],
 }
+
+/// The floats of `GpuLights` the programs for directional lights read
+/// (nativeres_3d_v.cg, the raw programs but the point-light ones): all but
+/// `light_ambient`.
+pub const DIRECTIONAL_LIGHT_FLOATS: u32 = (core::mem::offset_of!(GpuLights, light_ambient) / 4) as u32;
+const _: () = assert!(DIRECTIONAL_LIGHT_FLOATS == 88);
 
 /// `Geometry::add_*` check whether an entry repeats the last one by its
 /// bits rather than as floats (`PartialEq`: on the A9 each float compare is
@@ -650,7 +667,7 @@ const GPU_LIGHTS_WORDS: usize = core::mem::size_of::<GpuLights>() / 4;
 const _: () = assert!(core::mem::size_of::<GpuTransform>() == 48 * 4);
 const RAW_COLORS_WORDS: usize = core::mem::size_of::<RawColors>() / 4;
 const _: () = assert!(core::mem::size_of::<RawColors>() == 28 * 4);
-const _: () = assert!(core::mem::size_of::<GpuLights>() == 88 * 4);
+const _: () = assert!(core::mem::size_of::<GpuLights>() == 104 * 4);
 
 impl GpuTransform {
     /// Its floats as bits.
@@ -922,7 +939,7 @@ pub const NO_RING_INDICES: u32 = u32::MAX;
 const _: () = assert!(core::mem::size_of::<FrameVertex>() == 32);
 const _: () = assert!(core::mem::size_of::<Draw>() == 64);
 const _: () = assert!(core::mem::size_of::<GpuTransform>() == 192);
-const _: () = assert!(core::mem::size_of::<GpuLights>() == 352);
+const _: () = assert!(core::mem::size_of::<GpuLights>() == 416);
 const _: () = assert!(core::mem::size_of::<TextureDescriptor>() == 32);
 // 9 header words, vertices, indices: draws start here (the header checks the same).
 const _: () = assert!(core::mem::offset_of!(Frame, draws) == 2_490_404);
@@ -1400,7 +1417,8 @@ impl Frame {
                 // GPU-lit: the colour the 3D program lights (nativeres_3d_v.cg).
                 if let Some(lights) = &lights {
                     let normal = crate::lighting::unpack_normal(vertex.w.to_bits());
-                    screen.color = lights.color(vertex.color, normal, &transform.normal_rows);
+                    // The 3D program has no point lights (`Lights::gpu_ready`).
+                    screen.color = lights.color(vertex.color, normal, &transform.normal_rows, [0.0; 3]);
                 }
                 screen
             }

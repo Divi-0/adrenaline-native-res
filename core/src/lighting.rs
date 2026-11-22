@@ -34,6 +34,15 @@ use crate::ge_state::{float24, GeState};
 /// Read when a draw's transform is worked out.
 pub static LIGHTS_ON: AtomicBool = AtomicBool::new(true);
 
+/// Draws with point lights lit by the raw programs (true, default; the
+/// Vita turns it off if its point-light programs aren't there) as PPSSPP's
+/// vertex shader does (VertexShaderGenerator.cpp: toLight, inversesqrt,
+/// attenuation clamp(1 / (a + b d + c d^2))), or on the CPU (false). User
+/// decision 2026-11-22: PPSSPP's way, though not bit-exact with the CPU
+/// path (God of War's ~700 point-lit draws a frame). Point lights with
+/// specular and spot lights stay on the CPU.
+pub static POINT_LIGHTS_GPU: AtomicBool = AtomicBool::new(true);
+
 /// One enabled light, its registers decoded.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Light {
@@ -225,6 +234,23 @@ impl LightingRegisters {
     /// `Lights::gpu_ready` of the lights these registers give.
     pub fn gpu_ready(&self) -> bool {
         self.enabled_types().all(|kind| (kind >> 8) & 3 == DIRECTIONAL)
+    }
+
+    /// Whether the raw programs can light draws of `format` with these
+    /// lights: directional ones, and point lights without specular
+    /// (`POINT_LIGHTS_GPU`) in draws of at most four bones (only the
+    /// point-light variants of the one- and four-bone programs take them).
+    pub fn raw_ready(&self, format: crate::vertex::VertexFormat) -> bool {
+        if self.gpu_ready() {
+            return true;
+        }
+        POINT_LIGHTS_GPU.load(Ordering::Relaxed)
+            && (!format.has_weights() || format.weight_count() <= 4)
+            && self.enabled_types().all(|kind| match (kind >> 8) & 3 {
+                DIRECTIONAL => true,
+                POINT => kind & 3 != DIFFUSE_AND_SPECULAR,
+                _ => false,
+            })
     }
 }
 
@@ -469,6 +495,15 @@ impl Lights {
         let mut gpu = GpuLights::default();
         for (index, light) in self.lights[..self.count].iter().enumerate() {
             let [x, y, z] = light.position;
+            if light.kind == POINT {
+                // Position and attenuation (`GpuLights::to_light`, `half`).
+                let [a, b, c] = light.attenuation;
+                gpu.to_light[index] = [x, y, z, 1.0];
+                gpu.half[index] = [a, b, c, 0.0];
+                gpu.diffuse[index] = [light.diffuse[0], light.diffuse[1], light.diffuse[2], flag(light.computation == POWERED_DIFFUSE)];
+                gpu.light_ambient[index] = [light.ambient[0], light.ambient[1], light.ambient[2], 0.0];
+                continue;
+            }
             gpu.to_light[index] = [x, y, z, 0.0];
             let half: [f32; 3] = core::array::from_fn(|axis| light.position[axis] + self.view_direction[axis]);
             let half_length2 = dot(half, half);
@@ -489,7 +524,8 @@ impl Lights {
     fn with_material(&self, mut gpu: GpuLights, has_vertex_color: bool, opaque: bool) -> GpuLights {
         let flag = |on: bool| if on { 1.0 } else { 0.0 };
         gpu.ambient = self.ambient;
-        for light in &self.lights[..self.count] {
+        // Point lights' ambient colours are attenuated (`light_ambient`).
+        for light in self.lights[..self.count].iter().filter(|light| light.kind == DIRECTIONAL) {
             for channel in 0..3 {
                 gpu.ambient[channel] += light.ambient[channel];
             }
@@ -693,7 +729,12 @@ impl GpuLights {
     /// shader (VertexShaderGenerator.cpp) for directional lights; the pow
     /// here is the GE's (`psp_pow`), the shader's a true pow (as PPSSPP's
     /// without bit operations: "close enough").
-    pub fn color(&self, vertex: u32, normal: [f32; 3], normal_rows: &[[f32; 4]; 3]) -> u32 {
+    ///
+    /// Point lights (`to_light` w 1, the point-light raw programs) need the
+    /// vertex's `world_position`: as PPSSPP's shader, towards the light
+    /// times inversesqrt(distance^2), its diffuse and ambient parts times
+    /// the attenuation clamp(1 / (a + b d + c d^2), 0, 1).
+    pub fn color(&self, vertex: u32, normal: [f32; 3], normal_rows: &[[f32; 4]; 3], world_position: [f32; 3]) -> u32 {
         let row = |r: usize| [normal_rows[r][0], normal_rows[r][1], normal_rows[r][2]];
         let world = normalize_or_001([dot(row(0), normal), dot(row(1), normal), dot(row(2), normal)]);
         let vertex = channels(vertex);
@@ -704,8 +745,27 @@ impl GpuLights {
         let coefficient = self.emissive[3];
         let mut diffuse = [0.0f32; 3];
         let mut specular = [0.0f32; 3];
+        let mut point_ambient = [0.0f32; 3];
         for light in 0..4 {
             let xyz = |v: [f32; 4]| [v[0], v[1], v[2]];
+            if self.to_light[light][3] > 0.5 {
+                let towards: [f32; 3] = core::array::from_fn(|axis| self.to_light[light][axis] - world_position[axis]);
+                let distance2 = dot(towards, towards);
+                let inverse = inverse_sqrt(distance2);
+                let distance = distance2 * inverse;
+                let [a, b, c, _] = self.half[light];
+                let scale = (1.0 / (a + b * distance + c * distance2)).clamp(0.0, 1.0);
+                let scale = if scale.is_nan() { 0.0 } else { scale };
+                let mut light_dot = dot(towards.map(|value| value * inverse), world);
+                if self.diffuse[light][3] > 0.5 {
+                    light_dot = psp_pow(light_dot, coefficient);
+                }
+                for channel in 0..3 {
+                    diffuse[channel] += self.diffuse[light][channel] * light_dot.max(0.0) * scale;
+                    point_ambient[channel] += self.light_ambient[light][channel] * scale;
+                }
+                continue;
+            }
             let mut light_dot = dot(xyz(self.to_light[light]), world);
             if self.diffuse[light][3] > 0.5 {
                 light_dot = psp_pow(light_dot, coefficient);
@@ -728,7 +788,7 @@ impl GpuLights {
             }
             255.0
                 * (self.emissive[channel]
-                    + self.ambient[channel] * ambient_color[channel]
+                    + (self.ambient[channel] + point_ambient[channel]) * ambient_color[channel]
                     + diffuse[channel] * diffuse_color[channel]
                     + specular[channel] * specular_color[channel])
         });
@@ -990,7 +1050,7 @@ mod tests {
             let skinned: [f32; 3] = core::array::from_fn(|row| (0..3).map(|k| bone[3 * k + row] * normal[k]).sum());
             let expected = lights.color(Some(color), skinned, [0.0; 3]);
             let packed = unpack_normal(pack_normal(normal));
-            let fast = gpu.color(color, packed, &rows);
+            let fast = gpu.color(color, packed, &rows, [0.0; 3]);
             for shift in [0, 8, 16, 24] {
                 worst = worst.max(((expected >> shift) & 0xFF).abs_diff((fast >> shift) & 0xFF));
             }
@@ -998,6 +1058,84 @@ mod tests {
         // Packing arbitrary float normals into bytes turns them by up to
         // ~0.3 degrees; specular power 8 makes that up to 3 steps.
         assert!(worst <= 3, "worst channel difference {worst}");
+    }
+
+    /// God of War's point lights: two point lights (diffuse, attenuated,
+    /// with an ambient colour) and a directional one, ambient and diffuse
+    /// from the vertex colour.
+    fn ge_with_point_lights() -> GeState {
+        let mut ge = GeState::new();
+        set(&mut ge, op::LIGHTING_ENABLE, 1);
+        set(&mut ge, op::MATERIAL_UPDATE, 3);
+        set(&mut ge, op::AMBIENT_COLOR, 0x20_2020);
+        set(&mut ge, op::AMBIENT_ALPHA, 0xFF);
+        set(&mut ge, op::MATERIAL_EMISSIVE, 0x04_0810);
+        let positions = [[2.0f32, 3.0, -1.0], [-4.0, 1.0, 6.0], [0.3, 0.9, 0.3]];
+        for (light, position) in positions.into_iter().enumerate() {
+            let number = light as u8;
+            set(&mut ge, op::LIGHT_ENABLE_0 + number, 1);
+            set(&mut ge, op::LIGHT_TYPE_0 + number, if light < 2 { POINT << 8 } else { 0 });
+            for (axis, value) in position.into_iter().enumerate() {
+                set(&mut ge, op::LIGHT_X_0 + 3 * number + axis as u8, float(value));
+            }
+            for (axis, value) in [0.5f32, 0.25, 0.05].into_iter().enumerate() {
+                set(&mut ge, op::LIGHT_ATTENUATION_A_0 + 3 * number + axis as u8, float(value));
+            }
+            set(&mut ge, op::LIGHT_AMBIENT_0 + 3 * number, 0x10_3050 + 0x10 * light as u32);
+            set(&mut ge, op::LIGHT_AMBIENT_0 + 3 * number + 1, 0xC0_A080 - 0x20 * light as u32);
+        }
+        let world = rotation([0.48, 0.6, 0.64], 0.7, 1.5);
+        set(&mut ge, op::WORLD_MATRIX_NUMBER, 0);
+        for value in world.iter().chain(&[1.0, -2.0, 0.5]) {
+            set(&mut ge, op::WORLD_MATRIX_DATA, float(*value));
+        }
+        ge
+    }
+
+    /// The point-light raw programs' lighting (`GpuLights::color` with a
+    /// world position) gives what `Lights::color` gives, within a step (the
+    /// CPU rounds each vertex's colour, PPSSPP's shader doesn't).
+    #[test]
+    fn gpu_point_lighting_matches_cpu_lighting() {
+        let ge = ge_with_point_lights();
+        let registers = LightingRegisters::of(&ge).unwrap();
+        assert!(!registers.gpu_ready());
+        assert!(registers.raw_ready(crate::vertex::VertexFormat(0)));
+        let lights = Lights::of(&ge).unwrap();
+        assert!(!lights.gpu_ready(), "the 3D program has directional lights only");
+        let gpu = lights.gpu(true, false);
+        assert_eq!(gpu.to_light[0][3], 1.0);
+        assert_eq!(gpu.to_light[2][3], 0.0);
+        let rows = lights.normal_rows(None);
+        let world = lights.world();
+        let mut worst = 0;
+        for step in 0..400u32 {
+            let angle = step as f32 * 0.37;
+            let normal = [angle.cos() * (step as f32 * 0.11).sin(), angle.sin(), (step as f32 * 0.23).cos() * 0.7];
+            let position = [(step as f32 * 0.07).sin() * 3.0, (step as f32 * 0.13).cos() * 2.0, step as f32 * 0.01 - 2.0];
+            let color = 0x8000_0000 | step.wrapping_mul(0x9E37_79B9) >> 8;
+            let expected = lights.color(Some(color), normal, position);
+            let world_position: [f32; 3] = core::array::from_fn(|row| {
+                world[row] * position[0] + world[3 + row] * position[1] + world[6 + row] * position[2] + world[9 + row]
+            });
+            let fast = gpu.color(color, normal, &rows, world_position);
+            for shift in [0, 8, 16, 24] {
+                worst = worst.max(((expected >> shift) & 0xFF).abs_diff((fast >> shift) & 0xFF));
+            }
+        }
+        assert!(worst <= 1, "worst channel difference {worst}");
+    }
+
+    #[test]
+    fn point_lights_go_raw_only_without_specular_spots_or_many_bones() {
+        let mut ge = ge_with_point_lights();
+        let format = |weights: u32| crate::vertex::VertexFormat(if weights == 0 { 0 } else { (1 << 9) | ((weights - 1) << 14) });
+        assert!(LightingRegisters::of(&ge).unwrap().raw_ready(format(4)));
+        assert!(!LightingRegisters::of(&ge).unwrap().raw_ready(format(5)));
+        set(&mut ge, op::LIGHT_TYPE_0 + 1, (POINT << 8) | DIFFUSE_AND_SPECULAR);
+        assert!(!LightingRegisters::of(&ge).unwrap().raw_ready(format(0)));
+        set(&mut ge, op::LIGHT_TYPE_0 + 1, 2 << 8);
+        assert!(!LightingRegisters::of(&ge).unwrap().raw_ready(format(0)));
     }
 
     #[test]

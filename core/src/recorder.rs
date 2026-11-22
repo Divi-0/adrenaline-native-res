@@ -199,7 +199,7 @@ fn fallback_reason(
         fallback::TEXGEN
     } else if !prepared.gpu_transform {
         fallback::UNTEXTURED
-    } else if !may_go_raw(prepared, inputs.lighting().map(|lighting| lighting.gpu_ready()), format) {
+    } else if !may_go_raw(prepared, inputs.lighting().map(|lighting| lighting.raw_ready(format)), format) {
         fallback::LIGHTS
     } else if primitive_type == primitive::RECTANGLES {
         fallback::SPRITES
@@ -1348,7 +1348,7 @@ fn prepare_now(
         let raw_texgen = texgen.is_none_or(|texgen| raw_texgen_form(&texgen, format).is_some());
         let gpu_lit = draw_states.gpu_transform && textured && !format.is_through() && raw_texgen;
         match transform.lighting() {
-            Some(lights) if lights.approximated() && textured && !(gpu_lit && lights.gpu_ready()) => {
+            Some(lights) if lights.approximated() && textured && !(gpu_lit && lights.raw_ready(format)) => {
                 approximations |= approx::SEPARATE_SPECULAR
             }
             None if lit && ambient_lighting.is_none() => approximations |= approx::LIGHTS_LEFT_OUT,
@@ -2559,7 +2559,7 @@ fn raw_color_fields(
 ) -> Option<crate::frame::RawColors> {
     use crate::frame::RawColors;
     use crate::raw_vertex::{channels, lighting, replace};
-    if !may_go_raw(prepared, lights.map(|lights| lights.gpu_ready()), format) {
+    if !may_go_raw(prepared, lights.map(|lights| lights.raw_ready(format)), format) {
         return None;
     }
     let (texgen, texgen_source) = match prepared.texgen.and_then(|texgen| raw_texgen_form(&texgen, format)) {
@@ -2619,8 +2619,8 @@ fn raw_texgen_form(texgen: &Texgen, format: VertexFormat) -> Option<([f32; 4], f
 /// the copier doesn't hash vertices nobody looks up
 /// (`draw_stream::QueuedDraw::hash_vertices`).
 ///
-/// `lights_gpu_ready`: `None` without lights, else whether the GPU can
-/// light with them (`Lights::gpu_ready`).
+/// `lights_gpu_ready`: `None` without lights, else whether the raw
+/// programs can light with them (`LightingRegisters::raw_ready`).
 fn may_go_raw(prepared: &Prepared, lights_gpu_ready: Option<bool>, format: VertexFormat) -> bool {
     // Texgen: only where the raw program's texture coordinates do it
     // (`Texgen::raw_form`).
@@ -2639,7 +2639,7 @@ fn may_go_raw(prepared: &Prepared, lights_gpu_ready: Option<bool>, format: Verte
 /// their words themselves.
 fn goes_raw(prepared: &Prepared, lighting: Option<&crate::lighting::LightingRegisters>, format: VertexFormat) -> bool {
     crate::raw_arena::ENABLED.load(core::sync::atomic::Ordering::Relaxed)
-        && may_go_raw(prepared, lighting.map(|registers| registers.gpu_ready()), format)
+        && may_go_raw(prepared, lighting.map(|registers| registers.raw_ready(format)), format)
 }
 
 /// `raw_color_fields` while raw vertices are on (`raw_arena::ENABLED`).
