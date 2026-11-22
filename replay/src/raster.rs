@@ -17,7 +17,7 @@
 //! Pixels are sampled at their centres with a top-left fill rule, like GPUs
 //! do, so triangles sharing an edge don't draw its pixels twice.
 
-use nativeres_core::blend::{channel_mask, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_FIX_B_SHIFT, BLEND_PREMULTIPLY_SHIFT};
+use nativeres_core::blend::{channel_mask, StencilState, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_FIX_B_SHIFT, BLEND_PREMULTIPLY_SHIFT};
 use nativeres_core::frame::{draw_flags, test_flags, texture_flags, Draw, Frame, FrameVertex, TextureDescriptor};
 use nativeres_core::hidden_draws::{self, HiddenDraws};
 use nativeres_core::offscreen;
@@ -135,8 +135,11 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
 
     // The Vita screen is cleared to opaque black before drawing.
     let mut screen = vec![0xFF00_0000u32; WIDTH * HEIGHT];
-    // Depth per pixel (0..1). Games clear it before use.
-    let mut depth = vec![0.0f32; WIDTH * HEIGHT];
+    // Depth per pixel (0..1), far (1) at first as every GXM scene on the
+    // Vita starts (the depth surface's background depth): God of War draws
+    // its sky before it resets the depth, against the PSP's depth of the
+    // frame before; at 0 the sky failed its "<=" test here (2026-11-22).
+    let mut depth = vec![1.0f32; WIDTH * HEIGHT];
     // Debugging: REPLAY_MAX_DRAWS=n draws only the first n draws.
     let max_draws = std::env::var("REPLAY_MAX_DRAWS").ok().and_then(|value| value.parse().ok()).unwrap_or(usize::MAX);
     // Debugging: REPLAY_PIXEL=x,y (960x544 picture) prints every draw that
@@ -153,8 +156,12 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
     let mut offscreen: Vec<(u32, Vec<u32>, Vec<f32>)> = offscreen_framebuffers
         .iter()
         .filter(|&&framebuffer| framebuffer != 0)
-        .map(|&framebuffer| (framebuffer, vec![0xFF00_0000u32; WIDTH * HEIGHT], vec![0.0f32; WIDTH * HEIGHT]))
+        .map(|&framebuffer| (framebuffer, vec![0xFF00_0000u32; WIDTH * HEIGHT], vec![1.0f32; WIDTH * HEIGHT]))
         .collect();
+    // The screen read only by draws into other framebuffers (God of War's
+    // bloom chain): they sample the screen as drawn so far, as the Vita
+    // samples its target of it (frame_loop `screen_from_target`).
+    let screen_from_target = offscreen::screen_read_only_by_other_runs(frame.draws(), frame.textures(), frame.shown_framebuffer);
     // Draws a later draw paints over completely (core hidden_draws) are
     // left out, as on the Vita; the texels' opacity from our own decoding
     // (textures reading a framebuffer: unknown). Depth-only draws (and
@@ -192,6 +199,9 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
             .then(|| frame.textures().get(draw.texture as usize))
             .flatten()
             .and_then(|texture| {
+                if screen_from_target && texture.address == frame.shown_framebuffer {
+                    return Some(target_texture(texture, &screen));
+                }
                 let (_, picture, _) = offscreen.iter().find(|(framebuffer, _, _)| offscreen::reads_framebuffer(texture, *framebuffer))?;
                 Some(target_texture(texture, picture))
             });
@@ -224,9 +234,12 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
         }
     }
     // Shown opaque, as NativeResPresentFrame does: the alpha is the game's
-    // stencil, not meant for the screen.
-    for pixel in &mut screen {
-        *pixel |= 0xFF00_0000;
+    // stencil, not meant for the screen. Debugging: REPLAY_KEEP_ALPHA=1
+    // keeps it (the stencil in the PNG's alpha).
+    if std::env::var_os("REPLAY_KEEP_ALPHA").is_none() {
+        for pixel in &mut screen {
+            *pixel |= 0xFF00_0000;
+        }
     }
     screen
 }
@@ -271,7 +284,7 @@ fn draw_one(screen: &mut [u32], depth: &mut [f32], frame: &Frame, textures: &[Op
     };
     let mut corners = frame.screen_corners(draw);
     while let (Some(a), Some(b), Some(c)) = (corners.next(), corners.next(), corners.next()) {
-        draw_triangle(screen, depth, draw, texture, [a, b, c], frame.dither_matrix);
+        draw_triangle(screen, depth, draw, texture, [a, b, c], frame.dither_matrix, frame.stencil_state_of(draw));
     }
 }
 
@@ -343,7 +356,18 @@ fn passes<T: PartialOrd>(function: u32, value: T, reference: T) -> bool {
     }
 }
 
-fn draw_triangle(screen: &mut [u32], depth: &mut [f32], draw: &Draw, texture: Option<&Texture>, corners: [FrameVertex; 3], dither_matrix: u64) {
+/// `stencil`: the draw's exact stencil state (core `blend::stencil`): its
+/// test reads the target's alpha (the PSP's stencil) before anything is
+/// written, its value replaces the alpha where the draw writes.
+fn draw_triangle(
+    screen: &mut [u32],
+    depth: &mut [f32],
+    draw: &Draw,
+    texture: Option<&Texture>,
+    corners: [FrameVertex; 3],
+    dither_matrix: u64,
+    stencil: Option<StencilState>,
+) {
     let target_bits = nativeres_core::frame::target_channel_bits(draw.flags);
     let position = |vertex: &FrameVertex| (vertex.x * SCALE, vertex.y * SCALE);
     let [p0, p1, p2] = [position(&corners[0]), position(&corners[1]), position(&corners[2])];
@@ -399,6 +423,9 @@ fn draw_triangle(screen: &mut [u32], depth: &mut [f32], draw: &Draw, texture: Op
             if depth_test && !passes(depth_function, z, depth[index]) {
                 continue;
             }
+            if stencil.is_some_and(|state| !state.passes((screen[index] >> 24) as u8)) {
+                continue;
+            }
 
             let source = match texture {
                 Some(texture) => {
@@ -425,6 +452,9 @@ fn draw_triangle(screen: &mut [u32], depth: &mut [f32], draw: &Draw, texture: Op
             }
             let pixel = &mut screen[index];
             *pixel = blend(draw.blend, source, Color::from_rgba(*pixel)).to_rgba();
+            if let Some(value) = stencil.and_then(|state| state.write()) {
+                *pixel = (*pixel & 0x00FF_FFFF) | (value as u32) << 24;
+            }
             if let Some(bits) = target_bits {
                 // A 16-bit PSP target: cut as the GE does, after blending
                 // (the Vita's fragment programs do the same).
@@ -643,14 +673,14 @@ mod tests {
         // Unfogged: the screen-linear colour, 0.505 white (with perspective: 0.11).
         let whole = Draw { scissor_right: 479, scissor_bottom: 271, ..Draw::default() };
         let draw = Draw { flags: draw_flags::TEXTURED, ..whole };
-        draw_triangle(&mut screen, &mut depth, &draw, Some(&white), corners, 0);
+        draw_triangle(&mut screen, &mut depth, &draw, Some(&white), corners, 0, None);
         let pixel = |screen: &[u32]| screen[50 * WIDTH + 50] & 0xFF; // PSP (25, 25), weights 1/2, 1/4, 1/4
         assert!((pixel(&screen) as i32 - 129).abs() <= 1, "colour {}", pixel(&screen));
         // Black geometry, white fog: the fog factor alone gives the colour.
         let fogged = corners.map(|corner| FrameVertex { color: 0xFF00_0000, ..corner });
         let draw = Draw { flags: draw_flags::TEXTURED | draw_flags::FOG, fog_color: 0x00FF_FFFF, ..whole };
         screen.fill(0);
-        draw_triangle(&mut screen, &mut depth, &draw, Some(&white), fogged, 0);
+        draw_triangle(&mut screen, &mut depth, &draw, Some(&white), fogged, 0, None);
         // Fog factor about 1/2 half way: about half the fog colour (with
         // perspective: 0.89, near white).
         assert!((pixel(&screen) as i32 - 126).abs() <= 1, "fogged {}", pixel(&screen));
@@ -670,5 +700,27 @@ mod tests {
         assert_eq!((written.r, written.a), (1.0, 0.5));
         let stencil_only = blend(Blend::KEEP_COLOR.pack() | BLEND_WRITES_ALPHA | BLEND_ALPHA_ONLY, SOURCE, TARGET);
         assert_eq!((stencil_only.r, stencil_only.b, stencil_only.a), (0.0, 1.0, 0.5));
+    }
+
+    /// God of War's marks and its blur's test (core `blend::stencil`): a
+    /// draw writes its stencil value as the alpha, a tested draw changes
+    /// only the pixels whose alpha passes.
+    #[test]
+    fn stencil_values_are_written_and_tested_on_the_alpha() {
+        let mut screen = vec![0x0000_0000u32; WIDTH * HEIGHT];
+        let mut depth = vec![1.0f32; WIDTH * HEIGHT];
+        let corner = |x: f32, y: f32| FrameVertex { x, y, z: 0.5, w: 1.0, color: 0xFF00_00FF, ..FrameVertex::default() };
+        let left = [corner(0.0, 0.0), corner(100.0, 0.0), corner(0.0, 100.0)];
+        let whole = [corner(0.0, 0.0), corner(479.0, 0.0), corner(0.0, 271.0)];
+        let draw = Draw { blend: BLEND_WRITES_ALPHA, scissor_right: 479, scissor_bottom: 271, ..Draw::default() };
+        let mark = StencilState::new(None, Some(0x10));
+        draw_triangle(&mut screen, &mut depth, &draw, None, left, 0, Some(mark));
+        assert_eq!(screen[20 * WIDTH + 20], 0x1000_00FF, "red, stencil 0x10");
+        // Green where (stencil & 0x10) == 0x10, the alpha kept.
+        let green = whole.map(|vertex| FrameVertex { color: 0xFF00_FF00, ..vertex });
+        let tested = Draw { blend: 0, ..draw };
+        draw_triangle(&mut screen, &mut depth, &tested, None, green, 0, Some(StencilState::new(Some((2, 0x10, 0x10)), None)));
+        assert_eq!(screen[20 * WIDTH + 20], 0x1000_FF00);
+        assert_eq!(screen[20 * WIDTH + 400], 0, "failed the test: untouched");
     }
 }

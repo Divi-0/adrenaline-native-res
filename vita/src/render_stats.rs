@@ -70,6 +70,13 @@ pub struct RenderStats {
     pub fixed_color_draws: u32,
     /// Draws blended with FIX B through the alpha (BLEND_FIX programs).
     pub fix_b_draws: u32,
+    /// Exact stencil states (draw.rs `stencil_way`): value by a BLEND_FIX
+    /// program, 0 by GXM's alpha factors, the generic frame-read program,
+    /// and states left approximated for want of that program.
+    pub stencil_fix_draws: u32,
+    pub stencil_zero_draws: u32,
+    pub stencil_read_draws: u32,
+    pub stencil_missing_draws: u32,
     /// Draws into 16-bit PSP targets with the frame-read programs
     /// (draw.rs `TARGET_CUT`).
     pub cut_draws: u32,
@@ -146,6 +153,10 @@ impl RenderStats {
         fixed_color_draws: 0,
         raw_no_program: 0,
         fix_b_draws: 0,
+        stencil_fix_draws: 0,
+        stencil_zero_draws: 0,
+        stencil_read_draws: 0,
+        stencil_missing_draws: 0,
         cut_draws: 0,
         cut_fast_draws: 0,
         cut_off_draws: 0,
@@ -288,6 +299,14 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
     if s.raw_no_program > 0 {
         let _ = write!(text, " raw_no_program={}", s.raw_no_program);
     }
+    let _ = write!(
+        text,
+        " stencil_fix_draws={} stencil_zero_draws={} stencil_read_draws={} stencil_missing_draws={}",
+        s.stencil_fix_draws / frames,
+        s.stencil_zero_draws / frames,
+        s.stencil_read_draws / frames,
+        s.stencil_missing_draws / frames
+    );
     let _ = write!(text, " ");
     crate::heap::report(&mut text);
     let length = text.len();

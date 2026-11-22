@@ -193,6 +193,10 @@ pub struct FrameLoop {
     depth_only: bool,
     /// The game was quit: its frames still in the handover are never shown.
     after_quit: AfterQuit,
+    /// This frame reads the shown framebuffer only from runs into other
+    /// framebuffers (core `offscreen::screen_read_only_by_other_runs`):
+    /// those draws sample our target of the screen.
+    screen_from_target: bool,
 }
 
 static FRAME_LOOP: SingleThreaded<FrameLoop> = SingleThreaded::new(FrameLoop {
@@ -217,6 +221,7 @@ static FRAME_LOOP: SingleThreaded<FrameLoop> = SingleThreaded::new(FrameLoop {
     hiding: false,
     depth_only: false,
     after_quit: AfterQuit::new(),
+    screen_from_target: false,
 });
 
 /// True if the GE can have drawn framebuffer `psp_address` (physical, see
@@ -409,6 +414,10 @@ impl FrameLoop {
             }
         }
         targets.publish_addresses();
+        // God of War's bloom chain samples the screen mid-frame, in scenes
+        // of its own: from our target of it, not decoded from VRAM (~9 ms).
+        self.screen_from_target = targets.find(frame.shown_framebuffer).is_some()
+            && offscreen::screen_read_only_by_other_runs(frame.draws(), frame.textures(), frame.shown_framebuffer);
 
         // Decode (or find in the cache) every texture of the frame once.
         let lookup_start = now();
@@ -423,7 +432,7 @@ impl FrameLoop {
             .targets
             .iter()
             .chain(targets.offscreen.iter())
-            .filter(|t| t.exists() && t.psp_address != 0 && t.psp_address != frame.shown_framebuffer);
+            .filter(|t| t.exists() && t.psp_address != 0 && (t.psp_address != frame.shown_framebuffer || self.screen_from_target));
         for (slot, target) in info.render_targets.iter_mut().zip(sampled_targets) {
             *slot = target.psp_address;
         }
@@ -579,13 +588,14 @@ impl FrameLoop {
 
     /// Textures at a framebuffer we draw into a target of our own come from
     /// that target: our resolution, and no decoding of 1 MiB from VRAM (~20
-    /// ms). Not the framebuffer this frame draws into: a target can't be read
-    /// while drawn.
+    /// ms). Not the framebuffer this frame draws into (a target can't be read
+    /// while drawn), unless only other runs read it (`screen_from_target`).
     fn use_targets_as_textures(&mut self, targets: &mut Targets, frame: &Frame, render_count: u32) {
         let mut tile_views = 0;
         for (i, wanted) in frame.textures().iter().enumerate() {
             self.uv_scales[i] = [1.0, 1.0];
-            if !self.textures[i].is_null() || wanted.format >= 4 || wanted.address == frame.shown_framebuffer {
+            let drawn_into = wanted.address == frame.shown_framebuffer && !self.screen_from_target;
+            if !self.textures[i].is_null() || wanted.format >= 4 || drawn_into {
                 continue;
             }
             let Some(target) = targets.sampled(wanted.address) else {
@@ -759,7 +769,11 @@ impl FrameLoop {
         let texture_count = frame.textures().len();
         let mut alpha_read = false;
         for (i, draw) in frame.draws().iter().enumerate().take(range.end).skip(range.start) {
-            if draw.blend & BLEND_ENABLED != 0 && blend::reads_destination_alpha(draw.blend) {
+            // The target's alpha read: by the blend, or by a stencil test
+            // (core `blend::stencil`; God of War's depth-of-field blur).
+            if (draw.blend & BLEND_ENABLED != 0 && blend::reads_destination_alpha(draw.blend))
+                || frame.stencil_state_of(draw).is_some_and(|state| state.test().is_some())
+            {
                 alpha_read = true;
             }
             // Only the scene's framebuffer (other off-screen ones: without a

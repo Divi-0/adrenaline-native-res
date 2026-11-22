@@ -3784,6 +3784,9 @@ struct DrawState {
     /// The frame's texture entry `draw.texture` (when textured), to check
     /// that it is still there when the state is reused.
     texture: TextureDescriptor,
+    /// The frame's stencil state `draw.blend` names (`blend::stencil_index`),
+    /// to check likewise.
+    stencil: crate::blend::StencilState,
     /// 1 / texture size, to turn texel coordinates into 0..1. Sizes are
     /// powers of two, so multiplying by this is exact (the same as dividing).
     texel_scale: (f32, f32),
@@ -3849,6 +3852,13 @@ impl DrawStateCache {
             || catalog.textures().get(state.draw.texture as usize) == Some(&state.texture);
         if !texture_still_there {
             return false;
+        }
+        // Its stencil state is in this frame's table (a new frame starts
+        // an empty one).
+        if let Some(index) = crate::blend::stencil_index(state.draw.blend) {
+            if catalog.stencil_state(index) != Some(state.stencil) {
+                return false;
+            }
         }
         if !state.uses_palette || self.palette_generation == palette.generation {
             return true;
@@ -3963,7 +3973,16 @@ fn work_out_draw_state(catalog: &mut Catalog, stats: &mut FrameStats, palette: &
     // stencil value, so it isn't made opaque (`blending` below).
     let alpha_write = blend::alpha_write(ge);
     draw.blend = blend::alpha_write_bits(alpha_write, ge.clear_writes_color());
-    if alpha_write == (blend::AlphaWrite::Fragment { approximated: true }) {
+    // A stencil test and a constant written, done exactly on the target's
+    // alpha (`blend::stencil`): named by its index in the frame's table.
+    let exact_stencil = match blend::stencil(ge) {
+        blend::Stencil::Exact(state) => catalog
+            .add_stencil_state(state)
+            .map(|index| draw.blend |= (index as u32 + 1) << blend::BLEND_STENCIL_SHIFT)
+            .is_some(),
+        _ => false,
+    };
+    if alpha_write == (blend::AlphaWrite::Fragment { approximated: true }) && !exact_stencil {
         approximations |= approx::STENCIL_ALPHA;
     }
     let blend = blend::translate(ge);
@@ -3979,8 +3998,10 @@ fn work_out_draw_state(catalog: &mut Catalog, stats: &mut FrameStats, palette: &
         }
     }
 
+    let stencil = crate::blend::stencil_index(draw.blend).and_then(|index| catalog.stencil_state(index)).unwrap_or_default();
     Some(DrawState {
         draw,
+        stencil,
         texture,
         texel_scale,
         blending: blend.is_some() || alpha_write == blend::AlphaWrite::StencilClear,
@@ -4497,12 +4518,18 @@ mod tests {
         let (blend, _, _) = record(&ge, &mut memory);
         assert_eq!(blend.map(|blend| blend & BLEND_WRITES_ALPHA), Some(0));
 
-        // Stencil ops that write: the fragment alpha, counted as approximated
-        // (not when ALPHA_MASK keeps every stencil bit).
+        // Stencil ops that write a constant: exact, the frame's stencil
+        // state named (`blend::stencil`). Others write the fragment alpha,
+        // counted as approximated (not when ALPHA_MASK keeps every bit).
         ge.set_register(cmd(op::STENCIL_TEST_ENABLE, 1));
         ge.set_register(cmd(op::STENCIL_OP, 0x02_0000)); // REPLACE on pass
         let (blend, _, approximated) = record(&ge, &mut memory);
+        assert_eq!((blend.map(|blend| blend & BLEND_WRITES_ALPHA), approximated), (Some(BLEND_WRITES_ALPHA), 0));
+        assert_eq!(blend.and_then(crate::blend::stencil_index), Some(0));
+        ge.set_register(cmd(op::STENCIL_OP, 0x04_0000)); // INCR on pass
+        let (blend, _, approximated) = record(&ge, &mut memory);
         assert_eq!((blend.map(|blend| blend & BLEND_WRITES_ALPHA), approximated), (Some(BLEND_WRITES_ALPHA), 1));
+        assert_eq!(blend.and_then(crate::blend::stencil_index), None);
         ge.set_register(cmd(op::ALPHA_MASK, 0xFF));
         let (blend, _, approximated) = record(&ge, &mut memory);
         assert_eq!((blend.map(|blend| blend & BLEND_WRITES_ALPHA), approximated), (Some(0), 0));

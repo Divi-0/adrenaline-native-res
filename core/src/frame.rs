@@ -42,16 +42,22 @@ pub const MAX_RAW_TRANSFORMS: usize = 1024;
 /// Entries of `Frame::raw_cameras` (11 KiB): view, projection, viewport and
 /// the other registers raw draws share; a frame mostly has one or two.
 pub const MAX_RAW_CAMERAS: usize = 64;
-/// Entries of `Frame::light_sets` (42 KiB; every frame slot has them): the
+/// Entries of `Frame::light_sets` (39 KiB; every frame slot has them): the
 /// lighting of GPU-lit draws (`GpuLights`), consecutive equal ones stored
 /// once. When the table is full, the CPU lights the vertices. 104 since the
-/// point lights' fields (2026-11-22; was 128 of 352 bytes, the same memory):
-/// the regression dumps use at most 32 (MHF's intro).
-pub const MAX_LIGHT_SETS: usize = 104;
+/// point lights' fields (2026-11-22; was 128 of 352 bytes, the same memory),
+/// 96 since the stencil states' table (2026-11-22: memcheck was a page
+/// short): the regression dumps use at most 32 (MHF's intro; GoW's game 24).
+pub const MAX_LIGHT_SETS: usize = 96;
 /// Entries of `Frame::raw_colors` (5 KiB; every frame slot has them): the
 /// colour rules of raw draws, consecutive equal ones stored once. When the
 /// table is full, runs go the old way. MTX's race start uses 3.
 pub const MAX_RAW_COLORS: usize = 64;
+/// Entries of `Frame::stencil_states` (the exact stencil states of the
+/// frame's draws, `blend::StencilState`; 63: the index + 1 has 6 bits in
+/// `Draw::blend`). God of War's gameplay uses ~10. When full, draws are
+/// approximated as before (fragment alpha, no test).
+pub const MAX_STENCIL_STATES: usize = 63;
 /// Floats of `Frame::bone_floats` (96 KiB; every frame slot has them): the
 /// bones of raw draws skinned in the shader, 12 per bone. MTX's race start
 /// changes bones before nearly every rider part (4,584 floats used). When
@@ -922,6 +928,10 @@ pub struct Frame {
     /// `draw_flags::DITHER`: the one of the frame's last draw whose state was
     /// worked out with dithering on. Part of the catalog.
     pub dither_matrix: u64,
+    /// The exact stencil states draws name (`blend::stencil_index`). Part
+    /// of the catalog.
+    pub stencil_state_count: u32,
+    pub stencil_states: [crate::blend::StencilState; MAX_STENCIL_STATES],
     /// 1 + the last draw index a draw that may paint over everything before
     /// it can have (core `hidden_draws::maybe_occluder`, checked when each
     /// draw is finished, while its state and vertices are at hand; 0: none):
@@ -974,6 +984,7 @@ impl Frame {
         self.ring_indices_len = 0;
         self.ring_indices = core::ptr::null();
         self.raw_colors_count = 0;
+        self.stencil_state_count = 0;
         self.bone_float_count = 0;
         self.raw_transform_count = 0;
         self.raw_camera_count = 0;
@@ -1019,6 +1030,8 @@ impl Frame {
             overflowed,
             last_texture,
             dither_matrix,
+            stencil_state_count,
+            stencil_states,
             vertices,
             indices,
             draws,
@@ -1087,6 +1100,8 @@ impl Frame {
                 overflowed,
                 last_texture,
                 dither_matrix,
+                stencil_state_count,
+                stencil_states,
                 textures,
                 texture_lookup,
                 palette_count,
@@ -1186,6 +1201,8 @@ impl Frame {
             overflowed: &mut *addr_of_mut!((*frame).overflowed),
             last_texture: &mut *addr_of_mut!((*frame).last_texture),
             dither_matrix: &mut *addr_of_mut!((*frame).dither_matrix),
+            stencil_state_count: &mut *addr_of_mut!((*frame).stencil_state_count),
+            stencil_states: &mut *addr_of_mut!((*frame).stencil_states),
             textures: &mut *addr_of_mut!((*frame).textures),
             texture_lookup: &mut *addr_of_mut!((*frame).texture_lookup),
             palette_count: &mut *addr_of_mut!((*frame).palette_count),
@@ -1435,6 +1452,12 @@ impl Frame {
         };
         let count = crate::vertex::VertexFormat(draw.vertex_format).weight_count() as usize;
         self.bone_floats[..self.bone_float_count as usize].get(first..first + 12 * count).unwrap_or(&[])
+    }
+
+    /// A draw's exact stencil state (`blend::stencil_index`), if it has one.
+    pub fn stencil_state_of(&self, draw: &Draw) -> Option<crate::blend::StencilState> {
+        let index = crate::blend::stencil_index(draw.blend)?;
+        self.stencil_states[..self.stencil_state_count as usize].get(index).copied()
     }
 
     /// A raw draw's colour rules (`Draw::raw_colors`).
@@ -2333,6 +2356,8 @@ pub struct Catalog<'a> {
     overflowed: &'a mut u32,
     last_texture: &'a mut u32,
     dither_matrix: &'a mut u64,
+    stencil_state_count: &'a mut u32,
+    stencil_states: &'a mut [crate::blend::StencilState; MAX_STENCIL_STATES],
     textures: &'a mut [TextureDescriptor; MAX_TEXTURES],
     texture_lookup: &'a mut [u16; TEXTURE_LOOKUP_SLOTS],
     palette_count: &'a mut u32,
@@ -2360,6 +2385,24 @@ impl Catalog<'_> {
     /// Notes the GE's dither matrix for the frame (`Frame::dither_matrix`).
     pub fn set_dither_matrix(&mut self, matrix: u64) {
         *self.dither_matrix = matrix;
+    }
+
+    /// The index of `state` in `Frame::stencil_states`, added if new;
+    /// `None` if the table is full.
+    pub fn add_stencil_state(&mut self, state: crate::blend::StencilState) -> Option<usize> {
+        let count = *self.stencil_state_count as usize;
+        if let Some(index) = self.stencil_states[..count].iter().position(|&known| known == state) {
+            return Some(index);
+        }
+        let slot = self.stencil_states.get_mut(count)?;
+        *slot = state;
+        *self.stencil_state_count += 1;
+        Some(count)
+    }
+
+    /// The stencil state at `index` (`add_stencil_state`), if there is one.
+    pub fn stencil_state(&self, index: usize) -> Option<crate::blend::StencilState> {
+        self.stencil_states[..*self.stencil_state_count as usize].get(index).copied()
     }
 
     pub fn textures(&self) -> &[TextureDescriptor] {

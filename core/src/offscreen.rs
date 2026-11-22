@@ -207,6 +207,33 @@ pub fn offscreen_first(draws: &[Draw], textures: &[TextureDescriptor], shown: u3
     true
 }
 
+/// True if the frame reads the shown framebuffer `shown` as a texture, and
+/// only in draws into other framebuffers. Drawn in GE order (one scene per
+/// run, `offscreen_first` false), the screen's scene has ended before such a
+/// draw, so it can sample our target of the screen as drawn so far, as the
+/// GE samples VRAM. God of War's bloom chain samples the screen mid-frame;
+/// decoding the 512x512 framebuffer from VRAM instead took ~9 ms per frame
+/// and gave Sony's picture, not ours (2026-11-22). A draw into the screen
+/// that reads it can't sample a target it draws into: false then.
+pub fn screen_read_only_by_other_runs(draws: &[Draw], textures: &[TextureDescriptor], shown: u32) -> bool {
+    let reads_screen = |index: u32| textures.get(index as usize).is_some_and(|texture| reads_framebuffer(texture, shown));
+    // Cheap first: most frames have no texture at the screen at all.
+    if !textures.iter().any(|texture| reads_framebuffer(texture, shown)) {
+        return false;
+    }
+    let mut read = false;
+    for draw in draws {
+        if draw.flags & crate::frame::draw_flags::TEXTURED == 0 || !reads_screen(draw.texture) {
+            continue;
+        }
+        if fold_vram_mirror(draw.framebuffer) == fold_vram_mirror(shown) {
+            return false;
+        }
+        read = true;
+    }
+    read
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +398,26 @@ mod tests {
         let mut counts = [0u32; 7];
         runs_into(&draws, &framebuffers, &mut counts, |framebuffer| framebuffer);
         assert_eq!(counts, [2, 2, 1, 2, 2, 1, 0]);
+        // Only from a run into another framebuffer: the screen's scene has
+        // ended there, so our target of it is the texture.
+        assert!(screen_read_only_by_other_runs(&draws, &textures, SCREEN));
+    }
+
+    #[test]
+    fn the_screen_read_while_drawn_into_is_no_target_texture() {
+        let textures = vec![texture(SHOWN, format::ABGR8888), texture(TRAIL, format::BGR5650)];
+        // Read by a draw into the screen itself (feedback within one scene).
+        let into_itself = vec![draw(SHOWN), textured(TRAIL, 0), textured(SHOWN, 0)];
+        assert!(!screen_read_only_by_other_runs(&into_itself, &textures, SHOWN));
+        // Not read at all (an untextured draw doesn't read texture 0).
+        let not_read = vec![draw(SHOWN), draw(TRAIL), textured(SHOWN, 1)];
+        assert!(!screen_read_only_by_other_runs(&not_read, &textures, SHOWN));
+        // Through a VRAM mirror, from another run: read from the target.
+        let mirrored = [texture(SHOWN | 0x0020_0000, format::ABGR8888)];
+        assert!(screen_read_only_by_other_runs(&[draw(SHOWN), textured(TRAIL, 0)], &mirrored, SHOWN));
+        // As palette indices it is something else.
+        let indices = [texture(SHOWN, format::CLUT8)];
+        assert!(!screen_read_only_by_other_runs(&[draw(SHOWN), textured(TRAIL, 0)], &indices, SHOWN));
     }
 
     #[test]

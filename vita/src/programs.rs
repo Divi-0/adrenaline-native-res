@@ -28,7 +28,7 @@ use core::ffi::c_void;
 use core::mem::offset_of;
 use core::ptr::{null, null_mut};
 
-use nativeres_core::blend::{BLEND_ALPHA_ONLY, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_WRITES_ALPHA};
+use nativeres_core::blend::{BLEND_ALPHA_ONLY, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_STENCIL_MASK, BLEND_WRITES_ALPHA};
 use nativeres_core::frame::{FrameVertex, ReadVariant, ReadWay};
 use nativeres_core::vertex::VertexFormat;
 
@@ -544,6 +544,10 @@ pub struct ReadProgram {
     /// The generic one only (else null; the fast dithered ones read the
     /// matrix from a texture, draw.rs `use_dither_texture`).
     pub dither: [*const ProgramParameter; 4],
+    /// The generic one only: uStencilTest, uStencilWrite (core
+    /// `blend::stencil_uniforms`). Null in programs compiled before them:
+    /// stencil states are then approximated as before.
+    pub stencil: [*const ProgramParameter; 2],
 }
 
 /// Fast frame-read ways (`ReadWay`, all six).
@@ -694,6 +698,7 @@ impl ReadProgram {
             blend_fix: null(),
             cut: [null(); 9],
             dither: [null(); 4],
+            stencil: [null(); 2],
         }
     }
 
@@ -737,6 +742,7 @@ impl ReadProgram {
                 parameter(fragment_gxp, b"uDither2\0"),
                 parameter(fragment_gxp, b"uDither3\0"),
             ];
+            self.stencil = [parameter(fragment_gxp, b"uStencilTest\0"), parameter(fragment_gxp, b"uStencilWrite\0")];
         }
         let mut missing = generic && self.cut.iter().chain(&self.dither).any(|parameter| parameter.is_null());
         if textured {
@@ -783,7 +789,20 @@ impl ReadProgram {
 struct BlendProgram {
     kind: Kind,
     blend: u32,
+    alpha: AlphaOut,
     program: *mut gxm::FragmentProgram,
+}
+
+/// What GXM's blending writes into the alpha channel (`blend_program_with`):
+/// as the colour's blend says (`AsColor`), or, for a stencil value written
+/// exactly (core `blend::StencilWay`), 0 (`Zero`: alpha factors ZERO, ZERO)
+/// or the program's alpha as it is (`Source`: ONE, ZERO; the BLEND_FIX
+/// programs write the value there).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlphaOut {
+    AsColor,
+    Zero,
+    Source,
 }
 
 pub struct Programs {
@@ -806,7 +825,7 @@ pub struct Programs {
     read: [ReadProgram; READ_PROGRAMS],
 }
 
-const NO_BLEND_PROGRAM: BlendProgram = BlendProgram { kind: Kind::Color, blend: 0, program: null_mut() };
+const NO_BLEND_PROGRAM: BlendProgram = BlendProgram { kind: Kind::Color, blend: 0, alpha: AlphaOut::AsColor, program: null_mut() };
 
 impl RawSet {
     const fn new(variant: RawVariant, color: RawColor) -> RawSet {
@@ -1351,6 +1370,12 @@ impl Programs {
     /// normal alpha-blending program). `keep_target_alpha`: draws keep the
     /// target's alpha (the PSP's stencil) unless they write it.
     pub fn blend_program(&mut self, kind: Kind, blend: u32, keep_target_alpha: bool) -> *mut gxm::FragmentProgram {
+        self.blend_program_with(kind, blend, keep_target_alpha, AlphaOut::AsColor)
+    }
+
+    /// `blend_program` with GXM's alpha blending as `alpha` says (only
+    /// with the alpha written, `BLEND_WRITES_ALPHA`; else as the colour).
+    pub fn blend_program_with(&mut self, kind: Kind, blend: u32, keep_target_alpha: bool, alpha: AlphaOut) -> *mut gxm::FragmentProgram {
         let mut kind = kind;
         let mut blend = blend;
         if !keep_target_alpha && blend & BLEND_ALPHA_ONLY == 0 {
@@ -1366,7 +1391,17 @@ impl Programs {
             };
             blend &= !BLEND_FIX_B_VALUES;
         }
-        if let Some(known) = self.blend[..self.blend_count].iter().find(|known| known.kind == kind && known.blend == blend) {
+        // The stencil state's index doesn't change the program.
+        blend &= !BLEND_STENCIL_MASK;
+        // Blending off and the program's alpha written as it is: no GXM
+        // blending at all (a blending draw is translucent to the GPU: no
+        // hidden-surface removal; GoW's gameplay +1.8 ms with ONE, ZERO).
+        let alpha = match alpha {
+            _ if blend & BLEND_WRITES_ALPHA == 0 || blend & BLEND_ALPHA_ONLY != 0 => AlphaOut::AsColor,
+            AlphaOut::Source if blend & BLEND_ENABLED == 0 => AlphaOut::AsColor,
+            other => other,
+        };
+        if let Some(known) = self.blend[..self.blend_count].iter().find(|known| known.kind == kind && known.blend == blend && known.alpha == alpha) {
             return known.program;
         }
         if self.blend_count == MAX_BLEND_PROGRAMS {
@@ -1384,7 +1419,22 @@ impl Programs {
         } else {
             gxm::COLOR_MASK_R | gxm::COLOR_MASK_G | gxm::COLOR_MASK_B
         };
-        let info = if blend & BLEND_ENABLED != 0 && !alpha_only {
+        let info = if alpha != AlphaOut::AsColor {
+            // The colour as its blend says (blending off: ONE, ZERO), the
+            // alpha the stencil value: ZERO, ZERO or ONE, ZERO, added.
+            let (source, destination, equation) =
+                if blend & BLEND_ENABLED != 0 { (blend & 0xF, (blend >> 4) & 0xF, (blend >> 8) & 7) } else { (1, 0, 0) };
+            if source > 9 || destination > 9 || equation > 4 {
+                return null_mut();
+            }
+            let alpha_source = if alpha == AlphaOut::Source { gxm::BLEND_FACTOR_ONE } else { gxm::BLEND_FACTOR_ZERO };
+            Some(gxm::BlendInfo {
+                color_mask: mask,
+                functions: (equation as u8 + 1) | (1 << 4),
+                color_factors: source as u8 | (destination as u8) << 4,
+                alpha_factors: alpha_source | gxm::BLEND_FACTOR_ZERO << 4,
+            })
+        } else if blend & BLEND_ENABLED != 0 && !alpha_only {
             let (source, destination, equation) = (blend & 0xF, (blend >> 4) & 0xF, (blend >> 8) & 7);
             if source > 9 || destination > 9 || equation > 4 {
                 return null_mut();
@@ -1404,7 +1454,7 @@ impl Programs {
             _ => self.textured_fragment_program(kind, info_pointer),
         };
         if !program.is_null() {
-            self.blend[self.blend_count] = BlendProgram { kind, blend, program };
+            self.blend[self.blend_count] = BlendProgram { kind, blend, alpha, program };
             self.blend_count += 1;
         }
         program

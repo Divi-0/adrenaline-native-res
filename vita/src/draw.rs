@@ -22,7 +22,7 @@ use core::ffi::c_void;
 use core::ptr::{null, null_mut};
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, Ordering};
 
-use nativeres_core::blend::{BLEND_ALPHA_ONLY, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_WRITES_ALPHA};
+use nativeres_core::blend::{self, StencilState, StencilWay, BLEND_ALPHA_ONLY, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_WRITES_ALPHA};
 use nativeres_core::frame::{
     draw_flags, read_variant, test_flags, Draw, Frame, DIRECTIONAL_LIGHT_FLOATS, FrameVertex, GpuLights, GpuTransform, RawCamera, RawColors, RawTransform, ReadVariant,
     ReadWay, NO_RING_INDICES,
@@ -39,7 +39,7 @@ use crate::capture::{RAW_ARENA, RAW_ARENA_BYTES, VERTEX_ARENA, VERTEX_ARENA_VERT
 use crate::frame_pool::alloc as frame_pool_alloc;
 use crate::gpu_textures::TextureObject;
 use crate::gxm::{self, ProgramParameter};
-use crate::programs::{Kind, Programs, RawColor, RawUniforms, RawVariant, SPRITE_CORNERS};
+use crate::programs::{AlphaOut, Kind, Programs, RawColor, RawUniforms, RawVariant, SPRITE_CORNERS};
 use crate::render_stats::stats;
 use crate::{basic_programs, render_log, sys, SingleThreaded};
 
@@ -939,6 +939,47 @@ impl Draws {
         self.alpha_log_kinds = 0;
     }
 
+    /// The draw's exact stencil state and how it is done (core
+    /// `blend::stencil_way`; `StencilWay::None` while nobody reads the
+    /// target's alpha, `keep_target_alpha`). Into a 16-bit target (`choice`
+    /// a frame-read program) any state takes the generic one, which writes
+    /// the alpha itself; `FrameRead` sets `choice` to it, also for 8-bit
+    /// targets. Without a generic program that has the stencil uniforms the
+    /// draw goes as before (fragment alpha, no test).
+    fn stencil_way(
+        &mut self,
+        frame: &Frame,
+        draw: &Draw,
+        textured: bool,
+        choice: &mut Option<ReadVariant>,
+        programs_ready: bool,
+    ) -> (Option<StencilState>, StencilWay) {
+        let state = if self.keep_target_alpha { frame.stencil_state_of(draw) } else { None };
+        let Some(known) = state else {
+            return (None, StencilWay::None);
+        };
+        let mut way = blend::stencil_way(state, draw.blend, textured);
+        if choice.is_some() {
+            way = StencilWay::FrameRead(known);
+        }
+        if let StencilWay::FrameRead(_) = way {
+            let ready = programs_ready
+                && self
+                    .programs
+                    .read_program(textured, false, ReadVariant::Generic)
+                    .is_some_and(|program| !program.stencil[0].is_null() && !program.stencil[1].is_null());
+            if !ready {
+                stats().stencil_missing_draws += 1;
+                return (None, StencilWay::None);
+            }
+            *choice = Some(ReadVariant::Generic);
+            stats().stencil_read_draws += 1;
+        } else if way == StencilWay::Zero {
+            stats().stencil_zero_draws += 1;
+        }
+        (state, way)
+    }
+
     /// The PSP's alpha test of a textured draw as the fragment programs'
     /// uniform (`alpha_test_uniform`: the alpha values that pass, 0..255). None if the draw needs no test
     /// program: no test, "always", a mask other than 0xFF (blending stands in
@@ -971,12 +1012,21 @@ impl Draws {
     /// scale, for the alpha-test program its range, for the BLEND_FIX ones
     /// FIX B. Set into a fresh default uniform buffer only when something
     /// changed. `flat`: the draw took the flat program (`Kind::TexturedFlat`).
-    fn textured_fragment_uniforms(&mut self, tested: bool, flat: bool, fog_and_scale: [f32; 4], alpha_range: [f32; 4], blend: u32) {
+    ///
+    /// `stencil_value`: the draw took a BLEND_FIX program for its stencil
+    /// value (`StencilWay::FixProgram`): written as its alpha, the colour
+    /// as it is.
+    fn textured_fragment_uniforms(&mut self, tested: bool, flat: bool, fog_and_scale: [f32; 4], alpha_range: [f32; 4], blend: u32, stencil_value: Option<u8>) {
         let textured = &self.programs.textured;
-        if blend & BLEND_ENABLED != 0 && blend & BLEND_FIX_B_ALPHA != 0 && textured.have_fix {
+        let fix_b = blend & BLEND_ENABLED != 0 && blend & BLEND_FIX_B_ALPHA != 0;
+        if (fix_b || stencil_value.is_some()) && textured.have_fix {
             // The BLEND_FIX variants (blend_program picked them): FIX B and
-            // the source factor; rare, so no caching.
-            let fix = [((blend >> 12) & 0xFF) as f32 / 255.0, ((blend >> 20) & 3) as f32, 0.0, 0.0];
+            // the source factor, or the stencil value and none; rare, so no
+            // caching.
+            let fix = match stencil_value {
+                Some(value) => [value as f32 / 255.0, 0.0, 0.0, 0.0],
+                None => [((blend >> 12) & 0xFF) as f32 / 255.0, ((blend >> 20) & 3) as f32, 0.0, 0.0],
+            };
             let buffer = reserve_fragment_uniforms();
             if tested {
                 set_uniform(buffer, textured.fog_and_scale_test_fix, 4, fog_and_scale.as_ptr());
@@ -987,7 +1037,11 @@ impl Draws {
                 set_uniform(buffer, textured.blend_fix, 4, fix.as_ptr());
             }
             self.state.tint = None; // the cached default buffer is no longer the one in use
-            stats().fix_b_draws += 1;
+            if stencil_value.is_some() {
+                stats().stencil_fix_draws += 1;
+            } else {
+                stats().fix_b_draws += 1;
+            }
             return;
         }
         if !tested {
@@ -1017,12 +1071,27 @@ impl Draws {
     /// dither matrix; for the textured ones also fog, colour scale, alpha
     /// test (`ALPHA_ALL_PASS` without) and BLEND_FIX. The fast untextured
     /// ones have none.
-    fn read_fragment_uniforms(&mut self, frame: &Frame, draw: &Draw, variant: ReadVariant, tested: bool, textured: Option<([f32; 4], [f32; 4])>) {
-        let Some(bits) = nativeres_core::frame::target_channel_bits(draw.flags) else {
-            return;
-        };
-        stats().cut_draws += 1;
+    ///
+    /// `stencil`: the draw's stencil state done by the generic program
+    /// (`StencilWay::FrameRead`, which also takes 8-bit targets: no cut).
+    fn read_fragment_uniforms(
+        &mut self,
+        frame: &Frame,
+        draw: &Draw,
+        variant: ReadVariant,
+        tested: bool,
+        textured: Option<([f32; 4], [f32; 4])>,
+        stencil: Option<StencilState>,
+    ) {
         let generic = variant == ReadVariant::Generic;
+        let bits = match nativeres_core::frame::target_channel_bits(draw.flags) {
+            Some(bits) => {
+                stats().cut_draws += 1;
+                bits
+            }
+            None if generic => [8; 4],
+            None => return,
+        };
         if let ReadVariant::Fast { way, dither, .. } = variant {
             stats().cut_fast_draws += 1;
             if matches!(way, ReadWay::Off | ReadWay::Precut) {
@@ -1056,6 +1125,17 @@ impl Draws {
             });
             for (parameter, row) in program.dither.iter().zip(&rows) {
                 set_uniform(buffer, *parameter, 4, row.as_ptr());
+            }
+            // The stencil test and value (all pass, alpha as blended
+            // without); the value stored as the target's bits keep it.
+            if !program.stencil[0].is_null() && !program.stencil[1].is_null() {
+                let mut uniforms = blend::stencil_uniforms(stencil);
+                if uniforms[1][1] > 0.5 && bits[3] < 8 {
+                    uniforms[1][0] = nativeres_core::frame::quantize_like_the_ge(uniforms[1][0] as i32, 0, bits[3]) as f32;
+                }
+                for (parameter, values) in program.stencil.iter().zip(&uniforms) {
+                    set_uniform(buffer, *parameter, 4, values.as_ptr());
+                }
             }
         }
         if let Some((fog_and_scale, alpha_range)) = textured {
@@ -1399,6 +1479,9 @@ impl Draws {
         if tested && !alpha_test_is_one_sided(alpha_range) {
             choice = choice.map(|_| ReadVariant::Generic);
         }
+        // The draw's stencil test and value, exactly (core
+        // `blend::stencil_way`), while the game reads the target's alpha.
+        let (stencil_state, stencil_way) = self.stencil_way(frame, draw, true, &mut choice, programs_ready);
         let read_variant = choice.unwrap_or(ReadVariant::Generic);
         let read_program = match choice {
             Some(variant) if programs_ready => self.programs.read_program(true, tested, variant).map(|program| program.program),
@@ -1407,10 +1490,25 @@ impl Draws {
         let read = read_program.is_some();
         let read_alpha_range = if tested { alpha_range } else { ALPHA_ALL_PASS };
         let mut flat = false;
+        // The stencil value through a BLEND_FIX program, or 0 by GXM's
+        // alpha factors (`StencilWay`).
+        let mut stencil_value = match stencil_way {
+            StencilWay::FixProgram(value) if !read && self.programs.textured.have_fix && (!tested || self.programs.textured.have_test) => {
+                Some(value)
+            }
+            _ => None,
+        };
+        let alpha_out = match stencil_way {
+            StencilWay::Zero => AlphaOut::Zero,
+            _ if stencil_value.is_some() => AlphaOut::Source,
+            _ => AlphaOut::AsColor,
+        };
         let mut fragment = if let Some(program) = read_program {
             program
         } else if programs_ready {
-            let kind = if tested {
+            let kind = if stencil_value.is_some() {
+                if tested { Kind::TexturedTestFix } else { Kind::TexturedFix }
+            } else if tested {
                 Kind::TexturedTest
             } else if self.programs.textured.have_flat && flat_shading(frame, draw) {
                 flat = true;
@@ -1418,19 +1516,25 @@ impl Draws {
             } else {
                 Kind::Textured
             };
-            self.programs.blend_program(kind, draw.blend, keep)
+            self.programs.blend_program_with(kind, draw.blend, keep, alpha_out)
         } else {
             null_mut()
         };
+        if stencil_value.is_some() && fragment.is_null() {
+            // No BLEND_FIX program for it: the fragment's alpha, as before.
+            stencil_value = None;
+            fragment = self.programs.blend_program(if tested { Kind::TexturedTest } else { Kind::Textured }, draw.blend, keep);
+        }
         if flat && fragment.is_null() {
             flat = false;
-            fragment = self.programs.blend_program(Kind::Textured, draw.blend, keep);
+            fragment = self.programs.blend_program_with(Kind::Textured, draw.blend, keep, alpha_out);
         }
         if tested && fragment.is_null() {
             // No program for this blend mode: without the test, as before.
             tested = false;
-            fragment = self.programs.blend_program(Kind::Textured, draw.blend, keep);
+            fragment = self.programs.blend_program_with(Kind::Textured, draw.blend, keep, alpha_out);
         }
+        let read_stencil = if read { stencil_state } else { None };
         // Vertices in model space: the 3D program transforms them (raw
         // draws: their own blocks, `raw_transform_of` below).
         let transform = if draw.transform != 0 && draw.flags & draw_flags::RAW_VERTICES == 0 {
@@ -1561,9 +1665,9 @@ impl Draws {
             if !skip(2) {
                 self.use_raw_transform(frame, draw, set, program, blocks, colors, uv_scale, fragment);
                 if read {
-                    self.read_fragment_uniforms(frame, draw, read_variant, tested, Some((fog_and_scale(draw), read_alpha_range)));
+                    self.read_fragment_uniforms(frame, draw, read_variant, tested, Some((fog_and_scale(draw), read_alpha_range)), read_stencil);
                 } else {
-                    self.textured_fragment_uniforms(tested, flat, fog_and_scale(draw), alpha_range, draw.blend);
+                    self.textured_fragment_uniforms(tested, flat, fog_and_scale(draw), alpha_range, draw.blend, stencil_value);
                 }
             }
         } else if !fragment.is_null() {
@@ -1607,9 +1711,9 @@ impl Draws {
                     }
                 }
                 if read {
-                    self.read_fragment_uniforms(frame, draw, read_variant, tested, Some((fog_and_scale(draw), read_alpha_range)));
+                    self.read_fragment_uniforms(frame, draw, read_variant, tested, Some((fog_and_scale(draw), read_alpha_range)), read_stencil);
                 } else {
-                    self.textured_fragment_uniforms(tested, flat, fog_and_scale(draw), alpha_range, draw.blend);
+                    self.textured_fragment_uniforms(tested, flat, fog_and_scale(draw), alpha_range, draw.blend, stencil_value);
                 }
             }
         } else {
@@ -1731,13 +1835,15 @@ impl Draws {
         if INVISIBLE_SOURCES.load(Ordering::Relaxed) != 0 && vertices.iter().all(|vertex| vertex.color >> 24 == 0) {
             choice = choice.map(ReadVariant::for_invisible_source);
         }
+        let (stencil_state, stencil_way) = self.stencil_way(frame, draw, false, &mut choice, true);
         let read_variant = choice.unwrap_or(ReadVariant::Generic);
         let read_program = choice.and_then(|variant| self.programs.read_program(false, false, variant).map(|program| program.program));
         let read = read_program.is_some();
+        let alpha_out = if stencil_way == StencilWay::Zero { AlphaOut::Zero } else { AlphaOut::AsColor };
         let fragment = if let Some(program) = read_program {
             program
         } else {
-            self.programs.blend_program(Kind::Color, draw.blend, self.keep_target_alpha)
+            self.programs.blend_program_with(Kind::Color, draw.blend, self.keep_target_alpha, alpha_out)
         };
         self.use_default_viewport();
         let Some(basic) = basic_programs::get() else {
@@ -1747,7 +1853,7 @@ impl Draws {
             let fragment = if fragment.is_null() { basic.color_fragment } else { fragment };
             self.use_programs(basic.color_vertex, basic.color_wvp, basic_programs::ORTHO.as_ptr(), fragment);
             if read {
-                self.read_fragment_uniforms(frame, draw, read_variant, false, None);
+                self.read_fragment_uniforms(frame, draw, read_variant, false, None, if read { stencil_state } else { None });
             }
         }
         if skip(1) {
@@ -2031,8 +2137,8 @@ impl Draws {
         let matrix = self.native_matrix();
         self.use_programs(vertex, wvp, matrix, fragment as *const c_void);
         match program {
-            ShadeProgram::EightBit => self.textured_fragment_uniforms(tested, false, case.fog_and_scale, alpha_test, 0),
-            ShadeProgram::Flat => self.textured_fragment_uniforms(false, true, case.fog_and_scale, alpha_test, 0),
+            ShadeProgram::EightBit => self.textured_fragment_uniforms(tested, false, case.fog_and_scale, alpha_test, 0, None),
+            ShadeProgram::Flat => self.textured_fragment_uniforms(false, true, case.fog_and_scale, alpha_test, 0, None),
             ShadeProgram::Cut5551 => {
                 let read = self.programs.made_read_program(true, tested, off);
                 let (fog_and_scale, alpha) = (read.fog_and_scale, read.alpha_test);

@@ -83,6 +83,19 @@
 //                 (colour mask; the alpha is the PSP's stencil)
 //   uDither0..3   the dither matrix's rows (-8..7; zeros without dither),
 //                 indexed by the PSP pixel (two of ours per PSP pixel)
+//   uStencilTest  the PSP's stencil test on the target's alpha (its
+//                 stencil; core blend.rs `StencilState`): the stored value
+//                 ANDed with w (the mask) passes when it lies in x..y (z = 1)
+//                 or outside (z = -1), x and y half a step out, as
+//                 uAlphaTest; (-1, 256, 1, 0) lets everything pass. A
+//                 failing fragment is discarded (the GE's stencil-fail op
+//                 KEEP: nothing written).
+//   uStencilWrite x = the stencil value written as the alpha (0..255) where
+//                 y = 1 (the op REPLACE or ZERO); y = 0: alpha as blended.
+//                 With 8-bit targets (uStep, uWiden 1, uWidenLow 0) the
+//                 generic program also takes 8888 draws with a stencil test
+//                 or a stencil value GXM's blending can't write (draw.rs
+//                 `stencil_way`).
 //
 // (The fast variants: uFogAndScale, with READ_TEST also uAlphaTest.)
 //
@@ -197,6 +210,8 @@ __nativecolor __regformat unsigned char4 main(
 	uniform float4 uWiden,
 	uniform float4 uWidenLow,
 	uniform float4 uWrite,
+	uniform float4 uStencilTest,
+	uniform float4 uStencilWrite,
 #endif
 #ifdef UNTEXTURED
 	float4 vColor : COLOR
@@ -224,9 +239,18 @@ __nativecolor __regformat unsigned char4 main(
 {
 	// c: the colour as whole values 0..255 (textured: the GE's own;
 	// untextured: rounded, as GXM writes a colour).
+#ifndef READ_FAST
+	// The stencil test (uStencilTest above).
+	float stored = (float)(target.a & (unsigned char)uStencilTest.w);
+	float stencilPasses = (stored - uStencilTest.x) * (uStencilTest.y - stored) * uStencilTest.z;
+#endif
 #ifdef UNTEXTURED
 	float4 color = vColor;
 	float4 c = FLOOR(saturate(color) * 255.0f + 0.5f);
+#ifndef READ_FAST
+	if (stencilPasses < 0.0f)
+		discard;
+#endif
 #else
 	// Colour, specular and fog came times w (screen-linear, nativeres_3d_v.cg).
 	float overW = 1.0f / vFog.y;
@@ -244,8 +268,9 @@ __nativecolor __regformat unsigned char4 main(
 		discard;
 #elif !defined(READ_FAST)
 	// The alpha test on the whole alpha, as nativeres_textured_test_f.cg
-	// (uAlphaTest: x = lo - 0.5, y = hi + 0.5, z = 1 or -1 for NOTEQUAL).
-	if ((c.a - uAlphaTest.x) * (uAlphaTest.y - c.a) * uAlphaTest.z < 0.0f)
+	// (uAlphaTest: x = lo - 0.5, y = hi + 0.5, z = 1 or -1 for NOTEQUAL),
+	// and the stencil test: one discard for both.
+	if (min((c.a - uAlphaTest.x) * (uAlphaTest.y - c.a) * uAlphaTest.z, stencilPasses) < 0.0f)
 		discard;
 #endif
 	float4 color = c * (1.0f / 255.0f);
@@ -371,6 +396,8 @@ __nativecolor __regformat unsigned char4 main(
 	// Cut to the target's bits, widened back to 8.
 	float4 cut = floor(value * uStep);
 	float4 written = cut * uWiden + floor(cut * uWidenLow);
+	// The stencil value as the alpha (uStencilWrite above).
+	written.a = lerp(written.a, uStencilWrite.x, uStencilWrite.y);
 	return (unsigned char4)lerp(d, written, uWrite);
 #endif
 }

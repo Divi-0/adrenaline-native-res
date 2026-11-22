@@ -192,6 +192,209 @@ pub fn alpha_write(ge: &GeState) -> AlphaWrite {
     }
 }
 
+/// In `Draw::blend`: the draw's exact stencil state, as its index in
+/// `Frame::stencil_states` + 1 in bits 22..28 (0: none, `stencil`).
+pub const BLEND_STENCIL_SHIFT: u32 = 22;
+pub const BLEND_STENCIL_MASK: u32 = 0x3F << BLEND_STENCIL_SHIFT;
+
+/// The `Frame::stencil_states` index a packed blend word names, if any.
+pub fn stencil_index(packed: u32) -> Option<usize> {
+    (((packed & BLEND_STENCIL_MASK) >> BLEND_STENCIL_SHIFT) as usize).checked_sub(1)
+}
+
+/// A draw's stencil test and stencil write, done exactly on the target's
+/// alpha (the PSP's stencil): the subset of the GE's stencil state that
+/// comes down to "test the stored value, then write a constant or keep it"
+/// (`stencil`). Packed: bits 0..8 the value written, bit 8 set if it is
+/// written, bits 9..12 the compare function (PSP order, see `passes`),
+/// bit 12 set if there is a test, bits 16..24 the reference (already
+/// masked) and bits 24..32 the mask.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct StencilState(pub u32);
+
+impl StencilState {
+    const WRITES: u32 = 1 << 8;
+    const TESTS: u32 = 1 << 12;
+
+    pub fn new(test: Option<(u32, u8, u8)>, write: Option<u8>) -> StencilState {
+        let mut packed = 0;
+        if let Some(value) = write {
+            packed |= value as u32 | Self::WRITES;
+        }
+        if let Some((function, reference, mask)) = test {
+            packed |= Self::TESTS | (function & 7) << 9 | ((reference & mask) as u32) << 16 | (mask as u32) << 24;
+        }
+        StencilState(packed)
+    }
+
+    /// The value the draw writes where it draws (`None`: the alpha stays).
+    pub fn write(self) -> Option<u8> {
+        (self.0 & Self::WRITES != 0).then_some(self.0 as u8)
+    }
+
+    /// The test as (function, reference & mask, mask), if there is one.
+    pub fn test(self) -> Option<(u32, u8, u8)> {
+        (self.0 & Self::TESTS != 0).then_some(((self.0 >> 9) & 7, (self.0 >> 16) as u8, (self.0 >> 24) as u8))
+    }
+
+    /// Whether a pixel whose target alpha is `stored` passes the test: the
+    /// GE compares the reference with the stored value, both masked
+    /// (ppsspp-ref GPU/Software/DrawPixel.cpp `StencilTestPassed`: "ref <
+    /// stencil" for LESS).
+    pub fn passes(self, stored: u8) -> bool {
+        let Some((function, reference, mask)) = self.test() else {
+            return true;
+        };
+        let stored = stored & mask;
+        match function {
+            0 => false,
+            1 => true,
+            2 => reference == stored,
+            3 => reference != stored,
+            4 => reference < stored,
+            5 => reference <= stored,
+            6 => reference > stored,
+            _ => reference >= stored,
+        }
+    }
+}
+
+/// What the GE's stencil state does to a draw (`stencil`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stencil {
+    /// No stencil test (or no stencil: 565, clear mode): `alpha_write` alone.
+    Off,
+    /// Done exactly by testing and writing the target's alpha.
+    Exact(StencilState),
+    /// Ops or masks the alpha can't do (INCR, DECR, INVERT, a partly masked
+    /// write, writes on a failed test): as before, the fragment's alpha is
+    /// written and nothing is tested.
+    Approximated,
+}
+
+/// The stencil state of the current (non-clear) draw, as the GE runs it
+/// (ppsspp-ref GPU/Software/DrawPixel.cpp `DrawPixelInline`): with the
+/// test on, a failed test applies the "stencil fail" op and stops, a failed
+/// depth test the "depth fail" op, else the "pass" op; KEEP leaves the
+/// stored value, ZERO writes 0, REPLACE the (unmasked) reference; bits set
+/// in ALPHA_MASK aren't written. Exact when the draw's stencil comes down
+/// to a test and a constant written where it draws: fail ops KEEP (or
+/// never run: test ALWAYS, depth test off or ALWAYS) and the pass op KEEP,
+/// ZERO or REPLACE with all bits written (or none). God of War marks its
+/// picture with REPLACE (refs 0, 0x10, 0x20, 0x2C) and tests it for the
+/// depth-of-field blur (EQUAL 0x10, mask 0x10) and the bloom's bright pass.
+pub fn stencil(ge: &GeState) -> Stencil {
+    if ge.register(op::FRAMEBUFFER_PIXEL_FORMAT) & 3 == 0 || ge.is_clear_mode() || ge.register(op::STENCIL_TEST_ENABLE) & 1 == 0 {
+        return Stencil::Off;
+    }
+    const KEEP: u32 = 0;
+    const ZERO: u32 = 1;
+    const REPLACE: u32 = 2;
+    let test = ge.register(op::STENCIL_TEST);
+    let (function, reference, mask) = (test & 7, (test >> 8) as u8, (test >> 16) as u8);
+    let ops = ge.register(op::STENCIL_OP);
+    let (stencil_fail, depth_fail, pass) = (ops & 0xFF, (ops >> 8) & 0xFF, (ops >> 16) & 0xFF);
+    let write_mask = ge.register(op::ALPHA_MASK) & 0xFF; // set bits: not written
+    let depth_can_fail = ge.register(op::DEPTH_TEST_ENABLE) & 1 != 0 && ge.register(op::DEPTH_TEST) & 7 != 1;
+    let writes = write_mask != 0xFF;
+    let fails_written = writes && ((function != 1 && stencil_fail != KEEP) || (depth_can_fail && depth_fail != KEEP));
+    let write = match pass {
+        _ if !writes => None,
+        KEEP => None,
+        ZERO => Some(0),
+        REPLACE => Some(reference),
+        _ => return Stencil::Approximated,
+    };
+    if fails_written || (write.is_some() && write_mask != 0) {
+        return Stencil::Approximated;
+    }
+    let test = (function != 1).then_some((function, reference, mask));
+    if test.is_none() && write.is_none() {
+        return Stencil::Off;
+    }
+    Stencil::Exact(StencilState::new(test, write))
+}
+
+/// How the display does a draw's exact stencil state (`stencil_way`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StencilWay {
+    /// Nothing to do (no state).
+    None,
+    /// Alpha 0 written (REPLACE 0, ZERO): GXM's alpha blend factors ZERO,
+    /// ZERO; the colour's program and blending as before. (By the BLEND_FIX
+    /// program instead, keeping unblended draws opaque to the GPU: GoW's
+    /// gameplay 64.4 -> 67.8 ms GPU, slower; 2026-11-22.)
+    Zero,
+    /// A constant alpha from a textured BLEND_FIX program (its uBlendFix
+    /// with x = value / 255, y = 0: colour unchanged, alpha the value) and
+    /// GXM's alpha factors ONE, ZERO; the colour blending as before, as it
+    /// doesn't read the source alpha.
+    FixProgram(u8),
+    /// The generic frame-read program (nativeres_textured_read_f.cg
+    /// uStencilTest, uStencilWrite): a stencil test, or a value whose draw's
+    /// blending needs the source alpha (or has no BLEND_FIX program:
+    /// untextured, FIX B already through the alpha). It blends in the
+    /// program, so the alpha is free for the value.
+    FrameRead(StencilState),
+}
+
+/// The way for a draw with stencil state `state` (`Frame::stencil_state_of`),
+/// packed blend `blend` and textured or not. God of War writes its marks
+/// mostly unblended (`FixProgram`, or `Zero`), tests them in a few
+/// full-screen passes (`FrameRead`).
+pub fn stencil_way(state: Option<StencilState>, blend: u32, textured: bool) -> StencilWay {
+    let Some(state) = state else {
+        return StencilWay::None;
+    };
+    if state.test().is_some() {
+        return StencilWay::FrameRead(state);
+    }
+    let reads_source_alpha = |factor: u32| {
+        [Factor::SourceAlpha, Factor::OneMinusSourceAlpha].iter().any(|known| *known as u32 == factor)
+    };
+    let blended = blend & BLEND_ENABLED != 0 && blend & BLEND_ALPHA_ONLY == 0;
+    let needs_source_alpha = blended && (reads_source_alpha(blend & 0xF) || reads_source_alpha((blend >> 4) & 0xF) || blend & BLEND_FIX_B_ALPHA != 0);
+    match state.write() {
+        None => StencilWay::None,
+        Some(0) => StencilWay::Zero,
+        Some(_) if !textured || needs_source_alpha => StencilWay::FrameRead(state),
+        Some(value) => StencilWay::FixProgram(value),
+    }
+}
+
+/// The frame-read program's stencil uniforms (uStencilTest, uStencilWrite,
+/// nativeres_textured_read_f.cg) for `state` (`None`: no test, alpha as
+/// blended): the stored values that pass as a range half a step out, as the
+/// alpha test's uniform.
+pub fn stencil_uniforms(state: Option<StencilState>) -> [[f32; 4]; 2] {
+    let state = state.unwrap_or_default();
+    let test = match state.test() {
+        None => [-1.0, 256.0, 1.0, 0.0],
+        Some((function, reference, mask)) => {
+            let reference = reference as f32;
+            let mask = mask as f32;
+            // The stored (masked) values that pass "reference <op> stored".
+            let (lo, hi, outside) = match function {
+                0 => (1.0, 0.0, false),                // never: an empty range
+                2 => (reference, reference, false),    // equal
+                3 => (reference, reference, true),     // not equal
+                4 => (reference + 1.0, 255.0, false),  // reference < stored
+                5 => (reference, 255.0, false),        // reference <= stored
+                6 => (0.0, reference - 1.0, false),    // reference > stored
+                7 => (0.0, reference, false),          // reference >= stored
+                _ => (0.0, 255.0, false),              // always
+            };
+            [lo - 0.5, hi + 0.5, if outside { -1.0 } else { 1.0 }, mask]
+        }
+    };
+    let write = match state.write() {
+        Some(value) => [value as f32, 1.0, 0.0, 0.0],
+        None => [0.0; 4],
+    };
+    [test, write]
+}
+
 /// Whether a draw sampling one of our render targets (a PSP framebuffer)
 /// sees the target's alpha, the PSP's stencil values. Not with the texture
 /// alpha switched off (texture function "RGB", `texture_flags::IGNORE_ALPHA`):
@@ -486,6 +689,116 @@ mod tests {
         ]);
         let blend = translate(&ge).unwrap();
         assert!(blend.fix_b.is_none() && blend.approximated);
+    }
+
+    /// God of War's gameplay (2026-11-22): the world writes its stencil
+    /// marks with REPLACE (test ALWAYS, KEEP on depth fail), the
+    /// depth-of-field blur tests EQUAL 0x10 under mask 0x10.
+    #[test]
+    fn god_of_wars_stencil_marks_and_tests_are_exact() {
+        let mark = |reference: u32| {
+            ge_with(&[
+                (op::FRAMEBUFFER_PIXEL_FORMAT, 3),
+                (op::STENCIL_TEST_ENABLE, 1),
+                (op::STENCIL_TEST, 0x3C_0001 | reference << 8),
+                (op::STENCIL_OP, 0x02_0002),
+                (op::DEPTH_TEST_ENABLE, 1),
+                (op::DEPTH_TEST, 5),
+            ])
+        };
+        assert_eq!(stencil(&mark(0x20)), Stencil::Exact(StencilState::new(None, Some(0x20))));
+        assert_eq!(stencil(&mark(0)), Stencil::Exact(StencilState::new(None, Some(0))));
+        let blur = ge_with(&[
+            (op::FRAMEBUFFER_PIXEL_FORMAT, 3),
+            (op::STENCIL_TEST_ENABLE, 1),
+            (op::STENCIL_TEST, 0x10_1002),
+            (op::STENCIL_OP, 0),
+        ]);
+        let Stencil::Exact(state) = stencil(&blur) else { panic!("{:?}", stencil(&blur)) };
+        assert_eq!((state.test(), state.write()), (Some((2, 0x10, 0x10)), None));
+        assert!(state.passes(0x10) && state.passes(0x3F) && !state.passes(0x2C) && !state.passes(0));
+        // GREATER 0x10, REPLACE on pass: written only where 0x10 > stored.
+        let over = ge_with(&[
+            (op::FRAMEBUFFER_PIXEL_FORMAT, 3),
+            (op::STENCIL_TEST_ENABLE, 1),
+            (op::STENCIL_TEST, 0xFF_1006),
+            (op::STENCIL_OP, 0x02_0000),
+            (op::DEPTH_TEST_ENABLE, 1),
+            (op::DEPTH_TEST, 5),
+        ]);
+        let Stencil::Exact(state) = stencil(&over) else { panic!() };
+        assert_eq!(state.write(), Some(0x10));
+        assert!(state.passes(0) && !state.passes(0x10) && !state.passes(0x20));
+    }
+
+    #[test]
+    fn stencil_ops_the_alpha_cant_do_stay_approximated() {
+        let base = [(op::FRAMEBUFFER_PIXEL_FORMAT, 3), (op::STENCIL_TEST_ENABLE, 1), (op::STENCIL_TEST, 0xFF_2001)];
+        let with = |extra: &[(u8, u32)]| stencil(&ge_with(&[&base[..], extra].concat()));
+        // INCR on pass; REPLACE on a depth fail that can happen; a partly
+        // masked write; a write when an EQUAL test fails.
+        assert_eq!(with(&[(op::STENCIL_OP, 0x04_0000)]), Stencil::Approximated);
+        assert_eq!(with(&[(op::STENCIL_OP, 0x02_0200), (op::DEPTH_TEST_ENABLE, 1), (op::DEPTH_TEST, 4)]), Stencil::Approximated);
+        assert_eq!(with(&[(op::STENCIL_OP, 0x02_0000), (op::ALPHA_MASK, 0x0F)]), Stencil::Approximated);
+        assert_eq!(with(&[(op::STENCIL_TEST, 0xFF_2002), (op::STENCIL_OP, 0x02_0002)]), Stencil::Approximated);
+        // A depth-fail op without a depth test never runs; nothing written,
+        // nothing tested; 565 has no stencil; all bits masked: kept.
+        assert!(matches!(with(&[(op::STENCIL_OP, 0x02_0200)]), Stencil::Exact(_)));
+        assert_eq!(with(&[(op::STENCIL_OP, 0)]), Stencil::Off);
+        assert_eq!(with(&[(op::STENCIL_OP, 0x02_0000), (op::FRAMEBUFFER_PIXEL_FORMAT, 0)]), Stencil::Off);
+        assert_eq!(with(&[(op::STENCIL_OP, 0x02_0000), (op::ALPHA_MASK, 0xFF)]), Stencil::Off);
+    }
+
+    #[test]
+    fn stencil_ways_follow_what_the_blend_needs_of_the_alpha() {
+        let write = |value| Some(StencilState::new(None, Some(value)));
+        let off = 0;
+        let normal = Blend::ALPHA.pack();
+        let fixed = BLEND_ENABLED | Factor::One as u32 | (Factor::One as u32) << 4; // additive (FIX A, FIX B white)
+        assert_eq!(stencil_way(None, normal, true), StencilWay::None);
+        assert_eq!(stencil_way(write(0), normal, true), StencilWay::Zero);
+        assert_eq!(stencil_way(write(0x20), off, true), StencilWay::FixProgram(0x20));
+        assert_eq!(stencil_way(write(0x20), fixed, true), StencilWay::FixProgram(0x20));
+        // The blend takes the source alpha, FIX B rides in it, or no
+        // BLEND_FIX program (untextured): the frame-read program.
+        assert_eq!(stencil_way(write(0x10), normal, true), StencilWay::FrameRead(StencilState::new(None, Some(0x10))));
+        assert!(matches!(stencil_way(write(0x10), fixed | BLEND_FIX_B_ALPHA, true), StencilWay::FrameRead(_)));
+        assert!(matches!(stencil_way(write(0x10), off, false), StencilWay::FrameRead(_)));
+        // A test always reads the target.
+        let tested = StencilState::new(Some((2, 0x10, 0x10)), None);
+        assert_eq!(stencil_way(Some(tested), fixed, true), StencilWay::FrameRead(tested));
+    }
+
+    /// The program's range test (uStencilTest) agrees with `passes` for
+    /// every function, reference, mask sample and stored value.
+    #[test]
+    fn the_stencil_uniform_range_is_the_stencil_test() {
+        for function in 0..8 {
+            for (reference, mask) in [(0x10, 0x10), (0x20, 0xFF), (0, 0xFF), (0xFF, 0xFF), (0x2C, 0x3C)] {
+                let state = StencilState::new(Some((function, reference, mask)), Some(7));
+                let [test, write] = stencil_uniforms(Some(state));
+                assert_eq!(write, [7.0, 1.0, 0.0, 0.0]);
+                for stored in 0..=255u8 {
+                    let masked = (stored & test[3] as u8) as f32;
+                    let program_passes = (masked - test[0]) * (test[1] - masked) * test[2] >= 0.0;
+                    assert_eq!(program_passes, state.passes(stored), "function {function} ref {reference:x} mask {mask:x} stored {stored:x}");
+                }
+            }
+        }
+        // No state: everything passes, alpha as blended.
+        let [test, write] = stencil_uniforms(None);
+        assert!((0..=255).all(|stored| ((stored & test[3] as u32) as f32 - test[0]) * (test[1] - (stored & test[3] as u32) as f32) * test[2] >= 0.0));
+        assert_eq!(write, [0.0; 4]);
+    }
+
+    #[test]
+    fn the_stencil_state_index_rides_in_the_blend_word() {
+        assert_eq!(stencil_index(0), None);
+        assert_eq!(stencil_index(BLEND_ENABLED | 1 << BLEND_STENCIL_SHIFT), Some(0));
+        assert_eq!(stencil_index(63 << BLEND_STENCIL_SHIFT), Some(62));
+        // Clear of the other fields.
+        let used = BLEND_ENABLED | BLEND_WRITES_ALPHA | BLEND_ALPHA_ONLY | BLEND_FIX_B_ALPHA | 0xFF << BLEND_FIX_B_SHIFT | 3 << BLEND_PREMULTIPLY_SHIFT | 0x7FF;
+        assert_eq!(used & BLEND_STENCIL_MASK, 0);
     }
 
     #[test]
