@@ -102,6 +102,15 @@ pub trait PspMemory {
     fn begin_write(&mut self, _address: u32, _bytes: u32) -> bool {
         false
     }
+
+    /// A block transfer of `bytes` contiguous bytes from `source` to
+    /// `destination`, taken as a redirect: from now on (this frame) reads of
+    /// the destination come from the source, nothing is copied
+    /// (`ge_writes`). False: not taken, copy it (`begin_write`). The memory
+    /// counts a taken transfer as done.
+    fn redirect_write(&mut self, _destination: u32, _source: u32, _bytes: u32) -> bool {
+        false
+    }
 }
 
 /// Removes the cache/mirror bits from a PSP address.

@@ -844,6 +844,13 @@ pub(crate) fn block_transfer(ge: &GeState, memory: &mut impl PspMemory, start: C
     let height = ((size >> 10) & 0x3FF) + 1;
 
     let destination_bytes = (height - 1) * destination.row_bytes + width_bytes;
+    // Rows that follow on from each other on both sides are one run of
+    // bytes: taken as a redirect when the memory can (God of War streams
+    // ~530 KB per frame of sub-lists and vertices into VRAM this way).
+    let contiguous = height == 1 || (source.row_bytes == width_bytes && destination.row_bytes == width_bytes);
+    if contiguous && memory.redirect_write(destination.start, source.start, destination_bytes) {
+        return;
+    }
     if !memory.begin_write(destination.start, destination_bytes) {
         return;
     }

@@ -16,11 +16,24 @@
 //! real GE has done the transfers too.
 
 use crate::block_cache::{BLOCK_SIZE, BLOCK_WORDS};
-use crate::memory::{physical, PspMemory};
+use crate::memory::{physical, PspMemory, RAM_END, RAM_START};
 
 /// How many 1 KiB blocks the GE may write per frame before we stop
 /// following its writes. MTX's start gate: 4 transfers of ~1 KiB each.
 pub const MAX_WRITTEN_BLOCKS: usize = 32;
+
+/// How many transfers per frame may be taken as redirects (`Redirect`).
+/// God of War's title: 84 transfers per frame.
+pub const MAX_REDIRECTS: usize = 192;
+
+/// A transfer taken without copying: `bytes` bytes at `start` read as the
+/// same bytes at `source` (main RAM, which the GE writes never touch).
+#[derive(Clone, Copy)]
+struct Redirect {
+    start: u32,
+    end: u32,
+    source: u32,
+}
 
 /// The blocks written by block transfers in the current frame.
 pub struct GeWrites {
@@ -37,6 +50,15 @@ pub struct GeWrites {
     /// Transfers not done because they would need more blocks than are
     /// left (e.g. whole framebuffer copies) or had an unreadable source.
     pub transfers_skipped: u32,
+    /// Contiguous transfers from RAM, oldest first: where no written block
+    /// lies, the newest redirect covering an address supplies it. Written
+    /// blocks always hold the current view (a redirect is copied into the
+    /// blocks it covers when it is made), so they come first.
+    redirects: [Redirect; MAX_REDIRECTS],
+    redirect_count: usize,
+    /// Byte range all redirects lie in (reads outside need no search).
+    redirect_low: u32,
+    redirect_high: u32,
 }
 
 impl GeWrites {
@@ -49,6 +71,10 @@ impl GeWrites {
             high: 0,
             transfers_done: 0,
             transfers_skipped: 0,
+            redirects: [Redirect { start: 0, end: 0, source: 0 }; MAX_REDIRECTS],
+            redirect_count: 0,
+            redirect_low: u32::MAX,
+            redirect_high: 0,
         }
     }
 
@@ -59,10 +85,43 @@ impl GeWrites {
         self.high = 0;
         self.transfers_done = 0;
         self.transfers_skipped = 0;
+        self.redirect_count = 0;
+        self.redirect_low = u32::MAX;
+        self.redirect_high = 0;
     }
 
     pub fn is_empty(&self) -> bool {
-        self.used == 0
+        self.used == 0 && self.redirect_count == 0
+    }
+
+    /// Where the word at physical `address` comes from if a redirect (and
+    /// no written block) supplies it: the newest redirect covering it.
+    #[inline]
+    fn redirected(&self, address: u32) -> Option<u32> {
+        if address < self.redirect_low || address >= self.redirect_high {
+            return None;
+        }
+        self.redirects[..self.redirect_count]
+            .iter()
+            .rev()
+            .find(|redirect| address >= redirect.start && address < redirect.end)
+            .map(|redirect| redirect.source + (address - redirect.start))
+    }
+
+    /// Whether `bytes` bytes from `address` lie in one redirect, the
+    /// newest covering each of them, and no written block: then they read
+    /// as the source's bytes in one go.
+    fn redirected_run(&self, address: u32, bytes: u32) -> Option<u32> {
+        let end = address.checked_add(bytes)?;
+        let index = self.redirects[..self.redirect_count]
+            .iter()
+            .rposition(|redirect| address >= redirect.start && address < redirect.end)?;
+        let redirect = self.redirects[index];
+        let newer_overlap = self.redirects[index + 1..self.redirect_count]
+            .iter()
+            .any(|newer| newer.start < end && newer.end > address);
+        (end <= redirect.end && !newer_overlap && !self.blocks_overlap(address, bytes))
+            .then(|| redirect.source + (address - redirect.start))
     }
 
     /// Blocks not written yet.
@@ -83,9 +142,25 @@ impl GeWrites {
         self.addresses[..self.used].iter().position(|&address| address == block_address)
     }
 
-    /// Whether any written block lies in `bytes` bytes from `address`.
+    /// Whether any written block or redirect lies in `bytes` bytes from
+    /// `address`.
     #[inline]
     fn overlaps(&self, address: u32, bytes: u32) -> bool {
+        self.blocks_overlap(address, bytes) || self.redirects_overlap(address, bytes)
+    }
+
+    #[inline]
+    fn redirects_overlap(&self, address: u32, bytes: u32) -> bool {
+        if self.redirect_count == 0 || bytes == 0 {
+            return false;
+        }
+        let end = address.saturating_add(bytes);
+        end > self.redirect_low && address < self.redirect_high
+    }
+
+    /// Whether any written block lies in `bytes` bytes from `address`.
+    #[inline]
+    fn blocks_overlap(&self, address: u32, bytes: u32) -> bool {
         if self.used == 0 || bytes == 0 {
             return false;
         }
@@ -123,10 +198,20 @@ impl<M: PspMemory> Overlaid<'_, M> {
             return None;
         }
         let slot = self.writes.used;
-        let block = &mut self.writes.blocks[slot];
-        if self.inner.read_words(block_address, block).is_none() {
-            for (index, word) in block.iter_mut().enumerate() {
-                *word = self.inner.read_u32(block_address + 4 * index as u32).unwrap_or(0);
+        if self.writes.redirects_overlap(block_address, BLOCK_SIZE) {
+            // The block as the GE sees it now: redirected words from their
+            // source.
+            for index in 0..BLOCK_WORDS {
+                let address = block_address + 4 * index as u32;
+                let from = self.writes.redirected(address).unwrap_or(address);
+                self.writes.blocks[slot][index] = self.inner.read_u32(from).unwrap_or(0);
+            }
+        } else {
+            let block = &mut self.writes.blocks[slot];
+            if self.inner.read_words(block_address, block).is_none() {
+                for (index, word) in block.iter_mut().enumerate() {
+                    *word = self.inner.read_u32(block_address + 4 * index as u32).unwrap_or(0);
+                }
             }
         }
         self.writes.addresses[slot] = block_address;
@@ -147,13 +232,24 @@ impl<M: PspMemory> PspMemory for Overlaid<'_, M> {
                     return Some(self.writes.blocks[slot][((address - block_address) / 4) as usize]);
                 }
             }
+            if let Some(source) = self.writes.redirected(address) {
+                // Unreadable source words read as zero, as a copy makes them
+                // (`display_list::copy_bytes`).
+                return Some(self.inner.read_u32(source).unwrap_or(0));
+            }
         }
         self.inner.read_u32(address)
     }
 
     fn read_words(&mut self, address: u32, out: &mut [u32]) -> Option<()> {
-        if !self.writes.overlaps(physical(address), 4 * out.len() as u32) {
+        let bytes = 4 * out.len() as u32;
+        if !self.writes.overlaps(physical(address), bytes) {
             return self.inner.read_words(address, out);
+        }
+        if let Some(source) = self.writes.redirected_run(physical(address), bytes) {
+            if self.inner.read_words(source, out).is_some() {
+                return Some(());
+            }
         }
         // Rare (only reads near transferred data): word by word.
         for (index, word) in out.iter_mut().enumerate() {
@@ -168,6 +264,11 @@ impl<M: PspMemory> PspMemory for Overlaid<'_, M> {
         if !self.writes.overlaps(physical(address), 4 * (last + 1)) {
             return self.inner.read_samples(address, positions, out);
         }
+        if let Some(source) = self.writes.redirected_run(physical(address), 4 * (last + 1)) {
+            if self.inner.read_samples(source, positions, out).is_some() {
+                return Some(());
+            }
+        }
         for (word, &position) in out.iter_mut().zip(positions) {
             *word = self.read_u32(address.wrapping_add(4 * position as u32))?;
         }
@@ -178,6 +279,9 @@ impl<M: PspMemory> PspMemory for Overlaid<'_, M> {
         let start = physical(address);
         if !self.writes.overlaps(start, 4 * count as u32) {
             return self.inner.borrow_words(address, count);
+        }
+        if let Some(source) = self.writes.redirected_run(start, 4 * count as u32) {
+            return self.inner.borrow_words(source, count);
         }
         let block_address = start & !(BLOCK_SIZE - 1);
         let first = ((start - block_address) / 4) as usize;
@@ -209,6 +313,47 @@ impl<M: PspMemory> PspMemory for Overlaid<'_, M> {
             self.writes.transfers_skipped += 1;
         }
         fits
+    }
+
+    /// Taken when the source is main RAM no GE write touched, both sides
+    /// are word aligned and don't overlap, and a redirect is left: the
+    /// blocks written before that the destination covers get its words
+    /// now (blocks always hold the current view).
+    fn redirect_write(&mut self, destination: u32, source: u32, bytes: u32) -> bool {
+        let (destination, source) = (physical(destination), physical(source));
+        let (Some(destination_end), Some(source_end)) = (destination.checked_add(bytes), source.checked_add(bytes)) else {
+            return false;
+        };
+        let takes = bytes > 0
+            && (destination | source | bytes) % 4 == 0
+            && source >= RAM_START
+            && source_end <= RAM_END
+            && (source_end <= destination || destination_end <= source)
+            && self.writes.redirect_count < MAX_REDIRECTS
+            && !self.writes.overlaps(source, bytes);
+        if !takes {
+            return false;
+        }
+        if self.writes.blocks_overlap(destination, bytes) {
+            for slot in 0..self.writes.used {
+                let block_address = self.writes.addresses[slot];
+                let first = block_address.max(destination);
+                let end = (block_address + BLOCK_SIZE).min(destination_end);
+                let mut address = first;
+                while address < end {
+                    let word = self.inner.read_u32(source + (address - destination)).unwrap_or(0);
+                    self.writes.blocks[slot][((address - block_address) / 4) as usize] = word;
+                    address += 4;
+                }
+            }
+        }
+        let writes = &mut *self.writes;
+        writes.redirects[writes.redirect_count] = Redirect { start: destination, end: destination_end, source };
+        writes.redirect_count += 1;
+        writes.redirect_low = writes.redirect_low.min(destination);
+        writes.redirect_high = writes.redirect_high.max(destination_end);
+        writes.transfers_done += 1;
+        true
     }
 
     fn write_u32(&mut self, address: u32, value: u32) -> bool {
@@ -267,5 +412,79 @@ mod tests {
         assert!(memory.write_u32(VRAM + 4, 1)); // an existing block still takes writes
         writes.clear();
         assert!(writes.is_empty());
+    }
+    const RAM_A: u32 = 0x0970_0000;
+    const RAM_B: u32 = 0x0972_0000;
+
+    fn ram(inner: &mut TestMemory) {
+        inner.write(RAM_A, &(0..512).map(|word| 0xA000_0000 | word).collect::<Vec<_>>());
+        inner.write(RAM_B, &(0..512).map(|word| 0xB000_0000 | word).collect::<Vec<_>>());
+        inner.write(VRAM, &[7; 512]);
+    }
+
+    #[test]
+    fn a_redirect_reads_its_source_and_the_newest_one_wins() {
+        let mut inner = TestMemory::default();
+        ram(&mut inner);
+        let mut writes = GeWrites::new();
+        let mut memory = Overlaid { writes: &mut writes, inner: &mut inner };
+        assert!(memory.redirect_write(VRAM, RAM_A, 1024));
+        assert!(memory.redirect_write(VRAM + 512, RAM_B, 1024));
+        assert_eq!(memory.read_u32(VRAM), Some(0xA000_0000));
+        assert_eq!(memory.read_u32(VRAM + 512), Some(0xB000_0000)); // newer
+        assert_eq!(memory.read_u32(VRAM + 1536 - 4), Some(0xB000_00FF));
+        assert_eq!(memory.read_u32(VRAM + 1536), Some(7)); // past both: inner
+        assert_eq!(memory.read_u32(0x4415_4000 + 8), Some(0xA000_0002)); // uncached alias
+        // One run inside one redirect, and one across both, read alike.
+        let mut words = [0; 4];
+        memory.read_words(VRAM + 16, &mut words).unwrap();
+        assert_eq!(words, [0xA000_0004, 0xA000_0005, 0xA000_0006, 0xA000_0007]);
+        memory.read_words(VRAM + 504, &mut words).unwrap();
+        assert_eq!(words, [0xA000_007E, 0xA000_007F, 0xB000_0000, 0xB000_0001]);
+        assert!(!memory.defer(VRAM, 4)); // not in PSP memory yet
+        // Unreadable source words read as zero, as a copy makes them.
+        assert!(memory.redirect_write(VRAM + 0x2000, 0x0990_0000, 8));
+        assert_eq!(memory.read_u32(VRAM + 0x2000), Some(0));
+        memory.read_words(VRAM + 0x2000, &mut words[..2]).unwrap();
+        assert_eq!(words[..2], [0, 0]);
+        assert_eq!(memory.writes.transfers_done, 3);
+    }
+
+    #[test]
+    fn redirects_and_copied_blocks_keep_the_order_of_the_transfers() {
+        let mut inner = TestMemory::default();
+        ram(&mut inner);
+        let mut writes = GeWrites::new();
+        let mut memory = Overlaid { writes: &mut writes, inner: &mut inner };
+        // A copy into the block, then a redirect over part of it: the
+        // redirect's words replace the copy's.
+        assert!(memory.write_u32(VRAM, 1));
+        assert!(memory.write_u32(VRAM + 8, 3));
+        assert!(memory.redirect_write(VRAM + 4, RAM_A, 4));
+        assert_eq!(memory.read_u32(VRAM), Some(1));
+        assert_eq!(memory.read_u32(VRAM + 4), Some(0xA000_0000));
+        assert_eq!(memory.read_u32(VRAM + 8), Some(3));
+        // A redirect, then a copy into part of it: the copy wins there, the
+        // rest of the block still reads the redirect.
+        let far = VRAM + 0x1000;
+        assert!(memory.redirect_write(far, RAM_B, 64));
+        assert!(memory.write_u32(far + 4, 99));
+        assert_eq!(memory.read_u32(far), Some(0xB000_0000));
+        assert_eq!(memory.read_u32(far + 4), Some(99));
+        assert_eq!(memory.read_u32(far + 8), Some(0xB000_0002));
+    }
+
+    #[test]
+    fn a_redirect_is_refused_when_its_source_isnt_plain_ram() {
+        let mut inner = TestMemory::default();
+        ram(&mut inner);
+        let mut writes = GeWrites::new();
+        let mut memory = Overlaid { writes: &mut writes, inner: &mut inner };
+        assert!(!memory.redirect_write(VRAM, VRAM + 0x2000, 64)); // VRAM source
+        assert!(!memory.redirect_write(VRAM + 2, RAM_A, 64)); // unaligned
+        assert!(memory.write_u32(RAM_A, 5)); // a GE write into the source
+        assert!(!memory.redirect_write(VRAM, RAM_A, 64));
+        assert!(!memory.redirect_write(RAM_B, RAM_B + 32, 64)); // overlapping sides
+        assert_eq!(memory.writes.transfers_done, 0);
     }
 }

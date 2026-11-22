@@ -206,6 +206,7 @@ impl Capture {
     }
 
     /// The Vita side asked the plugin for the GE's state (`repairs_needed`).
+
     pub fn expect_ge_state(&mut self) {
         self.waiting_for_ge_state = true;
     }
@@ -1489,6 +1490,49 @@ mod tests {
         capture.handle(Event::ListEnqueued { list, stall: 0, id: 0, context: 0 }, &mut memory, None);
         let stats = capture.handle(shown(), &mut memory, None).unwrap();
         assert_eq!((stats.block_transfers, stats.draws, stats.vertices), (1, 1, 5));
+    }
+
+    #[test]
+    fn big_uploads_into_one_vram_area_are_followed_in_order() {
+        // God of War: Chains of Olympus streams ~530 KB of sub-lists and
+        // vertices per frame through one VRAM area (0x041CC95C): a block
+        // transfer from RAM (512-byte rows, up to 467 of them), then a CALL
+        // into the area, then the next upload over it (2026-11-22). Each CALL
+        // must see the upload right before it, however big.
+        let mut memory = TestMemory::default();
+        let list = 0x0890_0000;
+        let (first, second) = (0x0970_0000, 0x0972_0000);
+        let area = 0x041C_C95C;
+        let rows = 80; // 40 KiB, more than the 32 blocks copies may take
+        memory.write(first, &[cmd(op::PRIM, (3 << 16) | 5), cmd(op::RET, 0)]);
+        memory.write(first + 8, &vec![0; (rows * 512 / 4 - 2) as usize]);
+        memory.write(second, &[cmd(op::PRIM, (3 << 16) | 7), cmd(op::RET, 0)]);
+        memory.write(second + 8, &vec![0; (rows * 512 / 4 - 2) as usize]);
+        let upload = |source: u32| {
+            [
+                cmd(op::TRANSFER_SOURCE, source & 0xFF_FFF0),
+                cmd(op::TRANSFER_SOURCE_WIDTH, ((source >> 8) & 0xFF_0000) | 128),
+                cmd(op::TRANSFER_DESTINATION, area & 0xFF_FFF0),
+                cmd(op::TRANSFER_DESTINATION_WIDTH, ((area >> 8) & 0xFF_0000) | 128),
+                cmd(op::TRANSFER_SOURCE_POSITION, 0),
+                cmd(op::TRANSFER_DESTINATION_POSITION, (area & 0xF) / 4), // x in 32-bit pixels
+                cmd(op::TRANSFER_SIZE, ((rows - 1) << 10) | 127), // 128 x rows pixels
+                cmd(op::TRANSFER_START, 1),
+            ]
+        };
+        let mut commands = vec![cmd(op::BASE, 0x04_0000)];
+        commands.extend(upload(first));
+        commands.push(cmd(op::CALL, area & 0xFF_FFFF));
+        commands.extend(upload(second));
+        commands.push(cmd(op::CALL, area & 0xFF_FFFF));
+        commands.extend([cmd(op::FINISH, 0), cmd(op::END, 0)]);
+        memory.write(list, &commands);
+
+        let mut capture = Capture::new();
+        capture.handle(Event::ListEnqueued { list, stall: 0, id: 0, context: 0 }, &mut memory, None);
+        let stats = capture.handle(shown(), &mut memory, None).unwrap();
+        assert_eq!(stats.transfers_skipped, 0);
+        assert_eq!((stats.block_transfers, stats.draws, stats.vertices), (2, 2, 12));
     }
 
     #[test]
