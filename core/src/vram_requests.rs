@@ -31,6 +31,12 @@ pub const VRAM_START: u32 = 0x0400_0000;
 pub const VRAM_SIZE: u32 = 0x20_0000;
 /// Entries in the shared table (NATIVERES_VRAM_MAX_RANGES).
 pub const MAX_RANGES: usize = 32;
+/// Texture ranges kept (`add_texture_range`); a plan joins them into at
+/// most MAX_RANGES - CAPTURE_ROOM ranges (`joined_texture_ranges`).
+const MAX_TEXTURE_RANGES: usize = 128;
+/// Plan ranges kept for the capture's own blocks (lists, palettes,
+/// vertices in VRAM) however many textures there are.
+const CAPTURE_ROOM: usize = 8;
 pub const BLOCK_SIZE: u32 = 1024;
 pub const BLOCKS: usize = (VRAM_SIZE / BLOCK_SIZE) as usize;
 /// A range or block unused for longer than this is no longer requested.
@@ -103,8 +109,8 @@ impl Plan {
 pub struct VramRequests {
     /// Counts `plan` calls.
     frame: u32,
-    texture_ranges: [VramRange; MAX_RANGES],
-    texture_last_used: [u32; MAX_RANGES],
+    texture_ranges: [VramRange; MAX_TEXTURE_RANGES],
+    texture_last_used: [u32; MAX_TEXTURE_RANGES],
     texture_count: usize,
     /// `frame + 1` when the capture last read the block; 0 = never.
     block_last_used: [u32; BLOCKS],
@@ -118,6 +124,8 @@ pub struct VramRequests {
     covered: [bool; BLOCKS],
     /// Reads of unready blocks since the last `take_missing`.
     missing: u32,
+    /// The first unready address read (0: none), for the log.
+    first_missing: u32,
     /// Blocks the last plan requested for the capture (for the log).
     capture_blocks: u32,
     /// `frame` up to which a block back after a pause is not read
@@ -152,11 +160,13 @@ impl Default for VramRequests {
 pub struct StageVramReads {
     used: [u32; BLOCKS / 32],
     missing: u32,
+    /// The first unready address read (0: none), for the log.
+    first_missing: u32,
 }
 
 impl StageVramReads {
     pub const fn new() -> Self {
-        StageVramReads { used: [0; BLOCKS / 32], missing: 0 }
+        StageVramReads { used: [0; BLOCKS / 32], missing: 0, first_missing: 0 }
     }
 
     /// Stage B read the block at physical `address` (in VRAM); `ready`:
@@ -166,6 +176,9 @@ impl StageVramReads {
             if block < BLOCKS {
                 self.used[block / 32] |= 1 << (block % 32);
                 if !ready {
+                    if self.missing == 0 {
+                        self.first_missing = address;
+                    }
                     self.missing += 1;
                 }
             }
@@ -183,8 +196,8 @@ impl VramRequests {
     pub const fn new() -> Self {
         VramRequests {
             frame: 0,
-            texture_ranges: [VramRange { offset: 0, size: 0 }; MAX_RANGES],
-            texture_last_used: [0; MAX_RANGES],
+            texture_ranges: [VramRange { offset: 0, size: 0 }; MAX_TEXTURE_RANGES],
+            texture_last_used: [0; MAX_TEXTURE_RANGES],
             texture_count: 0,
             block_last_used: [0; BLOCKS],
             ready: [false; BLOCKS],
@@ -193,6 +206,7 @@ impl VramRequests {
             pending_generation: 0,
             covered: [false; BLOCKS],
             missing: 0,
+            first_missing: 0,
             capture_blocks: 0,
             distrusted_until: [0; BLOCKS],
             refresh_wanted: [false; BLOCKS],
@@ -223,6 +237,9 @@ impl VramRequests {
         }
         let stale = self.stale(block);
         self.block_last_used[block] = self.frame + 1;
+        if !self.ready[block] && self.first_missing == 0 {
+            self.first_missing = address;
+        }
         if self.ready[block] {
             if stale && !self.previous_block_recent(block) {
                 self.distrusted_until[block] = self.frame + DISTRUST_FRAMES;
@@ -302,13 +319,24 @@ impl VramRequests {
                 }
             }
         }
+        if self.first_missing == 0 {
+            self.first_missing = reads.first_missing;
+        }
+        reads.first_missing = 0;
         self.missing += core::mem::take(&mut reads.missing);
     }
 
     /// Reads of unready blocks since the last call (0 = the frame read
     /// nothing it lacked).
     pub fn take_missing(&mut self) -> u32 {
+        self.first_missing = 0;
         core::mem::take(&mut self.missing)
+    }
+
+    /// The first unready address read since `take_missing` (0: none), for
+    /// the log.
+    pub fn first_missing(&self) -> u32 {
+        self.first_missing
     }
 
     /// Reads of unready blocks so far in this frame.
@@ -390,12 +418,7 @@ impl VramRequests {
 
         // Texture ranges first, then the capture's blocks.
         let mut plan = Plan { ranges: [VramRange::default(); MAX_RANGES], count: 0, recent_mask: 0 };
-        for i in 0..self.texture_count {
-            plan.ranges[i] = self.texture_ranges[i];
-            if self.frame.wrapping_sub(self.texture_last_used[i]) < RECENT_FRAMES {
-                plan.recent_mask |= 1 << i;
-            }
-        }
+        let texture_part = self.joined_texture_ranges(&mut plan);
         // The capture's blocks: those read in the latest frames in runs of
         // their own, recent (the plugin copies recent ranges whole at the
         // enqueue while they fit `psp_copy::WHOLE_AT_ENQUEUE_BYTES`); the
@@ -404,10 +427,10 @@ impl VramRequests {
         // select: too big to copy whole, and its wipe showed stale tiles.
         // Room kept for the distrusted blocks' ranges of their own.
         let refresh_room = self.refresh_runs().min(REFRESH_RUNS);
-        let hot = self.add_block_ranges(&mut plan.ranges, self.texture_count, MAX_RANGES - 1 - refresh_room, |requests, block| {
+        let hot = self.add_block_ranges(&mut plan.ranges, texture_part, MAX_RANGES - 1 - refresh_room, |requests, block| {
             requests.block_used(block) && requests.block_recent(block)
         });
-        for i in self.texture_count..hot {
+        for i in texture_part..hot {
             plan.recent_mask |= 1 << i;
         }
         plan.count = self.add_block_ranges(&mut plan.ranges, hot, MAX_RANGES - refresh_room, |requests, block| {
@@ -506,11 +529,74 @@ impl VramRequests {
                 return;
             }
         }
-        if self.texture_count < MAX_RANGES {
+        if self.texture_count < MAX_TEXTURE_RANGES {
             self.texture_ranges[self.texture_count] = range;
             self.texture_last_used[self.texture_count] = self.frame;
             self.texture_count += 1;
         }
+    }
+
+    /// The texture ranges into the start of `plan`, joined until they fit
+    /// MAX_RANGES - CAPTURE_ROOM: sorted, overlapping or touching ones
+    /// joined, then, if still too many, aligned chunks over them (the gaps
+    /// are copied too). A joined range is recent if one of its textures is.
+    /// Returns how many ranges it took.
+    fn joined_texture_ranges(&self, plan: &mut Plan) -> usize {
+        let mut ranges = [(VramRange::default(), false); MAX_TEXTURE_RANGES];
+        let count = self.texture_count;
+        for i in 0..count {
+            ranges[i] = (self.texture_ranges[i], self.frame.wrapping_sub(self.texture_last_used[i]) < RECENT_FRAMES);
+        }
+        let ranges = &mut ranges[..count];
+        ranges.sort_unstable_by_key(|(range, _)| range.offset);
+        let end = |range: &VramRange| range.offset + range.size;
+        let join = |ranges: &mut [(VramRange, bool)], count: &mut usize, i: usize| {
+            let (next, next_recent) = ranges[i + 1];
+            let (range, recent) = &mut ranges[i];
+            let joined_end = end(range).max(end(&next));
+            range.size = joined_end - range.offset;
+            *recent |= next_recent;
+            ranges.copy_within(i + 2..*count, i + 1);
+            *count -= 1;
+        };
+        let mut n = count;
+        let mut i = 0;
+        while i + 1 < n {
+            if ranges[i + 1].0.offset <= end(&ranges[i].0) {
+                join(ranges, &mut n, i);
+            } else {
+                i += 1;
+            }
+        }
+        // Too many: aligned chunks over them (64 KiB, else coarser), joined
+        // where they meet. Stable while the textures stay in the same
+        // chunks: a plan that changes publishes a new table, and the VRAM
+        // textures wait for its copy (`VramState::copy_pending`); joining
+        // the closest pairs reshaped it nearly every frame.
+        let mut chunk = 64 * 1024;
+        while n > MAX_RANGES - CAPTURE_ROOM {
+            for (range, _) in ranges[..n].iter_mut() {
+                let first = range.offset / chunk * chunk;
+                let last = end(range).div_ceil(chunk) * chunk;
+                *range = VramRange { offset: first, size: last.min(VRAM_SIZE) - first };
+            }
+            let mut i = 0;
+            while i + 1 < n {
+                if ranges[i + 1].0.offset <= end(&ranges[i].0) {
+                    join(ranges, &mut n, i);
+                } else {
+                    i += 1;
+                }
+            }
+            chunk *= 2;
+        }
+        for (i, (range, recent)) in ranges[..n].iter().enumerate() {
+            plan.ranges[i] = *range;
+            if *recent {
+                plan.recent_mask |= 1 << i;
+            }
+        }
+        n
     }
 
     fn forget_old_texture_ranges(&mut self) {
@@ -904,20 +990,21 @@ mod tests {
     #[test]
     fn too_many_runs_are_joined_until_they_fit() {
         let mut requests = Box::new(VramRequests::new());
-        // 29 texture ranges leave 3 entries for the capture's 6 runs.
-        let mut textures = (0..29u32).map(|i| VramRange { offset: i * 0x100, size: 0x100 });
-        for run in 0..6u32 {
-            requests.block_ready(block_address(100 + run * 300));
+        // 29 texture ranges (apart) are joined into MAX_RANGES -
+        // CAPTURE_ROOM; the capture's 12 runs are joined into the rest.
+        let mut textures = (0..29u32).map(|i| VramRange { offset: i * 0x200, size: 0x100 });
+        for run in 0..12u32 {
+            requests.block_ready(block_address(100 + run * 150));
         }
         let plan = requests.plan(Some(&mut textures), 0);
-        assert!(plan.count > 29 && plan.count <= MAX_RANGES, "29 texture ranges + joined runs, got {}", plan.count);
-        for run in 0..6u32 {
-            let offset = (100 + run * 300) * BLOCK_SIZE;
-            let end = offset + LOOKAHEAD_BLOCKS as u32 * BLOCK_SIZE;
-            assert!(
-                plan.ranges()[29..].iter().any(|range| offset >= range.offset && end <= range.offset + range.size),
-                "run {run} requested"
-            );
+        assert!(plan.count <= MAX_RANGES, "got {}", plan.count);
+        let covered = |offset: u32, end: u32| plan.ranges().iter().any(|range| offset >= range.offset && end <= range.offset + range.size);
+        for i in 0..29u32 {
+            assert!(covered(i * 0x200, i * 0x200 + 0x100), "texture {i}");
+        }
+        for run in 0..12u32 {
+            let offset = (100 + run * 150) * BLOCK_SIZE;
+            assert!(covered(offset, offset + LOOKAHEAD_BLOCKS as u32 * BLOCK_SIZE), "run {run} requested");
         }
     }
 
@@ -971,6 +1058,46 @@ mod tests {
             requests.plan(Some(&mut no_textures()), 0);
         }
         assert_eq!(requests.plan(Some(&mut no_textures()), 0).count, 0);
+    }
+
+    /// NFS UR's main menu: ~100 textures in VRAM filled all MAX_RANGES
+    /// ranges, so the capture's own blocks (its colour tables at
+    /// 0x041f86c0..) never got a range, were never copied and every frame
+    /// missed them (dropped, 2026-11-22). Texture ranges beyond the room
+    /// were left out too. Now the texture ranges are joined (closest
+    /// neighbours first) until the capture's blocks have room.
+    #[test]
+    fn many_texture_ranges_leave_room_for_the_capture() {
+        let mut requests = Box::new(VramRequests::new());
+        // 100 textures of 2 KiB, 1 KiB apart, from 0x190000.
+        let textures: Vec<VramRange> = (0..100u32).map(|i| VramRange { offset: 0x19_0000 + i * 3072, size: 2048 }).collect();
+        let palettes = block_address(0x7E2); // 0x041f8800
+        assert!(!requests.block_ready(palettes));
+        requests.take_missing();
+        let plan = requests.plan(Some(&mut textures.iter().copied()), 0);
+        requests.published(1);
+        // Every texture is in a range of the plan.
+        for texture in &textures {
+            assert!(
+                plan.ranges().iter().any(|range| range.offset <= texture.offset && texture.offset + texture.size <= range.offset + range.size),
+                "texture at {:x} left out",
+                texture.offset
+            );
+        }
+        assert!(plan.ranges().iter().any(|range| range.offset <= 0x7E2 * BLOCK_SIZE && 0x7E3 * BLOCK_SIZE <= range.offset + range.size), "the palettes' block requested");
+        // Copied: ready.
+        let again = requests.plan(Some(&mut textures.iter().copied()), 1);
+        assert!(requests.block_ready(palettes));
+        assert_eq!(requests.take_missing(), 0);
+        // Stable: another frame using only some of the textures (the rest
+        // still kept) asks for the same ranges (a new table every frame kept
+        // the VRAM textures waiting for its copy).
+        // (The palettes are read every frame, as in the game.)
+        requests.block_ready(palettes);
+        let some = requests.plan(Some(&mut textures.iter().step_by(3).copied()), 1);
+        let texture_part = |plan: &Plan| plan.ranges().iter().filter(|range| range.offset < 0x1F_0000).copied().collect::<Vec<_>>();
+        assert_eq!(texture_part(&some), texture_part(&again));
+        assert_eq!(texture_part(&again), texture_part(&plan));
     }
 
     #[test]

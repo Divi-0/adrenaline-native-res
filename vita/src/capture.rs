@@ -1128,7 +1128,7 @@ fn log_frame(state: &mut CaptureState, timing: &mut FrameTiming, flip: &RawEvent
     let method = copy_method::name(method);
     let _ = write!(
         text,
-        "frame={} rec={} dt={}.{}ms cpu={}us run={}us copy={}us/{}x/{}direct/{}k stream={}waited/{}busy stage={}waited/{}busy/{}cpu waits={}/{}/{}/{}/{} badread={}@{:08x}+{:x} vram={}x/{}k/{}us/{} sync={}/{}us enq={}/{}us changes={} thread={}/{:08x} vramlist={}k/{}missing free={}k ours={}k wakes={} copier={}us/{}/{}/{} helped={}/{}/{}/{}/{} gesync={}/{}ms/{} behind={}.{}ms ",
+        "frame={} rec={} dt={}.{}ms cpu={}us run={}us copy={}us/{}x/{}direct/{}k stream={}waited/{}busy stage={}waited/{}busy/{}cpu waits={}/{}/{}/{}/{} badread={}@{:08x}+{:x} vram={}x/{}k/{}us/{} sync={}/{}us enq={}/{}us changes={} thread={}/{:08x} vramlist={}k/{}missing@{:08x} free={}k ours={}k wakes={} copier={}us/{}/{}/{} helped={}/{}/{}/{}/{} gesync={}/{}ms/{} behind={}.{}ms ",
         timing.frame_number,
         recorded as u8,
         frame_time / 1000,
@@ -1167,6 +1167,7 @@ fn log_frame(state: &mut CaptureState, timing: &mut FrameTiming, flip: &RawEvent
         error,
         state.vram.capture_blocks(),
         state.vram.missing(),
+        state.vram.first_missing(),
         crate::blocks::free_user_memory().max(0) / 1024,
         crate::blocks::our_memory() / 1024,
         crate::recorder_thread::WAKES.load(Ordering::Relaxed),
