@@ -2172,6 +2172,22 @@ impl Geometry<'_> {
         *self.vertex_count += 1;
         Some(number as u16)
     }
+    /// Room for `count` more vertices of the draw that starts at
+    /// `first_vertex`, right after the frame's last one, to be written
+    /// before `commit_vertices` adds them (or left unused). `None` if
+    /// the frame or the draw hasn't that much room (`overflowed` not set:
+    /// the caller adds them with `add_vertex` then).
+    #[inline]
+    pub fn spare_vertices(&mut self, first_vertex: u32, count: u32) -> Option<&mut [FrameVertex]> {
+        let start = *self.vertex_count as usize;
+        let fits = start + count as usize <= self.vertices.len() && *self.vertex_count - first_vertex + count <= MAX_DRAW_VERTICES;
+        fits.then(|| &mut self.vertices[start..start + count as usize])
+    }
+    /// Adds the first `count` of the vertices written into `spare_vertices`.
+    #[inline]
+    pub fn commit_vertices(&mut self, count: u32) {
+        *self.vertex_count += count;
+    }
     /// Adds a triangle corner: vertex `number` of the current draw. `None`
     /// (and `overflowed` set) if the index list is full.
     #[inline]

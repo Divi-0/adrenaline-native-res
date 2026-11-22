@@ -59,6 +59,12 @@ fn main() -> ExitCode {
     if std::env::var("NATIVERES_LIGHTS").is_ok_and(|value| value == "0") {
         nativeres_core::lighting::LIGHTS_ON.store(false, std::sync::atomic::Ordering::Relaxed);
     }
+    // NATIVERES_TEXGEN_RUNS=0: texgen draws vertex by vertex as before, 2:
+    // both ways and compared (`recorder::TEXGEN_RUNS`; --bench prints the
+    // counts); the frames must be the same.
+    if let Some(mode) = std::env::var("NATIVERES_TEXGEN_RUNS").ok().and_then(|value| value.parse::<u8>().ok()) {
+        nativeres_core::recorder::TEXGEN_RUNS.store(mode, std::sync::atomic::Ordering::Relaxed);
+    }
     // NATIVERES_EXPERIMENT=<mask>: the debug server's `benchexp` bits
     // (`bench::EXPERIMENT`), for A/Bs of the same frame.
     if let Some(mask) = std::env::var("NATIVERES_EXPERIMENT").ok().and_then(|value| value.parse::<u32>().ok()) {
@@ -523,6 +529,10 @@ fn bench(dump_path: &str, runs: u32, only: Option<&str>) -> Result<(), String> {
             // The hashes the Vita's capture of this dump must give too.
             println!("{:>12}  hashes {:016x} {:016x}", "", frame.description_hash(), frame.vertex_hash());
         }
+    }
+    if nativeres_core::recorder::TEXGEN_RUNS.load(std::sync::atomic::Ordering::Relaxed) == 2 {
+        let [checked, differing, vertices] = nativeres_core::recorder::TEXGEN_CHECKS.each_ref().map(|count| count.load(std::sync::atomic::Ordering::Relaxed));
+        println!("texgen check: {checked} draws, {differing} differing, {vertices} vertices");
     }
     Ok(())
 }

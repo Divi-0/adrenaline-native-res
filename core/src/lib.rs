@@ -69,6 +69,7 @@ pub mod report;
 pub mod snapshot;
 pub mod span;
 pub mod stats;
+pub mod texgen_run;
 pub mod texture;
 pub mod texture_cache;
 pub mod transform;

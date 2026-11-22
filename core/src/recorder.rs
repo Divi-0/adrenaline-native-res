@@ -1506,6 +1506,29 @@ fn record_on_cpu(
     // out only here: most lit runs took the run path above.
     let lit = transform.and_then(Transform::vertex_lighting);
 
+    // Unlit texgen draws (from the position or texture coordinates) of
+    // consecutive vertices: four vertices at a time (`record_texgen_run`),
+    // the same vertices and triangles as below. Checking (TEXGEN_RUNS 2):
+    // recorded both ways, the results compared (`texgen_check`).
+    let mut texgen_check_hash = None;
+    if let (Some(transform), Some(texgen), None) = (transform, prepared.texgen.as_ref(), lit.as_ref()) {
+        let shape = primitive_type != primitive::RECTANGLES && format.index_format() == IndexFormat::None;
+        let mode = TEXGEN_RUNS.load(core::sync::atomic::Ordering::Relaxed);
+        if shape && mode != 0 {
+            if let Some(kernel) = transform.texgen_kernel(texgen) {
+                let run = TexgenRun::new(kernel, prepared, material_color, format, layout, call, first_vertex);
+                match record_texgen_run(geometry, memory, run, transform, &color_of, &to_frame, call) {
+                    Some(recorded) if mode == 1 => return finish_on_cpu(geometry, stats, call, &draw, recorded),
+                    Some(recorded) => {
+                        texgen_check_hash = Some(recorded_hash(geometry, &draw, &recorded));
+                        geometry.undo_draw(&draw);
+                    }
+                    None => geometry.undo_draw(&draw), // the general path below
+                }
+            }
+        }
+    }
+
     // Read the vertices.
     let mut corners = VertexReader::new(format, layout, memory, call.vertex_address, call.index_address);
     let mut screen_corners = CornerCache::new();
@@ -1604,37 +1627,51 @@ fn record_on_cpu(
                     } else if screen.contains(&Corner::FrameFull) {
                         return Err(Failure::FrameFull);
                     } else {
-                        // The part in front of the near plane, as a fan of
-                        // new vertices. Rare: the vertices are read and
-                        // transformed again.
-                        let [Some(a), Some(b), Some(c)] = indices.map(|index| corners.get(index)) else {
-                            return Err(Failure::Unreadable);
-                        };
-                        let mut colors = [a, b, c].map(|vertex| color_of(&vertex));
-                        if let Some(lighting) = &lit {
-                            for (color, index) in colors.iter_mut().zip(indices) {
-                                *color = corners.lit_color(index, lighting).ok_or(Failure::Unreadable)?;
-                            }
-                        }
-                        let clipped = [(a, colors[0]), (b, colors[1]), (c, colors[2])].map(|(vertex, color)| transform.to_clip(&vertex, color));
-                        let mut polygon = [clipped[0]; 4];
-                        let corner_count = clip_triangle(&clipped, &mut polygon);
-                        for last in 2..corner_count {
-                            for corner in [polygon[0], polygon[last - 1], polygon[last]] {
-                                let vertex = to_frame(&transform.to_screen(&corner), corner.color, corner.fog, corner.w);
-                                geometry.add_corner(first_vertex, vertex).ok_or(Failure::FrameFull)?;
-                            }
-                        }
+                        cut_triangle(geometry, &mut corners, transform, lit.as_ref(), indices, &color_of, &to_frame, first_vertex)?;
                     }
                 }
             }
             Ok(())
         }),
     };
+    if let Some(fast) = texgen_check_hash {
+        texgen_check(fast, recorded_hash(geometry, &draw, &recorded), geometry.vertex_count() - draw.first_vertex);
+    }
+    finish_on_cpu(geometry, stats, call, &draw, recorded);
+}
+
+/// What a draw recorded (before `finish_on_cpu`): its vertices' bits, its
+/// indices and the outcome, hashed (FNV-1a), for `texgen_check`.
+fn recorded_hash(geometry: &Geometry, draw: &Draw, recorded: &Result<(), Failure>) -> u32 {
+    let outcome = match recorded {
+        Ok(()) => 0,
+        Err(Failure::Unreadable) => 1,
+        Err(Failure::FrameFull) => 2,
+    };
+    let vertices = geometry.vertices_from(draw.first_vertex).iter().flat_map(|v| [v.x, v.y, v.z, v.w, v.u, v.v, f32::from_bits(v.color), v.fog].map(f32::to_bits));
+    let indices = geometry.indices_from(draw.first_index).iter().map(|&index| index as u32);
+    core::iter::once(outcome).chain(vertices).chain(indices).fold(0x811C_9DC5u32, |hash, word| (hash ^ word).wrapping_mul(0x0100_0193))
+}
+
+/// TEXGEN_RUNS 2: texgen draws recorded by `record_texgen_run` and by the
+/// general path, and how many of them came out different (expected 0;
+/// debug `texgencheck` reads and clears them): [checked draws, differing
+/// draws, vertices of the checked draws].
+pub static TEXGEN_CHECKS: [core::sync::atomic::AtomicU32; 3] = [const { core::sync::atomic::AtomicU32::new(0) }; 3];
+
+fn texgen_check(fast: u32, general: u32, vertices: u32) {
+    use core::sync::atomic::Ordering::Relaxed;
+    TEXGEN_CHECKS[0].fetch_add(1, Relaxed);
+    TEXGEN_CHECKS[1].fetch_add((fast != general) as u32, Relaxed);
+    TEXGEN_CHECKS[2].fetch_add(vertices, Relaxed);
+}
+
+/// The end of `record_on_cpu`: the draw finished, or dropped for its failure.
+fn finish_on_cpu(geometry: &mut Geometry, stats: &mut FrameStats, call: PrimCall, draw: &Draw, recorded: Result<(), Failure>) {
     match recorded {
-        Ok(()) => geometry.finish_draw(draw),
+        Ok(()) => geometry.finish_draw(*draw),
         Err(failure) => {
-            geometry.undo_draw(&draw);
+            geometry.undo_draw(draw);
             match failure {
                 Failure::Unreadable => {
                     stats.unreadable_draws += 1;
@@ -1643,6 +1680,366 @@ fn record_on_cpu(
                 Failure::FrameFull => stats.frame_overflows += 1,
             }
         }
+    }
+}
+
+/// `record_on_cpu`'s triangles with a corner behind the near plane: the
+/// part in front of it, as a fan of new vertices (each used once). Rare:
+/// the vertices are read and transformed again. Lit draws take their
+/// colours from `lit`, others from `color_of`.
+#[allow(clippy::too_many_arguments)]
+fn cut_triangle<M: PspMemory>(
+    geometry: &mut Geometry,
+    corners: &mut VertexReader<M>,
+    transform: &Transform,
+    lit: Option<&VertexLighting>,
+    indices: [u32; 3],
+    color_of: &impl Fn(&Vertex) -> u32,
+    to_frame: &impl Fn(&Vertex, u32, f32, f32) -> FrameVertex,
+    first_vertex: u32,
+) -> Result<(), Failure> {
+    let [Some(a), Some(b), Some(c)] = indices.map(|index| corners.get(index)) else {
+        return Err(Failure::Unreadable);
+    };
+    let mut colors = [a, b, c].map(|vertex| color_of(&vertex));
+    if let Some(lighting) = lit {
+        for (color, index) in colors.iter_mut().zip(indices) {
+            *color = corners.lit_color(index, lighting).ok_or(Failure::Unreadable)?;
+        }
+    }
+    let clipped = [(a, colors[0]), (b, colors[1]), (c, colors[2])].map(|(vertex, color)| transform.to_clip(&vertex, color));
+    let mut polygon = [clipped[0]; 4];
+    let corner_count = clip_triangle(&clipped, &mut polygon);
+    for last in 2..corner_count {
+        for corner in [polygon[0], polygon[last - 1], polygon[last]] {
+            let vertex = to_frame(&transform.to_screen(&corner), corner.color, corner.fog, corner.w);
+            geometry.add_corner(first_vertex, vertex).ok_or(Failure::FrameFull)?;
+        }
+    }
+    Ok(())
+}
+
+/// Unlit texgen draws four vertices at a time (`record_texgen_run`): 1
+/// (default), or each vertex on its own as before (0, for A/Bs), or both
+/// and compared (2, `TEXGEN_CHECKS`); debug `texgenruns`, replay
+/// NATIVERES_TEXGEN_RUNS. Same frames either way.
+pub static TEXGEN_RUNS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1);
+
+/// Vertices per chunk of `record_texgen_run`: a multiple of 3 (a list's
+/// triangles never straddle two chunks) and of 4 (`TexgenKernel::transform4`).
+const TEXGEN_CHUNK: u32 = 60;
+
+/// Words a chunk can span (as RUN_WORDS).
+const TEXGEN_WORDS: usize = TEXGEN_CHUNK as usize * 17 + 1;
+
+/// A vertex of `record_texgen_run` as the general path's `CornerCache`
+/// knows it.
+#[derive(Clone, Copy, PartialEq)]
+enum Numbered {
+    /// Not used by a triangle yet.
+    Unset,
+    /// Stored as this vertex number of the draw.
+    On(u16),
+    /// Behind the near plane (not stored; its triangles are cut).
+    Behind,
+}
+
+/// `record_texgen_run`'s draw and what it carries from chunk to chunk. Its
+/// two steps per chunk (`pass`, `emit`) don't depend on the memory type,
+/// so they are in the plugin once, not once per memory type the recorder
+/// is built for.
+struct TexgenRun<'a> {
+    kernel: crate::texgen_run::TexgenKernel,
+    prepared: &'a Prepared,
+    material_color: u32,
+    format: VertexFormat,
+    layout: &'a VertexLayout,
+    primitive_type: u32,
+    first_vertex: u32,
+    /// Unskinned common layouts at even addresses: fields read directly
+    /// (`VertexFormat::read_common_unskinned`; NFS UR's menu: 0x112).
+    direct: Option<CommonLayout>,
+    /// Vertex 0 (fans) and the two vertices before the chunk.
+    first: Numbered,
+    previous: [Numbered; 2],
+    /// `pass` put the chunk's vertices into the frame's spare room (else
+    /// into `scratch`).
+    in_place: bool,
+    scratch: [FrameVertex; TEXGEN_CHUNK as usize],
+}
+
+impl<'a> TexgenRun<'a> {
+    fn new(
+        kernel: crate::texgen_run::TexgenKernel,
+        prepared: &'a Prepared,
+        material_color: u32,
+        format: VertexFormat,
+        layout: &'a VertexLayout,
+        call: PrimCall,
+        first_vertex: u32,
+    ) -> Self {
+        let stride = layout.size;
+        let direct = format.common_layout(layout).filter(|_| !format.has_weights() && call.vertex_address % 2 == 0 && stride % 2 == 0);
+        TexgenRun {
+            kernel,
+            prepared,
+            material_color,
+            format,
+            layout,
+            primitive_type: call.primitive_type,
+            first_vertex,
+            direct,
+            first: Numbered::Unset,
+            previous: [Numbered::Unset; 2],
+            in_place: false,
+            scratch: [FrameVertex::default(); TEXGEN_CHUNK as usize],
+        }
+    }
+
+    /// Pass 1 of a chunk: its `n` vertices from `words` (the first at byte
+    /// `skew`), into the frame if it has room (`spare_vertices`), else into
+    /// `scratch`. The vertices behind the near plane (bit k: vertex k);
+    /// `None` if one can't be decoded.
+    #[inline(never)]
+    fn pass(&mut self, geometry: &mut Geometry, words: &[u32], skew: u32, n: u32) -> Option<u64> {
+        let spare = geometry.spare_vertices(self.first_vertex, n);
+        self.in_place = spare.is_some();
+        let out = match spare {
+            Some(spare) => spare,
+            None => &mut self.scratch[..n as usize],
+        };
+        let (prepared, material_color) = (self.prepared, self.material_color);
+        let of_raw = |color: Option<u32>| prepared.frame_color(prepared.base_color(color, material_color));
+        let (format, layout, stride) = (self.format, self.layout, self.layout.size);
+        match &self.direct {
+            Some(common) => texgen_pass_direct(&self.kernel, words, skew, stride, n, format, common, &of_raw, out),
+            None => texgen_pass(&self.kernel, n, out, |vertex| {
+                let raw = format.decode_3d(&VertexBytes::new(words, skew + vertex * stride), layout)?;
+                Some((raw.position, raw.texcoord, raw.color))
+            }, &of_raw),
+        }
+    }
+
+    /// The triangles of the chunk of `n` vertices from vertex `chunk` on
+    /// (those whose last vertex is in it), after its `pass` (`behind`), in
+    /// the general path's order; `cut` cuts a triangle at the near plane
+    /// (`cut_triangle`).
+    #[inline(never)]
+    fn emit(&mut self, geometry: &mut Geometry, chunk: u32, n: u32, behind: u64, cut: &mut dyn FnMut(&mut Geometry, [u32; 3]) -> Result<(), Failure>) -> Result<(), Failure> {
+        let (primitive_type, first_vertex) = (self.primitive_type, self.first_vertex);
+        let (first, previous) = (self.first, self.previous);
+        let triangles = match primitive_type {
+            primitive::TRIANGLES => chunk / 3..(chunk + n) / 3,
+            _ => chunk.saturating_sub(2)..chunk + n - 2,
+        };
+        let corners_of = |t: u32| match primitive_type {
+            primitive::TRIANGLES => [3 * t, 3 * t + 1, 3 * t + 2],
+            primitive::TRIANGLE_STRIP => crate::frame::strip_triangle(t),
+            _ => [0, t + 1, t + 2], // TRIANGLE_FAN
+        };
+        // The vertices before the chunk its triangles use, all on the screen.
+        let before_ok = match primitive_type {
+            _ if chunk == 0 => true,
+            primitive::TRIANGLES => true,
+            primitive::TRIANGLE_STRIP => matches!(previous, [Numbered::On(_), Numbered::On(_)]),
+            _ => matches!((first, previous[1]), (Numbered::On(_), Numbered::On(_))),
+        };
+        let earlier = |v: u32| match v {
+            0 => first,
+            _ if v + 1 == chunk => previous[1],
+            _ => previous[0], // v + 2 == chunk
+        };
+        let mut numbered = [Numbered::Unset; TEXGEN_CHUNK as usize];
+        if behind == 0 && self.in_place && before_ok {
+            // All on the screen: the vertices as they are, numbered in order.
+            let base = geometry.vertex_count() - first_vertex;
+            geometry.commit_vertices(n);
+            for (k, slot) in numbered[..n as usize].iter_mut().enumerate() {
+                *slot = Numbered::On((base + k as u32) as u16);
+            }
+            let number = |v: u32| match if v >= chunk { numbered[(v - chunk) as usize] } else { earlier(v) } {
+                Numbered::On(number) => number,
+                _ => unreachable!("all on the screen"),
+            };
+            let indices = geometry.reserve_indices(3 * triangles.len()).ok_or(Failure::FrameFull)?;
+            for (three, t) in indices.chunks_exact_mut(3).zip(triangles) {
+                for (index, v) in three.iter_mut().zip(corners_of(t)) {
+                    *index = number(v);
+                }
+            }
+        } else {
+            // Triangle by triangle, as the general path.
+            if self.in_place {
+                let spare = geometry.spare_vertices(first_vertex, n).expect("room seen by pass");
+                self.scratch[..n as usize].copy_from_slice(spare);
+            }
+            for t in triangles {
+                let corners = corners_of(t);
+                let mut state = [Numbered::Unset; 3];
+                for (slot, v) in state.iter_mut().zip(corners) {
+                    if v >= chunk {
+                        let k = (v - chunk) as usize;
+                        if numbered[k] == Numbered::Unset {
+                            numbered[k] = if behind & (1 << k) != 0 {
+                                Numbered::Behind
+                            } else {
+                                Numbered::On(geometry.add_vertex(first_vertex, self.scratch[k]).ok_or(Failure::FrameFull)?)
+                            };
+                        }
+                        *slot = numbered[k];
+                    } else {
+                        *slot = earlier(v);
+                    }
+                }
+                if let [Numbered::On(a), Numbered::On(b), Numbered::On(c)] = state {
+                    for number in [a, b, c] {
+                        geometry.add_index(number).ok_or(Failure::FrameFull)?;
+                    }
+                } else {
+                    cut(geometry, corners)?;
+                }
+            }
+        }
+        // What the next chunk's triangles need of this one.
+        let state_of = |v: u32| if v >= chunk { numbered[(v - chunk) as usize] } else { earlier(v) };
+        let last = chunk + n - 1;
+        self.previous = [state_of(last - 1), state_of(last)];
+        if chunk == 0 {
+            self.first = numbered[0];
+        }
+        Ok(())
+    }
+}
+
+/// `record_on_cpu` for an unlit texgen draw (texgen from the position or
+/// the texture coordinates, `Transform::texgen_kernel`), a non-indexed
+/// list, strip or fan: per chunk of TEXGEN_CHUNK vertices, all of them
+/// worked out four at a time (`TexgenRun::pass`, `TexgenKernel::transform4`,
+/// straight into the frame where it has room), then the chunk's triangles
+/// in the general path's order (`TexgenRun::emit`). The general path
+/// numbers each vertex when a triangle first uses it, which for these
+/// primitives is the vertices' order; so a chunk with nothing behind the
+/// near plane is its vertices as they are, and the others are numbered
+/// triangle by triangle as there, with its cut code (`cut_triangle`, with
+/// `color_of` and `to_frame`). The frame comes out the same as the general
+/// path's.
+///
+/// `None` (the draw to be undone and done by the general path) for a
+/// vertex that can't be decoded or a chunk whose words can't be read.
+fn record_texgen_run<M: PspMemory>(
+    geometry: &mut Geometry,
+    memory: &mut M,
+    mut run: TexgenRun,
+    transform: &Transform,
+    color_of: &impl Fn(&Vertex) -> u32,
+    to_frame: &impl Fn(&Vertex, u32, f32, f32) -> FrameVertex,
+    call: PrimCall,
+) -> Option<Result<(), Failure>> {
+    let PrimCall { primitive_type, count, vertex_address, index_address, .. } = call;
+    // The vertices the triangles use (a list's incomplete last triangle:
+    // none of its vertices).
+    let used = match primitive_type {
+        primitive::TRIANGLES => count / 3 * 3,
+        _ if count >= 3 => count,
+        _ => 0,
+    };
+    let (format, layout, first_vertex) = (run.format, run.layout, run.first_vertex);
+    let stride = layout.size;
+    let bytes_used = format.bytes_used(layout);
+    let mut copy = [0u32; TEXGEN_WORDS];
+    let mut chunk = 0;
+    while chunk < used {
+        let n = (used - chunk).min(TEXGEN_CHUNK);
+        let address = vertex_address.wrapping_add(chunk * stride);
+        let skew = address & 3;
+        let word_count = (skew + stride * (n - 1) + bytes_used).div_ceil(4) as usize;
+        let behind = match memory.borrow_words(address & !3, word_count) {
+            Some(words) => run.pass(geometry, words, skew, n)?,
+            None => {
+                let words = copy.get_mut(..word_count)?;
+                memory.read_words(address & !3, words)?;
+                run.pass(geometry, words, skew, n)?
+            }
+        };
+        let mut cut = |geometry: &mut Geometry, corners: [u32; 3]| {
+            let mut reader = VertexReader::new(format, layout, memory, vertex_address, index_address);
+            cut_triangle(geometry, &mut reader, transform, None, corners, color_of, to_frame, first_vertex)
+        };
+        if let Err(failure) = run.emit(geometry, chunk, n, behind, &mut cut) {
+            return Some(Err(failure));
+        }
+        chunk += n;
+    }
+    Some(Ok(()))
+}
+
+/// Pass 1 of `record_texgen_run` for one chunk: `n` vertices into `out`,
+/// four at a time; `read(k)` gives vertex k's raw position, texture
+/// coordinates and colour (`None`: unreadable, then so is the chunk);
+/// `of_raw` the finished colour (worked out again only when the colour
+/// changes). The vertices behind the near plane (bit k: vertex k).
+#[inline(always)]
+fn texgen_pass(
+    kernel: &crate::texgen_run::TexgenKernel,
+    n: u32,
+    out: &mut [FrameVertex],
+    mut read: impl FnMut(u32) -> Option<([f32; 3], [f32; 2], Option<u32>)>,
+    of_raw: &impl Fn(Option<u32>) -> u32,
+) -> Option<u64> {
+    let mut behind = 0u64;
+    let mut last_color = None;
+    let mut last_finished = of_raw(None);
+    let mut lanes = crate::texgen_run::Lanes4::default();
+    let mut k = 0;
+    while k < n {
+        let count = (n - k).min(4);
+        for lane in 0..4 {
+            // Past the end: the last vertex again (not stored).
+            let ([x, y, z], [u, v], color) = read(k + lane.min(count - 1))?;
+            if color != last_color {
+                last_color = color;
+                last_finished = of_raw(color);
+            }
+            let lane = lane as usize;
+            (lanes.x[lane], lanes.y[lane], lanes.z[lane]) = (x, y, z);
+            (lanes.u[lane], lanes.v[lane]) = (u, v);
+            lanes.color[lane] = last_finished;
+        }
+        let stored = &mut out[k as usize..(k + count) as usize];
+        behind |= (kernel.transform4(&lanes, stored) as u64) << k;
+        k += 4;
+    }
+    Some(behind)
+}
+
+/// `texgen_pass` for an unskinned `CommonLayout` at an even address (each
+/// field read with one load), per colour format.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn texgen_pass_direct(
+    kernel: &crate::texgen_run::TexgenKernel,
+    words: &[u32],
+    skew: u32,
+    stride: u32,
+    n: u32,
+    format: VertexFormat,
+    common: &CommonLayout,
+    of_raw: &impl Fn(Option<u32>) -> u32,
+    out: &mut [FrameVertex],
+) -> Option<u64> {
+    let start = words.as_ptr() as *const u8;
+    // Safe: `words` covers every field of the chunk's `n` vertices (its
+    // span), the first starts at an even address and the stride is even.
+    macro_rules! pass {
+        ($color:literal) => {
+            texgen_pass(kernel, n, out, |k| Some(unsafe { VertexFormat::read_common_unskinned::<$color>(start.add((skew + stride * k) as usize), common) }), of_raw)
+        };
+    }
+    match format.color_format_bits() {
+        4 => pass!(4),
+        5 => pass!(5),
+        6 => pass!(6),
+        _ => pass!(0),
     }
 }
 

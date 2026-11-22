@@ -995,6 +995,30 @@ impl Transform {
         })
     }
 
+    /// `frame_vertex` with `texgen`'s texture coordinates (`Texgen::uv`)
+    /// for a vertex loop that works four vertices at once
+    /// (`texgen_run::TexgenKernel`). `None` for skinned draws and texgen
+    /// from the normal.
+    pub fn texgen_kernel(&self, texgen: &Texgen) -> Option<crate::texgen_run::TexgenKernel> {
+        if self.bone_count != 0 || texgen.source >= 2 {
+            return None;
+        }
+        let fast = &self.fast;
+        let from_texcoords = texgen.source == 1;
+        Some(crate::texgen_run::TexgenKernel {
+            rows: fast.rows,
+            fog_row: fast.fog_row,
+            viewport_origin: self.viewport_origin,
+            viewport_scale: self.viewport_scale,
+            depth_center: fast.depth_center,
+            depth_scale: fast.depth_scale,
+            from_texcoords,
+            source_scale: if from_texcoords { texgen.texcoord_scale } else { texgen.position_scale },
+            matrix: texgen.matrix,
+            projective: texgen.projective,
+        })
+    }
+
     /// What `frame_vertex` does for a vertex that needs no skinning (no
     /// bones, or one bone with weight 1), copied out for a vertex loop
     /// (`recorder::record_3d_run`): a small value the compiler keeps in
@@ -1961,5 +1985,92 @@ mod texgen_tests {
         let (u, _) = plain.uv(&raw([0.0; 3], [0.0; 2]), Some([3.0, 0.0, 4.0]));
         assert!((u - 3.0 / 5.0).abs() < 1e-6, "{u}");
         assert!(plain.needs_normal() && !Texgen::of(&ge_with(1, matrix), POSITION_16).unwrap().needs_normal());
+    }
+
+    /// `TexgenKernel::transform4` gives what `frame_vertex` and `uv` give,
+    /// bit for bit, and `None` lanes as its behind mask: both sources, a
+    /// projective texgen, fog, vertices on both sides of the near plane.
+    #[test]
+    fn texgen_kernel_matches_frame_vertex_and_uv() {
+        let set = |ge: &mut GeState, opcode: u8, data: u32| ge.set_register(Command(((opcode as u32) << 24) | data));
+        let set_float = |ge: &mut GeState, opcode: u8, value: f32| ge.set_register(Command(((opcode as u32) << 24) | (value.to_bits() >> 8)));
+        let upload = |ge: &mut GeState, number: u8, data: u8, values: &[f32]| {
+            ge.set_register(Command((number as u32) << 24));
+            for value in values {
+                ge.set_register(Command(((data as u32) << 24) | (value.to_bits() >> 8)));
+            }
+        };
+        let matrices = [
+            (1, [64.0, 0.0, 0.0, 0.0, 64.0, 0.0, 0.0, 0.0, 1.0, -32.0, -32.0, 1.0]),
+            (1, [1.37, 0.21, 0.5, -0.33, 0.91, 0.25, 7.0, 3.0, 1.0, 0.125, -0.75, 1.0]),
+            (0, [1.0999756, 0.0, 0.0, 0.0, 0.8937378, 0.0, 0.0, 0.0, 0.0, 0.4921875, 0.390625, 1.0]),
+            (0, [0.3, -0.7, 0.01, 0.2, 0.6, -0.02, -0.4, 0.1, 0.003, 0.5, 0.25, 1.5]),
+        ];
+        // s16 positions, u16 texture coordinates, 565 colours (NFS UR's 0x112).
+        let format = VertexFormat(2 | 4 << 2 | 2 << 7);
+        let mut seed = 0x1234_5678u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed
+        };
+        for (source, matrix) in matrices {
+            let mut ge = ge_with(1 | source << 8, matrix);
+            set_float(&mut ge, op::VIEWPORT_X_SCALE, 240.0);
+            set_float(&mut ge, op::VIEWPORT_Y_SCALE, -136.0);
+            set_float(&mut ge, op::VIEWPORT_X_CENTER, 2048.0);
+            set_float(&mut ge, op::VIEWPORT_Y_CENTER, 2048.0);
+            set_float(&mut ge, op::VIEWPORT_Z_SCALE, -32767.5);
+            set_float(&mut ge, op::VIEWPORT_Z_CENTER, 32767.5);
+            set(&mut ge, op::SCREEN_OFFSET_X, (2048 - 240) << 4);
+            set(&mut ge, op::SCREEN_OFFSET_Y, (2048 - 136) << 4);
+            upload(&mut ge, op::WORLD_MATRIX_NUMBER, op::WORLD_MATRIX_DATA, &[0.9, 0.1, -0.2, 0.05, 1.1, 0.3, 0.2, -0.1, 0.8, 0.5, -0.25, -1.6]);
+            upload(&mut ge, op::VIEW_MATRIX_NUMBER, op::VIEW_MATRIX_DATA, &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]);
+            // Perspective: w = -z, near plane at z = -1.
+            let projection = [1.5, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, -1.0, -1.0, 0.0, 0.0, -2.0, 0.0];
+            upload(&mut ge, op::PROJECTION_MATRIX_NUMBER, op::PROJECTION_MATRIX_DATA, &projection);
+            set(&mut ge, op::FOG_ENABLE, 1);
+            set_float(&mut ge, op::FOG_END, 30.0);
+            set_float(&mut ge, op::FOG_SCALE, 0.05);
+            let transform = Transform::new(&ge, format);
+            let texgen = Texgen::of(&ge, format).unwrap();
+            let kernel = transform.texgen_kernel(&texgen).expect("unskinned, source 0 or 1");
+            let (mut behind_seen, mut front_seen) = (0, 0);
+            for _ in 0..2000 {
+                let mut lanes = crate::texgen_run::Lanes4::default();
+                let mut raws = [raw([0.0; 3], [0.0; 2]); 4];
+                for lane in 0..4 {
+                    // Positions up to 1.5 units (x 32768), many in front of
+                    // the near plane, some behind it.
+                    let p = [next() as u16 as i16 as f32 * 1.5, next() as u16 as i16 as f32 * 1.5, next() as u16 as i16 as f32];
+                    let t = [(next() >> 16) as f32, (next() >> 16) as f32];
+                    raws[lane] = raw(p, t);
+                    (lanes.x[lane], lanes.y[lane], lanes.z[lane]) = (p[0], p[1], p[2]);
+                    (lanes.u[lane], lanes.v[lane]) = (t[0], t[1]);
+                    lanes.color[lane] = next();
+                }
+                for count in [4usize, 3, 1] {
+                    let mut out = [FrameVertex::default(); 4];
+                    let behind = kernel.transform4(&lanes, &mut out[..count]);
+                    for lane in 0..count {
+                        match transform.frame_vertex(&raws[lane], lanes.color[lane]) {
+                            None => {
+                                assert!(behind & (1 << lane) != 0, "lane {lane} should be behind");
+                                behind_seen += 1;
+                            }
+                            Some(mut expected) => {
+                                (expected.u, expected.v) = texgen.uv(&raws[lane], None);
+                                assert!(behind & (1 << lane) == 0, "lane {lane} should be in front");
+                                let bits = |v: &FrameVertex| [v.x, v.y, v.z, v.w, v.u, v.v, f32::from_bits(v.color), v.fog].map(f32::to_bits);
+                                assert_eq!(bits(&out[lane]), bits(&expected), "source {source} {:?}", raws[lane]);
+                                front_seen += 1;
+                            }
+                        }
+                    }
+                    assert_eq!(behind >> count, 0);
+                }
+            }
+            assert!(behind_seen > 100 && front_seen > 100, "{behind_seen} {front_seen}");
+            assert_eq!(texgen.projective, matrix[2] != 0.0 || matrix[5] != 0.0 || (matrix[8] != 0.0 && source != 1) || matrix[11] != 1.0);
+        }
     }
 }
