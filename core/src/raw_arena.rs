@@ -44,6 +44,16 @@ pub static ZERO_COPY: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 /// sparse spans). Monster Hunter Freedom draws everything indexed.
 pub static INDEXED_DRAWS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
+/// Texgen draws (TEXTURE_MAP_MODE 1) on the raw path where
+/// `Texgen::raw_form` allows it (renderer fa3c40b). Off by default: the
+/// GPU works their positions out with its own rounding, which no program
+/// can make the CPU route's (measured on the Vita 2026-11-22: its multiply,
+/// add and reciprocal aren't correctly rounded; a x b matched the ARM's
+/// round-to-nearest in 71 % of the cases where rounding matters), and the
+/// CPU route is the reference for these draws (NFS UR: 16 pixels on its
+/// title, 20 on the menu). Debug `rawtexgen`, replay NATIVERES_RAW_TEXGEN=1.
+pub static TEXGEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Whether the display can draw raw sprites (`draw_flags::RAW_SPRITES`):
 /// set once its sprite program exists (nativeres_render.c); without it 3D
 /// rectangles stay on the CPU path.

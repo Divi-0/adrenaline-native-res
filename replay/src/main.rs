@@ -141,6 +141,10 @@ fn new_vertex_cache() -> Option<&'static mut VertexCache> {
     // their indices were kept (`raw_arena::INDEXED_DRAWS`).
     let gather = std::env::args().any(|arg| arg == "--gather");
     nativeres_core::raw_arena::INDEXED_DRAWS.store(!gather, std::sync::atomic::Ordering::Relaxed);
+    // NATIVERES_RAW_TEXGEN=1: texgen draws raw where they can be
+    // (`raw_arena::TEXGEN`, off by default as on the Vita).
+    let raw_texgen = std::env::var("NATIVERES_RAW_TEXGEN").is_ok_and(|value| value == "1");
+    nativeres_core::raw_arena::TEXGEN.store(raw_texgen, std::sync::atomic::Ordering::Relaxed);
     // Like the Vita once its alpha-test program exists: textured draws are
     // alpha-tested in the shader (this rasterizer tests every draw).
     // NATIVERES_BLEND_ALPHA_TEST=1: blending stands in as before (A/B).

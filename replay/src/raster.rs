@@ -120,12 +120,14 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
         }
     }
 
-    // Debugging: REPLAY_SHOW_DRAW=n prints draw n and its first vertices.
+    // Debugging: REPLAY_SHOW_DRAW=n prints draw n and its first corners.
     if let Some(index) = std::env::var("REPLAY_SHOW_DRAW").ok().and_then(|value| value.parse::<usize>().ok()) {
         if let Some(draw) = frame.draws().get(index) {
             println!("draw {index}: {draw:x?}");
             println!("  texture: {:x?}", frame.textures().get(draw.texture as usize));
-            for vertex in frame.screen_corners(draw).take(12) {
+            // REPLAY_SHOW_CORNERS=n: the first n corners (12 by default).
+            let corners = std::env::var("REPLAY_SHOW_CORNERS").ok().and_then(|value| value.parse().ok()).unwrap_or(12);
+            for vertex in frame.screen_corners(draw).take(corners) {
                 println!("  {vertex:?}");
             }
         }

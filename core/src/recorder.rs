@@ -195,7 +195,7 @@ fn fallback_reason(
     // raw_off).
     if format.morph_count() != 1 {
         fallback::MORPH
-    } else if prepared.texgen.is_some_and(|texgen| texgen.raw_form(format).is_none()) {
+    } else if prepared.texgen.is_some_and(|texgen| raw_texgen_form(&texgen, format).is_none()) {
         fallback::TEXGEN
     } else if !prepared.gpu_transform {
         fallback::UNTEXTURED
@@ -1345,7 +1345,7 @@ fn prepare_now(
         // draws (clamped parts added, the same as clamping the sum).
         // Texgen: only where raw draws do it (`Texgen::raw_form`); its draws
         // never take the GPU transform runs (`record_3d_run`), only raw.
-        let raw_texgen = texgen.is_none_or(|texgen| texgen.raw_form(format).is_some());
+        let raw_texgen = texgen.is_none_or(|texgen| raw_texgen_form(&texgen, format).is_some());
         let gpu_lit = draw_states.gpu_transform && textured && !format.is_through() && raw_texgen;
         match transform.lighting() {
             Some(lights) if lights.approximated() && textured && !(gpu_lit && lights.gpu_ready()) => {
@@ -1370,7 +1370,7 @@ fn prepare_now(
         double_source_alpha: state.double_source_alpha,
         function,
         uses_texture_alpha,
-        gpu_transform: draw_states.gpu_transform && textured && !format.is_through() && texgen.is_none_or(|texgen| texgen.raw_form(format).is_some()),
+        gpu_transform: draw_states.gpu_transform && textured && !format.is_through() && texgen.is_none_or(|texgen| raw_texgen_form(&texgen, format).is_some()),
         ambient_lighting,
         texgen,
     })
@@ -2039,7 +2039,7 @@ fn raw_color_fields(
     if !may_go_raw(prepared, lights.map(|lights| lights.gpu_ready()), format) {
         return None;
     }
-    let (texgen, texgen_source) = match prepared.texgen.and_then(|texgen| texgen.raw_form(format)) {
+    let (texgen, texgen_source) = match prepared.texgen.and_then(|texgen| raw_texgen_form(&texgen, format)) {
         Some((uv, source)) => (uv, [source, 0.0, 0.0, 0.0]),
         None => ([0.0; 4], [0.0; 4]),
     };
@@ -2081,6 +2081,16 @@ fn raw_color_fields(
     Some(RawColors { material, ambient, emissive, rules: [lit, opaque, replacing, doubled], scale, texgen, texgen_source })
 }
 
+/// `Texgen::raw_form` while texgen draws may go raw (`raw_arena::TEXGEN`,
+/// off by default): `None` sends them to the CPU route.
+fn raw_texgen_form(texgen: &Texgen, format: VertexFormat) -> Option<([f32; 4], f32)> {
+    if crate::raw_arena::TEXGEN.load(core::sync::atomic::Ordering::Relaxed) {
+        texgen.raw_form(format)
+    } else {
+        None
+    }
+}
+
 /// Whether a draw's runs can go raw (`raw_color_fields` gives colour rules),
 /// without working the rules out: the producer asks it for every batch so
 /// the copier doesn't hash vertices nobody looks up
@@ -2091,7 +2101,7 @@ fn raw_color_fields(
 fn may_go_raw(prepared: &Prepared, lights_gpu_ready: Option<bool>, format: VertexFormat) -> bool {
     // Texgen: only where the raw program's texture coordinates do it
     // (`Texgen::raw_form`).
-    if format.morph_count() != 1 || prepared.texgen.is_some_and(|texgen| texgen.raw_form(format).is_none()) {
+    if format.morph_count() != 1 || prepared.texgen.is_some_and(|texgen| raw_texgen_form(&texgen, format).is_none()) {
         return false;
     }
     match lights_gpu_ready {
