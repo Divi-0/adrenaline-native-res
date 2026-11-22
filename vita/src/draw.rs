@@ -577,6 +577,10 @@ pub struct Draws {
     /// The target's own size (an off-screen one may be smaller): the
     /// scissor stays inside it.
     surface_size: (u32, u32),
+    /// Where the PSP framebuffer's x 0 lies in the target, in its pixels: a
+    /// tile drawn into a wider off-screen framebuffer (core
+    /// `offscreen::placement`).
+    origin_x: u32,
 }
 
 static DRAWS: SingleThreaded<Draws> = SingleThreaded::new(Draws {
@@ -592,6 +596,7 @@ static DRAWS: SingleThreaded<Draws> = SingleThreaded::new(Draws {
     test_block_tried: false,
     target_size: (TARGET_WIDTH, TARGET_HEIGHT),
     surface_size: (TARGET_WIDTH, TARGET_HEIGHT),
+    origin_x: 0,
 });
 
 /// The 960x544 targets' size (targets.rs `TARGET_WIDTH` / `TARGET_HEIGHT`).
@@ -602,19 +607,21 @@ const TARGET_HEIGHT: u32 = 544;
 /// `height` Vita pixels (960x544: doubled; 480x272: the off-screen targets,
 /// PSP pixels 1:1), of which the target itself has `surface_width` x
 /// `surface_height` (an off-screen target only the top left part the game
-/// samples). Sets the viewport for it (GXM's default for a target of
-/// `width` x `height`: x width / 2, y -height / 2, z 0.5) and the
-/// scissor's scale and bounds.
+/// samples), its x 0 at `origin_x` of the target's pixels (a tile of a
+/// wider framebuffer, else 0). Sets the viewport for it (GXM's default for
+/// a target of `width` x `height`: x width / 2, y -height / 2, z 0.5,
+/// moved right by `origin_x`) and the scissor's scale and bounds.
 /// Only off-screen scenes call it, at their start and (back to 960x544,
 /// for whatever draws next: our display scenes, vita2d) before their end;
 /// the display targets' scenes keep GXM's default as before.
-pub fn set_target_size(width: u32, height: u32, surface_width: u32, surface_height: u32) {
+pub fn set_target_size(width: u32, height: u32, surface_width: u32, surface_height: u32, origin_x: u32) {
     let draws = draws();
     draws.target_size = (width, height);
     draws.surface_size = (surface_width.min(width), surface_height.min(height));
+    draws.origin_x = origin_x;
     let (half_width, half_height) = (width as f32 / 2.0, height as f32 / 2.0);
     // Safe: the display thread's context.
-    unsafe { gxm::sceGxmSetViewport(context(), half_width, half_width, half_height, -half_height, 0.5, 0.5) };
+    unsafe { gxm::sceGxmSetViewport(context(), half_width + origin_x as f32, half_width, half_height, -half_height, 0.5, 0.5) };
     draws.state.raw_viewport = None;
     draws.state.scissor = None;
 }
@@ -834,9 +841,10 @@ impl Draws {
         // Vita pixels per PSP pixel: 2 on our targets, 1 off-screen.
         let scale = self.target_size.0 / 480;
         let (width, height) = self.surface_size;
+        let x = self.origin_x;
         let mut top = (draw.scissor_top as u32 * scale).min(height - 1);
-        let left = (draw.scissor_left as u32 * scale).min(width - 1);
-        let right = (draw.scissor_right as u32 * scale + scale - 1).min(width - 1);
+        let left = (x + draw.scissor_left as u32 * scale).min(width - 1);
+        let right = (x + draw.scissor_right as u32 * scale + scale - 1).min(width - 1);
         let mut bottom = (draw.scissor_bottom as u32 * scale + scale - 1).min(height - 1);
         let clip = GPU_CLIP_ROWS.load(Ordering::Relaxed);
         if clip > 0 && clip <= 544 && bottom > clip as u32 - 1 {
@@ -1118,7 +1126,7 @@ impl Draws {
         }
         let (half_width, half_height) = (self.target_size.0 as f32 / 2.0, self.target_size.1 as f32 / 2.0);
         // Safe: the display's context.
-        unsafe { gxm::sceGxmSetViewport(context(), half_width, half_width, half_height, -half_height, offset, scale) };
+        unsafe { gxm::sceGxmSetViewport(context(), half_width + self.origin_x as f32, half_width, half_height, -half_height, offset, scale) };
         self.state.raw_viewport = Some([offset, scale]);
     }
 
@@ -1130,7 +1138,7 @@ impl Draws {
         }
         let (half_width, half_height) = (self.target_size.0 as f32 / 2.0, self.target_size.1 as f32 / 2.0);
         // Safe: the display's context.
-        unsafe { gxm::sceGxmSetViewport(context(), half_width, half_width, half_height, -half_height, 0.5, 0.5) };
+        unsafe { gxm::sceGxmSetViewport(context(), half_width + self.origin_x as f32, half_width, half_height, -half_height, 0.5, 0.5) };
         self.state.raw_viewport = None;
     }
 

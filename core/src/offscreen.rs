@@ -61,9 +61,10 @@ impl Iterator for Runs<'_> {
 /// per frame than it was made for makes the second wait until the GPU has
 /// finished the first (God of War's bloom chain: ~26 ms per frame), so the
 /// display makes such targets with room for more (2026-11-22).
-pub fn runs_into(draws: &[Draw], framebuffers: &[u32], counts: &mut [u32]) {
+pub fn runs_into(draws: &[Draw], framebuffers: &[u32], counts: &mut [u32], base: impl Fn(u32) -> u32) {
     counts.iter_mut().for_each(|count| *count = 0);
     for (framebuffer, _) in runs(draws) {
+        let framebuffer = base(framebuffer);
         if let Some(index) = framebuffers.iter().position(|&known| known == framebuffer) {
             if let Some(count) = counts.get_mut(index) {
                 *count += 1;
@@ -83,20 +84,68 @@ pub fn reads_framebuffer(texture: &TextureDescriptor, framebuffer: u32) -> bool 
         && fold_vram_mirror(texture.address) == fold_vram_mirror(framebuffer)
 }
 
-/// How much of off-screen framebuffer `framebuffer` the frame's textures
-/// read, in PSP pixels: the widest and the highest of them (0 x 0 if none).
-/// Its target needs no more: God of War's title samples five off-screen
-/// framebuffers of 256x256 down to 32x32, which took 768 KiB of CDRAM each
-/// as 480x272 targets (2026-11-22, `CDRAM_RESERVE` in the Vita crate).
-pub fn sampled_size(textures: &[TextureDescriptor], framebuffer: u32) -> (u32, u32) {
+/// Bytes per pixel of a framebuffer read as `format` (16-bit or 32-bit
+/// colours); None for index and DXT formats.
+fn colour_bytes(format: u8) -> Option<u32> {
+    match format {
+        0..=2 => Some(2),
+        3 => Some(4),
+        _ => None,
+    }
+}
+
+/// Where framebuffer `framebuffer` lies: inside the first row of a wider
+/// one the frame samples, as (that framebuffer, x in pixels); else
+/// (`framebuffer`, 0). God of War's glow in the game (2026-11-22): seven
+/// 64x64 tiles at x 0, 64, .. 384 of a 1024-pixel 16-bit strip at
+/// 0x04161800, drawn one by one as framebuffers 0x04161880, 0x04161900, ..
+/// and read as one 512x64 texture; as targets of their own the strip read
+/// only its first tile (and eleven framebuffers didn't fit into
+/// `MAX_OFFSCREEN`: noise). PPSSPP takes such an address as rendering at an
+/// x offset too (FramebufferManagerCommon, `SetCurRTOffset`). Where the
+/// frame also reads the tile itself, those reads must have the wider one's
+/// row stride (same rows). The outermost framebuffer wins where reads nest.
+pub fn placement(textures: &[TextureDescriptor], framebuffer: u32) -> (u32, u32) {
+    let folded = fold_vram_mirror(framebuffer);
+    let same_rows = |stride: u32| {
+        textures
+            .iter()
+            .filter(|texture| colour_bytes(texture.format).is_some() && fold_vram_mirror(texture.address) == folded)
+            .all(|texture| texture.buffer_width == stride)
+    };
     textures
         .iter()
-        .filter(|texture| reads_framebuffer(texture, framebuffer))
-        .fold((0, 0), |(width, height), texture| (width.max(texture.width as u32), height.max(texture.height as u32)))
+        .filter_map(|texture| {
+            let bytes = colour_bytes(texture.format)?;
+            let base = fold_vram_mirror(texture.address);
+            let inside = folded > base && folded < base + texture.width as u32 * bytes && (folded - base) % bytes == 0;
+            (inside && same_rows(texture.buffer_width)).then(|| (texture.address, (folded - base) / bytes))
+        })
+        .max_by_key(|&(_, x)| x)
+        .unwrap_or((framebuffer, 0))
+}
+
+/// How much of off-screen framebuffer `framebuffer` the frame's textures
+/// read, in PSP pixels: the widest and the highest of them (0 x 0 if none),
+/// counting reads of its tiles (`placement`) from their x. Its target needs
+/// no more: God of War's title samples five off-screen framebuffers of
+/// 256x256 down to 32x32, which took 768 KiB of CDRAM each as 480x272
+/// targets (2026-11-22, `CDRAM_RESERVE` in the Vita crate).
+pub fn sampled_size(textures: &[TextureDescriptor], framebuffer: u32) -> (u32, u32) {
+    let folded = fold_vram_mirror(framebuffer);
+    textures.iter().filter(|texture| colour_bytes(texture.format).is_some()).fold((0, 0), |(width, height), texture| {
+        let (base, x) = placement(textures, texture.address);
+        if fold_vram_mirror(base) == folded {
+            (width.max(x + texture.width as u32), height.max(texture.height as u32))
+        } else {
+            (width, height)
+        }
+    })
 }
 
 /// The off-screen framebuffers (not `shown`) this frame draws into AND
-/// samples as a texture, first drawn first; 0 for unused places.
+/// samples as a texture, first drawn first, tiles of a wider one
+/// (`placement`) as that one; 0 for unused places.
 pub fn sampled(draws: &[Draw], textures: &[TextureDescriptor], shown: u32) -> [u32; MAX_OFFSCREEN] {
     let mut found = [0u32; MAX_OFFSCREEN];
     let mut count = 0;
@@ -104,17 +153,24 @@ pub fn sampled(draws: &[Draw], textures: &[TextureDescriptor], shown: u32) -> [u
         if count == MAX_OFFSCREEN {
             break;
         }
+        let (base, x) = placement(textures, framebuffer);
         if framebuffer == 0
-            || fold_vram_mirror(framebuffer) == fold_vram_mirror(shown)
-            || found[..count].contains(&framebuffer)
-            || !textures.iter().any(|texture| reads_framebuffer(texture, framebuffer))
+            || fold_vram_mirror(base) == fold_vram_mirror(shown)
+            || found[..count].contains(&base)
+            || (x == 0 && !textures.iter().any(|texture| reads_framebuffer(texture, framebuffer)))
         {
             continue;
         }
-        found[count] = framebuffer;
+        found[count] = base;
         count += 1;
     }
     found
+}
+
+/// Whether some framebuffer the frame draws into is a tile of another
+/// (`placement` with an x): such frames are drawn in the GE's order.
+pub fn draws_tiles(draws: &[Draw], textures: &[TextureDescriptor]) -> bool {
+    runs(draws).any(|(framebuffer, _)| framebuffer != 0 && placement(textures, framebuffer).1 > 0)
 }
 
 /// Whether the frame can be drawn as one scene per target: first each
@@ -173,6 +229,39 @@ mod tests {
 
     fn texture(address: u32, format: u8) -> TextureDescriptor {
         TextureDescriptor { address, format, width: 512, height: 512, buffer_width: 512, ..Default::default() }
+    }
+
+    /// God of War in the game: seven 64x64 tiles drawn into a 1024-pixel
+    /// 16-bit strip at 0x04161800, then the strip read as 512x64.
+    #[test]
+    fn tiles_of_a_wider_framebuffer_are_placed_at_their_x() {
+        let strip = 0x0416_1800;
+        let tile = |k: u32| strip + 0x80 * k;
+        let read = |address, width, height, format| TextureDescriptor { width, height, buffer_width: 1024, ..texture(address, format) };
+        let mut textures = vec![read(strip, 512, 64, format::BGR5650)];
+        textures.extend((1..7).map(|k| read(tile(k), 64, 64, format::BGR5650)));
+        textures.push(TextureDescriptor { width: 256, height: 256, buffer_width: 512, ..texture(0x0416_2000, format::ABGR8888) });
+        assert_eq!(placement(&textures, tile(3)), (strip, 192));
+        assert_eq!(placement(&textures, strip), (strip, 0));
+        assert_eq!(placement(&textures, 0x0416_1C00), (0x0416_1C00, 0), "past the 512 pixels read");
+        assert_eq!(placement(&textures, 0x0416_2400), (0x0416_2400, 0), "at the end of a row read, not inside");
+        let other_rows = [textures[0], TextureDescriptor { buffer_width: 512, ..textures[3] }];
+        assert_eq!(placement(&other_rows, tile(3)), (tile(3), 0), "read itself with other rows: not a tile");
+        let mut draws: Vec<Draw> = (0..7).map(|k| draw(tile(k))).collect();
+        draws.push(draw(SHOWN));
+        assert_eq!(sampled(&draws, &textures, SHOWN), slots(&[strip]));
+        assert_eq!(sampled_size(&textures, strip), (512, 64));
+        assert!(draws_tiles(&draws, &textures));
+        let mut counts = [0; 2];
+        runs_into(&draws, &[SHOWN, strip], &mut counts, |framebuffer| placement(&textures, framebuffer).0);
+        assert_eq!(counts, [1, 7]);
+        // God of War's title: framebuffers one row apart are not tiles.
+        let title = [
+            TextureDescriptor { width: 256, height: 256, buffer_width: 512, ..texture(0x0416_2000, format::ABGR8888) },
+            TextureDescriptor { width: 128, height: 128, buffer_width: 512, ..texture(0x0416_2400, format::ABGR8888) },
+        ];
+        assert_eq!(placement(&title, 0x0416_2400), (0x0416_2400, 0));
+        assert_eq!(placement(&title, 0x0416_2600), (0x0416_2600, 0));
     }
 
     #[test]
@@ -250,13 +339,15 @@ mod tests {
         const LEVEL_0: u32 = 0x0416_2000;
         const LEVEL_1: u32 = 0x0416_2400;
         const LEVEL_2: u32 = 0x0416_2600;
+        // Read as in the title's dump (tests/dumps/gow/title.bin).
+        let sized = |address, format, width, height, buffer_width| TextureDescriptor { width, height, buffer_width, ..texture(address, format) };
         let textures = vec![
-            texture(BLUR_A, format::BGR5650),
-            texture(BLUR_B, format::BGR5650),
-            texture(SCREEN, format::ABGR8888),
-            texture(LEVEL_0, format::ABGR8888),
-            texture(LEVEL_1, format::ABGR8888),
-            texture(LEVEL_2, format::ABGR8888),
+            sized(BLUR_A, format::BGR5650, 64, 64, 1024),
+            sized(BLUR_B, format::BGR5650, 32, 32, 1024),
+            sized(SCREEN, format::ABGR8888, 512, 512, 512),
+            sized(LEVEL_0, format::ABGR8888, 256, 256, 512),
+            sized(LEVEL_1, format::ABGR8888, 128, 128, 512),
+            sized(LEVEL_2, format::ABGR8888, 64, 64, 512),
         ];
         let draws = vec![
             draw(BLUR_A),
@@ -278,7 +369,7 @@ mod tests {
         // waits for the GPU to finish the first (~26 ms per frame).
         let framebuffers = [SCREEN, BLUR_A, BLUR_B, LEVEL_0, LEVEL_1, LEVEL_2, 0x0411_0000];
         let mut counts = [0u32; 7];
-        runs_into(&draws, &framebuffers, &mut counts);
+        runs_into(&draws, &framebuffers, &mut counts, |framebuffer| framebuffer);
         assert_eq!(counts, [2, 2, 1, 2, 2, 1, 0]);
     }
 

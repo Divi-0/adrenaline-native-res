@@ -144,6 +144,10 @@ pub enum Outcome {
     LeftOut,
 }
 
+/// Tiles of off-screen targets read as textures in one frame, at most
+/// (God of War in the game: 7).
+const TILE_VIEWS: usize = 16;
+
 /// The frame loop's state (display thread only).
 pub struct FrameLoop {
     /// Frames drawn (`draw_frame`); the texture cache, palette tables and
@@ -172,6 +176,9 @@ pub struct FrameLoop {
     palettes: [*const c_void; MAX_TEXTURES],
     waiting: [u8; MAX_TEXTURES],
     uv_scales: [[f32; 2]; MAX_TEXTURES],
+    /// Textures of tiles of off-screen targets this frame
+    /// (`use_targets_as_textures`).
+    tile_views: [TextureObject; TILE_VIEWS],
     /// How many rows from the top of each texture have only opaque texels
     /// (`texture::ALL_ROWS_OPAQUE`: every texel the GPU can sample): index
     /// textures by their colour table's entries (core `opaque_source`),
@@ -204,6 +211,7 @@ static FRAME_LOOP: SingleThreaded<FrameLoop> = SingleThreaded::new(FrameLoop {
     palettes: [null(); MAX_TEXTURES],
     waiting: [0; MAX_TEXTURES],
     uv_scales: [[1.0; 2]; MAX_TEXTURES],
+    tile_views: [const { TextureObject::view(gxm::Texture { control_words: [0; 4] }) }; TILE_VIEWS],
     opaque_rows: [0; MAX_TEXTURES],
     hidden: HiddenDraws::new(),
     hiding: false,
@@ -479,10 +487,9 @@ impl FrameLoop {
         }
         self.refresh_stale_targets(targets, frame, target);
 
-        let uses_offscreen = frame
-            .draws()
-            .iter()
-            .any(|draw| draw.framebuffer != frame.shown_framebuffer && targets.find_offscreen(draw.framebuffer).is_some());
+        let uses_offscreen = offscreen::runs(frame.draws()).any(|(framebuffer, _)| {
+            framebuffer != frame.shown_framebuffer && targets.find_offscreen(offscreen::placement(frame.textures(), framebuffer).0).is_some()
+        });
         let end_result = if uses_offscreen {
             self.draw_runs(targets, frame, target)
         } else {
@@ -575,12 +582,30 @@ impl FrameLoop {
     /// ms). Not the framebuffer this frame draws into: a target can't be read
     /// while drawn.
     fn use_targets_as_textures(&mut self, targets: &mut Targets, frame: &Frame, render_count: u32) {
+        let mut tile_views = 0;
         for (i, wanted) in frame.textures().iter().enumerate() {
             self.uv_scales[i] = [1.0, 1.0];
             if !self.textures[i].is_null() || wanted.format >= 4 || wanted.address == frame.shown_framebuffer {
                 continue;
             }
             let Some(target) = targets.sampled(wanted.address) else {
+                // A tile of a wider off-screen framebuffer (core
+                // `offscreen::placement`): its part of that one's target.
+                let (base, x) = offscreen::placement(frame.textures(), wanted.address);
+                let Some(index) = targets.find_offscreen(base).filter(|_| x > 0 && tile_views < TILE_VIEWS) else {
+                    continue;
+                };
+                let target = &targets.offscreen[index];
+                let opaque = !blend::samples_target_alpha(wanted.flags) || wanted.format == texture_format::BGR5650;
+                let Some(view) = target.tile_view(x, opaque) else {
+                    continue;
+                };
+                self.tile_views[tile_views] = TextureObject::view(view);
+                self.textures[i] = &self.tile_views[tile_views];
+                tile_views += 1;
+                let (psp_width, psp_height) = target.psp_size();
+                self.uv_scales[i] = [wanted.width as f32 / (psp_width - x) as f32, wanted.height as f32 / psp_height as f32];
+                stats().target_textures += 1;
                 continue;
             };
             // A 16-bit 565 framebuffer has no alpha: read opaque.
@@ -792,10 +817,13 @@ impl FrameLoop {
         for (address, target) in with_target.iter_mut().zip(targets.offscreen.iter()) {
             *address = if target.exists() { target.psp_address } else { 0 };
         }
-        let has_target = move |framebuffer: u32| framebuffer != 0 && framebuffer != shown && with_target.contains(&framebuffer);
+        // Tiles of a wider off-screen framebuffer go into its target.
+        let textures = frame.textures();
+        let base = |framebuffer: u32| offscreen::placement(textures, framebuffer).0;
+        let has_target = move |framebuffer: u32| framebuffer != 0 && framebuffer != shown && with_target.contains(&base(framebuffer));
         let draws = frame.draws();
         let mut end_result = 0;
-        if offscreen::offscreen_first(draws, frame.textures(), shown, has_target) {
+        if !offscreen::draws_tiles(draws, textures) && offscreen::offscreen_first(draws, textures, shown, has_target) {
             let offscreen_runs = || offscreen::runs(draws).filter(|(framebuffer, _)| has_target(*framebuffer));
             for (framebuffer, range) in offscreen_runs() {
                 end_result = self.draw_scene(targets, frame, target, framebuffer, range, false).min(end_result);
@@ -811,7 +839,7 @@ impl FrameLoop {
             framebuffers[0] = shown;
             framebuffers[1..].copy_from_slice(&with_target);
             let mut scenes = [0u32; targets::OFFSCREEN_COUNT + 1];
-            offscreen::runs_into(draws, &framebuffers, &mut scenes);
+            offscreen::runs_into(draws, &framebuffers, &mut scenes, base);
             targets.targets[target].ensure_scenes(scenes[0]);
             for ((offscreen_target, &address), &count) in targets.offscreen.iter_mut().zip(&with_target).zip(&scenes[1..]) {
                 if address != 0 {
@@ -833,9 +861,10 @@ impl FrameLoop {
     /// sceGxmEndScene's result.
     fn draw_scene(&mut self, targets: &mut Targets, frame: &Frame, target: usize, framebuffer: u32, range: Range<usize>, is_last: bool) -> i32 {
         let begin_start = now();
-        let offscreen_target = targets.find_offscreen(framebuffer).filter(|_| framebuffer != frame.shown_framebuffer);
+        let (base, origin_x) = offscreen::placement(frame.textures(), framebuffer);
+        let offscreen_target = targets.find_offscreen(base).filter(|_| framebuffer != frame.shown_framebuffer);
         match offscreen_target {
-            Some(k) => targets.begin_offscreen_scene(k, self.render_count),
+            Some(k) => targets.begin_offscreen_scene(k, self.render_count, origin_x),
             None => targets.begin_scene(target),
         }
         let loop_start = now();
@@ -846,7 +875,7 @@ impl FrameLoop {
         }
         if offscreen_target.is_some() {
             // Back to our targets' size for whatever draws next.
-            draw::set_target_size(TARGET_WIDTH, TARGET_HEIGHT, TARGET_WIDTH, TARGET_HEIGHT);
+            draw::set_target_size(TARGET_WIDTH, TARGET_HEIGHT, TARGET_WIDTH, TARGET_HEIGHT, 0);
         }
         let end_start = now();
         stats().loop_us += end_start - loop_start;

@@ -243,6 +243,23 @@ impl Target {
         (self.width / self.pixel_scale, self.height / self.pixel_scale)
     }
 
+    /// A texture of its part from PSP x `x` on (a tile of an off-screen
+    /// target, core `offscreen::placement`), alpha read or 1 (`opaque`);
+    /// None if it isn't made or `x` lies outside.
+    pub fn tile_view(&self, x: u32, opaque: bool) -> Option<gxm::Texture> {
+        let x = x * self.pixel_scale;
+        if self.pixels.is_null() || x >= self.width {
+            return None;
+        }
+        let format = if opaque { gxm::TEXTURE_FORMAT_X8U8U8U8_1BGR } else { gxm::TEXTURE_FORMAT_U8U8U8U8_ABGR };
+        let mut texture = NO_TEXTURE;
+        // Safe: inside its memory (rows of `width` texels, `x` < `width`).
+        let made = unsafe {
+            gxm::sceGxmTextureInitLinearStrided(&mut texture, self.pixels.add(x as usize) as *const _, format, self.width - x, self.height, self.width * 4)
+        };
+        (made >= 0).then_some(texture)
+    }
+
     /// Frees its render target and memory, to be made again at another size
     /// (the GPU is drained first: earlier scenes may still use them).
     fn destroy(&mut self) {
@@ -583,10 +600,11 @@ impl Targets {
     }
 
     /// Starts a scene drawing into off-screen target `index` (cleared
-    /// first if new), with the draws set up for its size
+    /// first if new), with the draws set up for its size and their x 0 at
+    /// `origin_x` (a tile, core `offscreen::placement`; else 0)
     /// (`draw::set_target_size`). Before its end the caller sets the size
     /// back to 960x544.
-    pub fn begin_offscreen_scene(&mut self, index: usize, render_count: u32) {
+    pub fn begin_offscreen_scene(&mut self, index: usize, render_count: u32, origin_x: u32) {
         let target = &mut self.offscreen[index];
         target.last_used = render_count;
         // Safe: the display thread's context; a target that exists has the
@@ -599,7 +617,7 @@ impl Targets {
             render_log::line(format_args!("sceGxmBeginScene (off-screen {:08x}) failed: {:08x}\n", target.psp_address, result));
         }
         draw::forget_gxm_state();
-        draw::set_target_size(OFFSCREEN_WIDTH, OFFSCREEN_HEIGHT, target.width, target.height);
+        draw::set_target_size(OFFSCREEN_WIDTH, OFFSCREEN_HEIGHT, target.width, target.height, origin_x);
         if target.needs_clear {
             // Safe: inside the scene.
             unsafe { basic_programs::clear_screen() };

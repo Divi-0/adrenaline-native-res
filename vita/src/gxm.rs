@@ -110,6 +110,15 @@ extern "C" {
         height: u32,
         mip_count: u32,
     ) -> i32;
+    /// A linear texture whose rows lie `byte_stride` bytes apart.
+    pub fn sceGxmTextureInitLinearStrided(
+        texture: *mut Texture,
+        data: *const c_void,
+        format: u32,
+        width: u32,
+        height: u32,
+        byte_stride: u32,
+    ) -> i32;
     pub fn sceGxmTextureSetPalette(texture: *mut Texture, palette: *const c_void) -> i32;
     pub fn sceGxmTextureGetPalette(texture: *const Texture) -> *mut c_void;
     pub fn sceGxmTextureGetData(texture: *const Texture) -> *mut c_void;
