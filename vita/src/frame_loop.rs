@@ -803,6 +803,19 @@ impl FrameLoop {
             // The shown framebuffer in several scenes: depths don't last
             // from one to the next, so nothing is left out.
             self.hiding = false;
+            // Targets drawn in several scenes: made for that many, else each
+            // scene past the first waits for the GPU (Target::ensure_scenes).
+            let mut framebuffers = [0u32; targets::OFFSCREEN_COUNT + 1];
+            framebuffers[0] = shown;
+            framebuffers[1..].copy_from_slice(&with_target);
+            let mut scenes = [0u32; targets::OFFSCREEN_COUNT + 1];
+            offscreen::runs_into(draws, &framebuffers, &mut scenes);
+            targets.targets[target].ensure_scenes(scenes[0]);
+            for ((offscreen_target, &address), &count) in targets.offscreen.iter_mut().zip(&with_target).zip(&scenes[1..]) {
+                if address != 0 {
+                    offscreen_target.ensure_scenes(count);
+                }
+            }
             let drawn = |framebuffer: u32| framebuffer == shown || has_target(framebuffer);
             let last = offscreen::runs(draws).filter(|(framebuffer, _)| drawn(*framebuffer)).count();
             for (number, (framebuffer, range)) in offscreen::runs(draws).filter(|(framebuffer, _)| drawn(*framebuffer)).enumerate() {
@@ -923,4 +936,4 @@ fn shows_cpu_written_picture(frame: &Frame, targets: &Targets) -> bool {
 }
 
 /// Every target can be a texture's (`FrameInfo::render_targets`).
-const _: () = assert!(TARGET_COUNT <= MAX_RENDER_TARGETS);
+const _: () = assert!(TARGET_COUNT + targets::OFFSCREEN_COUNT <= MAX_RENDER_TARGETS);

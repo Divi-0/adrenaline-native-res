@@ -211,8 +211,11 @@ pub enum Lookup {
     RenderTarget,
 }
 
-/// How many render targets `FrameStart::render_targets` can name.
-pub const MAX_RENDER_TARGETS: usize = 4;
+/// How many render targets `FrameStart::render_targets` can name: the
+/// display side's two screen targets and six off-screen ones (8 since
+/// 2026-11-22, was 4: God of War's title names six, and the two left out
+/// were decoded from VRAM every frame).
+pub const MAX_RENDER_TARGETS: usize = 8;
 
 /// True if `texture` is a framebuffer the display side draws itself.
 /// Index formats aren't: a framebuffer read as palette indices means

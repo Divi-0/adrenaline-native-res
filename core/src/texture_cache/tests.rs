@@ -927,7 +927,7 @@ fn a_framebuffer_we_draw_ourselves_comes_from_its_render_target() {
         frame_number: 1,
         render_count: 1,
         loop_start_us: test.host.now as u32,
-        render_targets: [VRAM_START + 0x8_8000, 0, 0, 0],
+        render_targets: [VRAM_START + 0x8_8000, 0, 0, 0, 0, 0, 0, 0],
         ..Default::default()
     };
     let mut out = [Lookup::Unavailable; MAX_TEXTURES];
@@ -941,6 +941,26 @@ fn a_framebuffer_we_draw_ourselves_comes_from_its_render_target() {
     frame.add_texture(texture(VRAM_START + 0x8_8000, 64, 64, format::CLUT8));
     test.cache.textures_for_frame(&mut test.host, &mut test.staging, &frame, start, &mut out);
     assert_ne!(out[0], Lookup::RenderTarget);
+}
+
+/// God of War's title (2026-11-22) samples the other screen and five
+/// off-screen framebuffers we draw ourselves: six render targets. With room
+/// for four names, the two smallest bloom levels (0x04162400, 0x04162600)
+/// were decoded from VRAM every frame (Sony's pixels, not ours).
+#[test]
+fn every_target_a_frame_names_comes_from_its_render_target() {
+    let mut test = Test::new();
+    let mut frame = crate::frame::new_boxed_frame();
+    let addresses = [0x0_0000, 0x16_1800, 0x18_1800, 0x16_2000, 0x16_2400, 0x16_2600].map(|offset| VRAM_START + offset);
+    let mut start = FrameStart { frame_number: 1, render_count: 1, loop_start_us: test.host.now as u32, ..Default::default() };
+    start.render_targets[..addresses.len()].copy_from_slice(&addresses);
+    for &address in &addresses {
+        frame.add_texture(texture(address, 128, 128, format::ABGR8888));
+    }
+    let mut out = [Lookup::Unavailable; MAX_TEXTURES];
+    test.cache.textures_for_frame(&mut test.host, &mut test.staging, &frame, start, &mut out);
+    assert_eq!(out[..addresses.len()], [Lookup::RenderTarget; 6]);
+    assert_eq!(test.host.decodes, 0, "no framebuffer is decoded");
 }
 
 /// Respawn stutter (2026-11-10): with ~3 MiB of main memory free in MTX's
