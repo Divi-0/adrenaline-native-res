@@ -265,6 +265,15 @@ impl FrameLoop {
         if options::renderer_enabled() == 0 {
             targets.forget();
             self.frame_pending = false;
+            // The frame recorded while the renderer was switched off (its
+            // last one, published after the switch) is taken now: else the
+            // first acquire after switching on hands it out as new, and with
+            // the game paused under Adrenaline's menu that old picture stayed
+            // until the menu closed (issue #1 follow-up, 2026-11-22). A game
+            // paused all along still gets its frame back (`newest` below).
+            let mut is_new = 0;
+            // Safe: display thread; a valid out pointer. The frame isn't used.
+            let _ = unsafe { acquire_frame(&mut is_new) };
             return false;
         }
         // Our programs before the first frame (see draw::make_programs),
