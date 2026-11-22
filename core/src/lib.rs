@@ -53,6 +53,7 @@ pub mod hidden_draws;
 pub mod lighting;
 pub mod log_ring;
 pub mod memory;
+pub mod menu_layout;
 pub mod offscreen;
 pub mod opaque_source;
 pub mod options;

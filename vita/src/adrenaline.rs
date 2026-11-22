@@ -138,10 +138,15 @@ extern "C" {
     fn sceCompatInterrupt(interrupt: i32) -> i32;
 }
 
-/// Where loaded module `name` (NUL-terminated) has segment `index` (0 =
-/// code, 1 = data): (Vita address, bytes).
-pub fn module_segment(name: &[u8], index: usize) -> Option<(usize, usize)> {
-    let mut tai = TaiModuleInfo {
+/// The module ID of loaded module `name` (NUL-terminated).
+pub fn module_id(name: &[u8]) -> Option<SceUID> {
+    let mut tai = tai_info();
+    // Safe: the struct has the size taiHEN expects, `name` is NUL-terminated.
+    (unsafe { taiGetModuleInfo(name.as_ptr(), &mut tai) } >= 0).then_some(tai.modid)
+}
+
+fn tai_info() -> TaiModuleInfo {
+    TaiModuleInfo {
         size: core::mem::size_of::<TaiModuleInfo>() as u32,
         modid: -1,
         module_nid: 0,
@@ -150,7 +155,13 @@ pub fn module_segment(name: &[u8], index: usize) -> Option<(usize, usize)> {
         exports_end: 0,
         imports_start: 0,
         imports_end: 0,
-    };
+    }
+}
+
+/// Where loaded module `name` (NUL-terminated) has segment `index` (0 =
+/// code, 1 = data): (Vita address, bytes).
+pub fn module_segment(name: &[u8], index: usize) -> Option<(usize, usize)> {
+    let mut tai = tai_info();
     let mut info = ModuleInfo([0; MODULE_INFO_BYTES]);
     info.0[..4].copy_from_slice(&(MODULE_INFO_BYTES as u32).to_le_bytes());
     // Safe: both structs have the sizes taiHEN and the kernel expect, `name`

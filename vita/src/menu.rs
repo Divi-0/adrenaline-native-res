@@ -3,12 +3,16 @@
 //! can: no C of ours in Adrenaline (user, 2026-11-14).
 //!
 //! - Adrenaline's Settings entries (menu.c `settings_entries`, in its
-//!   data) get our switch right below Graphics Filtering, in place: their
-//!   count is a constant (the tab table, `tab_entries`, ended up read-only
-//!   with the code), so the entries after it move one down and the blank
-//!   line before "Memory Stick Location" goes. Adrenaline's own code only
-//!   uses entries 0 and 2 (Graphics Filtering) by index, which stay. The
-//!   switch is a byte of Adrenaline's saved settings
+//!   data) get our switch right below Graphics Filtering
+//!   (nativeres_core::menu_layout). Their count is a constant of the tab
+//!   table (`tab_entries`, which ended up read-only with the code). With a
+//!   blank line below the filter (Adrenaline built from master) the switch
+//!   goes in place: the entries after it move one down and the blank line
+//!   before "Memory Stick Location" goes. Without one (the v8.0.2 release,
+//!   issue #1) the entries are copied into `GROWN`, one longer, and taiHEN
+//!   points the Settings tab there. Adrenaline's own code only uses entry 0
+//!   by index (and by name, so `sync` mirrors it into the copy), which
+//!   stays. The switch is a byte of Adrenaline's saved settings
 //!   (`nativeres_renderer_off`, padding; 0 = on), so Adrenaline saves it
 //!   with the rest.
 //! - Graphics Filtering stays the user's choice: its entry edits
@@ -20,8 +24,9 @@
 
 use core::ffi::c_void;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering::Relaxed};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering::Relaxed};
 
+use nativeres_core::menu_layout::{self, Layout, Line};
 use nativeres_core::span;
 
 use crate::adrenaline::{self, CONFIG_BYTES, FILTER_BILINEAR, GRAPHICS_FILTERING_OFFSET, NO_SMOOTH_GRAPHICS_OFFSET, RENDERER_OFF_OFFSET};
@@ -94,13 +99,23 @@ fn name_of(entry: *const MenuEntry) -> usize {
     unsafe { read_volatile(core::ptr::addr_of!((*entry).name)) as usize }
 }
 
-/// Adrenaline's Settings entries (in its data, writable) and how many: from
-/// the `TabEntry` named "Settings" right after "States", in either segment
-/// (the compiler put the tab table, never written, with the constants in
-/// the code segment). None unless they hold "Graphics Filtering".
-fn find_settings_entries(ranges: &[(usize, usize); 2]) -> Option<(*mut MenuEntry, usize)> {
+/// Adrenaline's Settings tab: its entries (in its data, writable), how many,
+/// and where the tab's `entries` word is (`n_entries` follows it): segment
+/// index and offset in it, for `taiInjectData`.
+struct SettingsTab {
+    entries: *mut MenuEntry,
+    count: usize,
+    segment: i32,
+    offset: u32,
+}
+
+/// Adrenaline's Settings tab: from the `TabEntry` named "Settings" right
+/// after "States", in either segment (the compiler put the tab table, never
+/// written, with the constants in the code segment). None unless its
+/// entries hold "Graphics Filtering".
+fn find_settings_entries(ranges: &[(usize, usize); 2]) -> Option<SettingsTab> {
     let (data, data_end) = ranges[1];
-    for &(start, end) in ranges {
+    for (segment, &(start, end)) in ranges.iter().enumerate() {
         let words = (end - start) / 4;
         // Safe: words inside the segment.
         let word = |index: usize| unsafe { read_volatile((start as *const u32).add(index)) } as usize;
@@ -118,61 +133,169 @@ fn find_settings_entries(ranges: &[(usize, usize); 2]) -> Option<(*mut MenuEntry
             let entries = entries as *mut MenuEntry;
             // Safe: inside the data segment (checked above).
             if (0..count).any(|entry| is_text(ranges, name_of(unsafe { entries.add(entry) }), b"Graphics Filtering\0")) {
-                return Some((entries, count));
+                return Some(SettingsTab { entries, count, segment: segment as i32, offset: ((index + 1) * 4) as u32 });
             }
         }
     }
     None
 }
 
-/// Puts our switch into Adrenaline's Settings entries, in place (the entry
-/// count is a constant): right below Graphics Filtering, the entries after
-/// it one down, the first blank line after it gone. False if they weren't
-/// found (tried again later); true also when they can't take it (logged).
-fn install() -> bool {
-    let (Some(ranges), Some(config)) = (module_ranges(), adrenaline::config_address()) else { return false };
-    let Some((entries, count)) = find_settings_entries(&ranges) else { return false };
+/// Our copy of the Settings entries, one longer, when Adrenaline's have no
+/// blank line to give up (`Layout::Grown`): the Settings tab points here.
+static mut GROWN: [MenuEntry; MAX_ENTRIES + 1] = [MenuEntry {
+    name: core::ptr::null(),
+    kind: MENU_ENTRY_TYPE_TEXT,
+    color: 0,
+    callback: 0,
+    value: core::ptr::null_mut(),
+    options: core::ptr::null(),
+    n_options: 0,
+}; MAX_ENTRIES + 1];
+/// Adrenaline's own Settings entries while the tab points at `GROWN` (0:
+/// in place), and how many: Adrenaline still writes them by name (the CFW
+/// entry's `n_options` at every menu open), `sync` mirrors that.
+static ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+static ORIGINAL_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Where the switch is in `GROWN` (entries after it are one down).
+static GROWN_SWITCH: AtomicUsize = AtomicUsize::new(0);
+
+/// tai_offset_args_t (taihen.h).
+#[repr(C)]
+struct TaiOffsetArgs {
+    size: u32,
+    modid: sys::SceUID,
+    segidx: i32,
+    offset: u32,
+    thumb: i32,
+    source: *const c_void,
+    source_size: u32,
+}
+
+extern "C" {
+    fn taiInjectDataForUser(args: *const TaiOffsetArgs) -> sys::SceUID;
+}
+
+/// taihen.h's `taiInjectData` (a header function over this export).
+unsafe fn tai_inject_data(modid: sys::SceUID, segment: i32, offset: u32, data: *const c_void, size: u32) -> sys::SceUID {
+    let args = TaiOffsetArgs {
+        size: core::mem::size_of::<TaiOffsetArgs>() as u32,
+        modid,
+        segidx: segment,
+        offset,
+        thumb: 0,
+        source: data,
+        source_size: size,
+    };
+    taiInjectDataForUser(&args)
+}
+
+/// Puts our switch into Adrenaline's Settings, right below Graphics
+/// Filtering (`menu_layout::plan`): in place over a blank line, or in
+/// `GROWN` with the Settings tab pointed there. None if the entries weren't
+/// found (tried again later); Some(false) if they can't take it (logged).
+fn install() -> Option<bool> {
+    let ranges = module_ranges()?;
+    let config = adrenaline::config_address()?;
+    let tab = find_settings_entries(&ranges)?;
+    let (entries, count) = (tab.entries, tab.count);
+    let mut lines = [Line::Other; MAX_ENTRIES];
     // Safe: Adrenaline's entries (found above), `count` long. The menu is
     // closed at Adrenaline's start, so nobody reads them meanwhile.
     unsafe {
-        let filter = (0..count).find(|&index| is_text(&ranges, name_of(entries.add(index)), b"Graphics Filtering\0"));
-        let blank = filter.and_then(|filter| {
-            (filter + 1..count).find(|&index| {
-                let entry = read_volatile(entries.add(index));
-                entry.kind == MENU_ENTRY_TYPE_TEXT && is_text(&ranges, entry.name as usize, b"\0")
-            })
-        });
-        let (Some(filter), Some(blank)) = (filter, blank) else {
-            render_log::line(format_args!("menu: no room for \"NativeRes Renderer\" ({} entries)\n", count));
-            return true;
-        };
-        for index in (filter + 1..blank).rev() {
-            write_volatile(entries.add(index + 1), read_volatile(entries.add(index)));
+        for (index, line) in lines[..count].iter_mut().enumerate() {
+            let entry = read_volatile(entries.add(index));
+            if is_text(&ranges, entry.name as usize, b"Graphics Filtering\0") {
+                *line = Line::Filter;
+            } else if entry.kind == MENU_ENTRY_TYPE_TEXT && is_text(&ranges, entry.name as usize, b"\0") {
+                *line = Line::Blank;
+            }
         }
+        let switch = MenuEntry {
+            name: RENDERER_NAME.0,
+            kind: MENU_ENTRY_TYPE_OPTION,
+            color: 0,
+            callback: 0,
+            value: config.add(RENDERER_OFF_OFFSET),
+            options: RENDERER_OPTIONS.as_ptr(),
+            n_options: RENDERER_OPTIONS.len() as i32,
+        };
         USER_FILTER.store(read_volatile(config.add(GRAPHICS_FILTERING_OFFSET)), Relaxed);
-        write_volatile(core::ptr::addr_of_mut!((*entries.add(filter)).value), USER_FILTER.as_ptr());
-        write_volatile(
-            entries.add(filter + 1),
-            MenuEntry {
-                name: RENDERER_NAME.0,
-                kind: MENU_ENTRY_TYPE_OPTION,
-                color: 0,
-                callback: 0,
-                value: config.add(RENDERER_OFF_OFFSET),
-                options: RENDERER_OPTIONS.as_ptr(),
-                n_options: RENDERER_OPTIONS.len() as i32,
-            },
-        );
-        render_log::line(format_args!(
-            "menu: \"NativeRes Renderer\" at entry {} of {} (entries {:08x}, blank line {} gone), filter {}\n",
-            filter + 1,
-            count,
-            entries as usize,
-            blank,
-            USER_FILTER.load(Relaxed)
-        ));
+        match menu_layout::plan(&lines[..count]) {
+            None => {
+                render_log::line(format_args!("menu: no Graphics Filtering for \"NativeRes Renderer\" ({} entries)\n", count));
+                return Some(false);
+            }
+            Some(Layout::InPlace { filter, blank }) => {
+                for index in (filter + 1..blank).rev() {
+                    write_volatile(entries.add(index + 1), read_volatile(entries.add(index)));
+                }
+                write_volatile(core::ptr::addr_of_mut!((*entries.add(filter)).value), USER_FILTER.as_ptr());
+                write_volatile(entries.add(filter + 1), switch);
+                render_log::line(format_args!(
+                    "menu: \"NativeRes Renderer\" at entry {} of {} (entries {:08x}, blank line {} gone), filter {}\n",
+                    filter + 1,
+                    count,
+                    entries as usize,
+                    blank,
+                    USER_FILTER.load(Relaxed)
+                ));
+            }
+            Some(Layout::Grown { filter }) => {
+                let grown = core::ptr::addr_of_mut!(GROWN) as *mut MenuEntry;
+                for index in 0..count {
+                    let to = if index > filter { index + 1 } else { index };
+                    write_volatile(grown.add(to), read_volatile(entries.add(index)));
+                }
+                write_volatile(core::ptr::addr_of_mut!((*grown.add(filter)).value), USER_FILTER.as_ptr());
+                write_volatile(grown.add(filter + 1), switch);
+                ORIGINAL.store(entries as usize, Relaxed);
+                ORIGINAL_COUNT.store(count, Relaxed);
+                GROWN_SWITCH.store(filter + 1, Relaxed);
+                // The tab table may be in the read-only code segment:
+                // taiHEN patches it (its `entries` and `n_entries` words).
+                let words = [grown as u32, (count + 1) as u32];
+                let injected = match adrenaline::module_id(b"AdrenalineUser\0") {
+                    Some(module) => tai_inject_data(module, tab.segment, tab.offset, words.as_ptr().cast(), 8),
+                    None => -1,
+                };
+                if injected < 0 {
+                    ORIGINAL.store(0, Relaxed);
+                    render_log::line(format_args!("menu: Settings tab not patched ({:08x})\n", injected));
+                    return Some(false);
+                }
+                render_log::line(format_args!(
+                    "menu: \"NativeRes Renderer\" at entry {} of {} (copy {:08x} of {:08x}, tab in segment {} +{:x}), filter {}\n",
+                    filter + 1,
+                    count + 1,
+                    grown as usize,
+                    entries as usize,
+                    tab.segment,
+                    tab.offset,
+                    USER_FILTER.load(Relaxed)
+                ));
+            }
+        }
     }
-    true
+    Some(true)
+}
+
+/// Adrenaline's writes to its own Settings entries (the CFW entry's
+/// `n_options`, at every menu open) carried into `GROWN`.
+fn mirror_original() {
+    let original = ORIGINAL.load(Relaxed) as *const MenuEntry;
+    if original.is_null() {
+        return;
+    }
+    let switch = GROWN_SWITCH.load(Relaxed);
+    let grown = core::ptr::addr_of_mut!(GROWN) as *mut MenuEntry;
+    for index in 0..ORIGINAL_COUNT.load(Relaxed) {
+        let to = if index >= switch { index + 1 } else { index };
+        // Safe: Adrenaline's entries and our copy, both in range (install).
+        unsafe {
+            let options = read_volatile(core::ptr::addr_of!((*original.add(index)).n_options));
+            write_volatile(core::ptr::addr_of_mut!((*grown.add(to)).n_options), options);
+        }
+    }
 }
 
 /// The filter Adrenaline's display loop should use for the user's
@@ -203,6 +326,12 @@ fn drawn_filter(config: *const u8, filter: u8) -> u8 {
 /// Brings Adrenaline's Graphics Filtering in line with the user's choice
 /// and our renderer (every 50 ms, and before Adrenaline saves).
 pub fn sync() {
+    // Without our entry the menu edits the filter Adrenaline draws with:
+    // leave it alone (issue #1: Original was turned into Bilinear at once).
+    if !INSTALLED.load(Relaxed) {
+        return;
+    }
+    mirror_original();
     let Some(config) = adrenaline::config_address() else { return };
     // Safe: Adrenaline's settings, bytes; races with the menu thread only
     // delay a change to the next sync.
@@ -261,10 +390,13 @@ pub fn config_write(data: *const c_void, size: u32) -> Option<[u8; CONFIG_BYTES]
 /// Our settings thread: adds the switch to the menu and keeps the filter
 /// in line (`sync`). Returns once the menu is ours.
 pub fn try_install() -> bool {
-    if !install() {
-        return false;
+    match install() {
+        None => false,
+        Some(false) => true,
+        Some(true) => {
+            INSTALLED.store(true, Relaxed);
+            sync();
+            true
+        }
     }
-    sync();
-    INSTALLED.store(true, Relaxed);
-    true
 }
