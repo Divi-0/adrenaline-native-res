@@ -217,11 +217,19 @@ pub enum Lookup {
 /// were decoded from VRAM every frame).
 pub const MAX_RENDER_TARGETS: usize = 8;
 
-/// True if `texture` is a framebuffer the display side draws itself.
-/// Index formats aren't: a framebuffer read as palette indices means
-/// something else than its colours.
-fn is_render_target(start: &FrameStart, texture: &TextureDescriptor) -> bool {
-    texture.address != 0 && !texture::is_palette_format(texture.format) && start.render_targets.contains(&texture.address)
+/// True if `texture` is a framebuffer the display side draws itself, or a
+/// tile inside one (`offscreen::placement`: the display reads its part of
+/// that target). Index formats aren't: a framebuffer read as palette
+/// indices means something else than its colours.
+fn is_render_target(start: &FrameStart, textures: &[TextureDescriptor], texture: &TextureDescriptor) -> bool {
+    if texture.address == 0 || texture::is_palette_format(texture.format) {
+        return false;
+    }
+    if start.render_targets.contains(&texture.address) {
+        return true;
+    }
+    let (base, x) = crate::offscreen::placement(textures, texture.address);
+    x > 0 && start.render_targets.contains(&base)
 }
 
 /// Set once per frame by the C side.
@@ -479,7 +487,7 @@ impl TextureCache {
             let index = (n + self.render_count as usize) % count;
             let texture = &textures[index];
             self.last_opaque_rows = 0;
-            out[index] = if is_render_target(&start, texture) {
+            out[index] = if is_render_target(&start, textures, texture) {
                 Lookup::RenderTarget
             } else {
                 // A texture with mip levels: their table for the lookup.

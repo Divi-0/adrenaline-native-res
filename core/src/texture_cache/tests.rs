@@ -963,6 +963,31 @@ fn every_target_a_frame_names_comes_from_its_render_target() {
     assert_eq!(test.host.decodes, 0, "no framebuffer is decoded");
 }
 
+/// God of War's game (2026-11-23): seven 64x64 shadow tiles drawn as
+/// framebuffers 0x04161880, 0x04161900, .. inside the 512x64 strip at
+/// 0x04161800 (a render target of ours, `offscreen::placement`), and read
+/// one by one by the shadows projected onto the ground. They were decoded
+/// from VRAM every frame, where the game's bloom chain (0x04162000, 8888)
+/// overwrites the strip at the frame's end: now and then a copy had the
+/// bloom's pixels and the ground showed them as a coloured grid.
+#[test]
+fn tiles_of_a_target_come_from_its_render_target() {
+    let mut test = Test::new();
+    let mut frame = crate::frame::new_boxed_frame();
+    let strip = VRAM_START + 0x16_1800;
+    let mut start = FrameStart { frame_number: 1, render_count: 1, loop_start_us: test.host.now as u32, ..Default::default() };
+    start.render_targets[0] = strip;
+    let wide = |address: u32, width: u16| TextureDescriptor { buffer_width: 1024, ..texture(address, width, 64, format::BGR5650) };
+    frame.add_texture(wide(strip, 512));
+    for x in 1..7u32 {
+        frame.add_texture(wide(strip + 2 * 64 * x, 64));
+    }
+    let mut out = [Lookup::Unavailable; MAX_TEXTURES];
+    test.cache.textures_for_frame(&mut test.host, &mut test.staging, &frame, start, &mut out);
+    assert_eq!(out[..7], [Lookup::RenderTarget; 7]);
+    assert_eq!(test.host.decodes, 0, "no tile is decoded from VRAM");
+}
+
 /// Respawn stutter (2026-11-10): with ~3 MiB of main memory free in MTX's
 /// race, below MEMORY_RESERVE, the cache dropped every texture the last
 /// frame didn't use, and each camera cut decoded dozens again (1,696
