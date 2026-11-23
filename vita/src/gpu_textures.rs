@@ -80,10 +80,11 @@ pub fn gxm_format(format: GpuFormat) -> u32 {
     }
 }
 
-/// The colour format a render-target texture is drawn in (only the 16-bit
-/// formats are unswizzled on the GPU).
+/// The colour format a render-target texture is drawn in (the GPU unswizzle:
+/// 4444 as it is, 5650 / 5551 widened into 8888, their raw data 16-bit).
 fn color_format(format: GpuFormat) -> Option<u32> {
     match format {
+        GpuFormat::Rgba8888 => Some(gxm::COLOR_FORMAT_A8B8G8R8),
         GpuFormat::Bgr565 => Some(gxm::COLOR_FORMAT_U5U6U5_BGR),
         GpuFormat::Abgr1555 => Some(gxm::COLOR_FORMAT_U1U5U5U5_ABGR),
         GpuFormat::Abgr4444 => Some(gxm::COLOR_FORMAT_U4U4U4U4_ABGR),
@@ -218,12 +219,28 @@ pub fn create(shape: &TextureShape, arena_offset: Option<u32>) -> *mut TextureOb
                 (state.arena.add(offset as usize) as *mut c_void, -1)
             }
             None => {
-                let block = sys::alloc_block(
-                    b"NativeResTexture\0".as_ptr(),
-                    sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_RW,
-                    bytes,
-                    core::ptr::null_mut(),
-                );
+                // Render targets of whole MiB (512x512 8888: the GPU
+                // unswizzle of FF1's frame copies) in phycont memory, which
+                // hands out whole MiB and has more room than main memory
+                // (~3 MiB left in MTX's race); the rest, and phycont
+                // failures, in main memory.
+                let mut block = -1;
+                if render_target && bytes % (1024 * 1024) == 0 {
+                    block = sys::alloc_block(
+                        b"NativeResTexture\0".as_ptr(),
+                        sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW,
+                        bytes,
+                        core::ptr::null_mut(),
+                    );
+                }
+                if block < 0 {
+                    block = sys::alloc_block(
+                        b"NativeResTexture\0".as_ptr(),
+                        sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_RW,
+                        bytes,
+                        core::ptr::null_mut(),
+                    );
+                }
                 if block < 0 {
                     return core::ptr::null_mut();
                 }

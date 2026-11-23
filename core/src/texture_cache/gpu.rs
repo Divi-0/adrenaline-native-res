@@ -23,8 +23,14 @@ pub struct GpuTexture {
 /// - 4- and 8-bit palette formats: an 8-bit palette texture plus a
 ///   256-colour table, a quarter of the memory, decoding only copies
 ///   indices (the table is chosen per draw, see the palette tables);
-/// - 16-bit formats: the Vita has the same bit layouts, half the memory,
-///   decoding only unswizzles.
+/// - 4444: the Vita has the same bit layout, half the memory, decoding
+///   only unswizzles.
+///
+/// 5650 and 5551 go to the GPU as 8888, expanded as the GE does (k << 3 |
+/// k >> 2 for 5 bits, k << 2 | k >> 4 for 6): the Vita's U5U6U5 / U1U5U5U5
+/// textures sample k / 31 (k / 63), which rounds to the GE's value for only
+/// 28 of 32 (48 of 64), and with the linear filter no program can undo it
+/// (2026-11-23). 4444's k / 15 rounds back to k x 17 exactly.
 ///
 /// The smooth filter needs RGBA: it changes individual texels (see
 /// `texture::bleed_transparent_texels`).
@@ -54,10 +60,20 @@ impl GpuFormat {
         }
         match texture.format {
             format::CLUT4 | format::CLUT8 => GpuFormat::Palette8,
-            format::BGR5650 => GpuFormat::Bgr565,
-            format::ABGR5551 => GpuFormat::Abgr1555,
             format::ABGR4444 => GpuFormat::Abgr4444,
             _ => GpuFormat::Rgba8888,
+        }
+    }
+
+    /// The Vita format with the same bit layout as a PSP 16-bit texture
+    /// (its data as it is: what the GPU unswizzle reads); None for the
+    /// other formats.
+    pub fn raw_16_bit(texture: &TextureDescriptor) -> Option<GpuFormat> {
+        match texture.format {
+            format::BGR5650 => Some(GpuFormat::Bgr565),
+            format::ABGR5551 => Some(GpuFormat::Abgr1555),
+            format::ABGR4444 => Some(GpuFormat::Abgr4444),
+            _ => None,
         }
     }
 
@@ -117,16 +133,18 @@ pub const TARGET_HEIGHT: u32 = 544;
 /// (SLICE_BYTES in nativeres_render.c, which must match).
 pub const GPU_UNSWIZZLE_SLICE_BYTES: u32 = 8 * 4096 * 2;
 
-/// True if the GPU can unswizzle this texture into a texture of `format`
-/// (instead of the CPU, ~6 ms for 512 KiB): swizzled 16-bit textures of at
-/// least `BACKGROUND_MIN_BYTES` whose data is whole slices, with rows as
-/// wide as the texture (no spare buffer width), that fit the shared depth
-/// surface. Texels made opaque on decoding (`IGNORE_ALPHA`) stay with the
-/// CPU.
-pub fn can_unswizzle_on_gpu(texture: &TextureDescriptor, format: GpuFormat) -> bool {
+/// True if the GPU can unswizzle this texture into its texture (instead of
+/// the CPU, ~6 ms for 512 KiB): swizzled 16-bit textures of at least
+/// `BACKGROUND_MIN_BYTES` whose data is whole slices, with rows as wide as
+/// the texture (no spare buffer width), that fit the shared depth surface.
+/// 5650 / 5551 are expanded to 8888 on the way (`GpuFormat::for_texture`).
+/// Texels made opaque on decoding (`IGNORE_ALPHA`) and the smooth filter
+/// (it changes texels) stay with the CPU.
+pub fn can_unswizzle_on_gpu(texture: &TextureDescriptor, smooth: bool) -> bool {
     let (width, height) = (texture.width as u32, texture.height as u32);
     let bytes = width * height * 2;
-    format.is_16_bit()
+    !smooth
+        && GpuFormat::raw_16_bit(texture).is_some()
         && texture.swizzled != 0
         && texture.buffer_width == width
         && texture.flags & texture_flags::IGNORE_ALPHA == 0

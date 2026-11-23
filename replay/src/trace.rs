@@ -224,9 +224,14 @@ impl CommandVisitor for DrawTracer {
         if ge.is_texture_enabled() {
             let function = register(op::TEXTURE_FUNCTION);
             line += &format!(
-                " | tex {:08x} fmt {} func {}{}{}",
+                " | tex {:08x} {}x{} fmt {} filter {}/{} func {}{}{}",
                 ge.texture_address(),
+                1u32 << (register(op::TEXTURE_SIZE_0) & 0xF),
+                1u32 << ((register(op::TEXTURE_SIZE_0) >> 8) & 0xF),
                 ge.texture_format(),
+                // TEXFILTER (0xC6): min bits 0..2 (4..7 with mip levels), mag bit 8.
+                register(0xC6) & 7,
+                (register(0xC6) >> 8) & 1,
                 TEXTURE_FUNCTIONS[(function & 7) as usize],
                 if function & 0x100 != 0 { " rgba" } else { " rgb" },
                 if function & 0x10000 != 0 { " x2" } else { "" },

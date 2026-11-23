@@ -183,3 +183,6 @@ embed_gxp!(nativeres_color_v);
 embed_gxp!(nativeres_color_f);
 embed_gxp!(nativeres_texture_v);
 embed_gxp!(nativeres_texture_tint_f);
+// The GPU unswizzle of 5650 / 5551 textures into 8888, widened as the GE does.
+embed_gxp!(nativeres_expand16_f);
+embed_gxp!(nativeres_expand5551_f);

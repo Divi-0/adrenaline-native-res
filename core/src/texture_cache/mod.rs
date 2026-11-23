@@ -974,7 +974,7 @@ impl TextureCache {
             self.remember_failure(host, wanted, data_hash, "texture cache full", -1, true);
             return Lookup::Unavailable;
         };
-        let mut on_gpu = can_unswizzle_on_gpu(wanted, format);
+        let mut on_gpu = can_unswizzle_on_gpu(wanted, self.smooth);
         let mut texture = self.acquire(host, TextureShape::new(wanted, format, on_gpu));
         if texture.is_none() && on_gpu {
             on_gpu = false; // no render target: the CPU unswizzles
@@ -1088,9 +1088,10 @@ impl TextureCache {
 
     /// Has the GPU unswizzle `wanted` into `target` (see
     /// `gpu::can_unswizzle_on_gpu`). The swizzled data goes into a texture
-    /// of its own for the GPU to read, a render target too (GPU-mapped),
-    /// retired afterwards like any replaced texture. False, having
-    /// submitted nothing, if it can't.
+    /// of its own for the GPU to read, in its 16-bit layout
+    /// (`GpuFormat::raw_16_bit`; `target` may be 8888), a render target too
+    /// (GPU-mapped), retired afterwards like any replaced texture. False,
+    /// having submitted nothing, if it can't.
     fn unswizzle_on_gpu<H: Host>(
         &mut self,
         host: &mut H,
@@ -1104,13 +1105,17 @@ impl TextureCache {
         {
             return false;
         }
-        let Some(raw) = self.acquire(host, shape) else {
+        let Some(raw_format) = GpuFormat::raw_16_bit(wanted) else {
+            return false;
+        };
+        let raw_shape = TextureShape { format: raw_format, ..shape };
+        let Some(raw) = self.acquire(host, raw_shape) else {
             return false;
         };
         let submitted = host.unswizzle_on_gpu(wanted, target, raw);
-        if !self.retire(raw, shape) {
+        if !self.retire(raw, raw_shape) {
             host.wait_for_gpu(); // retired list full: free it once the GPU is done
-            self.free_now(host, raw, shape);
+            self.free_now(host, raw, raw_shape);
         }
         submitted
     }
