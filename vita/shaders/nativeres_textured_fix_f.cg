@@ -17,6 +17,17 @@
 // source ONE, destination SOURCE ALPHA: src * factor + dst * FIX B, exact.
 // uBlendFix: x = FIX B (0..1), y = the source factor applied here: 0 none
 // (FIX A is already in the colour), 1 source alpha, 2 one minus source alpha.
+//
+// GE_FILTER (nativeres_textured_ge_f.cg, nativeres_textured_fix_ge_f.cg):
+// the GE's bilinear filter for draws that read one of our targets (core
+// frame.rs `ge_filter_read`; God of War's bloom chain): the Vita's texture
+// unit returns the filtered value of an 8-bit texture rounded to 8 bits,
+// the GE truncates (~0.5 levels per pass, ~1.6 over GoW's bloom). The
+// texture comes point-filtered (draw.rs); `GeTexel` samples the four
+// texels and filters as ppsspp-ref GPU/Software/Sampler.cpp
+// SampleLinearLevelT: the position in 1/16 texels, half a texel back,
+// each lerp ((a (16 - f) + b f) >> 4) truncated, the horizontal ones
+// first. uTexSize: xy = the texture's size in texels, zw = 1 / that.
 
 // The GE's texture function (modulate) and fog in its integer arithmetic
 // (ppsspp-ref GPU/Software/Sampler.cpp GetTextureFunctionOutput and
@@ -61,6 +72,30 @@ float4 GeShade(float4 texel, float4 vertexColor, float3 specular, float fog, flo
 	return c;
 }
 
+#ifdef GE_FILTER
+// The GE's bilinear filter of a point-filtered texture: the texel as k / 255
+// (GeShade takes it as it is). Point samples of 8-bit texels are exact
+// k / 255; all sums stay below 2^13: exact in fp32.
+float4 GeTexel(sampler2D tex, float2 uv, float4 size)
+{
+	float2 p = FLOOR(uv * size.xy * 16.0f) - 8.0f;
+	float2 cell = FLOOR(p * (1.0f / 16.0f));
+	float2 f = p - cell * 16.0f;
+	float2 at = (cell + 0.5f) * size.zw;
+	float2 next = at + size.zw;
+	float4 a = FLOOR(tex2D(tex, at) * 255.0f + 0.5f);
+	float4 b = FLOOR(tex2D(tex, float2(next.x, at.y)) * 255.0f + 0.5f);
+	float4 c = FLOOR(tex2D(tex, float2(at.x, next.y)) * 255.0f + 0.5f);
+	float4 d = FLOOR(tex2D(tex, next) * 255.0f + 0.5f);
+	float4 top = FLOOR((a * (16.0f - f.x) + b * f.x) * (1.0f / 16.0f));
+	float4 bottom = FLOOR((c * (16.0f - f.x) + d * f.x) * (1.0f / 16.0f));
+	return FLOOR((top * (16.0f - f.y) + bottom * f.y) * (1.0f / 16.0f)) * (1.0f / 255.0f);
+}
+#define SAMPLE(tex, uv) GeTexel(tex, uv, uTexSize)
+#else
+#define SAMPLE(tex, uv) tex2D(tex, uv)
+#endif
+
 float4 main(
 	float2 vTexcoord : TEXCOORD0,
 	float4 vColor : TEXCOORD1,
@@ -70,13 +105,16 @@ float4 main(
 #ifdef BLEND_FIX
 	uniform float4 uBlendFix,
 #endif
+#ifdef GE_FILTER
+	uniform float4 uTexSize,
+#endif
 	uniform float4 uFogAndScale) : COLOR
 {
 	// Colour, specular and fog came times w (screen-linear, nativeres_3d_v.cg).
 	float overW = 1.0f / vFog.y;
 	// The separate specular colour after texturing, then the doubling (PPSSPP:
 	// v = p * t + s, then the colour doubling, clamped), then fog.
-	float4 color = GeShade(tex2D(tex, vTexcoord), vColor * overW, vSpecular * overW, vFog.x * overW, uFogAndScale) * (1.0f / 255.0f);
+	float4 color = GeShade(SAMPLE(tex, vTexcoord), vColor * overW, vSpecular * overW, vFog.x * overW, uFogAndScale) * (1.0f / 255.0f);
 #ifdef BLEND_FIX
 	float sourceAlpha = saturate(color.a);
 	color.rgb *= uBlendFix.y > 1.5f ? 1.0f - sourceAlpha : (uBlendFix.y > 0.5f ? sourceAlpha : 1.0f);

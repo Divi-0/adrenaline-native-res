@@ -242,6 +242,39 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
         // of them that read a target (God of War's bloom chain). Against
         // the game's picture this separates resolution from arithmetic
         // (2026-11-23: GoW's bloom at 2x blurred too little).
+        // Draws reading our targets filter as the GE does (the Vita's
+        // GE_FILTER programs, core `ge_filter_read`); the rest as the Vita's
+        // texture unit. Measuring: REPLAY_PSP_FILTER=1 the GE's filter for
+        // every draw (2026-11-23: other games' pictures moved further from
+        // the PSP's), 0 the GPU's for every draw (before 2026-11-23).
+        let stencil = if reads_target_alpha {
+            nativeres_core::blend::stencil_way(frame.stencil_state_of(draw), draw.blend, draw.flags & draw_flags::TEXTURED != 0)
+        } else {
+            nativeres_core::blend::StencilWay::None
+        };
+        let ge_filter = match psp_filter_mode() {
+            Some(all) => all,
+            None => nativeres_core::frame::ge_filter_read(
+                draw.flags,
+                draw.tests,
+                draw.blend,
+                stencil,
+                reads_target_alpha,
+                from_target.is_some(),
+                draw.framebuffer != frame.shown_framebuffer,
+            ),
+        };
+        GE_FILTER_DRAW.store(ge_filter, std::sync::atomic::Ordering::Relaxed);
+        // Debugging: REPLAY_LIST_TARGET_READS=1 lists the draws sampling one
+        // of our targets (the GE-filtered ones).
+        if from_target.is_some() && std::env::var_os("REPLAY_LIST_TARGET_READS").is_some() {
+            let texture = &frame.textures()[draw.texture as usize];
+            println!(
+                "target read {index}: fb {:08x} tex {:08x} {}x{} fmt {} texflags {:08x} flags {:08x} blend {:08x} tests {:08x} verts {} linear {}",
+                draw.framebuffer, texture.address, texture.width, texture.height, texture.format, texture.flags,
+                draw.flags, draw.blend, draw.tests, draw.vertex_count, draw.flags & draw_flags::LINEAR_FILTER != 0
+            );
+        }
         NATIVE_DRAW.store(
             match native_mode() {
                 1 => true,
@@ -515,7 +548,7 @@ fn draw_triangle(
                     let u = b[0] * corners[0].u + b[1] * corners[1].u + b[2] * corners[2].u;
                     let v = b[0] * corners[0].v + b[1] * corners[1].v + b[2] * corners[2].v;
                     // Colour and fog: linear on the screen, as the PSP shades.
-                    ge_shade(sample(texture, draw, u, v), Color::weighted(colors, linear), fog_at(linear, &corners), draw, color_scale)
+                    ge_shade(sample(texture, draw, u, v, draw_filter()), Color::weighted(colors, linear), fog_at(linear, &corners), draw, color_scale)
                 }
                 None => Color::weighted(colors, linear),
             };
@@ -647,6 +680,21 @@ fn native_mode() -> u8 {
     *MODE.get_or_init(|| std::env::var("REPLAY_NATIVE").ok().and_then(|value| value.parse().ok()).unwrap_or(0))
 }
 
+/// Whether the draw being drawn filters as the GE does (`Filter::Ge`).
+static GE_FILTER_DRAW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The filter of the draw being drawn (`GE_FILTER_DRAW`).
+fn draw_filter() -> Filter {
+    if GE_FILTER_DRAW.load(std::sync::atomic::Ordering::Relaxed) { Filter::Ge } else { Filter::Gpu }
+}
+
+/// `REPLAY_PSP_FILTER`, read once: Some(true) the GE's filter for every
+/// draw, Some(false) the GPU's for every draw, None as the Vita.
+fn psp_filter_mode() -> Option<bool> {
+    static MODE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| std::env::var("REPLAY_PSP_FILTER").ok().map(|value| value != "0"))
+}
+
 /// Whether the draw being drawn is shaded at 1x (`native_mode`).
 static NATIVE_DRAW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -704,7 +752,19 @@ fn factor(code: u32, source: Color, destination: Color) -> Color {
     }
 }
 
-fn sample(texture: &Texture, draw: &Draw, u: f32, v: f32) -> Color {
+/// How a draw's bilinear filter works (`sample`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Filter {
+    /// The Vita's texture unit: the mix of the four texels, rounded to 8 bits.
+    Gpu,
+    /// The GE's (the Vita's GE_FILTER programs, core `ge_filter_read`):
+    /// positions in 1/16 texels, each lerp truncated to 8 bits, the
+    /// horizontal ones first (ppsspp-ref GPU/Software/Sampler.cpp
+    /// SampleLinearLevelT).
+    Ge,
+}
+
+fn sample(texture: &Texture, draw: &Draw, u: f32, v: f32, filter: Filter) -> Color {
     let clamp_u = draw.flags & draw_flags::CLAMP_U != 0;
     let clamp_v = draw.flags & draw_flags::CLAMP_V != 0;
     let texel = |x: i64, y: i64| -> Color {
@@ -718,14 +778,7 @@ fn sample(texture: &Texture, draw: &Draw, u: f32, v: f32) -> Color {
     if draw.flags & draw_flags::LINEAR_FILTER == 0 {
         return texel(x.floor() as i64, y.floor() as i64);
     }
-    // Measuring: REPLAY_PSP_FILTER=1 filters as the GE does: 1/16-texel
-    // fractions truncated toward zero, each lerp truncated to 8 bits, the
-    // horizontal ones first (ppsspp-ref GPU/Software/Sampler.cpp
-    // SampleLinearLevelT). The GPU's filter rounds; God of War's picture
-    // came ~0.5 levels closer to Sony's with it (2026-11-23), not done on
-    // the Vita (four samples a pixel).
-    static PSP_FILTER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *PSP_FILTER.get_or_init(|| std::env::var_os("REPLAY_PSP_FILTER").is_some()) {
+    if filter == Filter::Ge {
         let fixed = |value: f32| (value * 16.0) as i64 - 8;
         let (bx, by) = (fixed(x), fixed(y));
         let (fx, fy) = ((bx & 15) as u32, (by & 15) as u32);
@@ -745,7 +798,11 @@ fn sample(texture: &Texture, draw: &Draw, u: f32, v: f32) -> Color {
     let (x0, y0) = (x0 as i64, y0 as i64);
     let top = Color::mix(texel(x0, y0), texel(x0 + 1, y0), fx);
     let bottom = Color::mix(texel(x0, y0 + 1), texel(x0 + 1, y0 + 1), fx);
-    Color::mix(top, bottom, fy)
+    // The Vita's texture unit returns an 8-bit texture's filtered value
+    // rounded to 8 bits (2026-11-23: God of War's bloom on the Vita = this
+    // model within 0.4 levels; the plain mix, which the programs truncate,
+    // was ~1.6 darker).
+    Color::from_rgba(Color::mix(top, bottom, fy).to_rgba())
 }
 
 fn wrap(coordinate: i64, size: usize, clamp: bool) -> usize {
@@ -763,6 +820,46 @@ mod tests {
     use nativeres_core::blend::{Blend, BLEND_ALPHA_ONLY, BLEND_WRITES_ALPHA};
 
     const SOURCE: Color = Color { r: 1.0, g: 0.0, b: 0.0, a: 0.5 };
+
+    /// A 2x1 texture, black then white, bilinear, clamped: half way
+    /// between the texel centres the exact mix is 127.5.
+    fn black_white() -> (Texture, Draw) {
+        let texture = Texture { width: 2, height: 1, pixels: vec![0xFF00_0000, 0xFFFF_FFFF] };
+        let flags = draw_flags::TEXTURED | draw_flags::LINEAR_FILTER | draw_flags::CLAMP_U | draw_flags::CLAMP_V;
+        (texture, Draw { flags, ..Draw::default() })
+    }
+
+    /// God of War's bloom (2026-11-23): the Vita's texture unit returns the
+    /// bilinear result of an 8-bit texture rounded to 8 bits (the programs
+    /// then take it as it is); modelled as the float mix truncated, the
+    /// replay's bloom was ~1.6 levels darker than the Vita's. 127.5 -> 128,
+    /// which the program's texture function (white vertices) keeps.
+    #[test]
+    fn the_vitas_bilinear_filter_rounds_to_8_bits() {
+        let (texture, draw) = black_white();
+        let white = Color::from_rgba(0xFFFF_FFFF);
+        let shade = |filter| ge_shade(sample(&texture, &draw, 0.5, 0.5, filter), white, 1.0, &draw, 1.0).to_rgba() & 0xFF;
+        assert_eq!(shade(Filter::Gpu), 128);
+        assert_eq!(shade(Filter::Ge), 127);
+    }
+
+    /// Draws that read one of our targets filter as the GE does
+    /// (`Filter::Ge`, the Vita's GE_FILTER programs; ppsspp-ref
+    /// Sampler.cpp SampleLinearLevelT): positions in 1/16 texels, half a
+    /// texel back, each lerp truncated. u 0.5 of 2 texels: 16 - 8 = 8 ->
+    /// texel 0, fraction 8/16 -> (255 x 8) >> 4 = 127. u 0.65625: 21 - 8 =
+    /// 13 -> (255 x 13) >> 4 = 207 (207.2; the GPU: 0.8125 x 255 = 207.2,
+    /// 207). u 0.53125: 17 - 8 = 9 -> 143 (143.4).
+    #[test]
+    fn draws_reading_our_targets_filter_as_the_ge() {
+        let (texture, draw) = black_white();
+        let red = |u: f32| sample(&texture, &draw, u, 0.5, Filter::Ge).to_rgba() & 0xFF;
+        assert_eq!(red(0.5), 127);
+        assert_eq!(red(0.65625), 207);
+        assert_eq!(red(0.53125), 143);
+        // 16.96 truncated to 16: fraction 8, where the exact mix is 142.8.
+        assert_eq!(red(0.53), 127);
+    }
 
     /// MHF (2026-11-18): rounding the texture function and fog in float left
     /// the pictures about one level brighter than the PSP's. The GE

@@ -31,6 +31,9 @@ embed_gxp!(nativeres_textured_test_f);
 // Grey FIX B blending through the alpha, without and with the alpha test.
 embed_gxp!(nativeres_textured_fix_f);
 embed_gxp!(nativeres_textured_test_fix_f);
+// Both with the GE's bilinear filter, for draws reading our targets.
+embed_gxp!(nativeres_textured_ge_f);
+embed_gxp!(nativeres_textured_fix_ge_f);
 // Draws into the PSP's 16-bit framebuffers: frame-read programs that blend
 // themselves and cut the colour as the GE does (textured and untextured).
 embed_gxp!(nativeres_textured_read_f);

@@ -390,6 +390,46 @@ pub fn wide_variant(flags: u32, blend: u32, keep_target_alpha: bool) -> Option<R
     Some(ReadVariant::Fast { way, keep_alpha: true, dither: false, green6: false, fogless, wide: true })
 }
 
+/// Whether a draw filters its texture as the GE does (the GE_FILTER
+/// programs: four point samples, positions in 1/16 texels, each lerp
+/// truncated), not with the Vita's texture unit, which returns the
+/// bilinear result rounded to 8 bits: a draw that samples one of our own
+/// targets (`from_target`, a picture drawn this frame) with the linear
+/// filter into an off-screen target (`into_offscreen`), drawn by our
+/// textured or BLEND_FIX program. Not: 16-bit targets, alpha-tested draws,
+/// the 8-bit normal / additive blends of `wide_variant` and stencil states
+/// done by the generic program (`StencilWay::FrameRead`): frame-read
+/// programs, which have no such variant.
+///
+/// God of War's bloom chain (2026-11-23): each pass sampling a target came
+/// out ~0.5 levels brighter than the GE's truncating filter, the bloom
+/// ~1.6 levels over the whole picture (DESIGN, fifty-fourth session).
+/// Off-screen draws only: the program costs ~27 ns a pixel (four dependent
+/// texture reads); the off-screen ones are 1x and small (GoW +5..7 ms GPU,
+/// ~80 % of the gain), draws onto the 2x screen cost +18 ms (title, its
+/// bloom added) to +71 ms (gameplay, shadow textures). Textures from VRAM
+/// or RAM keep the GPU's filter: the GE filter on them moved other games'
+/// pictures further from the PSP's (at 2x the sample points are not the
+/// PSP's anyway).
+pub fn ge_filter_read(
+    flags: u32,
+    tests: u32,
+    blend: u32,
+    stencil: crate::blend::StencilWay,
+    keep_target_alpha: bool,
+    from_target: bool,
+    into_offscreen: bool,
+) -> bool {
+    from_target
+        && into_offscreen
+        && flags & draw_flags::TEXTURED != 0
+        && flags & draw_flags::LINEAR_FILTER != 0
+        && target_channel_bits(flags).is_none()
+        && tests & test_flags::ALPHA_TEST == 0
+        && wide_variant(flags, blend, keep_target_alpha).is_none()
+        && !matches!(stencil, crate::blend::StencilWay::FrameRead(_))
+}
+
 /// The corners of triangle `t` of a strip, counted from its first vertex:
 /// t, t + 1, t + 2, with the first two swapped for odd t, so every triangle
 /// of the strip turns the same way on the screen (the GE alternates the
@@ -2667,6 +2707,35 @@ pub fn new_boxed_frame() -> Box<Frame> {
 
 #[cfg(test)]
 mod tests {
+    /// God of War's title bloom chain (dump tests/dumps/gow/title.bin,
+    /// replay REPLAY_LIST_TARGET_READS): its target reads into off-screen
+    /// targets filter as the GE does; the add onto the screen, point-sampled
+    /// ones, those into 16-bit targets, frame-read stencil states and
+    /// textures that aren't our targets don't.
+    #[test]
+    fn target_reads_filter_as_the_ge_in_god_of_wars_bloom() {
+        use super::ge_filter_read;
+        use crate::blend::{StencilState, StencilWay};
+        let none = StencilWay::None;
+        // 85: the screen into bloom target A, ONE ZERO; 87: A into B, blending off;
+        // 89: FIX B through the alpha; 90: C added into B, ONE ONE.
+        for (flags, blend) in [(0x43f, 0x8000_0001), (0x41d, 0), (0x41f, 0xc005_5041), (0x41f, 0x8000_0011)] {
+            assert!(ge_filter_read(flags, 0x20, blend, none, true, true, true), "{flags:x} {blend:x}");
+            assert!(!ge_filter_read(flags, 0x20, blend, none, true, false, true), "not our target: {flags:x}");
+        }
+        // 93: B added onto the screen: the GPU's filter (cost).
+        assert!(!ge_filter_read(0x41f, 0x20, 0x8000_0011, none, true, true, false));
+        // 86: the bright pass, point-sampled, masked alpha test.
+        assert!(!ge_filter_read(0x43b, 0x2020_2021, 0x8000_0011, none, true, true, true));
+        // 7: into a 16-bit shadow target.
+        assert!(!ge_filter_read(0x0200_005d, 0x20, 0x2000_0000, none, true, true, true));
+        // A stencil test done by the generic frame-read program.
+        let read = StencilWay::FrameRead(StencilState::new(Some((2, 0x10, 0x10)), None));
+        assert!(!ge_filter_read(0x41f, 0x24, 0x8000_0011, read, true, true, true));
+        // A normal alpha blend into an 8-bit target the game reads: the wide program.
+        assert!(!ge_filter_read(0x41f, 0x20, 0x8000_0054, none, true, true, true));
+    }
+
     #[test]
     fn strip_triangles_keep_one_winding() {
         use super::{run_indices, strip_triangle};

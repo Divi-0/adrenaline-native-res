@@ -187,6 +187,9 @@ pub struct FrameLoop {
     palettes: [*const c_void; MAX_TEXTURES],
     waiting: [u8; MAX_TEXTURES],
     uv_scales: [[f32; 2]; MAX_TEXTURES],
+    /// The frame's textures that are one of our targets (a picture drawn
+    /// this frame: draw.rs `GE_FILTER`).
+    from_targets: [bool; MAX_TEXTURES],
     /// Textures of tiles of off-screen targets this frame
     /// (`use_targets_as_textures`).
     tile_views: [TextureObject; TILE_VIEWS],
@@ -226,6 +229,7 @@ static FRAME_LOOP: SingleThreaded<FrameLoop> = SingleThreaded::new(FrameLoop {
     palettes: [null(); MAX_TEXTURES],
     waiting: [0; MAX_TEXTURES],
     uv_scales: [[1.0; 2]; MAX_TEXTURES],
+    from_targets: [false; MAX_TEXTURES],
     tile_views: [const { TextureObject::view(gxm::Texture { control_words: [0; 4] }) }; TILE_VIEWS],
     opaque_rows: [0; MAX_TEXTURES],
     hidden: HiddenDraws::new(),
@@ -617,6 +621,7 @@ impl FrameLoop {
         let mut tile_views = 0;
         for (i, wanted) in frame.textures().iter().enumerate() {
             self.uv_scales[i] = [1.0, 1.0];
+            self.from_targets[i] = false;
             let drawn_into = wanted.address == frame.shown_framebuffer && !self.screen_from_target;
             if !self.textures[i].is_null() || wanted.format >= 4 || drawn_into {
                 continue;
@@ -638,6 +643,7 @@ impl FrameLoop {
                 tile_views += 1;
                 let (psp_width, psp_height) = target.psp_size();
                 self.uv_scales[i] = [wanted.width as f32 / (psp_width - x) as f32, wanted.height as f32 / psp_height as f32];
+                self.from_targets[i] = true;
                 stats().target_textures += 1;
                 continue;
             };
@@ -656,6 +662,7 @@ impl FrameLoop {
             // width x height PSP pixels.
             let (psp_width, psp_height) = target.psp_size();
             self.uv_scales[i] = [wanted.width as f32 / psp_width as f32, wanted.height as f32 / psp_height as f32];
+            self.from_targets[i] = true;
             stats().target_textures += 1;
         }
     }
@@ -870,7 +877,7 @@ impl FrameLoop {
                 if t < texture_count {
                     // Safe: textures from the cache or targets, alive this frame.
                     if let Some(texture) = unsafe { self.textures[t].as_ref() } {
-                        draw::draw_textured(frame, draw, i, texture, self.palettes[t], self.uv_scales[t], self.opaque_rows[t]);
+                        draw::draw_textured(frame, draw, i, texture, self.palettes[t], self.uv_scales[t], self.opaque_rows[t], self.from_targets[t]);
                     }
                 }
             } else {

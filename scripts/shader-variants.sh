@@ -13,6 +13,9 @@
 #                                   5551, 4444, 8888: the vertex colour format fixed)
 #   nativeres_textured_fix_f.cg     nativeres_textured_f.cg + BLEND_FIX (grey FIX B blending)
 #   nativeres_textured_test_fix_f.cg nativeres_textured_test_f.cg + BLEND_FIX
+#   nativeres_textured_ge_f.cg      nativeres_textured_f.cg + GE_FILTER (the GE's bilinear filter,
+#                                   draws reading our targets)
+#   nativeres_textured_fix_ge_f.cg  nativeres_textured_f.cg + BLEND_FIX GE_FILTER
 #   nativeres_color_read_f.cg       nativeres_textured_read_f.cg + UNTEXTURED (16-bit targets, untextured)
 #   nativeres_textured_read_<way>_f.cg, nativeres_color_read_<way>_f.cg
 #                                   the same + READ_NORMAL / READ_ADD / READ_OFF, the normalkeep and
@@ -56,6 +59,8 @@ for v in PLAIN:plain PLAIN4:plain4 LIT1:lit1 LIT4:lit4 LIT1_FLAT:lit1flat LIT4_F
   done
 done
 variant nativeres_textured_f BLEND_FIX nativeres_textured_fix_f
+variant nativeres_textured_f GE_FILTER nativeres_textured_ge_f
+variant nativeres_textured_f "BLEND_FIX GE_FILTER" nativeres_textured_fix_ge_f
 variant nativeres_textured_test_f BLEND_FIX nativeres_textured_test_fix_f
 variant nativeres_textured_read_f UNTEXTURED nativeres_color_read_f
 for dither in "" dither; do

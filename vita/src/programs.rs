@@ -54,6 +54,11 @@ pub enum Kind {
     TexturedTest,
     TexturedFix,
     TexturedTestFix,
+    /// `Textured` / `TexturedFix` with the GE's bilinear filter
+    /// (nativeres_textured_(fix_)ge_f.cg, GE_FILTER): draws reading one of
+    /// our targets (core `ge_filter_read`), the texture point-filtered.
+    TexturedGe,
+    TexturedFixGe,
 }
 
 /// Formats per program set (MTX uses a handful).
@@ -113,6 +118,16 @@ pub struct Textured {
     pub fog_and_scale_test_fix: *const ProgramParameter,
     pub alpha_test_fix: *const ProgramParameter,
     pub blend_fix_test: *const ProgramParameter,
+    /// nativeres_textured_(fix_)ge_f.cg: the GE's bilinear filter (uTexSize:
+    /// the texture's size and its inverse).
+    pub have_ge: bool,
+    fragment_ge_id: PatcherId,
+    fragment_fix_ge_id: PatcherId,
+    pub fog_and_scale_ge: *const ProgramParameter,
+    pub tex_size_ge: *const ProgramParameter,
+    pub fog_and_scale_fix_ge: *const ProgramParameter,
+    pub blend_fix_ge: *const ProgramParameter,
+    pub tex_size_fix_ge: *const ProgramParameter,
     /// nativeres_3d_v.cg; null if it couldn't be made (the capture then
     /// transforms on the CPU).
     pub vertex_3d: *mut gxm::VertexProgram,
@@ -1168,6 +1183,14 @@ impl Programs {
                 blend_fix: null(),
                 fog_and_scale_test_fix: null(),
                 alpha_test_fix: null(),
+                have_ge: false,
+                fragment_ge_id: null_mut(),
+                fragment_fix_ge_id: null_mut(),
+                fog_and_scale_ge: null(),
+                tex_size_ge: null(),
+                fog_and_scale_fix_ge: null(),
+                blend_fix_ge: null(),
+                tex_size_fix_ge: null(),
                 blend_fix_test: null(),
                 vertex_3d: null_mut(),
                 wvp_3d: null(),
@@ -1278,6 +1301,7 @@ impl Programs {
         self.make_flat_program();
         self.make_alpha_test_program();
         self.make_blend_fix_programs();
+        self.make_ge_filter_programs();
         self.make_3d_program();
         true
     }
@@ -1352,6 +1376,38 @@ impl Programs {
         render_log::line(format_args!("blend fix programs ready\n"));
     }
 
+    /// The GE_FILTER variants (the GE's bilinear filter for draws reading
+    /// our targets). Failing leaves those draws with the GPU's filter.
+    fn make_ge_filter_programs(&mut self) {
+        let textured = &mut self.textured;
+        let program = gxp(&shaders::nativeres_textured_ge_f);
+        let fix_program = gxp(&shaders::nativeres_textured_fix_ge_f);
+        let (Some(id), Some(fix_id)) = (register(program), register(fix_program)) else {
+            render_log::line(format_args!("ge filter programs: invalid GXP\n"));
+            return;
+        };
+        textured.fragment_ge_id = id;
+        textured.fragment_fix_ge_id = fix_id;
+        textured.fog_and_scale_ge = parameter(program, b"uFogAndScale\0");
+        textured.tex_size_ge = parameter(program, b"uTexSize\0");
+        textured.fog_and_scale_fix_ge = parameter(fix_program, b"uFogAndScale\0");
+        textured.blend_fix_ge = parameter(fix_program, b"uBlendFix\0");
+        textured.tex_size_fix_ge = parameter(fix_program, b"uTexSize\0");
+        let all = [
+            textured.fog_and_scale_ge,
+            textured.tex_size_ge,
+            textured.fog_and_scale_fix_ge,
+            textured.blend_fix_ge,
+            textured.tex_size_fix_ge,
+        ];
+        if all.iter().any(|parameter| parameter.is_null()) {
+            render_log::line(format_args!("ge filter programs: parameters missing\n"));
+            return;
+        }
+        textured.have_ge = true;
+        render_log::line(format_args!("ge filter programs ready\n"));
+    }
+
     /// The 3D vertex program. Failing only leaves the GPU transform off.
     fn make_3d_program(&mut self) {
         let textured = &mut self.textured;
@@ -1421,6 +1477,8 @@ impl Programs {
             Kind::TexturedTestFix if textured.have_test && textured.have_fix => textured.fragment_test_fix_id,
             Kind::Textured => textured.fragment_id,
             Kind::TexturedFlat if textured.have_flat => textured.fragment_flat_id,
+            Kind::TexturedGe if textured.have_ge => textured.fragment_ge_id,
+            Kind::TexturedFixGe if textured.have_ge => textured.fragment_fix_ge_id,
             _ => return null_mut(),
         };
         basic_programs::fragment_program(id, blend_info, gxp(&shaders::nativeres_textured_v))
@@ -1448,6 +1506,7 @@ impl Programs {
             kind = match kind {
                 Kind::Textured | Kind::TexturedFlat => Kind::TexturedFix,
                 Kind::TexturedTest => Kind::TexturedTestFix,
+                Kind::TexturedGe => Kind::TexturedFixGe,
                 other => other,
             };
             blend &= !BLEND_FIX_B_VALUES;
