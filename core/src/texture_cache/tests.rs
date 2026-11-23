@@ -185,7 +185,7 @@ impl Host for FakeHost {
     fn unswizzle_on_gpu(&mut self, wanted: &TextureDescriptor, target: GpuTexture, raw: GpuTexture) -> bool {
         assert!(self.live[&target.handle].render_target && self.live[&raw.handle].render_target);
         // The raw copy holds the PSP's 16-bit texels as they are; the target
-        // is what draws sample (8888 for 5650 / 5551: the GE's expansion).
+        // is what draws sample.
         let raw_shape = self.live[&raw.handle];
         assert!(raw_shape.format.is_16_bit());
         assert_eq!(raw_shape.bytes(), wanted.width as u32 * wanted.height as u32 * 2);
@@ -893,24 +893,21 @@ fn big_swizzled_16_bit_textures_are_unswizzled_on_the_gpu() {
     assert_eq!(test.host.live.len(), 2);
     let Lookup::Ready(target) = shown else { panic!() };
     assert!(test.host.live[&target.handle].render_target);
-    // Drawn as 8888 with the GE's bit expansion (see the next test).
-    assert_eq!(test.host.live[&target.handle].format, GpuFormat::Rgba8888);
+    assert_eq!(test.host.live[&target.handle].format, GpuFormat::Bgr565);
 }
 
-/// The Vita's U5U6U5 / U1U5U5U5 textures sample a 5-bit k as k / 31 (6-bit:
-/// k / 63), which the programs round to 8 bits: not the GE's expansion
-/// k << 3 | k >> 2 for 4 of 32 values (k << 2 | k >> 4: 16 of 64), and with
-/// the linear filter (every 16-bit texture in the dumps) no program can
-/// undo it. So 5650 and 5551 go to the GPU as 8888, expanded as the GE
-/// does (color::rgba_from_5650 / 5551). 4444 stays 16-bit: k / 15 rounds
-/// back to k x 17 exactly.
+/// 16-bit textures stay 16-bit on the GPU: the Vita's texture unit widens
+/// their channels as the GE does, also through the linear filter (measured
+/// 2026-11-23, see `GpuFormat`); 8888 would only double memory and reads.
+/// With the smooth filter they are decoded into 8888 (it changes texels).
 #[test]
-fn textures_with_5_and_6_bit_channels_are_decoded_into_8888() {
-    let gpu_format = |psp_format| GpuFormat::for_texture(&texture(RAM_START, 64, 64, psp_format), false);
-    assert_eq!(gpu_format(format::BGR5650), GpuFormat::Rgba8888);
-    assert_eq!(gpu_format(format::ABGR5551), GpuFormat::Rgba8888);
-    assert_eq!(gpu_format(format::ABGR4444), GpuFormat::Abgr4444);
-    // On the CPU path the 8888 decode is the GE's expansion.
+fn textures_with_16_bit_texels_stay_16_bit() {
+    let gpu_format = |psp_format, smooth| GpuFormat::for_texture(&texture(RAM_START, 64, 64, psp_format), smooth);
+    assert_eq!(gpu_format(format::BGR5650, false), GpuFormat::Bgr565);
+    assert_eq!(gpu_format(format::ABGR5551, false), GpuFormat::Abgr1555);
+    assert_eq!(gpu_format(format::ABGR4444, false), GpuFormat::Abgr4444);
+    assert_eq!(gpu_format(format::BGR5650, true), GpuFormat::Rgba8888);
+    // Where an 8888 decode happens (smooth filter), it is the GE's widening.
     for k in 0..32u16 {
         let ge = (k << 3 | k >> 2) as u32;
         assert_eq!(crate::color::rgba_from_5650(k) & 0xFF, ge);
@@ -922,14 +919,24 @@ fn textures_with_5_and_6_bit_channels_are_decoded_into_8888() {
 }
 
 #[test]
-fn a_big_swizzled_5551_texture_is_unswizzled_on_the_gpu_into_8888() {
+fn a_big_swizzled_5551_texture_is_unswizzled_on_the_gpu() {
     let mut test = Test::new();
     let mut frame_copy = texture(RAM_START, 512, 512, format::ABGR5551);
     frame_copy.swizzled = 1;
     let shown = test.use_texture(&frame_copy);
     assert_eq!((test.host.gpu_unswizzles, test.host.decodes), (1, 0));
     let Lookup::Ready(target) = shown else { panic!() };
-    assert_eq!(test.host.live[&target.handle].format, GpuFormat::Rgba8888);
+    assert_eq!(test.host.live[&target.handle].format, GpuFormat::Abgr1555);
+}
+
+#[test]
+fn the_smooth_filter_keeps_16_bit_textures_off_the_gpu_unswizzle() {
+    let mut test = Test::new();
+    test.smooth = true;
+    let mut frame_copy = texture(RAM_START, 512, 512, format::ABGR5551);
+    frame_copy.swizzled = 1;
+    test.use_texture(&frame_copy);
+    assert_eq!((test.host.gpu_unswizzles, test.host.decodes), (0, 1));
 }
 
 #[test]

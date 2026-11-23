@@ -1089,7 +1089,7 @@ impl TextureCache {
     /// Has the GPU unswizzle `wanted` into `target` (see
     /// `gpu::can_unswizzle_on_gpu`). The swizzled data goes into a texture
     /// of its own for the GPU to read, in its 16-bit layout
-    /// (`GpuFormat::raw_16_bit`; `target` may be 8888), a render target too
+    /// (`GpuFormat::raw_16_bit`), a render target too
     /// (GPU-mapped), retired afterwards like any replaced texture. False,
     /// having submitted nothing, if it can't.
     fn unswizzle_on_gpu<H: Host>(

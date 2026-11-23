@@ -393,25 +393,6 @@ pub unsafe fn use_texture_programs(fragment: *const gxm::FragmentProgram) -> boo
     true
 }
 
-/// The texture vertex program with the projection and `fragment`, a program
-/// without uniforms (the GPU unswizzle's expansion programs: no tint to
-/// set, and no default uniform buffer to reserve).
-///
-/// # Safety
-/// Display thread, inside a scene.
-pub unsafe fn use_texture_vertex_program(fragment: *const gxm::FragmentProgram) -> bool {
-    let Some(basic) = get() else {
-        return false;
-    };
-    let context = gxm::context();
-    gxm::sceGxmSetVertexProgram(context, basic.texture_vertex);
-    gxm::sceGxmSetFragmentProgram(context, fragment);
-    let mut vertex_uniforms = null_mut();
-    gxm::sceGxmReserveVertexDefaultUniformBuffer(context, &mut vertex_uniforms);
-    gxm::sceGxmSetUniformDataF(vertex_uniforms, basic.texture_wvp, 0, 16, ORTHO.as_ptr());
-    true
-}
-
 /// Fills the current scene with opaque black (alpha 1), no blending, as
 /// vita2d_clear_screen did with its clear colour: one triangle over the
 /// whole scene at depth 0 (z 1 after the projection).

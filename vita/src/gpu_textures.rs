@@ -81,7 +81,7 @@ pub fn gxm_format(format: GpuFormat) -> u32 {
 }
 
 /// The colour format a render-target texture is drawn in (the GPU unswizzle:
-/// 4444 as it is, 5650 / 5551 widened into 8888, their raw data 16-bit).
+/// 16-bit as they are; 8888 for its device test, unswizzle::expand_test).
 fn color_format(format: GpuFormat) -> Option<u32> {
     match format {
         GpuFormat::Rgba8888 => Some(gxm::COLOR_FORMAT_A8B8G8R8),
@@ -219,8 +219,8 @@ pub fn create(shape: &TextureShape, arena_offset: Option<u32>) -> *mut TextureOb
                 (state.arena.add(offset as usize) as *mut c_void, -1)
             }
             None => {
-                // Render targets of whole MiB (512x512 8888: the GPU
-                // unswizzle of FF1's frame copies) in phycont memory, which
+                // Render targets of whole MiB (512x512 8888: the
+                // unswizzle tests) in phycont memory, which
                 // hands out whole MiB and has more room than main memory
                 // (~3 MiB left in MTX's race); the rest, and phycont
                 // failures, in main memory.
