@@ -144,6 +144,47 @@ impl AfterQuit {
     }
 }
 
+/// When Sony's picture must be put back on the display. With Graphics
+/// Filtering Original, Adrenaline's loop draws nothing and the screen shows
+/// Sony's picture once Adrenaline's menu exit has put it on the display.
+/// Switched to Original outside the menu (our renderer off: SELECT), that
+/// never happened and vita2d's last buffer (our picture, with the label)
+/// stayed on the screen while the game ran on (user, 2026-11-23: "the game
+/// freezes"). vita2d's buffers reach the display at the display queue's
+/// flips, which trail the loop by up to ~110 ms: put back any earlier, a
+/// late flip covered Sony's picture again. So: once a poll (every 50 ms)
+/// sees no new flip after vita2d's buffers were shown, while Original is
+/// drawn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SonyHandBack {
+    /// vita2d's flips counted at the last poll.
+    last_flips: u32,
+    /// vita2d's buffers were on the display since Sony's picture last was.
+    loop_shown: bool,
+}
+
+impl SonyHandBack {
+    pub const fn new() -> Self {
+        SonyHandBack { last_flips: 0, loop_shown: false }
+    }
+
+    /// `flips`: vita2d's buffers put on the display so far; `original`:
+    /// Adrenaline draws nothing (Original, PSP game, not pops / native).
+    /// True: put Sony's picture on the display now.
+    pub fn poll(&mut self, flips: u32, original: bool) -> bool {
+        if flips != self.last_flips {
+            self.last_flips = flips;
+            self.loop_shown = true;
+            return false;
+        }
+        if !original || !self.loop_shown {
+            return false;
+        }
+        self.loop_shown = false;
+        true
+    }
+}
+
 /// A sample of the CPU-picture check differs when its R + G + B differ by
 /// more than this (0..765): far above what upscaling and filtering change.
 pub const CPU_PICTURE_DIFFERENCE: u32 = 96;
@@ -186,6 +227,66 @@ pub fn shows_cpu_written_picture(sony: &[u32], ours: Option<&[u32]>) -> bool {
         .filter(|&(index, &pixel)| differs(pixel, ours.map_or(BLACK, |ours| ours.get(index).copied().unwrap_or(BLACK))))
         .count();
     sony.len() >= 8 && 2 * differing >= sony.len()
+}
+
+#[cfg(test)]
+mod sony_hand_back_tests {
+    use super::SonyHandBack;
+
+    /// SELECT in GoW with Original (2026-11-23): our picture flipped every
+    /// frame, then the renderer went off. Sony's picture goes back once the
+    /// flips have stopped, and only once.
+    #[test]
+    fn sonys_picture_goes_back_once_the_flips_stop() {
+        let mut hand_back = SonyHandBack::new();
+        assert!(!hand_back.poll(3, false), "ours shown, renderer on");
+        assert!(!hand_back.poll(6, true), "switched off, the last flips still come");
+        assert!(hand_back.poll(6, true), "quiet: Sony's picture back");
+        assert!(!hand_back.poll(6, true), "once");
+    }
+
+    /// The display queue's late flip (two came 36 and 110 ms after the
+    /// loop stopped, 2026-11-23): it covers Sony's picture, so it goes back
+    /// again after it.
+    #[test]
+    fn a_late_flip_puts_sonys_picture_back_again() {
+        let mut hand_back = SonyHandBack::new();
+        hand_back.poll(10, true);
+        assert!(hand_back.poll(10, true));
+        assert!(!hand_back.poll(11, true), "the late flip");
+        assert!(hand_back.poll(11, true), "again after it");
+    }
+
+    /// Adrenaline's menu open over Original: its loop flips every frame,
+    /// nothing is put on the display until it closes.
+    #[test]
+    fn nothing_while_the_loop_keeps_flipping() {
+        let mut hand_back = SonyHandBack::new();
+        for flips in 1..20 {
+            assert!(!hand_back.poll(flips * 3, true));
+        }
+    }
+
+    /// Renderer on (Bilinear drawn): never, even with a still picture of
+    /// ours (no flips while nothing changes is not "Original").
+    #[test]
+    fn never_while_a_filter_draws() {
+        let mut hand_back = SonyHandBack::new();
+        hand_back.poll(5, false);
+        for _ in 0..5 {
+            assert!(!hand_back.poll(5, false));
+        }
+        assert!(hand_back.poll(5, true), "then switched off: back");
+    }
+
+    /// Original from the start: Sony's picture is on the display already.
+    #[test]
+    fn nothing_when_vita2d_never_flipped() {
+        let mut hand_back = SonyHandBack::new();
+        for _ in 0..5 {
+            assert!(!hand_back.poll(0, true));
+        }
+    }
 }
 
 #[cfg(test)]

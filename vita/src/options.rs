@@ -133,6 +133,7 @@ unsafe extern "C" fn options_thread(_args: u32, _argp: *mut core::ffi::c_void) -
             // Left out (`startskip=`).
         } else if menu_installed {
             menu::sync();
+            menu::hand_back_display();
         } else {
             menu_installed = menu::try_install();
             if menu_installed {

@@ -153,6 +153,10 @@ pub struct SceDisplayFrameBuf {
 }
 
 const _: () = assert!(core::mem::size_of::<SceDisplayFrameBuf>() == 0x18);
+/// SCE_DISPLAY_PIXELFORMAT_A8B8G8R8.
+pub const SCE_DISPLAY_PIXELFORMAT_A8B8G8R8: u32 = 0;
+/// SCE_DISPLAY_SETBUF_NEXTFRAME.
+pub const SCE_DISPLAY_SETBUF_NEXTFRAME: i32 = 1;
 
 // Ours, written in Rust; here so their callers can keep saying `sys::`.
 pub use crate::blocks::{alloc_block, free_block};
@@ -201,6 +205,7 @@ extern "C" {
     pub fn scePowerGetGpuClockFrequency() -> i32;
 
     pub fn sceDisplayGetVcount() -> i32;
+    pub fn sceDisplaySetFrameBuf(frame: *const SceDisplayFrameBuf, sync: i32) -> i32;
 
     pub fn sceIoOpen(path: *const u8, flags: i32, mode: i32) -> SceUID;
     pub fn sceIoRead(fd: SceUID, data: *mut c_void, size: u32) -> i32;

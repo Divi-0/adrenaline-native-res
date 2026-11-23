@@ -26,11 +26,12 @@ use core::ffi::c_void;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering::Relaxed};
 
+use nativeres_core::display_loop::SonyHandBack;
 use nativeres_core::menu_layout::{self, Layout, Line};
 use nativeres_core::span;
 
 use crate::adrenaline::{self, CONFIG_BYTES, FILTER_BILINEAR, GRAPHICS_FILTERING_OFFSET, NO_SMOOTH_GRAPHICS_OFFSET, RENDERER_OFF_OFFSET};
-use crate::{render_log, sys};
+use crate::{display_hooks, render_log, sys, SingleThreaded};
 
 /// menu.h `MenuEntry` (28 bytes).
 #[repr(C)]
@@ -345,6 +346,34 @@ pub fn sync() {
             write_volatile(config.add(GRAPHICS_FILTERING_OFFSET), wanted);
         }
         LAST_SET.store(wanted, Relaxed);
+    }
+}
+
+/// Our settings thread's `SonyHandBack` (display_loop.rs).
+static HAND_BACK: SingleThreaded<SonyHandBack> = SingleThreaded::new(SonyHandBack::new());
+
+/// With Original, puts Sony's picture back on the display once vita2d's
+/// last buffer has gone there (nativeres_core::display_loop::SonyHandBack:
+/// after SELECT the screen kept our last picture, 2026-11-23). Our settings
+/// thread only, after each `sync`.
+pub fn hand_back_display() {
+    if !INSTALLED.load(Relaxed) {
+        return;
+    }
+    let Some(config) = adrenaline::config_address() else { return };
+    // Safe: Adrenaline's settings and shared words, read as in `drawn_filter`.
+    let (drawn, pops, native) = unsafe {
+        (
+            read_volatile(config.add(GRAPHICS_FILTERING_OFFSET)),
+            read_volatile(sys::psp_to_vita(adrenaline::POPS_MODE_ADDRESS) as *const i32) != 0,
+            read_volatile(sys::psp_to_vita(adrenaline::DRAW_NATIVE_ADDRESS) as *const u32) != 0,
+        )
+    };
+    let original = drawn == 0 && !pops && !native;
+    // Safe: only the settings thread uses HAND_BACK.
+    if unsafe { HAND_BACK.get() }.poll(display_hooks::loop_flips(), original) {
+        let result = display_hooks::show_sony_picture();
+        render_log::line(format_args!("menu: Original: Sony's picture on the display again ({:x})\n", result));
     }
 }
 

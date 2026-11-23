@@ -59,6 +59,8 @@ const LCDC_SYNC_NID: u32 = 0xBD17_7787;
 const WRITE_SHARED_CTRL_NID: u32 = 0x2306_FFED;
 const SCE_LIBKERNEL_NID: u32 = 0xCAE9_ACE6;
 const CREATE_THREAD_NID: u32 = 0xC5C1_1EE7;
+const SCE_DISPLAY_NID: u32 = 0x4FAA_CD11;
+const SET_FRAME_BUF_NID: u32 = 0x7A41_0B64;
 
 const ADRENALINE_USER: &[u8] = b"AdrenalineUser\0";
 const PSPEMU: &[u8] = b"ScePspemu\0";
@@ -506,6 +508,55 @@ unsafe extern "C" fn user_create_thread_hooked(
     thread
 }
 
+// ------------------------------------------------------------ Sony's picture back on the display
+
+/// ScePspemu's sceDisplaySetFrameBuf: called from the GXM display queue's
+/// callback for every vita2d buffer of Adrenaline's loop (ours included)
+/// when the GPU is done with it, which trails the loop's
+/// sceGxmDisplayQueueAddEntry by up to ~110 ms (2026-11-23: two flips came
+/// after the loop had stopped). Counted for menu.rs' hand-back.
+static SET_FRAME_BUF: Hook = Hook::new();
+static LOOP_FLIPS: AtomicU32 = AtomicU32::new(0);
+
+/// The PSP screen's width: ScePspemu's own picture, not vita2d's 960.
+const PSP_WIDTH: u32 = 480;
+
+type SetFrameBuf = unsafe extern "C" fn(*const sys::SceDisplayFrameBuf, i32) -> i32;
+
+unsafe extern "C" fn set_frame_buf_hooked(frame: *const sys::SceDisplayFrameBuf, sync: i32) -> i32 {
+    let next: SetFrameBuf = core::mem::transmute(SET_FRAME_BUF.next());
+    let result = next(frame, sync);
+    if result >= 0 && !frame.is_null() && (*frame).width != PSP_WIDTH {
+        LOOP_FLIPS.fetch_add(1, Relaxed);
+    }
+    result
+}
+
+/// vita2d's buffers put on the display so far.
+pub fn loop_flips() -> u32 {
+    LOOP_FLIPS.load(Relaxed)
+}
+
+/// Sony's picture (SCE_PSPEMU_FRAMEBUFFER) on the display, as Adrenaline's
+/// menu exit puts it there (utils.c `SetPspemuFrameBuffer`): with Original
+/// the screen shows it from then on. Only after vita2d's last flip, or that
+/// flip covers it again. Returns sceDisplaySetFrameBuf's result.
+pub fn show_sony_picture() -> i32 {
+    let frame = sys::SceDisplayFrameBuf {
+        size: core::mem::size_of::<sys::SceDisplayFrameBuf>() as u32,
+        base: SONY_PICTURE as *mut c_void,
+        pitch: SONY_PICTURE_PITCH,
+        pixel_format: sys::SCE_DISPLAY_PIXELFORMAT_A8B8G8R8,
+        width: PSP_WIDTH,
+        height: PSP_HEIGHT,
+    };
+    // Safe: Sony's picture, mapped in this process for the whole session.
+    unsafe { sys::sceDisplaySetFrameBuf(&frame, sys::SCE_DISPLAY_SETBUF_NEXTFRAME) }
+}
+
+const SONY_PICTURE_PITCH: u32 = 512;
+const PSP_HEIGHT: u32 = 272;
+
 /// Sets all hooks (once; AdrenalineUser must be loaded) and logs their ids.
 /// Returns (hooks set, hooks tried); each failed one goes to the user log.
 pub fn install() -> (usize, usize) {
@@ -542,6 +593,10 @@ pub fn install() -> (usize, usize) {
             (
                 "ScePspemu sceKernelCreateThread",
                 EMULATOR_CREATE_THREAD.hook_import(PSPEMU, SCE_LIBKERNEL_NID, CREATE_THREAD_NID, emulator_create_thread_hooked as *const c_void),
+            ),
+            (
+                "ScePspemu sceDisplaySetFrameBuf",
+                SET_FRAME_BUF.hook_import(PSPEMU, SCE_DISPLAY_NID, SET_FRAME_BUF_NID, set_frame_buf_hooked as *const c_void),
             ),
         ]
     };
