@@ -321,11 +321,25 @@ unsafe extern "C" fn dmac_memcpy_hooked(target: *mut c_void, source: *const c_vo
 type SetFragmentTexture = unsafe extern "C" fn(*mut Context, u32, *const gxm::Texture) -> i32;
 
 unsafe extern "C" fn set_fragment_texture_hooked(context: *mut Context, unit: u32, texture: *const gxm::Texture) -> i32 {
+    let next: SetFragmentTexture = core::mem::transmute(SET_FRAGMENT_TEXTURE.next());
     if unit == 0 {
         let data = PSP_DATA.load(Relaxed);
-        SONY_TEXTURE_SET.store(data != 0 && !texture.is_null() && gxm::sceGxmTextureGetData(texture) as usize == data, Relaxed);
+        let sony = data != 0 && !texture.is_null() && gxm::sceGxmTextureGetData(texture) as usize == data;
+        SONY_TEXTURE_SET.store(sony, Relaxed);
+        // Graphics Filtering "Original" draws nothing Adrenaline's loop could
+        // draw into, so menu.rs makes it Bilinear in memory while the
+        // renderer is on. Sony's picture, when shown then (no picture of ours
+        // yet, HOME popup, movies), must look as with Original (user,
+        // 2026-11-23): sampled point-filtered, exactly 2x, every PSP pixel a
+        // sharp 2x2 block, not smoothed.
+        if sony && crate::menu::installed() && crate::menu::user_filter() == 0 {
+            let mut sharp = *texture;
+            gxm::sceGxmTextureSetMinFilter(&mut sharp, gxm::TEXTURE_FILTER_POINT);
+            gxm::sceGxmTextureSetMagFilter(&mut sharp, gxm::TEXTURE_FILTER_POINT);
+            // GXM copies the texture state: a copy on the stack will do.
+            return next(context, unit, &sharp);
+        }
     }
-    let next: SetFragmentTexture = core::mem::transmute(SET_FRAGMENT_TEXTURE.next());
     next(context, unit, texture)
 }
 
