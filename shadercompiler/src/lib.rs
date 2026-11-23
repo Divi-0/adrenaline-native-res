@@ -663,6 +663,16 @@ fn read_source(path: *const u8) -> Option<u32> {
     }
 }
 
+/// Whether the source holds `marker` (a comment line such as
+/// "// shacc: precise"): per-file compile options.
+fn source_has(size: u32, marker: &[u8]) -> bool {
+    // Safe: SOURCE_TEXT holds the source just read (`size` bytes); only
+    // this thread touches it.
+    let text: &[u8; MAX_SOURCE + 1] = unsafe { &*SOURCE_TEXT.0.get() };
+    let text = &text[..size as usize];
+    text.windows(marker.len()).any(|window| window == marker)
+}
+
 /// True for a vertex program: the name without ".cg" ends in "_v".
 fn is_vertex_program(name: &str) -> bool {
     name.strip_suffix(".cg").is_some_and(|stem| stem.ends_with("_v"))
@@ -696,8 +706,13 @@ fn compile(name: &str) -> bool {
         options.entry_function_name = b"main\0".as_ptr();
         options.locale = SCE_SHACCCG_ENGLISH;
         options.optimization_level = 3;
-        options.use_fastmath = 1;
-        options.use_fastprecision = 1;
+        // Fast maths and fast precision by default. "// shacc: precise":
+        // without fast precision (the compiler otherwise takes varyings and
+        // texture samples as fp16: a vertex colour arrives truncated to
+        // fp16, up to 0.25 levels low). "// shacc: exact-math": without
+        // fast maths (no reassociation).
+        options.use_fastmath = !source_has(size, b"// shacc: exact-math") as i32;
+        options.use_fastprecision = !source_has(size, b"// shacc: precise") as i32;
 
         let mut callbacks: SceShaccCgCallbackList = core::mem::zeroed();
         sceShaccCgInitializeCallbackList(&mut callbacks, SCE_SHACCCG_TRIVIAL);

@@ -599,6 +599,9 @@ fn fog_at(linear: [f32; 3], corners: &[FrameVertex; 3]) -> f32 {
 /// fog): texel and vertex colour truncated to 8 bits, (p + 1) t >> 8 (x 2
 /// with colour doubling), fog factor floor(f x 256), (c f + fog (255 - f) +
 /// 255) >> 8. Rounding in float instead left MHF about one level brighter.
+/// Rounding only the interpolated vertex colour moved every dumped scene
+/// further from Sony's frame (2026-11-23: GoW title 6.07 -> 6.40, MHF village
+/// 4.99 -> 5.07): the GE truncates gradients too.
 fn ge_shade(texel: Color, vertex: Color, fog: f32, draw: &Draw, color_scale: f32) -> Color {
     let to8 = |x: f32| (x.clamp(0.0, 1.0) * 255.0 + 0.01) as i32;
     let scale = color_scale as i32;

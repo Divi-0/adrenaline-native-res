@@ -265,6 +265,10 @@ impl CommandVisitor for DrawTracer {
         if register(op::COLOR_MASK) & 0xFF_FFFF != 0 {
             line += &format!(" | colour mask {:06x}", register(op::COLOR_MASK) & 0xFF_FFFF);
         }
+        if enabled(op::DITHER_ENABLE) {
+            let rows: Vec<String> = (0..4).map(|row| format!("{:04x}", register(op::DITHER_ROW_0 + row) & 0xFFFF)).collect();
+            line += &format!(" | dither {}", rows.join(" "));
+        }
         line += &format!(" | material {:08x}", ge.material_color());
         println!("{line}");
         if !ge.is_through_mode() {

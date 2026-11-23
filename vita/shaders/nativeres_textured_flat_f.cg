@@ -1,3 +1,10 @@
+// shacc: precise
+// shacc: exact-math
+// (Compile options, renderer/shadercompiler: with fast precision the
+// compiler hands the program its varyings as fp16, and a vertex colour
+// arrives truncated, up to 0.25 levels low: the GE's floor of it lost a
+// level for 79 of 256 values, in every textured draw (fifty-fifth session,
+// tools/shadetest.py --texel). Without fast maths the program is shorter.)
 // NativeRes: fragment program for textured draws without fog and without a
 // separate specular colour (Final Fantasy's 2D: tile maps, sprites, clouds):
 // nativeres_textured_f.cg's GeShade with both left out, the same pixels.
@@ -28,7 +35,7 @@ float4 main(
 {
 	// Colour came times w (screen-linear, nativeres_3d_v.cg).
 	float overW = 1.0f / vFog.y;
-	float4 t = FLOOR(tex2D(tex, vTexcoord) * 255.0f + 0.01f);
+	float4 t = FLOOR(tex2D<half4>(tex, vTexcoord) * 255.0f + 0.5f); // rounded: GeShade's comment
 	float4 p1 = FLOOR(vColor * overW * 255.0f + 1.01f); // p + 1
 	float4 c = FLOOR(p1 * t * (float4(uFogAndScale.aaa, 1.0f) * (1.0f / 256.0f)));
 	c.rgb = min(c.rgb, 255.0f);

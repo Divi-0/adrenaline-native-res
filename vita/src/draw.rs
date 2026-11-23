@@ -492,6 +492,11 @@ enum ShadeProgram {
     /// The flat one (nativeres_textured_flat_f.cg), for the cases without
     /// fog and alpha test: the same pixels as `EightBit`.
     Flat,
+    /// The 8-bit targets' normal-blend frame-read program
+    /// (nativeres_textured_read_normalwidekeep_f.cg), for the opaque cases
+    /// without alpha test: the GE's normal blend of alpha 255 is the
+    /// source, so the same pixels as `EightBit`.
+    Wide,
 }
 
 /// The shade test's alpha-test cases: PSP compare function and reference,
@@ -516,8 +521,9 @@ struct ShadeCase {
 }
 
 /// The shade test's texel: one colour over the whole texture, so filtering
-/// can't change it (r 200, g 120, b 60, a 255).
-const SHADE_TEST_TEXEL: u32 = 0xFF3C_78C8;
+/// can't change it (default r 200, g 120, b 60, a 255; debug "shadetexel
+/// <0xAABBGGRR>", tools/shadetest.py --texel).
+pub static SHADE_TEST_TEXEL: AtomicU32 = AtomicU32::new(0xFF3C_78C8);
 const SHADE_FOG: [f32; 4] = [127.0, 96.0, 79.0, 1.0];
 const SHADE_TESTS: [ShadeCase; 9] = [
     // 2D (w 1), no fog.
@@ -2226,9 +2232,10 @@ impl Draws {
         if texels.is_null() {
             return;
         }
+        let texel = SHADE_TEST_TEXEL.load(Ordering::Relaxed);
         for i in 0..64 {
             // Safe: the pool gave room for 64 texels.
-            unsafe { texels.add(i).write(SHADE_TEST_TEXEL) };
+            unsafe { texels.add(i).write(texel) };
         }
         let mut texture = gxm::Texture { control_words: [0; 4] };
         // Safe: our texture struct over the block.
@@ -2247,6 +2254,10 @@ impl Draws {
             let no_fog = case.fog == 1.0 && case.fog_and_scale[..3] == [0.0; 3];
             if no_fog && !case.tested {
                 self.shade_test_quad(left, 60.0, case, ShadeProgram::Flat, ALPHA_ALL_PASS);
+            }
+            let opaque = case.color.iter().all(|color| color >> 24 == 0xFF);
+            if opaque && !case.tested {
+                self.shade_test_quad(left, 20.0, case, ShadeProgram::Wide, ALPHA_ALL_PASS);
             }
         }
         for (i, &(function, reference)) in SHADE_ALPHA_TESTS.iter().enumerate() {
@@ -2267,7 +2278,9 @@ impl Draws {
     fn shade_test_quad(&mut self, left: f32, top: f32, case: &ShadeCase, program: ShadeProgram, alpha_test: [f32; 4]) {
         let tested = case.tested && self.programs.textured.have_test;
         // As the draws: the fast program for one-sided tests, else the generic one.
-        let off = if tested && !alpha_test_is_one_sided(alpha_test) {
+        let off = if matches!(program, ShadeProgram::Wide) {
+            ReadVariant::Fast { way: ReadWay::Normal, keep_alpha: true, dither: false, green6: false, fogless: false, wide: true }
+        } else if tested && !alpha_test_is_one_sided(alpha_test) {
             ReadVariant::Generic
         } else {
             ReadVariant::Fast { way: ReadWay::Off, keep_alpha: false, dither: false, green6: false, fogless: false, wide: false }
@@ -2281,7 +2294,7 @@ impl Draws {
                 self.programs.blend_program(Kind::TexturedFlat, 0, self.keep_target_alpha)
             }
             ShadeProgram::Flat => return,
-            ShadeProgram::Cut5551 => match self.programs.read_program(true, tested, off) {
+            ShadeProgram::Cut5551 | ShadeProgram::Wide => match self.programs.read_program(true, tested, off) {
                 Some(read) => read.program,
                 None => return,
             },
@@ -2296,7 +2309,7 @@ impl Draws {
         match program {
             ShadeProgram::EightBit => self.textured_fragment_uniforms(tested, false, case.fog_and_scale, alpha_test, 0, None, None),
             ShadeProgram::Flat => self.textured_fragment_uniforms(false, true, case.fog_and_scale, alpha_test, 0, None, None),
-            ShadeProgram::Cut5551 => {
+            ShadeProgram::Cut5551 | ShadeProgram::Wide => {
                 let read = self.programs.made_read_program(true, tested, off);
                 let (fog_and_scale, alpha) = (read.fog_and_scale, read.alpha_test);
                 let buffer = reserve_fragment_uniforms();
