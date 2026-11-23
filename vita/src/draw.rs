@@ -153,6 +153,17 @@ pub static RAW_FIXED_COLOR: AtomicI32 = AtomicI32::new(1);
 /// measuring: 5 = only unblended draws cut, 6 = only blended ones.
 pub static TARGET_CUT: AtomicI32 = AtomicI32::new(1);
 
+/// Normal and additive blends into 8-bit targets read the frame and blend
+/// as the GE does (core frame.rs `wide_variant`): 1 = while the game reads
+/// its targets' alpha (`keep_target_alpha`: God of War's stencil, every
+/// frame; default), 2 = in every game, 0 = never (GXM's blending, rounded
+/// once: every normal blend ~0.5 levels brighter than the GE's truncated
+/// terms, piling up under overdraw). GoW's picture vs Sony: title 7.42 ->
+/// 5.88, gameplay 5.90 -> 5.49 at +19.5 / +7.0 ms GPU per frame; MTX's
+/// paused race +4.1 ms (30.15 -> 34.21, past its 30 fps budget) for a
+/// small gain: hence not everywhere (user's choices, 2026-11-23).
+pub static BLEND_8888: AtomicI32 = AtomicI32::new(1);
+
 /// Textured normal alpha blends into 5551 whose every fragment is opaque
 /// (an opaque texture, vertex alphas 255: core `opaque_source`) are drawn
 /// with the unblended frame-read program (no frame read; the same
@@ -386,6 +397,29 @@ fn read_choice(frame: &Frame, draw: &Draw, keep_target_alpha: bool) -> Option<Re
         6 if off => None,
         _ => Some(variant),
     }
+}
+
+/// The program for `draw` into an 8-bit target that blends as the GE does
+/// (`BLEND_8888`, core `wide_variant`), or None (GXM's blending). Not for
+/// draws with a separate specular colour (the fast programs leave it out)
+/// or a stencil state (done exactly by the generic program or GXM's alpha
+/// factors, `stencil_way`).
+fn wide_choice(frame: &Frame, draw: &Draw, keep_target_alpha: bool) -> Option<ReadVariant> {
+    match BLEND_8888.load(Ordering::Relaxed) {
+        0 => return None,
+        1 if !keep_target_alpha => return None,
+        _ => {}
+    }
+    let variant = nativeres_core::frame::wide_variant(draw.flags, draw.blend, keep_target_alpha)?;
+    if separate_specular(frame, draw) || (keep_target_alpha && frame.stencil_state_of(draw).is_some()) {
+        return None;
+    }
+    Some(variant)
+}
+
+/// Whether `variant` is one of the 8-bit target programs (`wide_choice`).
+fn is_wide(variant: ReadVariant) -> bool {
+    matches!(variant, ReadVariant::Fast { wide: true, .. })
 }
 
 /// The alpha values the PSP's alpha test `function` (its 3 bits) with
@@ -989,7 +1023,11 @@ impl Draws {
                 && self
                     .programs
                     .read_program(textured, false, ReadVariant::Generic)
-                    .is_some_and(|program| !program.stencil[0].is_null() && !program.stencil[1].is_null());
+                    .is_some()
+                && {
+                    let generic = self.programs.generic_uniforms(textured);
+                    !generic.stencil[0].is_null() && !generic.stencil[1].is_null()
+                };
             if !ready {
                 stats().stencil_missing_draws += 1;
                 return (None, StencilWay::None);
@@ -1111,15 +1149,21 @@ impl Draws {
         stencil: Option<StencilState>,
     ) {
         let generic = variant == ReadVariant::Generic;
+        let wide = is_wide(variant);
         let bits = match nativeres_core::frame::target_channel_bits(draw.flags) {
             Some(bits) => {
                 stats().cut_draws += 1;
                 bits
             }
-            None if generic => [8; 4],
+            None if generic || wide => [8; 4],
             None => return,
         };
-        if let ReadVariant::Fast { way, dither, .. } = variant {
+        if wide {
+            stats().wide_draws += 1;
+            if textured.is_none() {
+                return; // the untextured fast ones have no uniforms
+            }
+        } else if let ReadVariant::Fast { way, dither, .. } = variant {
             stats().cut_fast_draws += 1;
             if matches!(way, ReadWay::Off | ReadWay::Precut) {
                 stats().cut_off_draws += 1;
@@ -1143,24 +1187,25 @@ impl Draws {
         let buffer = reserve_fragment_uniforms();
         if generic {
             let cut = cut_uniforms(blend, enabled && !alpha_only, bits, !alpha_only, writes_alpha, dither_flag);
-            for (parameter, values) in program.cut.iter().zip(&cut) {
+            let generic_uniforms = self.programs.generic_uniforms(textured.is_some());
+            for (parameter, values) in generic_uniforms.cut.iter().zip(&cut) {
                 set_uniform(buffer, *parameter, 4, values.as_ptr());
             }
             // The GE's matrix (zeros for an undithered draw).
             let rows: [[f32; 4]; 4] = core::array::from_fn(|y| {
                 core::array::from_fn(|x| if dither_flag { nativeres_core::frame::dither_value(frame.dither_matrix, x, y) as f32 } else { 0.0 })
             });
-            for (parameter, row) in program.dither.iter().zip(&rows) {
+            for (parameter, row) in generic_uniforms.dither.iter().zip(&rows) {
                 set_uniform(buffer, *parameter, 4, row.as_ptr());
             }
             // The stencil test and value (all pass, alpha as blended
             // without); the value stored as the target's bits keep it.
-            if !program.stencil[0].is_null() && !program.stencil[1].is_null() {
+            if !generic_uniforms.stencil[0].is_null() && !generic_uniforms.stencil[1].is_null() {
                 let mut uniforms = blend::stencil_uniforms(stencil);
                 if uniforms[1][1] > 0.5 && bits[3] < 8 {
                     uniforms[1][0] = nativeres_core::frame::quantize_like_the_ge(uniforms[1][0] as i32, 0, bits[3]) as f32;
                 }
-                for (parameter, values) in program.stencil.iter().zip(&uniforms) {
+                for (parameter, values) in generic_uniforms.stencil.iter().zip(&uniforms) {
                     set_uniform(buffer, *parameter, 4, values.as_ptr());
                 }
             }
@@ -1480,6 +1525,10 @@ impl Draws {
         let keep = self.keep_target_alpha;
         // A 16-bit PSP target: the frame-read program (alpha test included).
         let mut choice = read_choice(frame, draw, keep);
+        // An 8-bit one: blended as the GE does (`BLEND_8888`).
+        if choice.is_none() && programs_ready {
+            choice = wide_choice(frame, draw, keep);
+        }
         // An opaque texture and vertices of alpha 255: every fragment has
         // alpha 255 (core `opaque_source`; MHF's ground). A normal blend of
         // it is the source itself: drawn unblended, no frame read. An alpha
@@ -1490,15 +1539,20 @@ impl Draws {
         if masked {
             choice = Some(ReadVariant::Generic);
         }
+        // (An 8-bit target's normal blend of an opaque source: GXM's normal
+        // blend is exact then, s x 1 + d x 0; no program needed.)
+        let wide_normal = |variant: ReadVariant| {
+            matches!(variant, ReadVariant::Fast { wide: true, way: ReadWay::Normal, .. })
+        };
         let unblend = !masked
-            && choice.is_some_and(|variant| for_opaque_source(variant) != variant)
+            && choice.is_some_and(|variant| for_opaque_source(variant) != variant || wide_normal(variant))
             && OPAQUE_SOURCES.load(Ordering::Relaxed) != 0;
         let untest = tested && !masked && alpha_test_lets_255_pass(alpha_range) && OPAQUE_UNTESTED.load(Ordering::Relaxed) != 0;
         if opaque_rows != 0 && (unblend || untest) {
             let start = draw_clock();
             if vertices_opaque(frame, draw) && samples_opaque_rows(frame, draw, opaque_rows) {
                 if unblend {
-                    choice = choice.map(for_opaque_source);
+                    choice = choice.and_then(|variant| if is_wide(variant) { None } else { Some(for_opaque_source(variant)) });
                     stats().opaque_draws += 1;
                 }
                 if untest {
@@ -1510,8 +1564,9 @@ impl Draws {
         }
         // The fast frame-read programs test one side only (alpha from lo
         // up); other tests (less, equal, not equal) take the generic one.
+        // (8-bit targets: GXM's blending then, as before.)
         if tested && !alpha_test_is_one_sided(alpha_range) {
-            choice = choice.map(|_| ReadVariant::Generic);
+            choice = choice.and_then(|variant| if is_wide(variant) { None } else { Some(ReadVariant::Generic) });
         }
         // The draw's stencil test and value, exactly (core
         // `blend::stencil_way`), while the game reads the target's alpha.
@@ -1864,6 +1919,10 @@ impl Draws {
         }
         stats().convert_us += draw_clock().wrapping_sub(convert_start);
         let mut choice = read_choice(frame, draw, self.keep_target_alpha);
+        // An 8-bit target: blended as the GE does (`BLEND_8888`).
+        if choice.is_none() {
+            choice = wide_choice(frame, draw, self.keep_target_alpha);
+        }
         // Alpha 0 at every vertex: a normal blend leaves the target as it
         // is (`ReadWay::Invisible`, MHF's full-screen fade quad).
         if INVISIBLE_SOURCES.load(Ordering::Relaxed) != 0 && vertices.iter().all(|vertex| vertex.color >> 24 == 0) {
@@ -2147,7 +2206,7 @@ impl Draws {
         let off = if tested && !alpha_test_is_one_sided(alpha_test) {
             ReadVariant::Generic
         } else {
-            ReadVariant::Fast { way: ReadWay::Off, keep_alpha: false, dither: false, green6: false, fogless: false }
+            ReadVariant::Fast { way: ReadWay::Off, keep_alpha: false, dither: false, green6: false, fogless: false, wide: false }
         };
         let fragment = match program {
             ShadeProgram::EightBit => {
@@ -2185,10 +2244,11 @@ impl Draws {
                     // Unblended into 5551, undithered, no BLEND_FIX (as
                     // `read_fragment_uniforms` for such a draw).
                     let cut = cut_uniforms(0, false, [5, 5, 5, 1], true, !self.keep_target_alpha, false);
-                    for (parameter, values) in read.cut.iter().zip(&cut) {
+                    let generic = self.programs.generic_uniforms(true);
+                    for (parameter, values) in generic.cut.iter().zip(&cut) {
                         set_uniform(buffer, *parameter, 4, values.as_ptr());
                     }
-                    for parameter in &read.dither {
+                    for parameter in &generic.dither {
                         set_uniform(buffer, *parameter, 4, [0.0f32; 4].as_ptr());
                     }
                     set_uniform(buffer, read.blend_fix, 4, [1.0f32, 0.0, 0.0, 0.0].as_ptr());

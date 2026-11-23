@@ -537,38 +537,70 @@ pub struct ReadProgram {
     pub alpha_test: *const ProgramParameter,
     /// The generic one only (else null).
     pub blend_fix: *const ProgramParameter,
-    /// The generic one only (null for the fast ones): uSource,
-    /// uDestination, uBlend, uMinMax, uStep, uWiden, uWidenLow, uWrite,
-    /// uPath (the shader's comment), in this order.
+}
+
+/// The generic frame-read programs' own parameters (`Programs::
+/// generic_uniforms`; one per texturedness, kept apart so the ~200 fast
+/// programs' slots stay small: the plugin's image is short of memory).
+pub struct GenericUniforms {
+    /// uSource, uDestination, uBlend, uMinMax, uStep, uWiden, uWidenLow,
+    /// uWrite, uPath (the shader's comment), in this order.
     pub cut: [*const ProgramParameter; 9],
-    /// The generic one only (else null; the fast dithered ones read the
-    /// matrix from a texture, draw.rs `use_dither_texture`).
+    /// The matrix rows (the fast dithered ones read the matrix from a
+    /// texture, draw.rs `use_dither_texture`).
     pub dither: [*const ProgramParameter; 4],
-    /// The generic one only: uStencilTest, uStencilWrite (core
-    /// `blend::stencil_uniforms`). Null in programs compiled before them:
-    /// stencil states are then approximated as before.
+    /// uStencilTest, uStencilWrite (core `blend::stencil_uniforms`). Null
+    /// in programs compiled before them: stencil states are then
+    /// approximated as before.
     pub stencil: [*const ProgramParameter; 2],
 }
 
-/// Fast frame-read ways (`ReadWay`, all six).
+impl GenericUniforms {
+    const fn new() -> GenericUniforms {
+        GenericUniforms { cut: [null(); 9], dither: [null(); 4], stencil: [null(); 2] }
+    }
+}
+
+/// Fast frame-read ways of the 16-bit targets (`ReadWay` up to `Subtract`).
 const READ_WAYS: usize = 6;
 
-/// Frame-read programs (`read_index`): untextured generic + the ways x
-/// alpha kept or not x dithered or not, then the 565 ones (ways x dithered
-/// or not x fogless or not (textured only); 565 keeps no alpha); textured the same, the fast ones also with
-/// and without the alpha test (`ReadWay::Invisible` is untextured only, its
-/// textured slots stay unused).
-const READ_PROGRAMS: usize = READ_TEXTURED + 1 + 2 * READ_WAYS * 4 + 2 * READ_WAYS * 4;
+/// The 8-bit targets' ways (`wide_way`): normal, add, and one slot for any
+/// other (no program).
+const WIDE_WAYS: usize = 3;
+
+/// Fast programs per texturedness (before the alpha test): 5551 (ways x
+/// alpha kept or not x dithered or not), 565 (ways x dithered or not x
+/// fogless or not; 565 keeps no alpha), 8-bit targets (`wide`: their ways
+/// x fogless or not; the alpha always kept, never dithered).
+const READ_FAST_SLOTS: usize = 2 * READ_WAYS * 4 + WIDE_WAYS * 2;
+
+/// The place of an 8-bit target's way among `WIDE_WAYS`.
+fn wide_way(way: ReadWay) -> usize {
+    match way {
+        ReadWay::Normal => 0,
+        ReadWay::Add => 1,
+        _ => 2,
+    }
+}
+
+/// Frame-read programs (`read_index`): untextured generic + the fast ones,
+/// textured the same, the fast ones also with and without the alpha test
+/// (`ReadWay::Invisible` is untextured only, its textured slots stay
+/// unused; most ways have programs for some targets only).
+const READ_PROGRAMS: usize = READ_TEXTURED + 1 + 2 * READ_FAST_SLOTS;
 
 /// The first textured one in `read_index` (the textured generic program).
-const READ_TEXTURED: usize = 1 + READ_WAYS * 4 + READ_WAYS * 4;
+const READ_TEXTURED: usize = 1 + READ_FAST_SLOTS;
 
 /// The place of a frame-read program in `Programs::read`; `tested`: with
 /// the alpha test (textured only; the generic one always has it).
 fn read_index(textured: bool, tested: bool, variant: ReadVariant) -> usize {
-    // 5551: 0..READ_WAYS * 4; 565 after them (never keeping the alpha).
-    let fast = |way: ReadWay, keep_alpha: bool, dither: bool, green6: bool, fogless: bool| {
-        if green6 {
+    // 5551: 0..READ_WAYS * 4; 565 after them (never keeping the alpha);
+    // then the 8-bit ones (never dithered).
+    let fast = |way: ReadWay, keep_alpha: bool, dither: bool, green6: bool, fogless: bool, wide: bool| {
+        if wide {
+            READ_WAYS * 8 + 2 * wide_way(way) + fogless as usize
+        } else if green6 {
             READ_WAYS * 4 + (2 * way as usize + dither as usize) * 2 + fogless as usize
         } else {
             (2 * way as usize + keep_alpha as usize) * 2 + dither as usize
@@ -576,10 +608,12 @@ fn read_index(textured: bool, tested: bool, variant: ReadVariant) -> usize {
     };
     match (textured, variant) {
         (false, ReadVariant::Generic) => 0,
-        (false, ReadVariant::Fast { way, keep_alpha, dither, green6, fogless }) => 1 + fast(way, keep_alpha, dither, green6, fogless),
+        (false, ReadVariant::Fast { way, keep_alpha, dither, green6, fogless, wide }) => {
+            1 + fast(way, keep_alpha, dither, green6, fogless, wide)
+        }
         (true, ReadVariant::Generic) => READ_TEXTURED,
-        (true, ReadVariant::Fast { way, keep_alpha, dither, green6, fogless }) => {
-            READ_TEXTURED + 1 + 2 * fast(way, keep_alpha, dither, green6, fogless) + tested as usize
+        (true, ReadVariant::Fast { way, keep_alpha, dither, green6, fogless, wide }) => {
+            READ_TEXTURED + 1 + 2 * fast(way, keep_alpha, dither, green6, fogless, wide) + tested as usize
         }
     }
 }
@@ -590,9 +624,30 @@ fn read_index(textured: bool, tested: bool, variant: ReadVariant) -> usize {
 fn read_gxp(textured: bool, tested: bool, variant: ReadVariant) -> *const gxm::Program {
     use ReadWay::{Add, Invisible, Normal, Off, Precut, Subtract};
     use shaders::*;
-    let ReadVariant::Fast { way, keep_alpha, dither, green6, fogless } = variant else {
+    let ReadVariant::Fast { way, keep_alpha, dither, green6, fogless, wide } = variant else {
         return if textured { gxp(&nativeres_textured_read_f) } else { gxp(&nativeres_color_read_f) };
     };
+    // 8-bit targets (core `wide_variant`): the normal and add ways without
+    // a cut, keeping the target's alpha; nothing else.
+    if wide {
+        if dither || green6 || !keep_alpha {
+            return null();
+        }
+        let fogless = fogless && textured;
+        return match (textured, way, fogless, tested) {
+            (false, Normal, _, _) => gxp(&nativeres_color_read_normalwidekeep_f),
+            (false, Add, _, _) => gxp(&nativeres_color_read_addwidekeep_f),
+            (true, Normal, false, false) => gxp(&nativeres_textured_read_normalwidekeep_f),
+            (true, Normal, false, true) => gxp(&nativeres_textured_read_normalwidekeeptest_f),
+            (true, Normal, true, false) => gxp(&nativeres_textured_read_normalwidekeepnofog_f),
+            (true, Normal, true, true) => gxp(&nativeres_textured_read_normalwidekeepnofogtest_f),
+            (true, Add, false, false) => gxp(&nativeres_textured_read_addwidekeep_f),
+            (true, Add, false, true) => gxp(&nativeres_textured_read_addwidekeeptest_f),
+            (true, Add, true, false) => gxp(&nativeres_textured_read_addwidekeepnofog_f),
+            (true, Add, true, true) => gxp(&nativeres_textured_read_addwidekeepnofogtest_f),
+            _ => null(),
+        };
+    }
     // `ReadWay::Subtract` has one program: untextured 565 undithered
     // (`read_variant` gives it no other draw). Null: no program.
     if way == Subtract {
@@ -696,16 +751,13 @@ impl ReadProgram {
             fog_and_scale: null(),
             alpha_test: null(),
             blend_fix: null(),
-            cut: [null(); 9],
-            dither: [null(); 4],
-            stencil: [null(); 2],
         }
     }
 
     /// Makes the program on first use: `textured` a textured one (linked
     /// to nativeres_textured_v), else an untextured one (nativeres_color_v).
     /// False if it can't be made (the draw then goes the 8-bit way).
-    fn ready(&mut self, textured: bool, tested: bool, variant: ReadVariant) -> bool {
+    fn ready(&mut self, generic_uniforms: &mut GenericUniforms, textured: bool, tested: bool, variant: ReadVariant) -> bool {
         if self.tried {
             return !self.program.is_null();
         }
@@ -725,7 +777,7 @@ impl ReadProgram {
         };
         let generic = variant == ReadVariant::Generic;
         if generic {
-            self.cut = [
+            generic_uniforms.cut = [
                 parameter(fragment_gxp, b"uSource\0"),
                 parameter(fragment_gxp, b"uDestination\0"),
                 parameter(fragment_gxp, b"uBlend\0"),
@@ -736,15 +788,15 @@ impl ReadProgram {
                 parameter(fragment_gxp, b"uWrite\0"),
                 parameter(fragment_gxp, b"uPath\0"),
             ];
-            self.dither = [
+            generic_uniforms.dither = [
                 parameter(fragment_gxp, b"uDither0\0"),
                 parameter(fragment_gxp, b"uDither1\0"),
                 parameter(fragment_gxp, b"uDither2\0"),
                 parameter(fragment_gxp, b"uDither3\0"),
             ];
-            self.stencil = [parameter(fragment_gxp, b"uStencilTest\0"), parameter(fragment_gxp, b"uStencilWrite\0")];
+            generic_uniforms.stencil = [parameter(fragment_gxp, b"uStencilTest\0"), parameter(fragment_gxp, b"uStencilWrite\0")];
         }
-        let mut missing = generic && self.cut.iter().chain(&self.dither).any(|parameter| parameter.is_null());
+        let mut missing = generic && generic_uniforms.cut.iter().chain(&generic_uniforms.dither).any(|parameter| parameter.is_null());
         if textured {
             self.fog_and_scale = parameter(fragment_gxp, b"uFogAndScale\0");
             missing |= self.fog_and_scale.is_null();
@@ -823,6 +875,8 @@ pub struct Programs {
     blend_count: usize,
     /// Draws into 16-bit PSP targets (`read_index`).
     read: [ReadProgram; READ_PROGRAMS],
+    /// The generic programs' own parameters: untextured, textured.
+    read_generic: [GenericUniforms; 2],
 }
 
 const NO_BLEND_PROGRAM: BlendProgram = BlendProgram { kind: Kind::Color, blend: 0, alpha: AlphaOut::AsColor, program: null_mut() };
@@ -1139,6 +1193,7 @@ impl Programs {
             blend: [NO_BLEND_PROGRAM; MAX_BLEND_PROGRAMS],
             blend_count: 0,
             read: [const { ReadProgram::new() }; READ_PROGRAMS],
+            read_generic: [const { GenericUniforms::new() }; 2],
         }
     }
 
@@ -1147,7 +1202,13 @@ impl Programs {
     /// if it can't be made.
     pub fn read_program(&mut self, textured: bool, tested: bool, variant: ReadVariant) -> Option<&ReadProgram> {
         let program = &mut self.read[read_index(textured, tested, variant)];
-        program.ready(textured, tested, variant).then_some(&*program)
+        program.ready(&mut self.read_generic[textured as usize], textured, tested, variant).then_some(&*program)
+    }
+
+    /// The generic frame-read program's own parameters (made with it,
+    /// `read_program` with `ReadVariant::Generic`; null before).
+    pub fn generic_uniforms(&self, textured: bool) -> &GenericUniforms {
+        &self.read_generic[textured as usize]
     }
 
     /// The frame-read program made before (`read_program`).

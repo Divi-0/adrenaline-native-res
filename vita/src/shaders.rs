@@ -112,6 +112,18 @@ embed_gxp!(nativeres_color_read_invisible_f);
 embed_gxp!(nativeres_color_read_invisiblekeep_f);
 embed_gxp!(nativeres_color_read_invisibledither_f);
 embed_gxp!(nativeres_color_read_invisiblekeepdither_f);
+// 8-bit targets (core frame.rs `wide_variant`): the GE's normal / additive
+// blend without a cut, the target's alpha kept.
+embed_gxp!(nativeres_textured_read_normalwidekeep_f);
+embed_gxp!(nativeres_textured_read_normalwidekeeptest_f);
+embed_gxp!(nativeres_textured_read_normalwidekeepnofog_f);
+embed_gxp!(nativeres_textured_read_normalwidekeepnofogtest_f);
+embed_gxp!(nativeres_color_read_normalwidekeep_f);
+embed_gxp!(nativeres_textured_read_addwidekeep_f);
+embed_gxp!(nativeres_textured_read_addwidekeeptest_f);
+embed_gxp!(nativeres_textured_read_addwidekeepnofog_f);
+embed_gxp!(nativeres_textured_read_addwidekeepnofogtest_f);
+embed_gxp!(nativeres_color_read_addwidekeep_f);
 // Decoded vertices in model space: the GPU transforms and lights them.
 embed_gxp!(nativeres_3d_v);
 // Raw PSP vertices, read by the GPU as the game wrote them: with up to

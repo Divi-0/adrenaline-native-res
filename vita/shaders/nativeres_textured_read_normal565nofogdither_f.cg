@@ -28,6 +28,13 @@
 // the / 1024 is a power of two. A term with factor 255 (ONE) is the
 // colour itself.
 //
+// 8-bit targets (God of War, 2026-11-23): GXM's rounded blending left
+// every normal alpha blend ~0.5 levels brighter than the GE's truncated
+// terms, which piles up under smoke and glow overdraw (GoW's picture 3-10 %
+// brighter than Sony's before its bloom, which amplifies it). READ_WIDE:
+// the fast READ_NORMAL / READ_ADD blend without the cut (always with
+// READ_KEEP_ALPHA: core frame.rs `wide_variant`).
+//
 // Fast variants (scripts/shader-variants.sh, programs.rs `ReadVariant`):
 // for 5551 targets (and with READ_565 for 565 targets: green cut to 6
 // bits, no keep-alpha ones) and the common blends, one per way: READ_NORMAL (source alpha, one minus source alpha, add), READ_ADD
@@ -318,7 +325,13 @@ __nativecolor __regformat unsigned char4 main(
 	float dither = FLOOR(tex2D(uDitherTexture, vPosition.xy * (1.0f / 16.0f)).x * 255.0f + 0.5f) - 8.0f;
 	value.rgb = clamp(value.rgb + dither, 0.0f, 255.0f);
 #endif
-#ifdef READ_OFF
+#ifdef READ_WIDE
+	// An 8-bit target: no cut; value is whole, the cast exact.
+	unsigned char4 cut = (unsigned char4)value;
+#ifdef READ_KEEP_ALPHA
+	cut.a = target.a;
+#endif
+#elif defined(READ_OFF)
 	// The cut in floats (2 instructions less than the bit operations
 	// below): 5 bits widened = 8 h + (h >> 2) with h = v >> 3, and
 	// h x 8.25 - 0.375 lies 0.125 .. 0.375 off that whole number; the cast

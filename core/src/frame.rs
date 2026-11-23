@@ -283,7 +283,10 @@ pub enum ReadVariant {
     /// alpha; never `keep_alpha`); `fogless` = a textured 565 draw without
     /// fog: the program leaves the fog part out (exact: without fog the GE's
     /// fog formula gives the colour back).
-    Fast { way: ReadWay, keep_alpha: bool, dither: bool, green6: bool, fogless: bool },
+    ///
+    /// `wide`: an 8-bit target (`wide_variant`): no cut, the alpha always
+    /// kept, never dithered or `green6`; `fogless` as for 565.
+    Fast { way: ReadWay, keep_alpha: bool, dither: bool, green6: bool, fogless: bool, wide: bool },
 }
 
 impl ReadVariant {
@@ -293,8 +296,8 @@ impl ReadVariant {
     /// else stays as it is.
     pub fn for_invisible_source(self) -> ReadVariant {
         match self {
-            ReadVariant::Fast { way: ReadWay::Normal, keep_alpha, dither, green6, fogless } => {
-                ReadVariant::Fast { way: ReadWay::Invisible, keep_alpha, dither, green6, fogless }
+            ReadVariant::Fast { way: ReadWay::Normal, keep_alpha, dither, green6, fogless, wide: false } => {
+                ReadVariant::Fast { way: ReadWay::Invisible, keep_alpha, dither, green6, fogless, wide: false }
             }
             other => other,
         }
@@ -350,7 +353,41 @@ pub fn read_variant(flags: u32, blend: u32, keep_target_alpha: bool, exact_norma
     }
     // Textured 565 draws without fog: the fog-free programs.
     let fogless = green6 && flags & draw_flags::TEXTURED != 0 && flags & draw_flags::FOG == 0;
-    ReadVariant::Fast { way, keep_alpha: !writes_alpha, dither, green6, fogless }
+    ReadVariant::Fast { way, keep_alpha: !writes_alpha, dither, green6, fogless, wide: false }
+}
+
+/// The frame-read program for a draw into an 8-bit target with `flags`
+/// and packed `blend` (`Draw::blend`) that blends as the GE does: normal
+/// alpha blends and additive ones (source alpha, one), `ReadWay::Normal` /
+/// `Add` without the cut. None for GXM's blending as before: other blends,
+/// BLEND_FIX, dithered draws, draws that write an alpha the game reads
+/// (`keep_target_alpha` and `BLEND_WRITES_ALPHA`: the stencil's ways).
+///
+/// GXM rounds the whole blend once where the GE truncates each term
+/// (`ge_blend_term`): every normal alpha blend came out ~0.5 levels
+/// brighter, which piles up under overdraw (God of War's smoke and glow,
+/// its bloom amplifying it: its picture 3-10 % brighter than Sony's,
+/// 2026-11-23). The programs keep the target's alpha: either the game reads
+/// it (its stencil, which these blends leave alone) or nobody does.
+/// Measured instead and dropped: the GE's source term by the program with
+/// GXM's rounded destination term (no frame read): half the gain at half
+/// the GPU cost (DESIGN, fifty-first session).
+pub fn wide_variant(flags: u32, blend: u32, keep_target_alpha: bool) -> Option<ReadVariant> {
+    use crate::blend::{BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_WRITES_ALPHA};
+    let format = (flags & draw_flags::TARGET_FORMAT_MASK) >> draw_flags::TARGET_FORMAT_SHIFT;
+    if format != 0 || blend & BLEND_ENABLED == 0 || blend & BLEND_FIX_B_ALPHA != 0 || flags & draw_flags::DITHER != 0 {
+        return None;
+    }
+    if keep_target_alpha && blend & BLEND_WRITES_ALPHA != 0 {
+        return None;
+    }
+    let way = match (blend & 0xF, (blend >> 4) & 0xF, (blend >> 8) & 7) {
+        (4, 5, 0) => ReadWay::Normal,
+        (4, 1, 0) => ReadWay::Add,
+        _ => return None,
+    };
+    let fogless = flags & draw_flags::TEXTURED != 0 && flags & draw_flags::FOG == 0;
+    Some(ReadVariant::Fast { way, keep_alpha: true, dither: false, green6: false, fogless, wide: true })
 }
 
 /// The corners of triangle `t` of a strip, counted from its first vertex:
@@ -2702,13 +2739,57 @@ mod tests {
     }
 
     #[test]
+    fn eight_bit_targets_blend_as_the_ge_by_mode() {
+        use crate::blend::{BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_WRITES_ALPHA};
+        let normal = BLEND_ENABLED | 4 | 5 << 4;
+        let add = BLEND_ENABLED | 4 | 1 << 4;
+        let fogged = draw_flags::TEXTURED | draw_flags::FOG;
+        let wide = |way, fogless| Some(ReadVariant::Fast { way, keep_alpha: true, dither: false, green6: false, fogless, wide: true });
+        // Read and blended as the GE does; the alpha kept (read or not).
+        assert_eq!(wide_variant(fogged, normal, true), wide(ReadWay::Normal, false));
+        assert_eq!(wide_variant(fogged, add, true), wide(ReadWay::Add, false));
+        assert_eq!(wide_variant(draw_flags::TEXTURED, normal, false), wide(ReadWay::Normal, true));
+        assert_eq!(wide_variant(draw_flags::TEXTURED, normal | BLEND_WRITES_ALPHA, false), wide(ReadWay::Normal, true), "nobody reads it");
+        assert_eq!(wide_variant(0, add, false), wide(ReadWay::Add, false), "untextured: never fogless");
+        // Not: blending off, FIX B, other factors, dithered, 16-bit targets,
+        // an alpha written that the game reads (its stencil).
+        assert_eq!(wide_variant(fogged, 4 | 5 << 4, true), None);
+        assert_eq!(wide_variant(fogged, normal | BLEND_FIX_B_ALPHA, true), None);
+        assert_eq!(wide_variant(fogged, BLEND_ENABLED | 1 | 1 << 4, true), None);
+        assert_eq!(wide_variant(fogged | draw_flags::DITHER, normal, true), None);
+        assert_eq!(wide_variant(fogged | draw_flags::TARGET_5551 << draw_flags::TARGET_FORMAT_SHIFT, normal, true), None);
+        assert_eq!(wide_variant(fogged, normal | BLEND_WRITES_ALPHA, true), None);
+    }
+
+    /// GXM's blending (each blend rounded once, c f / 255 to the nearest)
+    /// against the GE's two truncated terms, over all source colours,
+    /// alphas and targets: ~0.5 levels brighter on average, which the
+    /// `wide_variant` programs take away.
+    #[test]
+    fn gxm_normal_blends_are_half_a_level_brighter_than_the_ges() {
+        let (mut bias, mut total) = (0i64, 0i64);
+        for s in (0..=255u32).step_by(3) {
+            for a in 0..=255u32 {
+                for d in (0..=255u32).step_by(5) {
+                    let ge = (ge_blend_term(s, a) + ge_blend_term(d, 255 - a)).min(255) as i64;
+                    let gxm = ((s * a + d * (255 - a) + 127) / 255).min(255) as i64;
+                    assert!((gxm - ge).abs() <= 2, "{s} {a} {d}");
+                    bias += gxm - ge;
+                    total += 1;
+                }
+            }
+        }
+        assert!((40..60).contains(&(bias * 100 / total)), "{bias} of {total}");
+    }
+
+    #[test]
     fn draws_into_5551_get_fast_programs_for_common_blends() {
         use crate::blend::{BLEND_ALPHA_ONLY, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_WRITES_ALPHA};
         let target = |format: u32| format << draw_flags::TARGET_FORMAT_SHIFT;
         let normal = BLEND_ENABLED | 4 | 5 << 4;
         let add = BLEND_ENABLED | 4 | 1 << 4;
-        let fast = |way, keep_alpha| ReadVariant::Fast { way, keep_alpha, dither: false, green6: false, fogless: false };
-        let dithered = |way, keep_alpha| ReadVariant::Fast { way, keep_alpha, dither: true, green6: false, fogless: false };
+        let fast = |way, keep_alpha| ReadVariant::Fast { way, keep_alpha, dither: false, green6: false, fogless: false, wide: false };
+        let dithered = |way, keep_alpha| ReadVariant::Fast { way, keep_alpha, dither: true, green6: false, fogless: false, wide: false };
         let f5551 = target(draw_flags::TARGET_5551);
         // Nobody reads the alpha: every draw writes it.
         assert_eq!(read_variant(f5551, normal, false, true), fast(ReadWay::Normal, false));
@@ -2749,8 +2830,8 @@ mod tests {
         let normal = BLEND_ENABLED | 4 | 5 << 4;
         let add = BLEND_ENABLED | 4 | 1 << 4;
         let zero_one = BLEND_ENABLED | 1 << 4;
-        let fast = |way, dither| ReadVariant::Fast { way, keep_alpha: false, dither, green6: true, fogless: false };
-        let fogless = |way, dither| ReadVariant::Fast { way, keep_alpha: false, dither, green6: true, fogless: true };
+        let fast = |way, dither| ReadVariant::Fast { way, keep_alpha: false, dither, green6: true, fogless: false, wide: false };
+        let fogless = |way, dither| ReadVariant::Fast { way, keep_alpha: false, dither, green6: true, fogless: true, wide: false };
         // NFS UR's title: dithered normal (logo, cars), add (trail buffer),
         // zero/one (untextured).
         let dithered = f565 | draw_flags::DITHER;
@@ -2819,7 +2900,7 @@ mod tests {
 
     #[test]
     fn only_normal_blends_become_invisible() {
-        let fast = |way, keep_alpha, dither| ReadVariant::Fast { way, keep_alpha, dither, green6: false, fogless: false };
+        let fast = |way, keep_alpha, dither| ReadVariant::Fast { way, keep_alpha, dither, green6: false, fogless: false, wide: false };
         for keep_alpha in [false, true] {
             for dither in [false, true] {
                 let normal = fast(ReadWay::Normal, keep_alpha, dither);

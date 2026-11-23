@@ -26,6 +26,9 @@
 #                                   UNTEXTURED READ_SUBTRACT READ_565 (one, one, reverse subtract)
 #   nativeres_color_read_invisible[keep][dither]_f.cg
 #                                   UNTEXTURED READ_INVISIBLE (normal blends of alpha 0)
+#   nativeres_textured_read_<way>widekeep[nofog][test]_f.cg, nativeres_color_read_<way>widekeep_f.cg
+#                                   8-bit targets (READ_WIDE READ_KEEP_ALPHA: the normal / add blend as
+#                                   the GE does, no cut; frame read)
 # Run after changing a source, then compile the shaders on the Vita
 # (README.md "Shaders").
 cd "$(dirname "$0")/../vita/shaders"
@@ -87,4 +90,15 @@ for dither in "" dither; do
   # Untextured only: normal blending of alpha 0 (ReadWay::Invisible).
   variant nativeres_textured_read_f "UNTEXTURED READ_INVISIBLE $DITHER" nativeres_color_read_invisible${dither}_f
   variant nativeres_textured_read_f "UNTEXTURED READ_INVISIBLE READ_KEEP_ALPHA $DITHER" nativeres_color_read_invisiblekeep${dither}_f
+done
+# 8-bit targets (God of War): the GE's normal / additive blend without a cut
+# (READ_WIDE, frame read; the target's alpha always kept: core frame.rs
+# `wide_variant`), with and without fog and alpha test.
+for way in normal add; do
+  WAY=READ_$(echo $way | tr a-z A-Z)
+  variant nativeres_textured_read_f "$WAY READ_WIDE READ_KEEP_ALPHA" nativeres_textured_read_${way}widekeep_f
+  variant nativeres_textured_read_f "$WAY READ_WIDE READ_KEEP_ALPHA READ_TEST" nativeres_textured_read_${way}widekeeptest_f
+  variant nativeres_textured_read_f "$WAY READ_WIDE READ_KEEP_ALPHA NO_FOG" nativeres_textured_read_${way}widekeepnofog_f
+  variant nativeres_textured_read_f "$WAY READ_WIDE READ_KEEP_ALPHA NO_FOG READ_TEST" nativeres_textured_read_${way}widekeepnofogtest_f
+  variant nativeres_textured_read_f "UNTEXTURED $WAY READ_WIDE READ_KEEP_ALPHA" nativeres_color_read_${way}widekeep_f
 done

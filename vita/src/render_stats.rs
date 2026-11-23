@@ -88,6 +88,9 @@ pub struct RenderStats {
     pub cut_fast_draws: u32,
     /// Of those, without a frame read (unblended, or `ReadWay::Precut`).
     pub cut_off_draws: u32,
+    /// Draws into 8-bit targets blended as the GE does (draw.rs
+    /// `BLEND_8888`).
+    pub wide_draws: u32,
     /// Normal alpha blends drawn unblended: every fragment opaque (draw.rs
     /// `OPAQUE_SOURCES`, core `opaque_source`).
     pub opaque_draws: u32,
@@ -163,6 +166,7 @@ impl RenderStats {
         masked_alpha_tests: 0,
         cut_draws: 0,
         cut_fast_draws: 0,
+        wide_draws: 0,
         cut_off_draws: 0,
         opaque_draws: 0,
         opaque_untested_draws: 0,
@@ -257,7 +261,7 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
     );
     let _ = write!(
         text,
-        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} point_light_draws={} fixed_color_draws={} fix_b_draws={} cut_draws={} cut_fast_draws={} cut_off_draws={} opaque_draws={} opaque_untested_draws={} opaque_rows_draws={} hidden_draws={} depth_only_draws={} hidden={}us flat_draws={} opaque={}us ",
+        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} point_light_draws={} fixed_color_draws={} fix_b_draws={} cut_draws={} cut_fast_draws={} cut_off_draws={} wide_draws={} opaque_draws={} opaque_untested_draws={} opaque_rows_draws={} hidden_draws={} depth_only_draws={} hidden={}us flat_draws={} opaque={}us ",
         per_frame(s.begin_us),
         per_frame(s.loop_us),
         per_frame(s.convert_us),
@@ -276,6 +280,7 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
         s.cut_draws / frames,
         s.cut_fast_draws / frames,
         s.cut_off_draws / frames,
+        s.wide_draws / frames,
         s.opaque_draws / frames,
         s.opaque_untested_draws / frames,
         s.opaque_rows_draws / frames,

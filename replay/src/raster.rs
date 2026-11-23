@@ -17,8 +17,8 @@
 //! Pixels are sampled at their centres with a top-left fill rule, like GPUs
 //! do, so triangles sharing an edge don't draw its pixels twice.
 
-use nativeres_core::blend::{channel_mask, StencilState, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_FIX_B_SHIFT, BLEND_PREMULTIPLY_SHIFT};
-use nativeres_core::frame::{draw_flags, test_flags, texture_flags, Draw, Frame, FrameVertex, TextureDescriptor};
+use nativeres_core::blend::{channel_mask, reads_destination_alpha, samples_target_alpha, StencilState, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_FIX_B_SHIFT, BLEND_PREMULTIPLY_SHIFT};
+use nativeres_core::frame::{draw_flags, ge_blend_term, test_flags, texture_flags, wide_variant, Draw, Frame, FrameVertex, TextureDescriptor};
 use nativeres_core::hidden_draws::{self, HiddenDraws};
 use nativeres_core::offscreen;
 use nativeres_core::texture::{data_size, decode_texture, format, ALL_ROWS_OPAQUE};
@@ -158,6 +158,24 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
         .filter(|&&framebuffer| framebuffer != 0)
         .map(|&framebuffer| (framebuffer, vec![0xFF00_0000u32; WIDTH * HEIGHT], vec![1.0f32; WIDTH * HEIGHT]))
         .collect();
+    // Normal and additive blends into 8-bit targets blend as the GE does
+    // while the game reads its targets' alpha, as the Vita's default
+    // (draw.rs `BLEND_8888` 1; its display notes the reads, frame_loop
+    // `target_alpha_read`: a target sampled with its alpha, a blend with
+    // the destination alpha, a stencil test). REPLAY_BLEND8888=0: never,
+    // 2: in every frame (the Vita's `blend8888 0|2`).
+    let reads_target_alpha = frame.draws().iter().any(|draw| {
+        (draw.blend & BLEND_ENABLED != 0 && reads_destination_alpha(draw.blend))
+            || frame.stencil_state_of(draw).is_some_and(|state| state.test().is_some())
+    }) || frame.textures().iter().any(|texture| {
+        samples_target_alpha(texture.flags)
+            && texture.format != format::BGR5650
+            && (texture.address == frame.shown_framebuffer
+                || other_framebuffer(texture, frame)
+                || offscreen_framebuffers.iter().any(|&framebuffer| framebuffer != 0 && offscreen::reads_framebuffer(texture, framebuffer)))
+    });
+    let blend_mode = std::env::var("REPLAY_BLEND8888").ok().and_then(|value| value.parse::<u8>().ok()).unwrap_or(1);
+    GE_BLEND_FRAME.store(blend_mode == 2 || (blend_mode == 1 && reads_target_alpha), std::sync::atomic::Ordering::Relaxed);
     // The screen read only by draws into other framebuffers (God of War's
     // bloom chain): they sample the screen as drawn so far, as the Vita
     // samples its target of it (frame_loop `screen_from_target`).
@@ -217,6 +235,22 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
                 let (_, picture, _) = offscreen.iter().find(|(framebuffer, _, _)| offscreen::reads_framebuffer(texture, *framebuffer))?;
                 Some(target_texture(texture, picture))
             });
+        // Measuring: REPLAY_NATIVE=1 shades every draw at the PSP's own
+        // resolution (each pixel at the centre of its PSP pixel: a 1x
+        // picture shown doubled), 2 only the draws into off-screen targets
+        // (the Vita's off-screen targets are 1:1, targets.rs), 3 only those
+        // of them that read a target (God of War's bloom chain). Against
+        // the game's picture this separates resolution from arithmetic
+        // (2026-11-23: GoW's bloom at 2x blurred too little).
+        NATIVE_DRAW.store(
+            match native_mode() {
+                1 => true,
+                2 => draw.framebuffer != frame.shown_framebuffer,
+                3 => draw.framebuffer != frame.shown_framebuffer && from_target.is_some(),
+                _ => false,
+            },
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let mut drawn_textures;
         let draw_textures: &[Option<Texture>] = match from_target {
             Some(texture) => {
@@ -434,9 +468,22 @@ fn draw_triangle(
     let alpha_function = draw.tests >> test_flags::ALPHA_FUNCTION_SHIFT;
     let alpha_reference = (draw.tests >> test_flags::ALPHA_REFERENCE_SHIFT) & 0xFF;
     let alpha_mask = draw.tests >> test_flags::ALPHA_MASK_SHIFT;
+    // Normal and additive blends into 8-bit targets blend as the GE does,
+    // as the Vita's frame-read programs for them (core `wide_variant`; the
+    // Vita leaves draws with a stencil state to GXM), in frames that read
+    // their targets' alpha (`GE_BLEND_FRAME`).
+    let ge_exact = GE_BLEND_FRAME.load(std::sync::atomic::Ordering::Relaxed)
+        && target_bits.is_none()
+        && stencil.is_none()
+        && wide_variant(draw.flags, draw.blend, true).is_some();
+    let native = NATIVE_DRAW.load(std::sync::atomic::Ordering::Relaxed);
     for y in min_y..max_y {
         for x in min_x..max_x {
-            let center = (x as f32 + 0.5, y as f32 + 0.5);
+            let center = if native {
+                ((x & !1) as f32 + 1.0, (y & !1) as f32 + 1.0) // REPLAY_NATIVE: the PSP pixel's centre
+            } else {
+                (x as f32 + 0.5, y as f32 + 0.5)
+            };
             let w0 = edge(p1, p2, center);
             let w1 = edge(p2, p0, center);
             let w2 = edge(p0, p1, center);
@@ -483,7 +530,8 @@ fn draw_triangle(
                 depth[index] = z;
             }
             let pixel = &mut screen[index];
-            *pixel = blend(draw.blend, source, Color::from_rgba(*pixel)).to_rgba();
+            let destination = Color::from_rgba(*pixel);
+            *pixel = if ge_exact { ge_blend(draw.blend, source, destination) } else { blend(draw.blend, source, destination) }.to_rgba();
             if let Some(value) = stencil.and_then(|state| state.write()) {
                 *pixel = (*pixel & 0x00FF_FFFF) | (value as u32) << 24;
             }
@@ -572,6 +620,36 @@ fn blend(packed: u32, source: Color, destination: Color) -> Color {
     }
 }
 
+/// The GE's normal or additive blend (`wide_variant`'s ways) of 8-bit
+/// values, as nativeres_textured_read_f.cg READ_WIDE: each term ((2c +
+/// 1)(2f + 1)) >> 10 (`ge_blend_term`; a factor of 255 is the colour
+/// itself), added, clamped; the target's alpha kept. GXM's blending rounds
+/// the whole blend once instead: ~0.5 levels brighter per normal blend.
+fn ge_blend(packed: u32, source: Color, destination: Color) -> Color {
+    let to8 = |value: f32| (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+    let alpha = to8(source.a);
+    let additive = (packed >> 4) & 0xF == 1;
+    let channel = |s: f32, d: f32| {
+        let d = to8(d);
+        let term = if additive { d } else { ge_blend_term(d, 255 - alpha) };
+        (ge_blend_term(to8(s), alpha) + term).min(255) as f32 / 255.0
+    };
+    Color { r: channel(source.r, destination.r), g: channel(source.g, destination.g), b: channel(source.b, destination.b), a: destination.a }
+}
+
+/// Whether this frame's normal and additive blends into 8-bit targets blend
+/// as the GE does (`render_frame`, as the Vita's `blend8888`).
+static GE_BLEND_FRAME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `REPLAY_NATIVE` (see the draw loop), read once.
+fn native_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| std::env::var("REPLAY_NATIVE").ok().and_then(|value| value.parse().ok()).unwrap_or(0))
+}
+
+/// Whether the draw being drawn is shaded at 1x (`native_mode`).
+static NATIVE_DRAW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn blend_channels(packed: u32, source: Color, destination: Color) -> Color {
     let clamp = |value: f32| value.clamp(0.0, 1.0);
     if packed & BLEND_ENABLED == 0 {
@@ -639,6 +717,26 @@ fn sample(texture: &Texture, draw: &Draw, u: f32, v: f32) -> Color {
     let y = v * texture.height as f32;
     if draw.flags & draw_flags::LINEAR_FILTER == 0 {
         return texel(x.floor() as i64, y.floor() as i64);
+    }
+    // Measuring: REPLAY_PSP_FILTER=1 filters as the GE does: 1/16-texel
+    // fractions truncated toward zero, each lerp truncated to 8 bits, the
+    // horizontal ones first (ppsspp-ref GPU/Software/Sampler.cpp
+    // SampleLinearLevelT). The GPU's filter rounds; God of War's picture
+    // came ~0.5 levels closer to Sony's with it (2026-11-23), not done on
+    // the Vita (four samples a pixel).
+    static PSP_FILTER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *PSP_FILTER.get_or_init(|| std::env::var_os("REPLAY_PSP_FILTER").is_some()) {
+        let fixed = |value: f32| (value * 16.0) as i64 - 8;
+        let (bx, by) = (fixed(x), fixed(y));
+        let (fx, fy) = ((bx & 15) as u32, (by & 15) as u32);
+        let (x0, y0) = (bx >> 4, by >> 4);
+        let raw = |x: i64, y: i64| texture.pixels[wrap(y, texture.height, clamp_v) * texture.width + wrap(x, texture.width, clamp_u)];
+        let lerp = |a: u32, b: u32, f: u32| -> u32 {
+            (0..4).fold(0, |out, c| out | (((a >> (8 * c)) & 0xFF) * (16 - f) + ((b >> (8 * c)) & 0xFF) * f) >> 4 << (8 * c))
+        };
+        let top = lerp(raw(x0, y0), raw(x0 + 1, y0), fx);
+        let bottom = lerp(raw(x0, y0 + 1), raw(x0 + 1, y0 + 1), fx);
+        return Color::from_rgba(lerp(top, bottom, fy));
     }
     // Bilinear: blend the four texels around the sample point.
     let (x, y) = (x - 0.5, y - 0.5);
@@ -732,6 +830,26 @@ mod tests {
         assert_eq!((written.r, written.a), (1.0, 0.5));
         let stencil_only = blend(Blend::KEEP_COLOR.pack() | BLEND_WRITES_ALPHA | BLEND_ALPHA_ONLY, SOURCE, TARGET);
         assert_eq!((stencil_only.r, stencil_only.b, stencil_only.a), (0.0, 1.0, 0.5));
+    }
+
+    /// Normal alpha blends into 8-bit targets as the GE does (core
+    /// `wide_variant`, the Vita's READ_WIDE programs): each term truncated
+    /// on its own, where GXM's blend rounds once (15.69 + 168.63 -> 184);
+    /// the target's alpha kept.
+    #[test]
+    fn eight_bit_targets_blend_as_the_ge() {
+        let mut screen = vec![0x3000_00C8u32; WIDTH * HEIGHT]; // red 200, alpha (stencil) 0x30
+        let mut depth = vec![1.0f32; WIDTH * HEIGHT];
+        let corner = |x: f32, y: f32| FrameVertex { x, y, z: 0.5, w: 1.0, color: 0x2800_0064, ..FrameVertex::default() };
+        let triangle = [corner(0.0, 0.0), corner(100.0, 0.0), corner(0.0, 100.0)];
+        let draw = Draw { blend: Blend::ALPHA.pack(), scissor_right: 479, scissor_bottom: 271, ..Draw::default() };
+        assert!(wide_variant(draw.flags, draw.blend, true).is_some());
+        GE_BLEND_FRAME.store(true, std::sync::atomic::Ordering::Relaxed); // a frame that reads its alpha
+        draw_triangle(&mut screen, &mut depth, &draw, None, triangle, 0, None);
+        GE_BLEND_FRAME.store(false, std::sync::atomic::Ordering::Relaxed);
+        // Red 100 at alpha 40 over 200: ((201 x 81) >> 10) + ((401 x 431) >> 10) = 15 + 168.
+        assert_eq!(screen[20 * WIDTH + 20], 0x3000_00B7);
+        assert_eq!(blend(draw.blend, Color::from_rgba(0x2800_0064), Color::from_rgba(0x3000_00C8)).to_rgba() & 0xFF, 184, "GXM's way");
     }
 
     /// God of War's marks and its blur's test (core `blend::stencil`): a

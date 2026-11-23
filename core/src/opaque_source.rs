@@ -105,8 +105,8 @@ impl RawColors {
 /// (module comment); anything else stays.
 pub fn for_opaque_source(variant: ReadVariant) -> ReadVariant {
     match variant {
-        ReadVariant::Fast { way: ReadWay::Normal | ReadWay::Precut, keep_alpha, dither, green6, fogless } => {
-            ReadVariant::Fast { way: ReadWay::Off, keep_alpha, dither, green6, fogless }
+        ReadVariant::Fast { way: ReadWay::Normal | ReadWay::Precut, keep_alpha, dither, green6, fogless, wide: false } => {
+            ReadVariant::Fast { way: ReadWay::Off, keep_alpha, dither, green6, fogless, wide: false }
         }
         other => other,
     }
@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn only_normal_blends_become_unblended() {
-        let fast = |way, keep_alpha, dither| ReadVariant::Fast { way, keep_alpha, dither, green6: false, fogless: false };
+        let fast = |way, keep_alpha, dither| ReadVariant::Fast { way, keep_alpha, dither, green6: false, fogless: false, wide: false };
         for keep_alpha in [false, true] {
             for dither in [false, true] {
                 for way in [ReadWay::Normal, ReadWay::Precut] {
