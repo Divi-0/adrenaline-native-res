@@ -72,6 +72,17 @@ pub static ALPHA_MASK: AtomicI32 = AtomicI32::new(1);
 /// render statistics' gpu=. Slows rendering down; for measuring only.
 /// 2: the GPU drained before the scene too.
 pub static MEASURE_GPU: AtomicI32 = AtomicI32::new(0);
+/// Debug `scenefinish 1`: wait for the GPU after every scene of our frames,
+/// so no two of them are on the GPU at once (slow; for finding glitches).
+pub static SCENE_FINISH: AtomicI32 = AtomicI32::new(0);
+
+/// After one of our scenes ended (`SCENE_FINISH`).
+fn finish_scene_if_wanted() {
+    if SCENE_FINISH.load(Ordering::Relaxed) != 0 {
+        // Safe: the display thread's context.
+        unsafe { gxm::sceGxmFinish(gxm::context()) };
+    }
+}
 /// Process time (low 32 bits) when the last drawn frame's rendering
 /// started / ended, and when `NativeResRenderFrame` was entered.
 pub static RENDER_START_US: AtomicU32 = AtomicU32::new(0);
@@ -404,6 +415,7 @@ impl FrameLoop {
 
         ext::frame_draw_started(frame);
         crate::capture::note_drawn_hash(frame);
+        crate::capture::note_parts_before_draw(frame);
 
         self.prepare_sampled_targets(targets, frame);
         // Off-screen framebuffers this frame samples (core offscreen.rs):
@@ -457,6 +469,7 @@ impl FrameLoop {
         let keep_target_alpha = alpha_mask == 2 || (alpha_mask == 1 && blend::keep_target_alpha(self.target_alpha_read, render_count));
         draw::set_keep_target_alpha(keep_target_alpha);
         self.find_palettes(frame, render_count);
+        crate::capture::note_inputs_before_draw(frame.frame_number, self.input_hash(frame));
         let textures_us = now() - start;
         {
             let stats = stats();
@@ -521,6 +534,7 @@ impl FrameLoop {
             draw::end_draws();
             // Safe: the display thread's context, inside the target scene.
             let end_result = unsafe { gxm::sceGxmEndScene(gxm::context(), null(), frame_pool::close_segment()) };
+            finish_scene_if_wanted();
             if end_result < 0 {
                 frame_pool::scene_failed();
             }
@@ -541,6 +555,8 @@ impl FrameLoop {
             // Safe: the display thread's context.
             unsafe { gxm::sceGxmFinish(gxm::context()) };
             stats().gpu_us += now() - gpu_start;
+            crate::capture::check_drawn_hash(frame);
+            crate::capture::check_inputs_after_draw(self.input_hash(frame).0);
         }
 
         let end = now();
@@ -658,6 +674,51 @@ impl FrameLoop {
         let rows = &self.opaque_rows;
         hidden_draws::find(frame, &|texture| rows.get(texture).copied().unwrap_or(0), &mut self.hidden);
         stats().hidden_us += draw::draw_clock().wrapping_sub(start);
+    }
+
+    /// Debug `rawhash`: a hash of the index textures the frame's draws get
+    /// as the GPU reads them: control words, texels (sampled) and the 256 colours of the
+    /// table each is given (a palette table or its own); and how many use
+    /// their own table.
+    pub fn input_hash(&self, frame: &Frame) -> (u64, u32) {
+        if !crate::capture::RAW_HASH.load(Ordering::Relaxed) {
+            return (0, 0);
+        }
+        let mut hash = 0xCBF2_9CE4_8422_2325u64;
+        let mut own = 0;
+        let mut add = |word: u32| hash = (hash ^ word as u64).wrapping_mul(0x0100_0000_01B3);
+        for i in 0..frame.textures().len() {
+            // Safe: textures from the cache or targets, alive this frame.
+            let Some(texture) = (unsafe { self.textures[i].as_ref() }) else {
+                add(0xDEAD_0002);
+                continue;
+            };
+            // Safe: a texture description of ours.
+            if unsafe { gxm::sceGxmTextureGetFormat(&texture.gxm) } != gxm::TEXTURE_FORMAT_P8_ABGR {
+                continue; // direct colour: VRAM ones are decoded anew every frame
+            }
+            texture.gxm.control_words.iter().for_each(|&word| add(word));
+            // Its texels (one byte each), every 16th word.
+            // Safe: a texture description of ours; its data holds width x
+            // height bytes at least.
+            unsafe {
+                let data = gxm::sceGxmTextureGetData(&texture.gxm) as *const u32;
+                let words = (gxm::sceGxmTextureGetWidth(&texture.gxm) * gxm::sceGxmTextureGetHeight(&texture.gxm) / 4) as usize;
+                if !data.is_null() {
+                    core::slice::from_raw_parts(data, words).iter().step_by(16).for_each(|&word| add(word));
+                }
+            }
+            let table = if self.palettes[i].is_null() {
+                own += 1;
+                // Safe: a palette texture of ours has its 256-word table.
+                unsafe { gxm::sceGxmTextureGetPalette(&texture.gxm) }
+            } else {
+                self.palettes[i]
+            } as *const u32;
+            // Safe: a 256-colour table (palette tables or the texture's own).
+            unsafe { core::slice::from_raw_parts(table, 256) }.iter().for_each(|&word| add(word));
+        }
+        (hash, own)
     }
 
     /// The colour tables of the frame's index textures: a palette table
@@ -904,6 +965,7 @@ impl FrameLoop {
         let notification = if is_last { frame_pool::close_segment() } else { null() };
         // Safe: the display thread's context, inside the scene.
         let result = unsafe { gxm::sceGxmEndScene(gxm::context(), null(), notification) };
+        finish_scene_if_wanted();
         if result < 0 && is_last {
             frame_pool::scene_failed();
         }

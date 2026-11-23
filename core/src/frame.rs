@@ -1576,11 +1576,47 @@ impl Frame {
     /// corner, its bones and its transform and camera. Taken on the capture
     /// thread when the frame is complete and on the display thread before
     /// the GPU gets it: which side a one-frame glitch comes from.
-    /// Zero-copy draws (`RAW_PSP_RAM`) and raw sprites hash their corners
-    /// only.
+    /// Zero-copy draws (`RAW_PSP_RAM`) hash their corners and their PSP
+    /// address (not the bytes there), raw sprites their corners only.
     pub fn raw_draw_hash(&self) -> u64 {
         let parts = self.raw_draw_hash_parts();
         parts.iter().fold(0xCBF2_9CE4_8422_2325u64, |hash, &part| (hash ^ part).wrapping_mul(0x0100_0000_01B3))
+    }
+
+    /// Debug `rawhash`: a hash of the bytes the zero-copy draws
+    /// (`RAW_PSP_RAM`) give the GPU, from the lowest to the highest corner,
+    /// read from `ram` (PSP RAM from 0x08000000); and how many draws it
+    /// covered (every fourth word). Taken when the capture completes the
+    /// frame, before the GPU draws it and after it finished:
+    /// did the game write there meanwhile?
+    pub fn raw_psp_ram_hash(&self, ram: &[u8]) -> (u64, u32) {
+        let mut hash = 0xCBF2_9CE4_8422_2325u64;
+        let mut covered = 0;
+        for draw in self.draws() {
+            if draw.flags & draw_flags::RAW_PSP_RAM == 0 || draw.flags & draw_flags::RAW_SPRITES != 0 {
+                continue;
+            }
+            let (mut lowest, mut highest) = (u16::MAX, 0u16);
+            self.draw_indices(draw).for_each(|corner| (lowest, highest) = (lowest.min(corner), highest.max(corner)));
+            if lowest > highest {
+                continue;
+            }
+            let format = crate::vertex::VertexFormat(draw.vertex_format);
+            let layout = format.layout();
+            let base = (draw.first_vertex & 0x1FFF_FFFF).wrapping_sub(0x0800_0000) as usize;
+            let start = base + lowest as usize * layout.size as usize;
+            let end = base + highest as usize * layout.size as usize + format.bytes_used(&layout) as usize;
+            if let Some(bytes) = ram.get(start & !3..end) {
+                covered += 1;
+                // Every fourth word: cheap enough for the capture thread
+                // (~1.2 MiB of God of War's runs per frame), enough to see
+                // a buffer written again.
+                bytes.chunks_exact(4).step_by(4).for_each(|word| {
+                    hash = (hash ^ u32::from_le_bytes([word[0], word[1], word[2], word[3]]) as u64).wrapping_mul(0x0100_0000_01B3)
+                });
+            }
+        }
+        (hash, covered)
     }
 
     /// `raw_draw_hash` in four parts: draw fields, corners, vertex bytes,
@@ -1635,6 +1671,10 @@ impl Frame {
                     }
                     None => add(2, 0xDEAD_0000),
                 }
+            } else if draw.flags & draw_flags::RAW_PSP_RAM != 0 {
+                // Where the GPU reads it in PSP RAM (the bytes may change
+                // there after the hash; the place is the frame's).
+                add(2, draw.first_vertex);
             }
             if draw.bones != 0 {
                 let first = draw.bones as usize - 1;
@@ -1648,6 +1688,23 @@ impl Frame {
                 transform.world.iter().flatten().for_each(|value| add(3, value.to_bits()));
                 camera.view.iter().flatten().chain(camera.projection.iter().flatten()).for_each(|value| add(3, value.to_bits()));
                 camera.viewport.iter().for_each(|value| add(3, value.to_bits()));
+                // What else the raw programs read: depth, fog, texture
+                // scale and offset; the light set.
+                [camera.depth, camera.fog, camera.texture].iter().flatten().for_each(|value| add(3, value.to_bits()));
+                let set = transform.light_set as usize;
+                if let Some(lights) = (set != 0 && set <= self.light_set_count as usize).then(|| &self.light_sets[set - 1]) {
+                    // Safe: plain f32 fields (repr(C)), read as words.
+                    let words = unsafe {
+                        core::slice::from_raw_parts(lights as *const GpuLights as *const u32, core::mem::size_of::<GpuLights>() / 4)
+                    };
+                    words.iter().for_each(|&word| add(3, word));
+                }
+            }
+            if let Some(colors) = self.raw_colors_of(draw) {
+                [colors.material, colors.ambient, colors.emissive, colors.rules, colors.scale, colors.texgen, colors.texgen_source]
+                    .iter()
+                    .flatten()
+                    .for_each(|value| add(0, value.to_bits()));
             }
         }
         hashes

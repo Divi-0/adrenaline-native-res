@@ -198,6 +198,140 @@ pub fn note_drawn_hash(frame: &Frame) {
     DRAWN_HASHES_WRITTEN.fetch_add(1, Ordering::Release);
 }
 
+/// Debug `rawhash` with `gputime 1`: frames whose raw draw hash changed
+/// while the GPU drew them (taken again after the GPU finished,
+/// `check_drawn_hash`), checked frames, the last changed frame and which
+/// parts changed (bits 0-3, `Frame::raw_draw_hash_parts`). Log
+/// `afterdraw=`.
+static AFTER_CHANGED: AtomicU32 = AtomicU32::new(0);
+static AFTER_CHECKED: AtomicU32 = AtomicU32::new(0);
+static AFTER_LAST: AtomicU32 = AtomicU32::new(0);
+static AFTER_PARTS: AtomicU32 = AtomicU32::new(0);
+static BEFORE_PARTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Display thread, debug `rawhash`: `frame`'s parts before its draws
+/// (`note_drawn_hash` takes the whole hash; this keeps the parts for
+/// `check_drawn_hash`).
+pub fn note_parts_before_draw(frame: &Frame) {
+    if !RAW_HASH.load(Ordering::Relaxed) {
+        return;
+    }
+    for (slot, part) in BEFORE_PARTS.iter().zip(frame.raw_draw_hash_parts()) {
+        slot.store(part, Ordering::Relaxed);
+    }
+    let (hash, covered) = frame.raw_psp_ram_hash(psp_ram());
+    BEFORE_RAM.store(hash, Ordering::Relaxed);
+    RAM_COVERED.store(covered, Ordering::Relaxed);
+    let slot = frame.frame_number as usize % CAPTURED_RAM;
+    let mut stale = false;
+    if CAPTURED_RAM_FRAMES[slot].load(Ordering::Acquire) == frame.frame_number {
+        STALE_CHECKED.fetch_add(1, Ordering::Relaxed);
+        stale = CAPTURED_RAM_HASHES[slot].load(Ordering::Relaxed) != hash;
+        STALE_FRAMES.fetch_add(stale as u32, Ordering::Relaxed);
+    }
+    LAST_STALE.store(stale, Ordering::Relaxed);
+}
+
+/// Debug `rawhash`: the drawn frames' texture inputs (`FrameLoop::input_hash`,
+/// textures as bound with their colour tables) by frame number (log
+/// `inputs=<frame>:<hash>/<own tables>,...`, those since the last line),
+/// and frames where they changed while the GPU drew them (`gputime 1`; log
+/// `afterdraw=... tex=<changed>`).
+const INPUT_HASHES: usize = 8;
+static INPUTS_WRITTEN: AtomicU32 = AtomicU32::new(0);
+static INPUTS_LOGGED: AtomicU32 = AtomicU32::new(0);
+static INPUT_FRAMES: [AtomicU32; INPUT_HASHES] = [const { AtomicU32::new(0) }; INPUT_HASHES];
+static INPUT_VALUES: [AtomicU64; INPUT_HASHES] = [const { AtomicU64::new(0) }; INPUT_HASHES];
+static INPUT_OWN: [AtomicU32; INPUT_HASHES] = [const { AtomicU32::new(0) }; INPUT_HASHES];
+static INPUTS_CHANGED: AtomicU32 = AtomicU32::new(0);
+
+/// Display thread, debug `rawhash`: frame `frame_number`'s texture inputs
+/// before its draws.
+pub fn note_inputs_before_draw(frame_number: u32, (hash, own): (u64, u32)) {
+    if !RAW_HASH.load(Ordering::Relaxed) {
+        return;
+    }
+    let slot = INPUTS_WRITTEN.load(Ordering::Relaxed) as usize % INPUT_HASHES;
+    INPUT_FRAMES[slot].store(frame_number, Ordering::Relaxed);
+    INPUT_VALUES[slot].store(hash, Ordering::Relaxed);
+    INPUT_OWN[slot].store(own + 1000 * LAST_STALE.load(Ordering::Relaxed) as u32, Ordering::Relaxed);
+    INPUTS_WRITTEN.fetch_add(1, Ordering::Release);
+}
+
+/// Display thread, debug `rawhash` with `gputime 1`: the texture inputs
+/// after the GPU finished the frame noted last.
+pub fn check_inputs_after_draw(hash: u64) {
+    if !RAW_HASH.load(Ordering::Relaxed) {
+        return;
+    }
+    let last = INPUTS_WRITTEN.load(Ordering::Relaxed).wrapping_sub(1) as usize % INPUT_HASHES;
+    if INPUT_VALUES[last].load(Ordering::Relaxed) != hash {
+        INPUTS_CHANGED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Debug `rawhash`: the zero-copy bytes' hash (`Frame::raw_psp_ram_hash`)
+/// when the capture completed each frame, by frame number, and frames
+/// whose bytes differed when the display began drawing them (log
+/// `afterdraw=... stale=<frames>/<checked>`; per frame `inputs=...` own
+/// tables + 1000 if stale).
+const CAPTURED_RAM: usize = 16;
+static CAPTURED_RAM_FRAMES: [AtomicU32; CAPTURED_RAM] = [const { AtomicU32::new(0) }; CAPTURED_RAM];
+static CAPTURED_RAM_HASHES: [AtomicU64; CAPTURED_RAM] = [const { AtomicU64::new(0) }; CAPTURED_RAM];
+static STALE_FRAMES: AtomicU32 = AtomicU32::new(0);
+static STALE_CHECKED: AtomicU32 = AtomicU32::new(0);
+static LAST_STALE: AtomicBool = AtomicBool::new(false);
+
+/// Capture thread, debug `rawhash`: `frame` is complete.
+fn note_captured_ram(frame: &Frame) {
+    let slot = frame.frame_number as usize % CAPTURED_RAM;
+    CAPTURED_RAM_HASHES[slot].store(frame.raw_psp_ram_hash(psp_ram()).0, Ordering::Relaxed);
+    CAPTURED_RAM_FRAMES[slot].store(frame.frame_number, Ordering::Release);
+}
+
+/// Debug `rawhash`: the zero-copy bytes' hash before the frame's draws
+/// (`Frame::raw_psp_ram_hash`), the draws it covered, frames where it
+/// changed while the GPU drew them (log `afterdraw=...ram=`).
+static BEFORE_RAM: AtomicU64 = AtomicU64::new(0);
+static RAM_COVERED: AtomicU32 = AtomicU32::new(0);
+static RAM_CHANGED: AtomicU32 = AtomicU32::new(0);
+
+/// PSP RAM as the GPU reads it (empty before zero copy mapped it).
+fn psp_ram() -> &'static [u8] {
+    let ram = crate::arenas::PSP_RAM_FOR_GPU.load(Ordering::Acquire);
+    let bytes = crate::arenas::PSP_RAM_FOR_GPU_BYTES.load(Ordering::Acquire);
+    if ram.is_null() {
+        return &[];
+    }
+    // Safe: the mapped block, which stays mapped.
+    unsafe { core::slice::from_raw_parts(ram, bytes as usize) }
+}
+
+/// Display thread, debug `rawhash`: the GPU has finished `frame`
+/// (`gputime 1`): did what its raw draws read change meanwhile?
+pub fn check_drawn_hash(frame: &Frame) {
+    if !RAW_HASH.load(Ordering::Relaxed) {
+        return;
+    }
+    let after = frame.raw_draw_hash_parts();
+    let mut parts = 0;
+    for (index, (slot, part)) in BEFORE_PARTS.iter().zip(after).enumerate() {
+        if slot.load(Ordering::Relaxed) != part {
+            parts |= 1 << index;
+        }
+    }
+    AFTER_CHECKED.fetch_add(1, Ordering::Relaxed);
+    if frame.raw_psp_ram_hash(psp_ram()).0 != BEFORE_RAM.load(Ordering::Relaxed) {
+        RAM_CHANGED.fetch_add(1, Ordering::Relaxed);
+        parts |= 1 << 4;
+    }
+    if parts != 0 {
+        AFTER_CHANGED.fetch_add(1, Ordering::Relaxed);
+        AFTER_LAST.store(frame.frame_number, Ordering::Relaxed);
+        AFTER_PARTS.store(parts, Ordering::Relaxed);
+    }
+}
+
 /// Copiers read small ranges until two reads agree
 /// (`nativeres_core::draw_stream::STABLE_COPIES`; on by default).
 pub fn set_stable_copies(on: u32) {
@@ -1210,7 +1344,35 @@ fn log_frame(state: &mut CaptureState, timing: &mut FrameTiming, flip: &RawEvent
     if RAW_HASH.load(Ordering::Relaxed) {
         let _ = write!(text, " rawhash={}:{:016x} ", RECORDED_HASH_FRAME.load(Ordering::Relaxed), RECORDED_HASH.load(Ordering::Relaxed));
         let parts = RECORDED_PARTS.each_ref().map(|part| part.load(Ordering::Relaxed));
-        let _ = write!(text, "parts={:08x}/{:08x}/{:08x}/{:08x} drawn=", parts[0], parts[1], parts[2], parts[3]);
+        let _ = write!(text, "parts={:08x}/{:08x}/{:08x}/{:08x} ", parts[0], parts[1], parts[2], parts[3]);
+        let _ = write!(text, "inputs=");
+        let written = INPUTS_WRITTEN.load(Ordering::Acquire);
+        let logged = INPUTS_LOGGED.swap(written, Ordering::Relaxed);
+        for n in written.saturating_sub(INPUT_HASHES as u32).max(logged)..written {
+            let slot = n as usize % INPUT_HASHES;
+            let _ = write!(
+                text,
+                "{}:{:08x}/{},",
+                INPUT_FRAMES[slot].load(Ordering::Relaxed),
+                INPUT_VALUES[slot].load(Ordering::Relaxed) as u32,
+                INPUT_OWN[slot].load(Ordering::Relaxed)
+            );
+        }
+        let _ = write!(text, " ");
+        let _ = write!(
+            text,
+            "afterdraw={}/{}@{}:{:x} tex={} ram={}/{} stale={}/{} ",
+            AFTER_CHANGED.load(Ordering::Relaxed),
+            AFTER_CHECKED.load(Ordering::Relaxed),
+            AFTER_LAST.load(Ordering::Relaxed),
+            AFTER_PARTS.load(Ordering::Relaxed),
+            INPUTS_CHANGED.load(Ordering::Relaxed),
+            RAM_CHANGED.load(Ordering::Relaxed),
+            RAM_COVERED.load(Ordering::Relaxed),
+            STALE_FRAMES.load(Ordering::Relaxed),
+            STALE_CHECKED.load(Ordering::Relaxed)
+        );
+        let _ = write!(text, "drawn=");
         let written = DRAWN_HASHES_WRITTEN.load(Ordering::Acquire);
         let logged = DRAWN_HASHES_LOGGED.swap(written, Ordering::Relaxed);
         for n in written.saturating_sub(DRAWN_HASHES as u32).max(logged)..written {
@@ -1528,6 +1690,7 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
                     slot.store(part as u32, Ordering::Relaxed);
                 }
                 RECORDED_HASH_FRAME.store(frame.frame_number, Ordering::Relaxed);
+                note_captured_ram(frame);
             }
             if recording && SKIN_WATCH.load(Ordering::Relaxed) {
                 // Safe: as above.

@@ -40,7 +40,7 @@ pub mod start_skip {
 pub struct Options {
     pub mip: u8,
     pub smooth: bool,
-    /// 0 none, 1 the GAME label, 2 the diagnostics.
+    /// 0 none (default), 1 the diagnostics.
     pub game_fps: u8,
     pub arm_clock: i32,
     /// `start_skip` bits.
