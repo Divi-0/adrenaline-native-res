@@ -13,9 +13,9 @@
 //! kind (programs are registered once and never released) and switches
 //! between them when the game changes (`Draws::choose_programs`).
 //!
-//! The PSP-depth twins are not embedded: they come from pspdepth.pak next
-//! to the plugin (scripts/pack-depth-twins.py), read only when a game needs
-//! them (`load_depth_pack`), so they take no memory in other games
+//! The PSP-depth twins are embedded zlib-compressed as one pack
+//! (scripts/pack-depth-twins.py) and unpacked only when a game needs them
+//! (`load_depth_pack`): ~64 KB instead of ~250 KB in every other game
 //! (DESIGN "sixty-first session").
 
 use core::ffi::c_void;
@@ -42,7 +42,7 @@ impl<const BYTES: usize> Program for Gxp<BYTES> {
 }
 
 /// A program and its PSP-depth twin (scripts/shader-variants.sh `twins`):
-/// the twin by name from pspdepth.pak (`load_depth_pack`, which made sure
+/// the twin by name from the unpacked depth pack (`load_depth_pack`, which made sure
 /// every twin is there before `set_psp_depth` turns them on).
 #[repr(C)]
 pub struct Twin<const BASE: usize> {
@@ -61,17 +61,23 @@ impl<const BASE: usize> Program for Twin<BASE> {
     }
 }
 
-/// Where pspdepth.pak lies (deployed next to the plugin).
-const DEPTH_PACK_PATH: &[u8] = b"ux0:data/nativeres/pspdepth.pak\0";
+/// The PSP-depth twins' pack, zlib-compressed.
+static DEPTH_PACK_PACKED: &[u8] = include_bytes!("../shaders/pspdepth.pak.z");
 const DEPTH_PACK_NAME_BYTES: usize = 64;
 const DEPTH_PACK_ENTRY_BYTES: usize = DEPTH_PACK_NAME_BYTES + 8;
 
-/// Memory plan (tools/memcheck.py): the pack, read for PSP-depth games only.
+/// Memory plan (tools/memcheck.py): the unpacked pack (and the inflater's
+/// state), for PSP-depth games only.
 #[no_mangle]
 #[used]
-pub static nativeres_plan_optin_psp_depth_pack: u32 = sys::pages(DEPTH_PACK_BYTES);
+pub static nativeres_plan_optin_psp_depth_pack: u32 = sys::pages(DEPTH_PACK_BLOCK_BYTES);
 
-/// pspdepth.pak in memory once read and checked (never freed: GXM keeps
+/// The unpacked pack, then the inflater's state (in the same block, freed
+/// with it: no room for it on the stack).
+const DEPTH_PACK_STATE_OFFSET: usize = DEPTH_PACK_BYTES.next_multiple_of(16);
+const DEPTH_PACK_BLOCK_BYTES: usize = DEPTH_PACK_STATE_OFFSET + core::mem::size_of::<miniz_oxide::inflate::core::DecompressorOxide>();
+
+/// The depth pack once unpacked and checked (never freed: GXM keeps
 /// pointers into it); None before (or if it couldn't be read).
 static DEPTH_PACK: SingleThreaded<Option<&'static [u8]>> = SingleThreaded::new(None);
 
@@ -95,9 +101,9 @@ fn depth_program(name: &[u8]) -> Option<*const u8> {
     })
 }
 
-/// Reads pspdepth.pak (display thread, once: the first PSP-depth game) and
-/// checks it is this build's (size, hash, entries). False if it is missing
-/// or another build's: the float programs stay then.
+/// Unpacks the pack (display thread, once: the first PSP-depth game) and
+/// checks it (size, hash). False if that fails (no memory): the float
+/// programs stay then.
 pub fn load_depth_pack() -> bool {
     // Safe: display thread only.
     let slot = unsafe { DEPTH_PACK.get() };
@@ -107,28 +113,33 @@ pub fn load_depth_pack() -> bool {
     let bytes = DEPTH_PACK_BYTES;
     // Safe: plain system calls; the block is ours, freed if the file is wrong.
     unsafe {
-        let block = sys::alloc_block(b"NativeResDepthPack\0".as_ptr(), sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, sys::pages(bytes), core::ptr::null_mut());
+        let block = sys::alloc_block(
+            b"NativeResDepthPack\0".as_ptr(),
+            sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_RW,
+            sys::pages(DEPTH_PACK_BLOCK_BYTES),
+            core::ptr::null_mut(),
+        );
         if block < 0 {
             render_log::line(format_args!("depth pack: no memory ({bytes} bytes)\n"));
             return false;
         }
         let mut base: *mut c_void = core::ptr::null_mut();
         sys::sceKernelGetMemBlockBase(block, &mut base);
-        let file = sys::sceIoOpen(DEPTH_PACK_PATH.as_ptr(), sys::SCE_O_RDONLY, 0);
-        let mut read = -1;
-        if file >= 0 {
-            read = sys::sceIoRead(file, base, bytes as u32);
-            sys::sceIoClose(file);
-        }
+        use miniz_oxide::inflate::core::{decompress, inflate_flags, DecompressorOxide};
+        let state = (base as *mut u8).add(DEPTH_PACK_STATE_OFFSET) as *mut DecompressorOxide;
+        state.write(DecompressorOxide::new());
+        let output = core::slice::from_raw_parts_mut(base as *mut u8, bytes);
+        let flags = inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER | inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
+        let (_, _, read) = decompress(&mut *state, DEPTH_PACK_PACKED, output, 0, flags);
         let pack = core::slice::from_raw_parts(base as *const u8, bytes);
-        let fits = read == bytes as i32
+        let fits = read == bytes
             && &pack[..4] == b"NRDP"
             && word(pack, 4) == 1
             && word(pack, 8) as usize == DEPTH_PACK_COUNT
             && word(pack, 12) == DEPTH_PACK_HASH
             && fnv1a(&pack[16..]) == DEPTH_PACK_HASH;
         if !fits {
-            render_log::line(format_args!("depth pack: {} unreadable or another build's (read {read} of {bytes} bytes)\n", "ux0:data/nativeres/pspdepth.pak"));
+            render_log::line(format_args!("depth pack: unpacked {read} of {bytes} bytes or wrong hash\n"));
             sys::free_block(block);
             return false;
         }
@@ -191,7 +202,7 @@ macro_rules! embed_gxp {
 }
 
 /// Embeds `shaders/<name>.gxp` as the `Twin` static `<name>`, its PSP-depth
-/// twin `<depth>` named (from pspdepth.pak).
+/// twin `<depth>` named (from the depth pack).
 macro_rules! embed_twin {
     ($name:ident, $depth:ident) => {
         #[allow(non_upper_case_globals)]

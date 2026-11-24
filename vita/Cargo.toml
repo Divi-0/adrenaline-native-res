@@ -14,3 +14,5 @@ name = "nativeres_vita"
 
 [dependencies]
 nativeres-core = { path = "../core" }
+# Unpacks the PSP-depth programs (shaders.rs, core-only inflate: no alloc).
+miniz_oxide = { version = "0.9", default-features = false }

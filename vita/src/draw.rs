@@ -865,7 +865,7 @@ impl Draws {
         if wanted == self.programs_psp_depth || self.other_programs_failed {
             return;
         }
-        // The PSP-depth twins come from pspdepth.pak: without it, float depth stays.
+        // The PSP-depth twins come from the depth pack: if it can't be unpacked, float depth stays.
         if wanted && !crate::shaders::load_depth_pack() {
             self.other_programs_failed = true;
             return;
