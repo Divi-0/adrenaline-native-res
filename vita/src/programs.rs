@@ -103,6 +103,14 @@ pub struct Textured {
     /// -1: 0), see nativeres_textured_v.cg; draw.rs `set_textured_depth_far`.
     pub depth_far: *const ProgramParameter,
     pub fog_and_scale: *const ProgramParameter,
+    /// uTexSize of the textured, flat, alpha-test and BLEND_FIX programs:
+    /// set only where the program filters as the GE (`GeTexel`: the
+    /// PSP-depth set's twins, core game_quirks.rs `PSP_DEPTH_GAMES`), else null.
+    pub tex_size: *const ProgramParameter,
+    pub tex_size_flat: *const ProgramParameter,
+    pub tex_size_test: *const ProgramParameter,
+    pub tex_size_fix: *const ProgramParameter,
+    pub tex_size_test_fix: *const ProgramParameter,
     /// nativeres_textured_flat_f.cg: without fog and specular.
     pub have_flat: bool,
     fragment_flat_id: PatcherId,
@@ -122,7 +130,7 @@ pub struct Textured {
     pub alpha_test_fix: *const ProgramParameter,
     pub blend_fix_test: *const ProgramParameter,
     /// nativeres_textured_(fix_)ge_f.cg: the GE's bilinear filter (uTexSize:
-    /// the texture's size and its inverse).
+    /// the texture's size and the filter, draw.rs `ge_texel_size`).
     pub have_ge: bool,
     fragment_ge_id: PatcherId,
     fragment_fix_ge_id: PatcherId,
@@ -565,6 +573,9 @@ pub struct ReadProgram {
     pub alpha_test: *const ProgramParameter,
     /// The generic one only (else null).
     pub blend_fix: *const ProgramParameter,
+    /// Textured ones that filter as the GE (`GeTexel`, the PSP-depth set's
+    /// twins), else null.
+    pub tex_size: *const ProgramParameter,
 }
 
 /// The generic frame-read programs' own parameters (`Programs::
@@ -779,6 +790,7 @@ impl ReadProgram {
             fog_and_scale: null(),
             alpha_test: null(),
             blend_fix: null(),
+            tex_size: null(),
         }
     }
 
@@ -828,6 +840,7 @@ impl ReadProgram {
         if textured {
             self.fog_and_scale = parameter(fragment_gxp, b"uFogAndScale\0");
             missing |= self.fog_and_scale.is_null();
+            self.tex_size = parameter(fragment_gxp, b"uTexSize\0");
             if generic || tested {
                 self.alpha_test = parameter(fragment_gxp, b"uAlphaTest\0");
                 missing |= self.alpha_test.is_null();
@@ -1185,6 +1198,11 @@ impl Textured {
             have_flat: false,
             fragment_flat_id: null_mut(),
             fog_and_scale_flat: null(),
+            tex_size: null(),
+            tex_size_flat: null(),
+            tex_size_test: null(),
+            tex_size_fix: null(),
+            tex_size_test_fix: null(),
             have_test: false,
             fragment_test_id: null_mut(),
             fog_and_scale_test: null(),
@@ -1342,6 +1360,7 @@ impl Programs {
         textured.wvp = parameter(vertex_gxp, b"wvp\0");
         textured.depth_far = parameter(vertex_gxp, b"uDepthFar\0");
         textured.fog_and_scale = parameter(fragment_gxp, b"uFogAndScale\0");
+        textured.tex_size = parameter(fragment_gxp, b"uTexSize\0");
         if [position, texcoord, color, fog, textured.wvp, textured.fog_and_scale].iter().any(|parameter| parameter.is_null()) {
             render_log::line(format_args!("our programs: parameters missing\n"));
             return false;
@@ -1376,6 +1395,7 @@ impl Programs {
         };
         textured.fragment_flat_id = id;
         textured.fog_and_scale_flat = parameter(program, b"uFogAndScale\0");
+        textured.tex_size_flat = parameter(program, b"uTexSize\0");
         if textured.fog_and_scale_flat.is_null() {
             render_log::line(format_args!("flat program: parameters missing\n"));
             return;
@@ -1396,6 +1416,7 @@ impl Programs {
         textured.fragment_test_id = id;
         textured.fog_and_scale_test = parameter(program, b"uFogAndScale\0");
         textured.alpha_test = parameter(program, b"uAlphaTest\0");
+        textured.tex_size_test = parameter(program, b"uTexSize\0");
         if textured.fog_and_scale_test.is_null() || textured.alpha_test.is_null() {
             render_log::line(format_args!("alpha test program: parameters missing\n"));
             return;
@@ -1421,6 +1442,8 @@ impl Programs {
         textured.fog_and_scale_test_fix = parameter(test_program, b"uFogAndScale\0");
         textured.alpha_test_fix = parameter(test_program, b"uAlphaTest\0");
         textured.blend_fix_test = parameter(test_program, b"uBlendFix\0");
+        textured.tex_size_fix = parameter(program, b"uTexSize\0");
+        textured.tex_size_test_fix = parameter(test_program, b"uTexSize\0");
         let all = [
             textured.fog_and_scale_fix,
             textured.blend_fix,
@@ -1437,8 +1460,13 @@ impl Programs {
     }
 
     /// The GE_FILTER variants (the GE's bilinear filter for draws reading
-    /// our targets). Failing leaves those draws with the GPU's filter.
+    /// our targets). Failing leaves those draws with the GPU's filter. Not
+    /// in the PSP-depth set: its textured programs all filter as the GE
+    /// (`Textured::tex_size`), these would be the same programs again.
     fn make_ge_filter_programs(&mut self) {
+        if shaders::psp_depth() {
+            return;
+        }
         let textured = &mut self.textured;
         let program = gxp(&shaders::nativeres_textured_ge_f);
         let fix_program = gxp(&shaders::nativeres_textured_fix_ge_f);

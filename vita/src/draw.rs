@@ -557,6 +557,20 @@ fn smooth_textures() -> bool {
     crate::frame_loop::SMOOTH_TEXTURES.load(Ordering::Relaxed) != 0
 }
 
+/// uTexSize of a program that filters as the GE (`GeTexel`,
+/// nativeres_textured_f.cg) for `texture`: its size in texels, then 8, 1 for
+/// the GE's bilinear filter (`linear`), 0, 0 for its nearest texel.
+fn ge_texel_size(texture: &gxm::Texture, linear: bool) -> [f32; 4] {
+    // Safe: a texture description of ours.
+    let (width, height) = unsafe { (gxm::sceGxmTextureGetWidth(texture), gxm::sceGxmTextureGetHeight(texture)) };
+    let (width, height) = (width.max(1) as f32, height.max(1) as f32);
+    if linear {
+        [width, height, 8.0, 1.0]
+    } else {
+        [width, height, 0.0, 0.0]
+    }
+}
+
 fn skip(bit: u32) -> bool {
     REDRAW_SKIP.load(Ordering::Relaxed) & bit != 0
 }
@@ -1193,6 +1207,11 @@ impl Draws {
     /// `stencil_value`: the draw took a BLEND_FIX program for its stencil
     /// value (`StencilWay::FixProgram`): written as its alpha, the colour
     /// as it is.
+    ///
+    /// `ge_size`: the program filters as the GE (`ge_texel_size`): the
+    /// target-read GE_FILTER program (`ge_target_read`, never tested), or
+    /// any of them in the PSP-depth set (`Textured::tex_size`).
+    #[allow(clippy::too_many_arguments)]
     fn textured_fragment_uniforms(
         &mut self,
         tested: bool,
@@ -1202,6 +1221,7 @@ impl Draws {
         blend: u32,
         stencil_value: Option<u8>,
         ge_size: Option<[f32; 4]>,
+        ge_target_read: bool,
     ) {
         let textured = &self.programs.textured;
         let fix_b = blend & BLEND_ENABLED != 0 && blend & BLEND_FIX_B_ALPHA != 0;
@@ -1210,18 +1230,42 @@ impl Draws {
             None => [((blend >> 12) & 0xFF) as f32 / 255.0, ((blend >> 20) & 3) as f32, 0.0, 0.0],
         };
         if let Some(size) = ge_size {
-            // The GE_FILTER programs (never tested): the texture's size too;
-            // few draws, so no caching.
-            let buffer = reserve_fragment_uniforms();
-            if fix_b || stencil_value.is_some() {
-                set_uniform(buffer, textured.fog_and_scale_fix_ge, 4, fog_and_scale.as_ptr());
-                set_uniform(buffer, textured.blend_fix_ge, 4, fix.as_ptr());
-                set_uniform(buffer, textured.tex_size_fix_ge, 4, size.as_ptr());
+            // The texture's size too, per draw: no caching.
+            let fixed = (fix_b || stencil_value.is_some()) && (ge_target_read || textured.have_fix);
+            // (uFogAndScale, uAlphaTest, uBlendFix, uTexSize) of the program in use.
+            let parameters = if ge_target_read {
+                if fixed {
+                    (textured.fog_and_scale_fix_ge, null(), textured.blend_fix_ge, textured.tex_size_fix_ge)
+                } else {
+                    (textured.fog_and_scale_ge, null(), null(), textured.tex_size_ge)
+                }
+            } else if fixed && tested {
+                (textured.fog_and_scale_test_fix, textured.alpha_test_fix, textured.blend_fix_test, textured.tex_size_test_fix)
+            } else if fixed {
+                (textured.fog_and_scale_fix, null(), textured.blend_fix, textured.tex_size_fix)
+            } else if tested {
+                (textured.fog_and_scale_test, textured.alpha_test, null(), textured.tex_size_test)
+            } else if flat {
+                (textured.fog_and_scale_flat, null(), null(), textured.tex_size_flat)
             } else {
-                set_uniform(buffer, textured.fog_and_scale_ge, 4, fog_and_scale.as_ptr());
-                set_uniform(buffer, textured.tex_size_ge, 4, size.as_ptr());
-            }
+                (textured.fog_and_scale, null(), null(), textured.tex_size)
+            };
+            let buffer = reserve_fragment_uniforms();
+            set_uniform(buffer, parameters.0, 4, fog_and_scale.as_ptr());
+            set_uniform(buffer, parameters.1, 4, alpha_range.as_ptr());
+            set_uniform(buffer, parameters.2, 4, fix.as_ptr());
+            set_uniform(buffer, parameters.3, 4, size.as_ptr());
             self.state.tint = None; // the cached default buffer is no longer the one in use
+            let stats = stats();
+            if fixed && !ge_target_read {
+                if stencil_value.is_some() {
+                    stats.stencil_fix_draws += 1;
+                } else {
+                    stats.fix_b_draws += 1;
+                }
+            } else if flat && !tested {
+                stats.flat_draws += 1;
+            }
             return;
         }
         if (fix_b || stencil_value.is_some()) && textured.have_fix {
@@ -1275,6 +1319,9 @@ impl Draws {
     ///
     /// `stencil`: the draw's stencil state done by the generic program
     /// (`StencilWay::FrameRead`, which also takes 8-bit targets: no cut).
+    /// `ge_size`: the program filters as the GE (`ReadProgram::tex_size`,
+    /// `ge_texel_size`).
+    #[allow(clippy::too_many_arguments)]
     fn read_fragment_uniforms(
         &mut self,
         frame: &Frame,
@@ -1283,6 +1330,7 @@ impl Draws {
         tested: bool,
         textured: Option<([f32; 4], [f32; 4])>,
         stencil: Option<StencilState>,
+        ge_size: Option<[f32; 4]>,
     ) {
         let generic = variant == ReadVariant::Generic;
         let wide = is_wide(variant);
@@ -1364,6 +1412,9 @@ impl Draws {
             }
             if !program.blend_fix.is_null() {
                 set_uniform(buffer, program.blend_fix, 4, fix.as_ptr());
+            }
+            if let Some(size) = ge_size {
+                set_uniform(buffer, program.tex_size, 4, size.as_ptr());
             }
         }
         self.state.tint = None; // the cached default buffer is no longer the one in use
@@ -1709,9 +1760,12 @@ impl Draws {
         // `blend::stencil_way`), while the game reads the target's alpha.
         let (stencil_state, stencil_way) = self.stencil_way(frame, draw, true, &mut choice, programs_ready);
         let read_variant = choice.unwrap_or(ReadVariant::Generic);
-        let read_program = match choice {
-            Some(variant) if programs_ready => self.programs.read_program(true, tested, variant).map(|program| program.program),
-            _ => None,
+        let (read_program, read_tex_size) = match choice {
+            Some(variant) if programs_ready => match self.programs.read_program(true, tested, variant) {
+                Some(program) => (Some(program.program), program.tex_size),
+                None => (None, null()),
+            },
+            _ => (None, null()),
         };
         let read = read_program.is_some();
         let read_alpha_range = if tested { alpha_range } else { ALPHA_ALL_PASS };
@@ -1764,6 +1818,7 @@ impl Draws {
         // the textured or BLEND_FIX program (`GE_FILTER`); the texture
         // point-filtered below, its size a uniform.
         let mut ge_size = None;
+        let mut ge_target_read = false;
         if !read
             && !tested
             && !fragment.is_null()
@@ -1783,10 +1838,33 @@ impl Draws {
             if !program.is_null() {
                 fragment = program;
                 flat = false;
-                // Safe: a texture description of ours.
-                let (width, height) = unsafe { (gxm::sceGxmTextureGetWidth(&texture.gxm), gxm::sceGxmTextureGetHeight(&texture.gxm)) };
-                let (width, height) = (width.max(1) as f32, height.max(1) as f32);
-                ge_size = Some([width, height, 1.0 / width, 1.0 / height]);
+                ge_size = Some(ge_texel_size(&texture.gxm, true));
+                ge_target_read = true;
+                stats().ge_filter_draws += 1;
+            }
+        }
+        // The PSP-depth set (core game_quirks.rs `PSP_DEPTH_GAMES`): its textured
+        // programs filter as the GE, bilinear or nearest as the draw says.
+        if ge_size.is_none() && !fragment.is_null() {
+            let fixed = (stencil_value.is_some() || (draw.blend & BLEND_ENABLED != 0 && draw.blend & BLEND_FIX_B_ALPHA != 0))
+                && self.programs.textured.have_fix;
+            let textured = &self.programs.textured;
+            let tex_size = if read {
+                read_tex_size
+            } else if fixed && tested {
+                textured.tex_size_test_fix
+            } else if fixed {
+                textured.tex_size_fix
+            } else if tested {
+                textured.tex_size_test
+            } else if flat {
+                textured.tex_size_flat
+            } else {
+                textured.tex_size
+            };
+            if !tex_size.is_null() {
+                let linear = draw.flags & draw_flags::LINEAR_FILTER != 0 || smooth_textures();
+                ge_size = Some(ge_texel_size(&texture.gxm, linear));
                 stats().ge_filter_draws += 1;
             }
         }
@@ -1921,9 +1999,9 @@ impl Draws {
             if !skip(2) {
                 self.use_raw_transform(frame, draw, set, program, blocks, colors, uv_scale, fragment);
                 if read {
-                    self.read_fragment_uniforms(frame, draw, read_variant, tested, Some((fog_and_scale(draw), read_alpha_range)), read_stencil);
+                    self.read_fragment_uniforms(frame, draw, read_variant, tested, Some((fog_and_scale(draw), read_alpha_range)), read_stencil, ge_size);
                 } else {
-                    self.textured_fragment_uniforms(tested, flat, fog_and_scale(draw), alpha_range, draw.blend, stencil_value, ge_size);
+                    self.textured_fragment_uniforms(tested, flat, fog_and_scale(draw), alpha_range, draw.blend, stencil_value, ge_size, ge_target_read);
                 }
             }
         } else if !fragment.is_null() {
@@ -1968,9 +2046,9 @@ impl Draws {
                     }
                 }
                 if read {
-                    self.read_fragment_uniforms(frame, draw, read_variant, tested, Some((fog_and_scale(draw), read_alpha_range)), read_stencil);
+                    self.read_fragment_uniforms(frame, draw, read_variant, tested, Some((fog_and_scale(draw), read_alpha_range)), read_stencil, ge_size);
                 } else {
-                    self.textured_fragment_uniforms(tested, flat, fog_and_scale(draw), alpha_range, draw.blend, stencil_value, ge_size);
+                    self.textured_fragment_uniforms(tested, flat, fog_and_scale(draw), alpha_range, draw.blend, stencil_value, ge_size, ge_target_read);
                 }
             }
         } else {
@@ -2120,7 +2198,7 @@ impl Draws {
             let fragment = if fragment.is_null() { basic.color_fragment } else { fragment };
             self.use_programs(basic.color_vertex, basic.color_wvp, basic_programs::ORTHO.as_ptr(), fragment);
             if read {
-                self.read_fragment_uniforms(frame, draw, read_variant, false, None, if read { stencil_state } else { None });
+                self.read_fragment_uniforms(frame, draw, read_variant, false, None, if read { stencil_state } else { None }, None);
             }
         }
         if skip(1) {
@@ -2413,9 +2491,15 @@ impl Draws {
         let wvp = self.programs.textured.wvp;
         let matrix = self.native_matrix();
         self.use_programs(vertex, wvp, matrix, fragment as *const c_void);
+        // The PSP-depth set's programs filter as the GE: the one-colour 8x8
+        // test texture as its nearest texel (`ge_texel_size`).
+        let nearest = Some([8.0f32, 8.0, 0.0, 0.0]);
+        let textured = &self.programs.textured;
+        let ge = |tex_size: *const ProgramParameter| if tex_size.is_null() { None } else { nearest };
+        let (eight_bit_ge, flat_ge) = (ge(if tested { textured.tex_size_test } else { textured.tex_size }), ge(textured.tex_size_flat));
         match program {
-            ShadeProgram::EightBit => self.textured_fragment_uniforms(tested, false, case.fog_and_scale, alpha_test, 0, None, None),
-            ShadeProgram::Flat => self.textured_fragment_uniforms(false, true, case.fog_and_scale, alpha_test, 0, None, None),
+            ShadeProgram::EightBit => self.textured_fragment_uniforms(tested, false, case.fog_and_scale, alpha_test, 0, None, eight_bit_ge, false),
+            ShadeProgram::Flat => self.textured_fragment_uniforms(false, true, case.fog_and_scale, alpha_test, 0, None, flat_ge, false),
             ShadeProgram::Cut5551 | ShadeProgram::Wide => {
                 let read = self.programs.made_read_program(true, tested, off);
                 let (fog_and_scale, alpha) = (read.fog_and_scale, read.alpha_test);
@@ -2423,6 +2507,9 @@ impl Draws {
                 set_uniform(buffer, fog_and_scale, 4, case.fog_and_scale.as_ptr());
                 if !alpha.is_null() {
                     set_uniform(buffer, alpha, 4, alpha_test.as_ptr());
+                }
+                if !read.tex_size.is_null() {
+                    set_uniform(buffer, read.tex_size, 4, nearest.unwrap_or_default().as_ptr());
                 }
                 if off == ReadVariant::Generic {
                     // Unblended into 5551, undithered, no BLEND_FIX (as

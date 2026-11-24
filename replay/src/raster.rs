@@ -279,7 +279,15 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
         } else {
             nativeres_core::blend::StencilWay::None
         };
-        let ge_filter = match psp_filter_mode() {
+        // Measuring: REPLAY_GE_FILTER_PLAIN=1 the GE's filter also for every
+        // unblended draw without alpha test (the Vita's plain textured
+        // programs; blended draws go through the frame-read programs in GoW).
+        let plain_ge = std::env::var_os("REPLAY_GE_FILTER_PLAIN").is_some()
+            && draw.flags & draw_flags::TEXTURED != 0
+            && draw.flags & draw_flags::LINEAR_FILTER != 0
+            && draw.blend & BLEND_ENABLED == 0
+            && draw.tests & test_flags::ALPHA_TEST == 0;
+        let ge_filter = plain_ge || match psp_filter_mode() {
             Some(all) => all,
             None => nativeres_core::frame::ge_filter_read(
                 draw.flags,
@@ -818,10 +826,15 @@ fn draw_filter() -> Filter {
 }
 
 /// `REPLAY_PSP_FILTER`, read once: Some(true) the GE's filter for every
-/// draw, Some(false) the GPU's for every draw, None as the Vita.
+/// draw, Some(false) the GPU's for every draw, None as the Vita. `--ge-filter`
+/// (the Vita's program set for God of War, core game_quirks.rs
+/// `PSP_DEPTH_GAMES`): Some(true).
 fn psp_filter_mode() -> Option<bool> {
     static MODE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| std::env::var("REPLAY_PSP_FILTER").ok().map(|value| value != "0"))
+    *MODE.get_or_init(|| match std::env::var("REPLAY_PSP_FILTER") {
+        Ok(value) => Some(value != "0"),
+        Err(_) => std::env::args().any(|arg| arg == "--ge-filter").then_some(true),
+    })
 }
 
 /// Whether the draw being drawn is shaded at 1x (`native_mode`).

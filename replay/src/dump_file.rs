@@ -50,6 +50,36 @@ impl DumpMemory {
         }
         Some(out)
     }
+
+    /// The framebuffer at `address` (`stride` pixels a row, PSP pixel
+    /// format `format`: 0 5650, 1 5551, 2 4444, 3 8888) as a `width` x
+    /// `height` picture, in the GE's colours (16-bit channels widened by
+    /// repeating their top bits), opaque; None unless all of it was dumped.
+    /// God of War's dumps hold the screen it samples: Sony's own picture of
+    /// the dumped frame (`--reference-vram`).
+    pub fn framebuffer_picture(&self, address: u32, stride: u32, format: u32, width: usize, height: usize) -> Option<OriginalPicture> {
+        let bytes_per_pixel = if format == 3 { 4 } else { 2 };
+        let bytes = self.bytes(address, stride * height as u32 * bytes_per_pixel)?;
+        let widen = |value: u32, bits: u32| (value << (8 - bits)) | (value >> (2 * bits - 8));
+        let mut pixels = Vec::with_capacity(width * height);
+        for y in 0..height {
+            for x in 0..width {
+                let at = (y * stride as usize + x) * bytes_per_pixel as usize;
+                let (r, g, b) = if format == 3 {
+                    (bytes[at] as u32, bytes[at + 1] as u32, bytes[at + 2] as u32)
+                } else {
+                    let p = u16::from_le_bytes([bytes[at], bytes[at + 1]]) as u32;
+                    match format {
+                        0 => (widen(p & 31, 5), widen((p >> 5) & 63, 6), widen(p >> 11, 5)),
+                        1 => (widen(p & 31, 5), widen((p >> 5) & 31, 5), widen((p >> 10) & 31, 5)),
+                        _ => ((p & 15) * 17, ((p >> 4) & 15) * 17, ((p >> 8) & 15) * 17),
+                    }
+                };
+                pixels.push(0xFF00_0000 | b << 16 | g << 8 | r);
+            }
+        }
+        Some(OriginalPicture { width, height, pixels })
+    }
 }
 
 /// The dump as the source of a `BlockCache`.
@@ -199,4 +229,43 @@ fn copier_bytes(address: u32, out: &mut [u8]) -> bool {
 
 fn copier_sample(address: u32, positions: &[usize], out: &mut [u32]) -> bool {
     positions.iter().zip(out.iter_mut()).all(|(&position, word)| copier_read(address + 4 * position as u32, std::slice::from_mut(word)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A dump memory holding `bytes` at `address` (whole blocks).
+    fn memory_with(address: u32, bytes: &[u8]) -> DumpMemory {
+        let mut blocks = HashMap::new();
+        for (index, chunk) in bytes.chunks(BLOCK_SIZE as usize).enumerate() {
+            let mut block = chunk.to_vec();
+            block.resize(BLOCK_SIZE as usize, 0);
+            blocks.insert(address + index as u32 * BLOCK_SIZE, block);
+        }
+        DumpMemory { blocks }
+    }
+
+    #[test]
+    fn a_framebuffer_reads_as_the_ges_colours() {
+        // 8888: as stored (RGBA bytes), the alpha (the PSP's stencil) shown opaque.
+        let mut bytes = vec![0u8; 4 * 8 * 2];
+        bytes[..4].copy_from_slice(&[10, 20, 30, 0x20]);
+        bytes[4 * 8 + 4..4 * 8 + 8].copy_from_slice(&[200, 100, 50, 0]); // row 1, pixel 1
+        let picture = memory_with(0x0400_0000, &bytes).framebuffer_picture(0x0400_0000, 8, 3, 2, 2).unwrap();
+        assert_eq!((picture.width, picture.height), (2, 2));
+        assert_eq!(picture.pixels, vec![0xFF1E_140A, 0xFF00_0000, 0xFF00_0000, 0xFF32_64C8]);
+        // 5650: red 5 bits, green 6, blue 5, widened by repeating the top bits (as the GE).
+        let pixel: u16 = 0b10000_100000_00001; // blue 16, green 32, red 1
+        let bytes: Vec<u8> = [pixel, 0xFFFF].iter().flat_map(|value| value.to_le_bytes()).collect();
+        let picture = memory_with(0x0400_0000, &bytes).framebuffer_picture(0x0400_0000, 2, 0, 2, 1).unwrap();
+        assert_eq!(picture.pixels, vec![0xFF84_8208, 0xFFFF_FFFF]);
+        // 5551 and 4444.
+        let bytes = 0b1_00001_10000_11111u16.to_le_bytes();
+        assert_eq!(memory_with(0x0400_0000, &bytes).framebuffer_picture(0x0400_0000, 1, 1, 1, 1).unwrap().pixels, vec![0xFF08_84FF]);
+        let bytes = 0x0F81u16.to_le_bytes();
+        assert_eq!(memory_with(0x0400_0000, &bytes).framebuffer_picture(0x0400_0000, 1, 2, 1, 1).unwrap().pixels, vec![0xFFFF_8811]);
+        // Not dumped: none.
+        assert!(memory_with(0x0400_0000, &bytes).framebuffer_picture(0x0410_0000, 1, 2, 1, 1).is_none());
+    }
 }

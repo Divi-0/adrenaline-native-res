@@ -25,16 +25,22 @@
 // uBlendFix: x = FIX B (0..1), y = the source factor applied here: 0 none
 // (FIX A is already in the colour), 1 source alpha, 2 one minus source alpha.
 //
-// GE_FILTER (nativeres_textured_ge_f.cg, nativeres_textured_fix_ge_f.cg):
-// the GE's bilinear filter for draws that read one of our targets (core
-// frame.rs `ge_filter_read`; God of War's bloom chain): the Vita's texture
+// GE_FILTER (nativeres_textured_ge_f.cg, nativeres_textured_fix_ge_f.cg; in
+// the PSP-depth twins of every textured program too): the GE's bilinear
+// filter. For draws that read one of our targets (core frame.rs
+// `ge_filter_read`; God of War's bloom chain) and, in the games of core
+// game_quirks.rs `PSP_DEPTH_GAMES`, for every textured draw: the Vita's texture
 // unit returns the filtered value of an 8-bit texture rounded to 8 bits,
-// the GE truncates (~0.5 levels per pass, ~1.6 over GoW's bloom). The
-// texture comes point-filtered (draw.rs); `GeTexel` samples the four
-// texels and filters as ppsspp-ref GPU/Software/Sampler.cpp
-// SampleLinearLevelT: the position in 1/16 texels, half a texel back,
-// each lerp ((a (16 - f) + b f) >> 4) truncated, the horizontal ones
-// first. uTexSize: xy = the texture's size in texels, zw = 1 / that.
+// the GE truncates (~0.5 levels per pass, ~1.6 over GoW's bloom; x2 under
+// the colour doubling). The texture comes point-filtered (draw.rs);
+// `GeTexel` samples the four texels and filters as ppsspp-ref
+// GPU/Software/Sampler.cpp SampleLinearLevelT: the position in 1/16
+// texels, half a texel back, each lerp ((a (16 - f) + b f) >> 4)
+// truncated, the horizontal ones first. uTexSize: xy = the texture's size
+// in texels; zw = 8, 1 for the bilinear filter, 0, 0 for the GE's nearest
+// texel (the position not moved back, f = 0: the first texel as it is).
+// Keep GeTexel the same in nativeres_textured_f.cg, nativeres_textured_test_f.cg,
+// nativeres_textured_flat_f.cg and nativeres_textured_read_f.cg.
 
 // The GE's texture function (modulate) and fog in its integer arithmetic
 // (ppsspp-ref GPU/Software/Sampler.cpp GetTextureFunctionOutput and
@@ -89,11 +95,12 @@ float4 GeShade(float4 texel, float4 vertexColor, float3 specular, float fog, flo
 // k / 255; all sums stay below 2^13: exact in fp32.
 float4 GeTexel(sampler2D tex, float2 uv, float4 size)
 {
-	float2 p = FLOOR(uv * size.xy * 16.0f) - 8.0f;
+	float2 step = 1.0f / size.xy; // only lands the reads inside their texels
+	float2 p = FLOOR(uv * size.xy * 16.0f) - size.z;
 	float2 cell = FLOOR(p * (1.0f / 16.0f));
-	float2 f = p - cell * 16.0f;
-	float2 at = (cell + 0.5f) * size.zw;
-	float2 next = at + size.zw;
+	float2 f = (p - cell * 16.0f) * size.w;
+	float2 at = (cell + 0.5f) * step;
+	float2 next = at + step;
 	float4 a = FLOOR(tex2D(tex, at) * 255.0f + 0.5f);
 	float4 b = FLOOR(tex2D(tex, float2(next.x, at.y)) * 255.0f + 0.5f);
 	float4 c = FLOOR(tex2D(tex, float2(at.x, next.y)) * 255.0f + 0.5f);

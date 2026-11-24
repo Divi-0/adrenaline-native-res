@@ -20,7 +20,12 @@
 //! If the dump contains the original picture, also writes
 //! `<out>-original.png` (enlarged 2x) and `<out>-diff.png` (differences
 //! amplified, black = identical), and prints the average difference per
-//! screen region.
+//! screen region. `--reference-vram`: compared with the shown framebuffer
+//! in the dump's memory instead (Sony's own picture of the dumped frame,
+//! where the dump holds it).
+//!
+//! `--ge-filter`: every textured draw filters as the GE, as the Vita draws
+//! the games of core game_quirks.rs `PSP_DEPTH_GAMES` (God of War).
 //!
 //! Runs the same `nativeres-core` code as the Vita: restores the capture
 //! state from the start of the frame, feeds the frame's events through
@@ -439,7 +444,19 @@ fn run(dump_path: &str, png_path: &str, trace: bool) -> Result<(), String> {
     }
     write_png(png_path, &image)?;
 
-    if let Some(original) = &dump.original {
+    // `--reference-vram`: compared with the shown framebuffer as the dump's
+    // memory holds it (Sony's own picture of this frame, where the dump has
+    // it: God of War's screen) instead of the picture the dump stored, which
+    // can be another frame where the game animates (God of War's title: the
+    // fire glow, the menu highlight; DESIGN "fifty-ninth session").
+    let vram_reference = if std::env::args().any(|arg| arg == "--reference-vram") {
+        let shown = stats.displayed.ok_or("--reference-vram: the frame shows no framebuffer")?;
+        let picture = dump.memory.framebuffer_picture(shown.address, shown.stride, shown.pixel_format, raster::WIDTH / 2, raster::HEIGHT / 2);
+        Some(picture.ok_or("--reference-vram: the dump doesn't hold the shown framebuffer")?)
+    } else {
+        None
+    };
+    if let Some(original) = vram_reference.as_ref().or(dump.original.as_ref()) {
         let enlarged = compare::enlarge(original, raster::WIDTH, raster::HEIGHT);
         let base = png_path.trim_end_matches(".png");
         write_png(&format!("{base}-original.png"), &enlarged)?;

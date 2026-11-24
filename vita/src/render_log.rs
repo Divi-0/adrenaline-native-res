@@ -1,5 +1,6 @@
-//! The renderer's log: a ring in memory holding the last 64 KiB of text
-//! (`read`).
+//! The renderer's log: a ring in memory holding the last 40 KiB of text
+//! (`read`). (64 KiB until 2026-11-24: 24 KiB went to God of War's
+//! GE-filter programs, user's choice; DESIGN "fifty-ninth session".)
 //!
 //! It used to go to a file, but opening, writing and closing a file takes
 //! ~10 ms, on the display thread: at Final Fantasy's battle start, logging
@@ -14,7 +15,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use nativeres_core::report::TextBuffer;
 
-const RENDER_LOG_SIZE: usize = 64 * 1024;
+const RENDER_LOG_SIZE: usize = 40 * 1024;
 
 struct Ring(UnsafeCell<[u8; RENDER_LOG_SIZE]>);
 

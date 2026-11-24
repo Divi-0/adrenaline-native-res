@@ -16,6 +16,14 @@
 /// - God of War: Chains of Olympus: the title fence's rail boxes tie with the
 ///   planks (z-fighting the PSP decides by whole units). Every version PPSSPP's
 ///   compat.ini lists (2026-11-24); only UCES00842 (Europe) tested on the Vita.
+///
+/// These games' program set also filters every texture as the GE does
+/// (GE_FILTER in the textured fragment programs' PSP-depth twins: four point
+/// samples, 1/16 positions, each lerp truncated; nativeres_textured_f.cg
+/// `GeTexel`): God of War's clut textures, doubled by "modulate x2", came out
+/// brighter with the Vita's rounding filter (title vs Sony's own VRAM 3.48 ->
+/// 2.87 in the replay, DESIGN "fifty-ninth session"; user: God of War only,
+/// 2026-11-24). It costs GPU time (four dependent reads a pixel).
 const PSP_DEPTH_GAMES: &[&[u8]] = &[
     // God of War: Chains of Olympus: discs (Europe, US, Asia, Japan, Korea).
     b"UCES00842", b"UCET00844", b"UCUS98653", b"UCAS40198", b"UCAS40191", b"ULJM05348", b"ULJM05438", b"UCKS45084",

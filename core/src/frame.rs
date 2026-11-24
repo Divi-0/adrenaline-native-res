@@ -408,9 +408,12 @@ pub fn wide_variant(flags: u32, blend: u32, keep_target_alpha: bool) -> Option<R
 /// texture reads); the off-screen ones are 1x and small (GoW +5..7 ms GPU,
 /// ~80 % of the gain), draws onto the 2x screen cost +18 ms (title, its
 /// bloom added) to +71 ms (gameplay, shadow textures). Textures from VRAM
-/// or RAM keep the GPU's filter: the GE filter on them moved other games'
-/// pictures further from the PSP's (at 2x the sample points are not the
-/// PSP's anyway).
+/// or RAM keep the GPU's filter in most games (cost). The games of
+/// game_quirks.rs `PSP_DEPTH_GAMES` (God of War) filter every texture as the
+/// GE: their program set's textured programs all do (not this function).
+/// (2026-11-23 the GE filter everywhere seemed to move other games further
+/// from the PSP; re-measured 2026-11-24 with the current replay it is closer
+/// in 27 of 28 scenes: DESIGN "fifty-ninth session".)
 pub fn ge_filter_read(
     flags: u32,
     tests: u32,

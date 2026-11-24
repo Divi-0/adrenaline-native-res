@@ -187,6 +187,32 @@ float4 GeShade(float4 texel, float4 vertexColor, float3 specular, float fog, flo
 // The dither value (-8..7) of the PSP pixel under `position` (WPOS: two of
 // ours per PSP pixel), from the GE's 4x4 dither matrix `row0..3` (core
 // frame.rs `dither_value`): its row and column picked by one-hot weights.
+// GE_FILTER: the GE's filter (nativeres_textured_f.cg's comment; keep GeTexel the same).
+#ifdef GE_FILTER
+// The GE's bilinear filter of a point-filtered texture: the texel as k / 255
+// (GeShade takes it as it is). Point samples of 8-bit texels are exact
+// k / 255; all sums stay below 2^13: exact in fp32.
+float4 GeTexel(sampler2D tex, float2 uv, float4 size)
+{
+	float2 step = 1.0f / size.xy; // only lands the reads inside their texels
+	float2 p = FLOOR(uv * size.xy * 16.0f) - size.z;
+	float2 cell = FLOOR(p * (1.0f / 16.0f));
+	float2 f = (p - cell * 16.0f) * size.w;
+	float2 at = (cell + 0.5f) * step;
+	float2 next = at + step;
+	float4 a = FLOOR(tex2D(tex, at) * 255.0f + 0.5f);
+	float4 b = FLOOR(tex2D(tex, float2(next.x, at.y)) * 255.0f + 0.5f);
+	float4 c = FLOOR(tex2D(tex, float2(at.x, next.y)) * 255.0f + 0.5f);
+	float4 d = FLOOR(tex2D(tex, next) * 255.0f + 0.5f);
+	float4 top = FLOOR((a * (16.0f - f.x) + b * f.x) * (1.0f / 16.0f));
+	float4 bottom = FLOOR((c * (16.0f - f.x) + d * f.x) * (1.0f / 16.0f));
+	return FLOOR((top * (16.0f - f.y) + bottom * f.y) * (1.0f / 16.0f)) * (1.0f / 255.0f);
+}
+#define SAMPLE(tex, uv) GeTexel(tex, uv, uTexSize)
+#else
+#define SAMPLE(tex, uv) tex2D(tex, uv)
+#endif
+
 float DitherValue(float2 position, float4 row0, float4 row1, float4 row2, float4 row3)
 {
 	float2 psp = floor(position * 0.5f);
@@ -247,6 +273,9 @@ __nativecolor __regformat unsigned char4 main(
 #if !defined(READ_FAST) || defined(READ_TEST)
 	uniform float4 uAlphaTest,
 #endif
+#ifdef GE_FILTER
+	uniform float4 uTexSize,
+#endif
 	uniform float4 uFogAndScale
 #endif
 #ifdef READ_DITHER
@@ -283,7 +312,7 @@ __nativecolor __regformat unsigned char4 main(
 #endif
 	// The separate specular colour after texturing, then the doubling (PPSSPP:
 	// v = p * t + s, then the colour doubling, clamped), then fog.
-	float4 c = GeShade(tex2D(tex, vTexcoord), vColor * overW, vSpecular * overW, vFog.x * overW, uFogAndScale);
+	float4 c = GeShade(SAMPLE(tex, vTexcoord), vColor * overW, vSpecular * overW, vFog.x * overW, uFogAndScale);
 #if defined(READ_FAST) && defined(READ_TEST)
 	// The alpha test on the whole alpha, one-sided: only tests that pass
 	// the alphas from lo up (greater, greater or equal: core opaque_source.rs

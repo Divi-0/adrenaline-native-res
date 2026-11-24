@@ -14,7 +14,8 @@
 #   nativeres_textured_fix_f.cg     nativeres_textured_f.cg + BLEND_FIX (grey FIX B blending)
 #   nativeres_textured_test_fix_f.cg nativeres_textured_test_f.cg + BLEND_FIX
 #   nativeres_textured_ge_f.cg      nativeres_textured_f.cg + GE_FILTER (the GE's bilinear filter,
-#                                   draws reading our targets)
+#                                   draws reading our targets; no PSP-depth twin: that set's
+#                                   textured programs all filter as the GE)
 #   nativeres_textured_fix_ge_f.cg  nativeres_textured_f.cg + BLEND_FIX GE_FILTER
 #   nativeres_color_read_f.cg       nativeres_textured_read_f.cg + UNTEXTURED (16-bit targets, untextured)
 #   nativeres_textured_read_<way>_f.cg, nativeres_color_read_<way>_f.cg
@@ -98,12 +99,13 @@ for dither in "" dither; do
 done
 # PSP-depth twins last (they copy the variants above): each program in
 # psp_depth_twins.txt again with PSP_DEPTH (the PSP's whole-unit depth written
-# by the fragment programs; only for the games core game_quirks.rs lists),
+# by the fragment programs; only for the games core game_quirks.rs lists) and
+# the defines listed after it (GE_FILTER: the GE's texture filter),
 # nativeres_x_f -> nativeres_x_pspdepth_f.
 twins() {
-  grep -v '^#' psp_depth_twins.txt | tr -d '\r' | while read -r stem; do
+  grep -v '^#' psp_depth_twins.txt | tr -d '\r' | while read -r stem defines; do
     [ -n "$stem" ] || continue
-    variant "$stem" PSP_DEPTH "${stem%_?}_pspdepth_${stem##*_}"
+    variant "$stem" "PSP_DEPTH $defines" "${stem%_?}_pspdepth_${stem##*_}"
   done
 }
 # 8-bit targets (God of War): the GE's normal / additive blend without a cut

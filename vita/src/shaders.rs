@@ -127,8 +127,8 @@ embed_twin!(nativeres_textured_test_f, nativeres_textured_test_pspdepth_f);
 embed_twin!(nativeres_textured_fix_f, nativeres_textured_fix_pspdepth_f);
 embed_twin!(nativeres_textured_test_fix_f, nativeres_textured_test_fix_pspdepth_f);
 // Both with the GE's bilinear filter, for draws reading our targets.
-embed_twin!(nativeres_textured_ge_f, nativeres_textured_ge_pspdepth_f);
-embed_twin!(nativeres_textured_fix_ge_f, nativeres_textured_fix_ge_pspdepth_f);
+embed_gxp!(nativeres_textured_ge_f);
+embed_gxp!(nativeres_textured_fix_ge_f);
 // Draws into the PSP's 16-bit framebuffers: frame-read programs that blend
 // themselves and cut the colour as the GE does (textured and untextured).
 embed_twin!(nativeres_textured_read_f, nativeres_textured_read_pspdepth_f);

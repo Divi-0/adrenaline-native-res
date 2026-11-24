@@ -82,6 +82,23 @@ const MODES: [Mode; 2] = [
     Mode { flags: &["--raw", "--twice"], expected: "expected-raw.txt", suffix: "-raw" },
 ];
 
+/// The replay's extra arguments for scene `name` ("<game>/<scene>"), in
+/// every mode:
+/// - God of War: its program set on the Vita filters every texture as the
+///   GE (core game_quirks.rs `PSP_DEPTH_GAMES`): `--ge-filter`.
+/// - gow/title: compared with Sony's own picture in the dump's VRAM
+///   (`--reference-vram`): the stored picture is another frame where the
+///   title animates (the fire glow behind the fence, the menu highlight;
+///   DESIGN "fifty-ninth session"). gow/game keeps its stored picture: its
+///   VRAM screen holds pieces of the next frame's HUD.
+fn scene_flags(name: &str) -> &'static [&'static str] {
+    match name {
+        "gow/title" => &["--ge-filter", "--reference-vram"],
+        _ if name.starts_with("gow/") => &["--ge-filter"],
+        _ => &[],
+    }
+}
+
 /// Replays one dump; `name` is "<game>/<scene>".
 fn replay(name: &str, dump: &Path, out_dir: &Path, mode: &Mode) -> std::result::Result<Result, String> {
     let picture = out_dir.join(format!("{}{}.png", name.replace('/', "-"), mode.suffix));
@@ -89,6 +106,7 @@ fn replay(name: &str, dump: &Path, out_dir: &Path, mode: &Mode) -> std::result::
         .arg(dump)
         .arg(&picture)
         .args(mode.flags)
+        .args(scene_flags(name))
         .output()
         .map_err(|error| format!("can't run replay: {error}"))?;
     let text = String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr);
