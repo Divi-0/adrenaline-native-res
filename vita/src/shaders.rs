@@ -320,6 +320,8 @@ embed_twin!(nativeres_textured_read_addwidekeeptest_f, nativeres_textured_read_a
 embed_twin!(nativeres_textured_read_addwidekeepnofog_f, nativeres_textured_read_addwidekeepnofog_pspdepth_f);
 embed_twin!(nativeres_textured_read_addwidekeepnofogtest_f, nativeres_textured_read_addwidekeepnofogtest_pspdepth_f);
 embed_gxp!(nativeres_color_read_addwidekeep_f);
+// FIX B onto 8-bit targets with the stencil test (ReadWay::FixB).
+embed_twin!(nativeres_textured_read_fixbwidekeep_f, nativeres_textured_read_fixbwidekeep_pspdepth_f);
 // Decoded vertices in model space: the GPU transforms and lights them.
 embed_twin!(nativeres_3d_v, nativeres_3d_pspdepth_v);
 // Raw PSP vertices, read by the GPU as the game wrote them: with up to

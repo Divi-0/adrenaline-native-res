@@ -164,6 +164,10 @@ pub static TARGET_CUT: AtomicI32 = AtomicI32::new(1);
 /// small gain: hence not everywhere (user's choices, 2026-11-23).
 pub static BLEND_8888: AtomicI32 = AtomicI32::new(1);
 
+/// FIX B onto 8-bit targets (core `ReadWay::FixB`) by its own program (1,
+/// default) or, as before, the generic one (0; for A/Bs: the same pixels).
+pub static FIX_B_PROGRAM: AtomicI32 = AtomicI32::new(1);
+
 /// Textured normal alpha blends into 5551 whose every fragment is opaque
 /// (an opaque texture, vertex alphas 255: core `opaque_source`) are drawn
 /// with the unblended frame-read program (no frame read; the same
@@ -418,9 +422,22 @@ fn wide_choice(frame: &Frame, draw: &Draw, keep_target_alpha: bool) -> Option<Re
         1 if !keep_target_alpha => return None,
         _ => {}
     }
-    let variant = nativeres_core::frame::wide_variant(draw.flags, draw.blend, keep_target_alpha)?;
-    if separate_specular(frame, draw) || (keep_target_alpha && frame.stencil_state_of(draw).is_some()) {
+    let mut variant = nativeres_core::frame::wide_variant(draw.flags, draw.blend, keep_target_alpha)?;
+    let fix_b = matches!(variant, ReadVariant::Fast { way: ReadWay::FixB, .. });
+    if fix_b && FIX_B_PROGRAM.load(Ordering::Relaxed) == 0 {
+        variant = ReadVariant::Generic;
+    }
+    if separate_specular(frame, draw) {
         return None;
+    }
+    // A stencil state: done by the generic program or GXM's alpha factors
+    // (`stencil_way`); the FIX B program tests the stencil itself (a value
+    // written: the generic one).
+    if keep_target_alpha {
+        if let Some(state) = frame.stencil_state_of(draw) {
+            let fix_b = matches!(variant, ReadVariant::Fast { way: ReadWay::FixB, .. });
+            return (fix_b && state.write().is_none()).then_some(variant);
+        }
     }
     Some(variant)
 }
@@ -1152,6 +1169,13 @@ impl Draws {
         if choice.is_some() {
             way = StencilWay::FrameRead(known);
         }
+        // FIX B onto an 8-bit target (`ReadWay::FixB`): its own program
+        // tests the stencil; it writes no stencil value (the alpha stays).
+        let fix_b = matches!(*choice, Some(ReadVariant::Fast { way: ReadWay::FixB, .. }));
+        if fix_b && known.write().is_none() && programs_ready && self.programs.read_program(textured, false, choice.unwrap()).is_some() {
+            stats().stencil_read_draws += 1;
+            return (state, way);
+        }
         if let StencilWay::FrameRead(_) = way {
             let ready = programs_ready
                 && self
@@ -1377,6 +1401,11 @@ impl Draws {
         let alpha_only = writes_alpha && blend & BLEND_ALPHA_ONLY != 0;
         let dither_flag = draw.flags & draw_flags::DITHER != 0;
         let buffer = reserve_fragment_uniforms();
+        if !program.stencil_test.is_null() {
+            // The FIX B program's stencil test (all pass without a state).
+            let uniforms = blend::stencil_uniforms(stencil);
+            set_uniform(buffer, program.stencil_test, 4, uniforms[0].as_ptr());
+        }
         if generic {
             let cut = cut_uniforms(blend, enabled && !alpha_only, bits, !alpha_only, writes_alpha, dither_flag);
             let generic_uniforms = self.programs.generic_uniforms(textured.is_some());
@@ -1724,6 +1753,10 @@ impl Draws {
         // An 8-bit one: blended as the GE does (`BLEND_8888`).
         if choice.is_none() && programs_ready {
             choice = wide_choice(frame, draw, keep);
+        }
+        // The FIX B program has no alpha test: the generic one then.
+        if tested && matches!(choice, Some(ReadVariant::Fast { way: ReadWay::FixB, .. })) {
+            choice = Some(ReadVariant::Generic);
         }
         // An opaque texture and vertices of alpha 255: every fragment has
         // alpha 255 (core `opaque_source`; MHF's ground). A normal blend of

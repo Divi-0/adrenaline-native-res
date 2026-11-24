@@ -260,6 +260,13 @@ pub enum ReadWay {
     /// 255 is the colour itself (`ge_blend_term`), so the GE's blend is
     /// max(d - s, 0), as the generic program works it out.
     Subtract,
+    /// 8-bit targets only (`wide_variant`): source factor one, destination
+    /// FIX B (through the alpha, `BLEND_FIX_B_ALPHA`), add, the source
+    /// premultiplied as its BLEND_FIX says; with the stencil test, no
+    /// stencil value (nativeres_textured_read_f.cg READ_FIXB). God of War's
+    /// full-screen stencil-tested pass (~27 ms of its gameplay frame with
+    /// the generic program) and its bloom downsampling.
+    FixB,
 }
 
 /// One term of the GE's blend: colour `c` times factor `f` (both 0..255)
@@ -391,8 +398,15 @@ pub fn wide_variant(flags: u32, blend: u32, keep_target_alpha: bool) -> Option<R
         return None;
     }
     if blend & BLEND_FIX_B_ALPHA != 0 {
-        // Textured only: the untextured way sets no uBlendFix.
-        return (flags & draw_flags::TEXTURED != 0).then_some(ReadVariant::Generic);
+        // Textured only: the untextured way sets no uBlendFix. Source one,
+        // destination FIX B (source alpha), add: the fast program.
+        if flags & draw_flags::TEXTURED == 0 {
+            return None;
+        }
+        if (blend & 0xF, (blend >> 4) & 0xF, (blend >> 8) & 7) == (1, 4, 0) {
+            return Some(ReadVariant::Fast { way: ReadWay::FixB, keep_alpha: true, dither: false, green6: false, fogless: false, wide: true });
+        }
+        return Some(ReadVariant::Generic);
     }
     let way = match (blend & 0xF, (blend >> 4) & 0xF, (blend >> 8) & 7) {
         (4, 5, 0) => ReadWay::Normal,
@@ -444,10 +458,11 @@ pub fn ge_filter_read(
         && tests & test_flags::ALPHA_TEST == 0
         && match wide_variant(flags, blend, keep_target_alpha) {
             None => true,
-            // FIX B: the generic program only while the game reads its
-            // targets' alpha (the Vita's `BLEND_8888` 1); God of War's
-            // program set has its GE-filter twin.
-            Some(ReadVariant::Generic) => !keep_target_alpha,
+            // FIX B (the generic or the FIX B program): frame-read
+            // programs only while the game reads its targets' alpha (the
+            // Vita's `BLEND_8888` 1); God of War's program set has their
+            // GE-filter twins.
+            Some(ReadVariant::Generic | ReadVariant::Fast { way: ReadWay::FixB, .. }) => !keep_target_alpha,
             Some(_) => false,
         }
         && !matches!(stencil, crate::blend::StencilWay::FrameRead(_))
@@ -2848,11 +2863,16 @@ mod tests {
         assert_eq!(wide_variant(draw_flags::TEXTURED, normal, false), wide(ReadWay::Normal, true));
         assert_eq!(wide_variant(draw_flags::TEXTURED, normal | BLEND_WRITES_ALPHA, false), wide(ReadWay::Normal, true), "nobody reads it");
         assert_eq!(wide_variant(0, add, false), wide(ReadWay::Add, false), "untextured: never fogless");
-        // FIX B (God of War's bloom downsampling, d x 0x55): the generic
-        // program, which blends any factors as the GE (GXM rounded d x FIX B).
+        // FIX B (God of War's bloom downsampling, d x 0x55): source one,
+        // destination FIX B: the FIX B program (GXM rounded d x FIX B);
+        // other source factors the generic program, which blends any
+        // factors as the GE.
         let fix_b = BLEND_ENABLED | BLEND_FIX_B_ALPHA | 1 | 4 << 4 | 0x55 << crate::blend::BLEND_FIX_B_SHIFT;
-        assert_eq!(wide_variant(fogged, fix_b, true), Some(ReadVariant::Generic));
-        assert_eq!(wide_variant(draw_flags::TEXTURED, fix_b, false), Some(ReadVariant::Generic));
+        let fix_way = Some(ReadVariant::Fast { way: ReadWay::FixB, keep_alpha: true, dither: false, green6: false, fogless: false, wide: true });
+        assert_eq!(wide_variant(fogged, fix_b, true), fix_way);
+        assert_eq!(wide_variant(draw_flags::TEXTURED, fix_b, false), fix_way, "fog or not: one program");
+        let fix_b_dest_color = BLEND_ENABLED | BLEND_FIX_B_ALPHA | 6 | 4 << 4 | 0x55 << crate::blend::BLEND_FIX_B_SHIFT;
+        assert_eq!(wide_variant(fogged, fix_b_dest_color, true), Some(ReadVariant::Generic));
         assert_eq!(wide_variant(0, fix_b, true), None, "untextured: no uBlendFix there");
         assert_eq!(wide_variant(fogged | draw_flags::DITHER, fix_b, true), None);
         assert_eq!(wide_variant(fogged | 2 << draw_flags::TARGET_FORMAT_SHIFT, fix_b, true), None);

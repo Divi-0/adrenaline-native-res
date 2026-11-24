@@ -123,4 +123,7 @@ for way in normal add; do
   variant nativeres_textured_read_f "$WAY READ_WIDE READ_KEEP_ALPHA NO_FOG READ_TEST" nativeres_textured_read_${way}widekeepnofogtest_f
   variant nativeres_textured_read_f "UNTEXTURED $WAY READ_WIDE READ_KEEP_ALPHA" nativeres_color_read_${way}widekeep_f
 done
+# FIX B onto 8-bit targets with the stencil test (READ_FIXB, core frame.rs
+# `ReadWay::FixB`): God of War's full-screen stencil pass and bloom downsampling.
+variant nativeres_textured_read_f "READ_FIXB READ_WIDE READ_KEEP_ALPHA" nativeres_textured_read_fixbwidekeep_f
 twins

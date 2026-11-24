@@ -582,8 +582,10 @@ pub struct ReadProgram {
     pub fog_and_scale: *const ProgramParameter,
     /// The generic one and the fast tested ones only (else null).
     pub alpha_test: *const ProgramParameter,
-    /// The generic one only (else null).
+    /// The generic one and the FIX B one (`ReadWay::FixB`), else null.
     pub blend_fix: *const ProgramParameter,
+    /// uStencilTest of the FIX B one (the generic one's: `GenericUniforms`).
+    pub stencil_test: *const ProgramParameter,
     /// Textured ones that filter as the GE (`GeTexel`, the PSP-depth set's
     /// twins), else null.
     pub tex_size: *const ProgramParameter,
@@ -614,8 +616,8 @@ impl GenericUniforms {
 /// Fast frame-read ways of the 16-bit targets (`ReadWay` up to `Subtract`).
 const READ_WAYS: usize = 6;
 
-/// The 8-bit targets' ways (`wide_way`): normal, add, and one slot for any
-/// other (no program).
+/// The 8-bit targets' ways (`wide_way`): normal, add, FIX B (any other:
+/// no program).
 const WIDE_WAYS: usize = 3;
 
 /// Fast programs per texturedness (before the alpha test): 5551 (ways x
@@ -629,7 +631,7 @@ fn wide_way(way: ReadWay) -> usize {
     match way {
         ReadWay::Normal => 0,
         ReadWay::Add => 1,
-        _ => 2,
+        _ => 2, // FixB
     }
 }
 
@@ -672,7 +674,7 @@ fn read_index(textured: bool, tested: bool, variant: ReadVariant) -> usize {
 /// "off" ones keep the alpha by GXM's colour mask: one program for both,
 /// and for `ReadWay::Precut` (GXM blends).
 fn read_gxp(textured: bool, tested: bool, variant: ReadVariant) -> *const gxm::Program {
-    use ReadWay::{Add, Invisible, Normal, Off, Precut, Subtract};
+    use ReadWay::{Add, FixB, Invisible, Normal, Off, Precut, Subtract};
     use shaders::*;
     let ReadVariant::Fast { way, keep_alpha, dither, green6, fogless, wide } = variant else {
         return if textured { gxp(&nativeres_textured_read_f) } else { gxp(&nativeres_color_read_f) };
@@ -695,6 +697,8 @@ fn read_gxp(textured: bool, tested: bool, variant: ReadVariant) -> *const gxm::P
             (true, Add, false, true) => gxp(&nativeres_textured_read_addwidekeeptest_f),
             (true, Add, true, false) => gxp(&nativeres_textured_read_addwidekeepnofog_f),
             (true, Add, true, true) => gxp(&nativeres_textured_read_addwidekeepnofogtest_f),
+            // FIX B: fog included, never alpha-tested (draw.rs takes the generic one).
+            (true, FixB, _, false) => gxp(&nativeres_textured_read_fixbwidekeep_f),
             _ => null(),
         };
     }
@@ -718,7 +722,7 @@ fn read_gxp(textured: bool, tested: bool, variant: ReadVariant) -> *const gxm::P
             (Off | Precut, true, false) => gxp(&nativeres_textured_read_off565nofogtest_f),
             (Off | Precut, false, true) => gxp(&nativeres_textured_read_off565nofogdither_f),
             (Off | Precut, true, true) => gxp(&nativeres_textured_read_off565nofogtestdither_f),
-            (Subtract, _, _) => null(), // above
+            (Subtract | FixB, _, _) => null(), // above; FixB: 8-bit targets only
         };
     }
     if green6 {
@@ -744,7 +748,7 @@ fn read_gxp(textured: bool, tested: bool, variant: ReadVariant) -> *const gxm::P
             (true, Off | Precut, true, false) => gxp(&nativeres_textured_read_off565test_f),
             (true, Off | Precut, false, true) => gxp(&nativeres_textured_read_off565dither_f),
             (true, Off | Precut, true, true) => gxp(&nativeres_textured_read_off565testdither_f),
-            (_, Subtract, _, _) => null(), // above
+            (_, Subtract | FixB, _, _) => null(), // above; FixB: 8-bit targets only
         };
     }
     if !textured {
@@ -763,7 +767,7 @@ fn read_gxp(textured: bool, tested: bool, variant: ReadVariant) -> *const gxm::P
             (Invisible, true, false) => gxp(&nativeres_color_read_invisiblekeep_f),
             (Invisible, false, true) => gxp(&nativeres_color_read_invisibledither_f),
             (Invisible, true, true) => gxp(&nativeres_color_read_invisiblekeepdither_f),
-            (Subtract, _, _) => null(), // above
+            (Subtract | FixB, _, _) => null(), // above; FixB: 8-bit targets only
         };
     }
     // `ReadWay::Invisible` is untextured only (a textured draw never gets
@@ -789,7 +793,7 @@ fn read_gxp(textured: bool, tested: bool, variant: ReadVariant) -> *const gxm::P
         (Add, true, true, true) => gxp(&nativeres_textured_read_addkeeptestdither_f),
         (Off | Precut, _, false, true) => gxp(&nativeres_textured_read_offdither_f),
         (Off | Precut, _, true, true) => gxp(&nativeres_textured_read_offtestdither_f),
-        (Subtract, _, _, _) => null(), // above
+        (Subtract | FixB, _, _, _) => null(), // above; FixB: 8-bit targets only
     }
 }
 
@@ -801,6 +805,7 @@ impl ReadProgram {
             fog_and_scale: null(),
             alpha_test: null(),
             blend_fix: null(),
+            stencil_test: null(),
             tex_size: null(),
         }
     }
@@ -856,9 +861,14 @@ impl ReadProgram {
                 self.alpha_test = parameter(fragment_gxp, b"uAlphaTest\0");
                 missing |= self.alpha_test.is_null();
             }
-            if generic {
+            let fix_b = matches!(variant, ReadVariant::Fast { way: ReadWay::FixB, .. });
+            if generic || fix_b {
                 self.blend_fix = parameter(fragment_gxp, b"uBlendFix\0");
                 missing |= self.blend_fix.is_null();
+            }
+            if fix_b {
+                self.stencil_test = parameter(fragment_gxp, b"uStencilTest\0");
+                missing |= self.stencil_test.is_null();
             }
         }
         if missing {
