@@ -657,6 +657,19 @@ impl TextureCache {
         self.bytes
     }
 
+    /// Takes `bytes` (whole pages) of the texture arena for the host for
+    /// good (the host's own GPU surfaces: wide copies of render targets,
+    /// vita wide_targets.rs): their byte offset there; None before the
+    /// arena exists (the first frame makes it) or without a free run of
+    /// pages that long (the host may ask again later). The pages are never
+    /// given back: the arena only shrinks for textures.
+    pub fn reserve_arena(&mut self, bytes: u32) -> Option<u32> {
+        if !self.arena.exists() {
+            return None;
+        }
+        self.arena.allocate(bytes)
+    }
+
     /// The GPU texture for frame texture `wanted` (`palette_words`: the
     /// frame's), decoding it if needed.
     pub fn texture_for<H: Host>(

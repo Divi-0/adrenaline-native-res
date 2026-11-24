@@ -413,3 +413,5 @@ embed_gxp!(nativeres_color_v);
 embed_gxp!(nativeres_color_f);
 embed_gxp!(nativeres_texture_v);
 embed_gxp!(nativeres_texture_tint_f);
+// Wide copies of off-screen targets (wide_targets.rs).
+embed_gxp!(nativeres_widecopy_f);

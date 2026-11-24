@@ -93,6 +93,7 @@ pub mod textures;
 pub mod threads;
 pub mod unswizzle;
 pub mod user_log;
+pub mod wide_targets;
 
 use core::cell::UnsafeCell;
 use core::fmt::Write;

@@ -186,6 +186,20 @@ pub fn moved_on() -> u32 {
     unsafe { DISPLAY.get() }.cache.moved_on()
 }
 
+/// Display thread: `bytes` of the texture arena for good
+/// (`TextureCache::reserve_arena`), GPU-readable and writable; None if the
+/// arena has no free run that long now, or none at all.
+pub fn reserve_arena(bytes: u32) -> Option<*mut u8> {
+    let base = crate::gpu_textures::arena_base();
+    if base.is_null() {
+        return None;
+    }
+    // Safe: only the display thread calls this.
+    let offset = unsafe { DISPLAY.get() }.cache.reserve_arena(bytes)?;
+    // Safe: inside the arena (the cache hands out its pages only).
+    Some(unsafe { base.add(offset as usize) })
+}
+
 /// Display thread: where the last frame's texture time went.
 pub fn frame_times() -> FrameTimes {
     // Safe: only the display thread calls this.

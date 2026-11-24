@@ -150,7 +150,9 @@ pub fn texture_arena_bytes() -> u32 {
         }
         let mut base: *mut c_void = core::ptr::null_mut();
         sys::sceKernelGetMemBlockBase(block, &mut base);
-        if gxm::sceGxmMapMemory(base, TEXTURE_ARENA_BYTES as u32, gxm::MEMORY_ATTRIB_READ) < 0 {
+        // Writable too: the wide copies of off-screen targets are drawn into
+        // pages the cache gives up for them (wide_targets.rs).
+        if gxm::sceGxmMapMemory(base, TEXTURE_ARENA_BYTES as u32, gxm::MEMORY_ATTRIB_READ | gxm::MEMORY_ATTRIB_WRITE) < 0 {
             log(format_args!("texture arena: not mapped for the GPU\n"));
             sys::free_block(block);
             return 0;
@@ -159,6 +161,12 @@ pub fn texture_arena_bytes() -> u32 {
     }
     log(format_args!("texture arena ready: {} KiB phycont memory\n", TEXTURE_ARENA_BYTES / 1024));
     TEXTURE_ARENA_BYTES as u32
+}
+
+/// The texture arena's memory (null until `texture_arena_bytes` made it).
+pub fn arena_base() -> *mut u8 {
+    // Safe: display thread only.
+    unsafe { STATE.get() }.arena
 }
 
 /// The render target for textures of this size, made on first use; null if
@@ -209,7 +217,8 @@ pub fn create(shape: &TextureShape, arena_offset: Option<u32>) -> *mut TextureOb
     unsafe {
         let (data, block) = match arena_offset {
             Some(offset) => {
-                // Already mapped for the GPU (read only: never a render target).
+                // Already mapped for the GPU (never a render target: those
+                // are blocks of their own).
                 if state.arena.is_null() || render_target || offset as usize + bytes as usize > TEXTURE_ARENA_BYTES {
                     return core::ptr::null_mut();
                 }

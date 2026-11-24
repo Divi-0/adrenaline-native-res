@@ -639,6 +639,23 @@ fn wide_textures_leave_room_in_the_arena() {
     assert_eq!(test.host.live[&made.handle].format, GpuFormat::Palette8, "no arena: no wide textures");
 }
 
+/// The host's reservation in the arena: none before the arena exists, then
+/// pages no texture gets, counted out of the wide textures' room.
+#[test]
+fn host_reservations_come_out_of_the_arena() {
+    let mut test = Test::new();
+    test.host.arena_bytes = 64 * 4096;
+    assert_eq!(test.cache.reserve_arena(4096), None, "no arena before the first frame");
+    test.idle_frames(1);
+    let reserved = test.cache.reserve_arena(60 * 4096).unwrap();
+    assert_eq!(test.cache.reserve_arena(8 * 4096), None, "only 4 pages left");
+    // Textures get only the pages outside the reservation.
+    let Lookup::Ready(made) = test.use_texture(&texture(RAM_START, 64, 64, format::CLUT8)) else { panic!() };
+    let offset = test.host.in_arena[&made.handle];
+    let bytes = test.host.live[&made.handle].bytes();
+    assert!(offset + bytes <= reserved || offset >= reserved + 60 * 4096, "texture inside the reservation");
+}
+
 /// A texture kept as a palette texture for lack of room is widened once
 /// the arena has room again, at most WIDE_UPGRADES_PER_FRAME a frame.
 #[test]

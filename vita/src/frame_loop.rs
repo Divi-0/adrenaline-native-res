@@ -33,7 +33,7 @@ use crate::gpu_textures::TextureObject;
 use crate::render_stats::stats;
 use crate::targets::{self, Targets, SONY_PICTURE, SONY_PICTURE_STRIDE, TARGET_COUNT, TARGET_HEIGHT, TARGET_WIDTH};
 use crate::textures::{self, FrameInfo};
-use crate::{ext, frame_pool, gxm, options, palettes, render_log, sys, SingleThreaded};
+use crate::{ext, frame_pool, gxm, options, palettes, render_log, sys, wide_targets, SingleThreaded};
 
 /// Menu option "NativeRes Texture Filter" (menu.c points at this byte): 0 =
 /// as the game asks (mostly nearest, so every texel becomes a hard 2x2 block
@@ -163,6 +163,9 @@ pub enum Outcome {
 /// Tiles of off-screen targets read as textures in one frame, at most
 /// (God of War in the game: 7).
 const TILE_VIEWS: usize = 16;
+/// Views of off-screen target textures cut to their own size, a frame
+/// (`FrameLoop::screen_view`).
+const CUT_VIEWS: usize = 32;
 
 /// The frame loop's state (display thread only).
 pub struct FrameLoop {
@@ -216,6 +219,20 @@ pub struct FrameLoop {
     /// framebuffers (core `offscreen::screen_read_only_by_other_runs`):
     /// those draws sample our target of the screen.
     screen_from_target: bool,
+    /// This frame has wide textures (`FrameInfo::wide`).
+    wide_frame: bool,
+    /// What draws into the shown framebuffer read for the frame's textures
+    /// from off-screen targets in wide frames (wide_targets.rs; null: as
+    /// the other draws, `textures`): the texture's own part of the target
+    /// (`cut_views`), or its wide copy. Their texture coordinates run over
+    /// it 1:1.
+    screen_views: [*const TextureObject; MAX_TEXTURES],
+    /// The wide copy each such texture is (or would be) in, and whether a
+    /// draw into the shown framebuffer read it this frame (told to
+    /// wide_targets.rs: the next frame copies it).
+    screen_keys: [Option<wide_targets::Key>; MAX_TEXTURES],
+    screen_read: [bool; MAX_TEXTURES],
+    cut_views: [TextureObject; CUT_VIEWS],
 }
 
 static FRAME_LOOP: SingleThreaded<FrameLoop> = SingleThreaded::new(FrameLoop {
@@ -242,6 +259,11 @@ static FRAME_LOOP: SingleThreaded<FrameLoop> = SingleThreaded::new(FrameLoop {
     depth_only: false,
     after_quit: AfterQuit::new(),
     screen_from_target: false,
+    wide_frame: false,
+    screen_views: [null(); MAX_TEXTURES],
+    screen_keys: [None; MAX_TEXTURES],
+    screen_read: [false; MAX_TEXTURES],
+    cut_views: [const { TextureObject::view(gxm::Texture { control_words: [0; 4] }) }; CUT_VIEWS],
 });
 
 /// True if the GE can have drawn framebuffer `psp_address` (physical, see
@@ -472,6 +494,7 @@ impl FrameLoop {
         for (slot, target) in info.render_targets.iter_mut().zip(sampled_targets) {
             *slot = target.psp_address;
         }
+        self.wide_frame = info.wide;
         textures::for_frame(frame, &info, &mut self.textures, &mut self.waiting);
         let palette_start = now();
         let parts = textures::frame_times();
@@ -540,6 +563,7 @@ impl FrameLoop {
             self.draw_runs(targets, frame, target)
         } else {
             let begin_start = now();
+            wide_targets::flush(targets, render_count);
             targets.begin_scene(target);
             let loop_start = now();
             stats().begin_us += loop_start - begin_start;
@@ -632,9 +656,14 @@ impl FrameLoop {
     /// while drawn), unless only other runs read it (`screen_from_target`).
     fn use_targets_as_textures(&mut self, targets: &mut Targets, frame: &Frame, render_count: u32) {
         let mut tile_views = 0;
+        let wide = if self.wide_frame { wide_targets::WIDE_TARGETS.load(Ordering::Relaxed) } else { 0 };
+        let mut cuts = 0;
         for (i, wanted) in frame.textures().iter().enumerate() {
             self.uv_scales[i] = [1.0, 1.0];
             self.from_targets[i] = false;
+            self.screen_views[i] = null();
+            self.screen_keys[i] = None;
+            self.screen_read[i] = false;
             let drawn_into = wanted.address == frame.shown_framebuffer && !self.screen_from_target;
             if !self.textures[i].is_null() || wanted.format >= 4 || drawn_into {
                 continue;
@@ -651,6 +680,10 @@ impl FrameLoop {
                 let Some(view) = target.tile_view(x, opaque) else {
                     continue;
                 };
+                if wide != 0 {
+                    let key = wide_targets::Key { address: base, x, opaque };
+                    self.screen_view(frame, i, target, key, wide, &mut cuts, render_count);
+                }
                 self.tile_views[tile_views] = TextureObject::view(view);
                 self.textures[i] = &self.tile_views[tile_views];
                 tile_views += 1;
@@ -660,6 +693,11 @@ impl FrameLoop {
                 stats().target_textures += 1;
                 continue;
             };
+            if wide != 0 && target.is_offscreen() {
+                let opaque = !blend::samples_target_alpha(wanted.flags) || wanted.format == texture_format::BGR5650;
+                let key = wide_targets::Key { address: wanted.address, x: 0, opaque };
+                self.screen_view(frame, i, target, key, wide, &mut cuts, render_count);
+            }
             // A 16-bit 565 framebuffer has no alpha: read opaque.
             if blend::samples_target_alpha(wanted.flags) && wanted.format != texture_format::BGR5650 {
                 self.target_alpha_read = render_count;
@@ -677,6 +715,40 @@ impl FrameLoop {
             self.uv_scales[i] = [wanted.width as f32 / psp_width as f32, wanted.height as f32 / psp_height as f32];
             self.from_targets[i] = true;
             stats().target_textures += 1;
+        }
+    }
+
+    /// What draws into the shown framebuffer read for frame texture `i`, the
+    /// part `key` of off-screen `target` (`screen_views`; wide frames,
+    /// `mode` = debug "widetargets"): a view of exactly the texture's part,
+    /// so the GE's clamp and wrap happen at its own edges (God of War's
+    /// shadow tiles: a view running on to the end of the strip blurred the
+    /// next tile in at the edges, dark streaks Sony doesn't have; DESIGN
+    /// "sixty-sixth session"), and in mode 2 its wide copy instead if one
+    /// was read so last frame (the same pixels, faster). Nothing if the
+    /// texture can't have a copy (`wide_targets::fits`).
+    #[allow(clippy::too_many_arguments)]
+    fn screen_view(&mut self, frame: &Frame, i: usize, target: &targets::Target, key: wide_targets::Key, mode: u8, cuts: &mut usize, render_count: u32) {
+        let wanted = &frame.textures()[i];
+        let (width, height) = (wanted.width as u32, wanted.height as u32);
+        let source = (target.width, target.height);
+        if !wide_targets::fits(width, height, key.x, source) {
+            return;
+        }
+        self.screen_keys[i] = Some(key);
+        if mode == 2 {
+            if let Some(copy) = wide_targets::texture_for(key, width, height, source, render_count) {
+                self.screen_views[i] = copy;
+                stats().wide_target_textures += 1;
+                return;
+            }
+        }
+        if *cuts < CUT_VIEWS {
+            if let Some(view) = target.cut_view(key.x, width, height, key.opaque) {
+                self.cut_views[*cuts] = TextureObject::view(view);
+                self.screen_views[i] = &self.cut_views[*cuts];
+                *cuts += 1;
+            }
         }
     }
 
@@ -889,9 +961,20 @@ impl FrameLoop {
             if draw.flags & draw_flags::TEXTURED != 0 {
                 let t = draw.texture as usize;
                 if t < texture_count {
-                    // Safe: textures from the cache or targets, alive this frame.
-                    if let Some(texture) = unsafe { self.textures[t].as_ref() } {
-                        draw::draw_textured(frame, draw, i, texture, self.palettes[t], self.uv_scales[t], self.opaque_rows[t], self.from_targets[t]);
+                    // Off-screen target textures read into the shown
+                    // framebuffer: their own part, or its wide copy
+                    // (`screen_view`), whose texture coordinates run 1:1.
+                    let screen = if framebuffer == frame.shown_framebuffer { self.screen_views[t] } else { null() };
+                    let (texture, uv_scale) = if screen.is_null() { (self.textures[t], self.uv_scales[t]) } else { (screen, [1.0, 1.0]) };
+                    if !screen.is_null() && !self.screen_read[t] {
+                        self.screen_read[t] = true;
+                        if let Some(key) = self.screen_keys[t] {
+                            wide_targets::note_read(key, self.render_count);
+                        }
+                    }
+                    // Safe: textures from the cache, targets or wide copies, alive this frame.
+                    if let Some(texture) = unsafe { texture.as_ref() } {
+                        draw::draw_textured(frame, draw, i, texture, self.palettes[t], uv_scale, self.opaque_rows[t], self.from_targets[t]);
                     }
                 }
             } else {
@@ -966,6 +1049,10 @@ impl FrameLoop {
         let begin_start = now();
         let (base, origin_x) = offscreen::placement(frame.textures(), framebuffer);
         let offscreen_target = targets.find_offscreen(base).filter(|_| framebuffer != frame.shown_framebuffer);
+        if framebuffer == frame.shown_framebuffer {
+            // Wide copies of targets drawn since, for this scene's draws.
+            wide_targets::flush(targets, self.render_count);
+        }
         match offscreen_target {
             Some(k) => targets.begin_offscreen_scene(k, self.render_count, origin_x),
             None => targets.begin_scene(target),

@@ -1,0 +1,24 @@
+// shacc: precise
+// NativeRes: fragment program for nativeres_texture_v.cg: wide copies of
+// off-screen targets (wide_targets.rs, DESIGN "sixty-sixth session").
+//
+// Drawn into an 8888 surface twice as wide as the copied part of the
+// target: pixel 2x of a row gets texel x's (r, r, g, g), pixel 2x + 1 its
+// (b, b, a, a). Those bytes are one U16x4 texel holding k x 257 in each
+// channel (read back as k / 255), the texture the GE_WIDE programs filter
+// exactly (texture cache GpuFormat::Wide16). The quad maps two pixels onto
+// each texel, so the point-filtered read lands a quarter texel off its
+// centre; the pixel's column parity comes from its window position (pixel
+// centre or corner: either way the fraction of x / 2 is below 0.5 only for
+// even columns). Each channel written exactly as read (8-bit out).
+//
+// Compiled on the Vita with the shader compiler app (README.md "Shaders").
+
+float4 main(
+	float2 vTexcoord : TEXCOORD0,
+	float4 vPosition : WPOS,
+	uniform sampler2D tex) : COLOR
+{
+	float4 texel = tex2D<float4>(tex, vTexcoord);
+	return frac(vPosition.x * 0.5f) < 0.5f ? texel.xxyy : texel.zzww;
+}

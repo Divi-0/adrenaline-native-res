@@ -50,7 +50,7 @@ const MAX_SCENES_PER_FRAME: u16 = 4;
 /// Makes a GXM render target of `width` x `height` for `scenes` scenes per
 /// frame (GXM allocates its driver memory) into `out`; returns
 /// sceGxmCreateRenderTarget's result.
-fn make_render_target(width: u32, height: u32, scenes: u16, out: &mut *mut gxm::RenderTarget) -> i32 {
+pub(crate) fn make_render_target(width: u32, height: u32, scenes: u16, out: &mut *mut gxm::RenderTarget) -> i32 {
     let params = gxm::RenderTargetParams {
         flags: 0,
         width: width as u16,
@@ -119,6 +119,14 @@ pub static DISPLAY_TARGETS: [AtomicU32; 4] = [AtomicU32::new(0), AtomicU32::new(
 pub const SONY_PICTURE: *const u32 = 0x7400_0000 as *const u32;
 pub const SONY_PICTURE_STRIDE: usize = 512;
 
+/// The last `Target::generation` given out.
+static GENERATION: AtomicU32 = AtomicU32::new(1);
+
+/// A new `Target::generation`: never 0, nor one given out before.
+fn next_generation() -> u32 {
+    GENERATION.fetch_add(1, Ordering::Relaxed).wrapping_add(1).max(2)
+}
+
 /// The four corners of a quad as a triangle strip.
 const STRIP_CORNERS: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
 /// The full-screen strip's size.
@@ -132,6 +140,10 @@ pub struct Target {
     pub last_used: u32,
     /// Of the last frame drawn into it.
     pub frame_number: u32,
+    /// Changes whenever its picture may have (a scene drawing into it, made
+    /// or cleared): its wide copies are made again then (wide_targets.rs).
+    /// Never 0, unique across targets (`next_generation`).
+    pub generation: u32,
     /// New: cleared before the first frame.
     pub needs_clear: bool,
     /// Its size in Vita pixels: 960x544, or up to 480x272 off-screen; 0
@@ -163,6 +175,7 @@ const UNUSED_TARGET: Target = Target {
     psp_address: 0,
     last_used: 0,
     frame_number: 0,
+    generation: 1,
     needs_clear: false,
     width: 0,
     height: 0,
@@ -235,7 +248,13 @@ impl Target {
         self.height = height;
         self.pixel_scale = if offscreen { 1 } else { 2 };
         self.scenes = 1;
+        self.generation = next_generation();
         true
+    }
+
+    /// One of the off-screen targets (PSP pixels 1:1).
+    pub fn is_offscreen(&self) -> bool {
+        self.pixel_scale == 1
     }
 
     /// The PSP pixels it holds (width, height).
@@ -256,6 +275,22 @@ impl Target {
         // Safe: inside its memory (rows of `width` texels, `x` < `width`).
         let made = unsafe {
             gxm::sceGxmTextureInitLinearStrided(&mut texture, self.pixels.add(x as usize) as *const _, format, self.width - x, self.height, self.width * 4)
+        };
+        (made >= 0).then_some(texture)
+    }
+
+    /// A `width` x `height` texture of its part from PSP x `x` on: a PSP
+    /// texture read with its own edges (frame_loop.rs `screen_view`); None
+    /// if it isn't made or the part lies outside.
+    pub fn cut_view(&self, x: u32, width: u32, height: u32, opaque: bool) -> Option<gxm::Texture> {
+        if self.pixels.is_null() || self.pixel_scale != 1 || x + width > self.width || height > self.height {
+            return None;
+        }
+        let format = if opaque { gxm::TEXTURE_FORMAT_X8U8U8U8_1BGR } else { gxm::TEXTURE_FORMAT_U8U8U8U8_ABGR };
+        let mut texture = NO_TEXTURE;
+        // Safe: inside its memory (checked above).
+        let made = unsafe {
+            gxm::sceGxmTextureInitLinearStrided(&mut texture, self.pixels.add(x as usize) as *const _, format, width, height, self.width * 4)
         };
         (made >= 0).then_some(texture)
     }
@@ -607,6 +642,7 @@ impl Targets {
     pub fn begin_offscreen_scene(&mut self, index: usize, render_count: u32, origin_x: u32) {
         let target = &mut self.offscreen[index];
         target.last_used = render_count;
+        target.generation = next_generation();
         // Safe: the display thread's context; a target that exists has the
         // shared depth surface (960 wide, so it covers 480x272).
         let result = unsafe {
@@ -629,6 +665,7 @@ impl Targets {
     /// Starts a scene drawing into target `index` (cleared first if new).
     pub fn begin_scene(&mut self, index: usize) {
         let target = &mut self.targets[index];
+        target.generation = next_generation();
         // Safe: the display thread's context; a target that exists has the
         // shared depth surface.
         let result = unsafe {
