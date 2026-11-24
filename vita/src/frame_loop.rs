@@ -322,6 +322,13 @@ impl FrameLoop {
         if now().wrapping_sub(self.last_new_frame_us) > FRAME_DUE_US {
             wait_for_frame(FRAME_WAIT_US);
         }
+        // The GPU first catches up (frame_pool.rs `fence_frame`), and only
+        // then the newest recorded frame is taken: its vertices in PSP RAM
+        // (zero copy) are read by the GPU right after we submit it, before
+        // the game rewrites them. Waiting after taking it (God of War's
+        // gameplay: 0.4-1 s of GPU per frame) let the GPU read them hundreds
+        // of ms late: giant flat-coloured triangles (2026-11-24).
+        frame_pool::fence_frame(self.render_count.wrapping_add(1));
         let mut is_new = 0;
         // Safe: display thread; a valid out pointer.
         let frame = unsafe { acquire_frame(&mut is_new) };
@@ -537,7 +544,7 @@ impl FrameLoop {
             // vita2d draws with GXM's defaults (all at z 0.5, no depth test, no culling).
             draw::end_draws();
             // Safe: the display thread's context, inside the target scene.
-            let end_result = unsafe { gxm::sceGxmEndScene(gxm::context(), null(), frame_pool::close_segment()) };
+            let end_result = unsafe { gxm::sceGxmEndScene(gxm::context(), null(), frame_pool::close_segment(self.render_count)) };
             finish_scene_if_wanted();
             if end_result < 0 {
                 frame_pool::scene_failed();
@@ -969,7 +976,7 @@ impl FrameLoop {
         let end_start = now();
         stats().loop_us += end_start - loop_start;
         draw::end_draws();
-        let notification = if is_last { frame_pool::close_segment() } else { null() };
+        let notification = if is_last { frame_pool::close_segment(self.render_count) } else { null() };
         // Safe: the display thread's context, inside the scene.
         let result = unsafe { gxm::sceGxmEndScene(gxm::context(), null(), notification) };
         finish_scene_if_wanted();

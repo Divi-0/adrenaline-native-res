@@ -11,7 +11,7 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use nativeres_core::frame::{MAX_INDICES, MAX_VERTICES};
-use nativeres_core::frame_pool::{segment_done, Allocation, FramePool};
+use nativeres_core::frame_pool::{segment_done, Allocation, FramePool, FrameFence};
 
 use crate::{gxm, render_log, sys, SingleThreaded};
 
@@ -29,6 +29,9 @@ pub static nativeres_plan_fixed_frame_pool: u32 = sys::pages(FRAME_POOL_BYTES);
 const NOTIFICATION_SLOT: usize = 496;
 /// Waiting longer for the GPU than this: give up on the allocation.
 const WAIT_US: u64 = 200_000;
+/// Waiting longer than this for an old frame (`fence_frame`): the GPU is
+/// stuck, drain it. God of War's gameplay frames take up to ~1 s of GPU.
+const FENCE_WAIT_US: u64 = 3_000_000;
 /// How often each kind of trouble is logged (they would repeat every frame).
 const MAX_LOGGED: u32 = 5;
 
@@ -44,6 +47,9 @@ struct State {
     notification: gxm::Notification,
     logged_slow_gpu: u32,
     logged_too_big: u32,
+    /// Which segment each recent frame closed (`fence_frame`).
+    fence: FrameFence,
+    logged_fence: u32,
 }
 
 /// Times the display thread had to wait for the GPU (render statistics
@@ -58,6 +64,8 @@ static STATE: SingleThreaded<State> = SingleThreaded::new(State {
     notification: gxm::Notification { address: core::ptr::null_mut(), value: 0 },
     logged_slow_gpu: 0,
     logged_too_big: 0,
+    fence: FrameFence::new(),
+    logged_fence: 0,
 });
 
 fn log(text: fmt::Arguments) {
@@ -172,10 +180,53 @@ pub fn alloc(size: u32, align: u32) -> *mut c_void {
     }
 }
 
-/// At a target scene's end: closes the segment of everything allocated
-/// since the last call and returns the notification for sceGxmEndScene's
-/// fragment notification (null without a frame pool).
-pub fn close_segment() -> *const gxm::Notification {
+/// How many frames back `fence_frame` waits for (debug `fenceframes`;
+/// at most `RETIRE_FRAMES`, for textures and palette tables): 2, so at most
+/// the previous frame is still on the GPU when the next is taken. Its
+/// vertex work then starts right after we submit it (the GPU's vertex
+/// phase overlaps the previous scene's fragments). God of War's gameplay
+/// (2026-11-24): 1 and 2 both clean, 2 ~345 ms per frame vs ~390 ms
+/// (overlap kept). Waiting the same way after taking the frame showed
+/// stale-vertex triangles at any depth.
+pub static FENCE_FRAMES: AtomicU32 = AtomicU32::new(2);
+
+/// Before display frame `now` (`render_count`) takes the newest recorded
+/// frame: waits until the GPU has finished frame `now - FENCE_FRAMES`
+/// (`FrameFence`). So the frame's zero-copy vertices are read soon after
+/// it was recorded, and memory the texture cache and palette tables retired
+/// `RETIRE_FRAMES` frames ago is no longer read. Nothing to wait for while
+/// the GPU keeps up.
+pub fn fence_frame(now: u32) {
+    // Safe: display thread only.
+    let state = unsafe { STATE.get() };
+    if state.memory.is_null() {
+        return;
+    }
+    let back = FENCE_FRAMES.load(Ordering::Relaxed).min(nativeres_core::texture_cache::RETIRE_FRAMES);
+    let Some(segment) = state.fence.must_finish_back(now, back) else { return };
+    if segment_done(state.done(), segment) {
+        return;
+    }
+    let start = sys::now_us();
+    while !segment_done(state.done(), segment) {
+        if sys::now_us() - start > FENCE_WAIT_US {
+            state.finish_everything();
+            break;
+        }
+        // Safe: a plain sleep.
+        unsafe { sys::sceKernelDelayThread(200) };
+    }
+    if state.logged_fence < MAX_LOGGED {
+        state.logged_fence += 1;
+        log(format_args!("frame {}: waited {} us for the GPU to finish frame segment {}
+", now, sys::now_us() - start, segment));
+    }
+}
+
+/// At the end of display frame `frame`'s last scene: closes the segment of
+/// everything allocated since the last call and returns the notification
+/// for sceGxmEndScene's fragment notification (null without a frame pool).
+pub fn close_segment(frame: u32) -> *const gxm::Notification {
     // Safe: display thread only.
     let state = unsafe { STATE.get() };
     if state.memory.is_null() {
@@ -189,6 +240,7 @@ pub fn close_segment() -> *const gxm::Notification {
         state.pool.release(state.done());
     }
     let id = state.pool.close_segment();
+    state.fence.closed(frame, id);
     state.notification = gxm::Notification { address: state.done, value: id };
     &state.notification
 }

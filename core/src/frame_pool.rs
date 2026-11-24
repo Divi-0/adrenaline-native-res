@@ -157,6 +157,67 @@ impl FramePool {
     }
 }
 
+/// Frames remembered by `FrameFence`: more than `RETIRE_FRAMES` in flight.
+const FENCE_FRAMES: usize = 8;
+
+/// Which segment each recent frame closed, so a frame can wait for the GPU
+/// to finish the frames whose memory it may reuse.
+///
+/// Why: the texture cache and the palette tables hand a texture's or
+/// table's memory to another one `RETIRE_FRAMES` frames after its last use
+/// (`texture_cache::RETIRE_FRAMES`, counted in the display's frames,
+/// `render_count`), assuming the GPU is done with those frames by then.
+/// Nothing made sure of that: with God of War's exact programs a gameplay
+/// frame takes 0.4-1 s of GPU time, the display thread queued frames
+/// further ahead, and later frames overwrote textures the GPU was still
+/// reading (flat-coloured sails and sky, 2026-11-24). Frame `now` first
+/// waits for the newest frame at most `now - RETIRE_FRAMES` (`must_finish`).
+/// When the GPU keeps up, that frame is long finished and nothing waits.
+pub struct FrameFence {
+    /// (frame, segment) of the last frames that closed one, oldest first.
+    frames: [(u32, u32); FENCE_FRAMES],
+    count: usize,
+}
+
+impl FrameFence {
+    pub const fn new() -> Self {
+        FrameFence { frames: [(0, 0); FENCE_FRAMES], count: 0 }
+    }
+
+    /// Frame `frame` closed segment `segment` (its last scene).
+    pub fn closed(&mut self, frame: u32, segment: u32) {
+        if self.count == FENCE_FRAMES {
+            self.frames.copy_within(1.., 0);
+            self.count -= 1;
+        }
+        self.frames[self.count] = (frame, segment);
+        self.count += 1;
+    }
+
+    /// The segment the GPU must have finished before frame `now` reuses
+    /// memory retired `RETIRE_FRAMES` frames ago, if any frame that old
+    /// closed one.
+    pub fn must_finish(&self, now: u32) -> Option<u32> {
+        self.must_finish_back(now, crate::texture_cache::RETIRE_FRAMES)
+    }
+
+    /// The segment of the newest frame at least `back` frames before `now`
+    /// (`back` >= 1), if any closed one.
+    pub fn must_finish_back(&self, now: u32, back: u32) -> Option<u32> {
+        self.frames[..self.count]
+            .iter()
+            .rev()
+            .find(|&&(frame, _)| now.wrapping_sub(frame) as i32 >= back.max(1) as i32)
+            .map(|&(_, segment)| segment)
+    }
+}
+
+impl Default for FrameFence {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +352,42 @@ mod tests {
         assert_eq!(pool.oldest_segment(), Some(extra));
         pool.release(extra);
         assert_eq!(pool.oldest_segment(), None);
+    }
+    /// God of War's gameplay with the exact programs takes 0.4-1 s of GPU
+    /// time per frame; the display thread queued frames further ahead than
+    /// the texture cache's and palette tables' `RETIRE_FRAMES`, so a frame
+    /// overwrote textures an earlier frame's scenes were still reading
+    /// (big flat-coloured sails and sky on the Vita, 2026-11-24). Frame F
+    /// must wait for the newest frame at most F - RETIRE_FRAMES.
+    #[test]
+    fn a_frame_waits_for_the_one_whose_memory_it_may_reuse() {
+        use crate::texture_cache::RETIRE_FRAMES;
+        let mut fence = FrameFence::new();
+        // Nothing closed yet: nothing to wait for.
+        assert_eq!(fence.must_finish(1), None);
+        for frame in 1..=2 {
+            fence.closed(frame, 100 + frame);
+            assert_eq!(fence.must_finish(frame + 1), None, "frame {frame}: none 3 back yet");
+        }
+        fence.closed(3, 103);
+        assert_eq!(RETIRE_FRAMES, 3);
+        // Frame 4 may reuse what frame 1 used last.
+        assert_eq!(fence.must_finish(4), Some(101));
+        fence.closed(4, 104);
+        assert_eq!(fence.must_finish(5), Some(102));
+        // Frames that closed no segment (drawn nothing) leave the newest
+        // older one to wait for.
+        assert_eq!(fence.must_finish(9), Some(104));
+        // One back: the previous frame.
+        assert_eq!(fence.must_finish_back(5, 1), Some(104));
+        assert_eq!(fence.must_finish_back(5, 2), Some(103));
+        // Counters wrap.
+        let mut fence = FrameFence::new();
+        fence.closed(u32::MAX - 1, 7);
+        fence.closed(u32::MAX, 8);
+        fence.closed(0, 9);
+        assert_eq!(fence.must_finish(1), Some(7));
+        assert_eq!(fence.must_finish(2), Some(8));
+        assert_eq!(fence.must_finish(3), Some(9));
     }
 }
