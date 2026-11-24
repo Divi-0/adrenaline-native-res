@@ -22,6 +22,7 @@ use core::ffi::c_void;
 use core::ptr::{null, null_mut};
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, Ordering};
 
+use nativeres_core::black_texels::BlackOutside;
 use nativeres_core::blend::{self, StencilState, StencilWay, BLEND_ALPHA_ONLY, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_WRITES_ALPHA};
 use nativeres_core::frame::{
     draw_flags, read_variant, test_flags, Draw, Frame, DIRECTIONAL_LIGHT_FLOATS, FrameVertex, GpuLights, GpuTransform, RawCamera, RawColors, RawTransform, ReadVariant,
@@ -1734,11 +1735,13 @@ impl Draws {
         uv_scale: [f32; 2],
         opaque_rows: u16,
         from_target: bool,
+        black: Option<BlackOutside>,
     ) {
         let convert_start = draw_clock();
         let Some((indices, index_count)) = self.draw_indices(frame, draw, draw_index) else {
             return; // the frame pool is full
         };
+        let (mut indices, mut index_count) = (indices, index_count);
         if skip(8) {
             return;
         }
@@ -2088,6 +2091,16 @@ impl Draws {
                 else {
                     return; // the frame pool is full
                 };
+                // Triangles sampling black texels only (frame_loop.rs
+                // `black_outside`; screen-space vertices of its own), read
+                // from the frame's vertices: the same as the copy, and just
+                // read by it.
+                if let Some(black) = black.filter(|_| transform.is_none()) {
+                    let first = draw.first_vertex as usize;
+                    if let Some(source) = frame.vertices.get(first..first + vertices.len()) {
+                        (indices, index_count) = cull_black_triangles(frame, draw, source, indices, index_count, &black);
+                    }
+                }
                 if smooth_textures() && draw.flags & draw_flags::RECTANGLES != 0 {
                     keep_filter_inside_sprites(vertices, &texture.gxm);
                 }
@@ -2922,6 +2935,62 @@ fn run_corners(runs: &[u16]) -> u32 {
     corners
 }
 
+/// The triangles of `indices` (`index_count` corners, from `draw_indices`,
+/// over the draw's `vertices`) that sample texels `black` doesn't know to
+/// be black (core black_texels), copied into the frame pool: the list and
+/// its length. The draw keeps the target wherever its texel is black
+/// (frame_loop.rs `black_outside`), so the others change nothing. With none
+/// left, one triangle of three equal corners (draws nothing; the draw's
+/// uniforms are already reserved, so it is drawn anyway). All of them if
+/// the pool is full.
+fn cull_black_triangles(
+    frame: &Frame,
+    draw: &Draw,
+    vertices: &[FrameVertex],
+    indices: *const u16,
+    index_count: u32,
+    black: &BlackOutside,
+) -> (*const u16, u32) {
+    let out = frame_pool_alloc(index_count.max(3) * 2, 2) as *mut u16;
+    if out.is_null() {
+        return (indices, index_count);
+    }
+    // Plain index lists are the frame's own (draw_indices copied them as
+    // they are, and the index ring holds only runs and raw draws' lists);
+    // index runs as written out.
+    let first = draw.first_index as usize;
+    let stored = frame.indices.get(first..first + index_count as usize).filter(|_| draw.flags & draw_flags::INDEX_RUNS == 0);
+    // Safe: draw_indices gave `index_count` corners; the pool as many u16s.
+    let (list, out) = unsafe {
+        (
+            stored.unwrap_or_else(|| core::slice::from_raw_parts(indices, index_count as usize)),
+            core::slice::from_raw_parts_mut(out, index_count as usize),
+        )
+    };
+    // Kept triangles gathered on the stack, copied into the pool in bursts.
+    // (God of War's ~40 such draws, ~5k triangles a frame: ~1.8 ms of the
+    // display thread's time, frozen-frame redraws; GPU -22 ms.)
+    let mut chunk = [0u16; 3 * 256];
+    let mut kept = 0;
+    for part in list.chunks(chunk.len()) {
+        let count = black.cull_triangles(vertices, part, &mut chunk);
+        out[kept..kept + count].copy_from_slice(&chunk[..count]);
+        kept += count;
+    }
+    let kept = kept as u32;
+    let stats = stats();
+    stats.black_draws += 1;
+    stats.black_kept += kept / 3;
+    stats.black_culled += (index_count - kept) / 3;
+    if kept == 0 {
+        stats.black_skipped += 1;
+        // Safe: the pool gave at least 3 u16s.
+        unsafe { core::slice::from_raw_parts_mut(out.as_mut_ptr(), 3) }.fill(0);
+        return (out.as_ptr(), 3);
+    }
+    (out.as_ptr(), kept)
+}
+
 /// Writes index runs (type, count, first vertex) out as triangle lists, in
 /// the order frame.rs run_indices gives.
 fn write_runs(runs: &[u16], out: &mut [u16]) {
@@ -3038,8 +3107,9 @@ pub fn draw_textured(
     uv_scale: [f32; 2],
     opaque_rows: u16,
     from_target: bool,
+    black: Option<BlackOutside>,
 ) {
-    draws().draw_textured(frame, draw, draw_index, texture, palette, uv_scale, opaque_rows, from_target);
+    draws().draw_textured(frame, draw, draw_index, texture, palette, uv_scale, opaque_rows, from_target, black);
 }
 
 /// Untextured draw `draw_index` of `frame`. Inside a target scene.

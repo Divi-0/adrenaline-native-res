@@ -26,6 +26,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod bench;
+pub mod black_texels;
 pub mod blend;
 pub mod block_cache;
 pub mod capture;

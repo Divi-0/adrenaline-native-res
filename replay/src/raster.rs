@@ -19,6 +19,7 @@
 
 use nativeres_core::blend::{channel_mask, reads_destination_alpha, samples_target_alpha, StencilState, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_FIX_B_SHIFT, BLEND_PREMULTIPLY_SHIFT};
 use nativeres_core::frame::{draw_flags, ge_blend_term, test_flags, texture_flags, wide_variant, Draw, Frame, FrameVertex, TextureDescriptor};
+use nativeres_core::black_texels;
 use nativeres_core::hidden_draws::{self, HiddenDraws};
 use nativeres_core::offscreen;
 use nativeres_core::texture::{data_size, decode_texture, format, ALL_ROWS_OPAQUE};
@@ -233,6 +234,20 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
             println!("depth-only draws: {}: {list:?}", hidden.depth_only_count());
         }
     }
+    // REPLAY_BLACK_TEXELS=1: triangles reading only black texels of an
+    // off-screen picture with a blend that keeps the target there are left
+    // out (core black_texels, as the Vita's draw loop does); the picture must
+    // not change. Each off-screen picture starts black.
+    let black_texels = std::env::var("REPLAY_BLACK_TEXELS").is_ok_and(|value| value == "1");
+    let mut contents: Vec<(u32, black_texels::TargetContents)> = offscreen
+        .iter()
+        .map(|(framebuffer, _, _)| {
+            let mut known = black_texels::TargetContents::UNKNOWN;
+            known.note_fill(black_texels::Rect::new(0, 0, (WIDTH / 2) as i32, (HEIGHT / 2) as i32));
+            (*framebuffer, known)
+        })
+        .collect();
+    let (mut black_kept, mut black_culled) = (0u32, 0u32);
     for (index, draw) in frame.draws().iter().enumerate().take(max_draws) {
         // Debugging: REPLAY_STENCIL_LIST=1 lists the draws with an exact
         // stencil state and the way the Vita does it (core `stencil_way`).
@@ -384,15 +399,41 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
             draw_one(&mut screen, &mut depth, frame, draw_textures, draw);
             screen.copy_from_slice(&colour);
         } else if draw.framebuffer == frame.shown_framebuffer {
-            draw_one(&mut screen, &mut depth, frame, draw_textures, draw);
+            let black = (black_texels && draw.flags & draw_flags::TEXTURED != 0)
+                .then(|| frame.textures().get(draw.texture as usize))
+                .flatten()
+                .filter(|_| black_texels::zero_source_keeps_target(frame, draw))
+                .and_then(|texture| {
+                    let (_, known) = contents.iter().find(|(framebuffer, _)| offscreen::reads_framebuffer(texture, *framebuffer))?;
+                    let lit = known.lit_box(black_texels::Rect::new(0, 0, texture.width as i32, texture.height as i32))?;
+                    Some(black_texels::BlackOutside {
+                        lit,
+                        width: texture.width as u32,
+                        height: texture.height as u32,
+                        clamp_u: draw.flags & draw_flags::CLAMP_U != 0,
+                        clamp_v: draw.flags & draw_flags::CLAMP_V != 0,
+                    })
+                });
+            let (kept, culled) = draw_one_black(&mut screen, &mut depth, frame, draw_textures, draw, black);
+            if black.is_some() {
+                println!("black texels: draw {index} kept {kept} culled {culled} triangles");
+                black_kept += kept;
+                black_culled += culled;
+            }
         } else if let Some((_, picture, picture_depth)) = offscreen.iter_mut().find(|(framebuffer, _, _)| *framebuffer == draw.framebuffer) {
             draw_one(picture, picture_depth, frame, draw_textures, draw);
+            if let Some((_, known)) = contents.iter_mut().find(|(framebuffer, _)| *framebuffer == draw.framebuffer) {
+                known.note_draw(frame, draw, 0);
+            }
         }
         if let (Some(at), Some(before)) = (watched, before) {
             if screen[at] != before || Some(depth[at]) != depth_before {
                 println!("pixel: draw {index} {before:08x} -> {:08x} depth {:?} -> {} tests {:x} texture {} {:x?}", screen[at], depth_before, depth[at], draw.tests, draw.texture, frame.textures().get(draw.texture as usize));
             }
         }
+    }
+    if black_texels {
+        println!("black texels: {black_kept} triangles kept, {black_culled} culled");
     }
     if TIE_STATS.with(|on| *on) {
         TIE_COUNTS.with(|counts| {
@@ -463,10 +504,25 @@ fn target_texture(texture: &TextureDescriptor, picture: &[u32]) -> Texture {
 /// Draws one of the frame's draws into `screen` (the shown framebuffer's
 /// picture or an off-screen one).
 fn draw_one(screen: &mut [u32], depth: &mut [f32], frame: &Frame, textures: &[Option<Texture>], draw: &Draw) {
+    draw_one_black(screen, depth, frame, textures, draw, None);
+}
+
+/// `draw_one`, leaving out the triangles `black` says sample only black
+/// texels (core black_texels); returns how many triangles were drawn and
+/// how many left out.
+fn draw_one_black(
+    screen: &mut [u32],
+    depth: &mut [f32],
+    frame: &Frame,
+    textures: &[Option<Texture>],
+    draw: &Draw,
+    black: Option<black_texels::BlackOutside>,
+) -> (u32, u32) {
+    let (mut kept, mut culled) = (0, 0);
     let texture = if draw.flags & draw_flags::TEXTURED != 0 {
         match textures.get(draw.texture as usize) {
             Some(Some(texture)) => Some(texture),
-            _ => return, // the Vita skips draws whose texture failed
+            _ => return (0, 0), // the Vita skips draws whose texture failed
         }
     } else {
         None
@@ -474,6 +530,11 @@ fn draw_one(screen: &mut [u32], depth: &mut [f32], frame: &Frame, textures: &[Op
     let index = (draw as *const Draw as usize - frame.draws().as_ptr() as usize) / core::mem::size_of::<Draw>();
     let mut corners = frame.screen_corners(draw);
     while let (Some(a), Some(b), Some(c)) = (corners.next(), corners.next(), corners.next()) {
+        if black.is_some_and(|black| !black.keeps_triangle([&a, &b, &c])) {
+            culled += 1;
+            continue;
+        }
+        kept += 1;
         // Debugging: REPLAY_COVER=x,y (960x544) prints every triangle covering
         // that pixel with its depth there, whether it passes or not.
         if let Some((px, py)) = std::env::var("REPLAY_COVER").ok().and_then(|value| {
@@ -503,6 +564,7 @@ fn draw_one(screen: &mut [u32], depth: &mut [f32], frame: &Frame, textures: &[Op
             !range.is_some_and(|range| range.contains(&index))
         }));
     }
+    (kept, culled)
 }
 
 /// A texture that is the PSP framebuffer the frame doesn't draw into: a

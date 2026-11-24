@@ -128,6 +128,14 @@ pub struct RenderStats {
     pub wide_target_textures: u32,
     pub wide_copies: u32,
     pub wide_copy_scenes: u32,
+    /// Draws onto the screen reading black texels with a blend that keeps
+    /// the target there (core black_texels, DESIGN "sixty-seventh
+    /// session"), their triangles left out and kept, and the draws left
+    /// out whole.
+    pub black_draws: u32,
+    pub black_culled: u32,
+    pub black_kept: u32,
+    pub black_skipped: u32,
     /// The display thread's time finding them (vertex alphas read).
     pub opaque_us: u64,
     /// Raw draws left out: no vertex program for their format (all
@@ -202,6 +210,10 @@ impl RenderStats {
         wide_target_textures: 0,
         wide_copies: 0,
         wide_copy_scenes: 0,
+        black_draws: 0,
+        black_culled: 0,
+        black_kept: 0,
+        black_skipped: 0,
         opaque_us: 0,
         lookup_us: 0,
         palette_us: 0,
@@ -288,7 +300,7 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
     );
     let _ = write!(
         text,
-        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} point_light_draws={} fixed_color_draws={} fix_b_draws={} cut_draws={} cut_fast_draws={} cut_off_draws={} wide_draws={} opaque_draws={} opaque_untested_draws={} opaque_rows_draws={} hidden_draws={} depth_only_draws={} hidden={}us flat_draws={} ge_filter_draws={} ge_wide_draws={} ge_wide_missed={} ge_wide_inexact={} wide_target_textures={} wide_copies={} wide_copy_scenes={} opaque={}us ",
+        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} point_light_draws={} fixed_color_draws={} fix_b_draws={} cut_draws={} cut_fast_draws={} cut_off_draws={} wide_draws={} opaque_draws={} opaque_untested_draws={} opaque_rows_draws={} hidden_draws={} depth_only_draws={} hidden={}us flat_draws={} ge_filter_draws={} ge_wide_draws={} ge_wide_missed={} ge_wide_inexact={} wide_target_textures={} wide_copies={} wide_copy_scenes={} black_draws={} black_culled={} black_kept={} black_skipped={} opaque={}us ",
         per_frame(s.begin_us),
         per_frame(s.loop_us),
         per_frame(s.convert_us),
@@ -322,6 +334,10 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
         s.wide_target_textures / frames,
         s.wide_copies / frames,
         s.wide_copy_scenes / frames,
+        s.black_draws / frames,
+        s.black_culled / frames,
+        s.black_kept / frames,
+        s.black_skipped / frames,
         per_frame(s.opaque_us)
     );
     let _ = write!(

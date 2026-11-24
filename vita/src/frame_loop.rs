@@ -16,6 +16,7 @@ use core::ops::Range;
 use core::ptr::null;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, Ordering};
 
+use nativeres_core::black_texels::{self, BlackOutside, TargetContents};
 use nativeres_core::blend::{self, BLEND_ENABLED};
 use nativeres_core::display_loop::AfterQuit;
 use nativeres_core::frame::{draw_flags, Frame, MAX_TEXTURES};
@@ -45,6 +46,13 @@ pub static SMOOTH_TEXTURES: AtomicU8 = AtomicU8::new(0);
 /// and 8888 textures as U16x4 for their GE_WIDE twins (1, the default;
 /// core `FrameStart::wide`, DESIGN "sixty-fifth session"), or as before (0).
 pub static WIDE_TEXTURES: AtomicU8 = AtomicU8::new(1);
+
+/// Debug "blacktexels 0|1": draws onto the screen that read only black
+/// texels of an off-screen target's part with a blend that then keeps the
+/// target (God of War's shadow tiles laid over the ground) leave those
+/// triangles out (1, the default; core black_texels, DESIGN "sixty-seventh
+/// session"), or draw them all (0). The same picture either way.
+pub static BLACK_TEXELS: AtomicU8 = AtomicU8::new(1);
 
 /// Only these draws of a frame are drawn (count 0 = off), to find which draw makes a part of the picture (pause
 /// the game: the frame is redrawn).
@@ -233,6 +241,17 @@ pub struct FrameLoop {
     screen_keys: [Option<wide_targets::Key>; MAX_TEXTURES],
     screen_read: [bool; MAX_TEXTURES],
     cut_views: [TextureObject; CUT_VIEWS],
+    /// What each off-screen target holds, as far as this frame's draws
+    /// drawn so far tell (core black_texels): forgotten at every frame's
+    /// start and whenever a target is cleared; told of every draw into it.
+    contents: [TargetContents; targets::OFFSCREEN_COUNT],
+    /// The off-screen target the current scene draws into and its x
+    /// origin (a tile), if any.
+    scene_offscreen: Option<(usize, i32)>,
+    /// For textures with a `screen_views` part: its texels that may not be
+    /// black, as the target held it when this scene of the shown
+    /// framebuffer began (None: not known; `TargetContents::lit_box`).
+    screen_lit: [Option<black_texels::Rect>; MAX_TEXTURES],
 }
 
 static FRAME_LOOP: SingleThreaded<FrameLoop> = SingleThreaded::new(FrameLoop {
@@ -264,6 +283,9 @@ static FRAME_LOOP: SingleThreaded<FrameLoop> = SingleThreaded::new(FrameLoop {
     screen_keys: [None; MAX_TEXTURES],
     screen_read: [false; MAX_TEXTURES],
     cut_views: [const { TextureObject::view(gxm::Texture { control_words: [0; 4] }) }; CUT_VIEWS],
+    contents: [TargetContents::UNKNOWN; targets::OFFSCREEN_COUNT],
+    scene_offscreen: None,
+    screen_lit: [None; MAX_TEXTURES],
 });
 
 /// True if the GE can have drawn framebuffer `psp_address` (physical, see
@@ -556,6 +578,9 @@ impl FrameLoop {
         }
         self.refresh_stale_targets(targets, frame, target);
 
+        // What the off-screen targets hold is learnt anew from this frame's draws.
+        self.contents.iter_mut().for_each(TargetContents::forget);
+        self.scene_offscreen = None;
         let uses_offscreen = offscreen::runs(frame.draws()).any(|(framebuffer, _)| {
             framebuffer != frame.shown_framebuffer && targets.find_offscreen(offscreen::placement(frame.textures(), framebuffer).0).is_some()
         });
@@ -564,6 +589,7 @@ impl FrameLoop {
         } else {
             let begin_start = now();
             wide_targets::flush(targets, render_count);
+            self.find_screen_lit(targets, frame);
             targets.begin_scene(target);
             let loop_start = now();
             stats().begin_us += loop_start - begin_start;
@@ -750,6 +776,63 @@ impl FrameLoop {
                 *cuts += 1;
             }
         }
+    }
+
+    /// Tells the scene's off-screen target's `TargetContents` about `draw`,
+    /// right after the draw loop drew it: its vertices were just read, so
+    /// its box reads them from the cache (before the draw, the boxes cost
+    /// God of War's display thread ~1.6 ms a frame, after it ~0.35). A
+    /// depth-only draw changes no colour but counts as painting, which is
+    /// never wrong.
+    fn note_contents(&mut self, frame: &Frame, draw: &nativeres_core::frame::Draw, depth_only: bool) {
+        let Some((k, origin_x)) = self.scene_offscreen else {
+            return;
+        };
+        if depth_only {
+            self.contents[k].note_paint(black_texels::paint_area(frame, draw).offset(origin_x, 0));
+        } else {
+            self.contents[k].note_draw(frame, draw, origin_x);
+        }
+    }
+
+    /// For a scene of the shown framebuffer about to begin: the texels of
+    /// each texture's `screen_views` part that may not be black
+    /// (`screen_lit`), from what its target holds now. Off-screen draws
+    /// come in scenes of their own, so this holds for the whole scene.
+    fn find_screen_lit(&mut self, targets: &Targets, frame: &Frame) {
+        let on = BLACK_TEXELS.load(Ordering::Relaxed) != 0;
+        for (i, wanted) in frame.textures().iter().enumerate() {
+            self.screen_lit[i] = None;
+            let Some(key) = self.screen_keys[i].filter(|_| on && !self.screen_views[i].is_null()) else {
+                continue;
+            };
+            let Some(k) = targets.find_offscreen(key.address) else {
+                continue;
+            };
+            let part = black_texels::Rect::new(key.x as i32, 0, (key.x + wanted.width as u32) as i32, wanted.height as i32);
+            self.screen_lit[i] = self.contents[k].lit_box(part);
+        }
+    }
+
+    /// For textured `draw` onto the shown framebuffer reading texture `t`'s
+    /// part of an off-screen target: where its texels are known black, if
+    /// the draw keeps the target wherever it samples only those
+    /// (`black_texels::zero_source_keeps_target`).
+    fn black_outside(&self, frame: &Frame, draw: &nativeres_core::frame::Draw, t: usize) -> Option<BlackOutside> {
+        let lit = self.screen_lit[t]?;
+        if !black_texels::zero_source_keeps_target(frame, draw) {
+            return None;
+        }
+        let texture = frame.textures().get(t)?;
+        let black = BlackOutside {
+            lit,
+            width: texture.width as u32,
+            height: texture.height as u32,
+            clamp_u: draw.flags & draw_flags::CLAMP_U != 0,
+            clamp_v: draw.flags & draw_flags::CLAMP_V != 0,
+        };
+        // (Not where no triangle could go: God of War's bloom added onto the screen.)
+        black.culls_anything().then_some(black)
     }
 
     /// The frame's draws a later draw paints over completely (core
@@ -953,9 +1036,11 @@ impl FrameLoop {
             if skip & 16 != 0 {
                 continue;
             }
-            if self.depth_only && ((self.hiding && self.hidden.is_depth_only(i)) || hidden_draws::colourless_depth_only(draw)) {
+            let depth_only = self.depth_only && ((self.hiding && self.hidden.is_depth_only(i)) || hidden_draws::colourless_depth_only(draw));
+            if depth_only {
                 stats().depth_only_draws += 1;
                 draw::draw_depth_only(frame, draw, i);
+                self.note_contents(frame, draw, true);
                 continue;
             }
             if draw.flags & draw_flags::TEXTURED != 0 {
@@ -972,14 +1057,18 @@ impl FrameLoop {
                             wide_targets::note_read(key, self.render_count);
                         }
                     }
+                    // Triangles reading only black texels of that part
+                    // that keep the target there: left out (core black_texels).
+                    let black = if screen.is_null() { None } else { self.black_outside(frame, draw, t) };
                     // Safe: textures from the cache, targets or wide copies, alive this frame.
                     if let Some(texture) = unsafe { texture.as_ref() } {
-                        draw::draw_textured(frame, draw, i, texture, self.palettes[t], uv_scale, self.opaque_rows[t], self.from_targets[t]);
+                        draw::draw_textured(frame, draw, i, texture, self.palettes[t], uv_scale, self.opaque_rows[t], self.from_targets[t], black);
                     }
                 }
             } else {
                 draw::draw_colored(frame, draw, i);
             }
+            self.note_contents(frame, draw, false);
         }
         if alpha_read {
             self.target_alpha_read = self.render_count;
@@ -1052,14 +1141,22 @@ impl FrameLoop {
         if framebuffer == frame.shown_framebuffer {
             // Wide copies of targets drawn since, for this scene's draws.
             wide_targets::flush(targets, self.render_count);
+            self.find_screen_lit(targets, frame);
         }
         match offscreen_target {
-            Some(k) => targets.begin_offscreen_scene(k, self.render_count, origin_x),
+            Some(k) => {
+                if targets.offscreen[k].needs_clear {
+                    self.contents[k].forget(); // cleared as the scene begins
+                }
+                targets.begin_offscreen_scene(k, self.render_count, origin_x);
+            }
             None => targets.begin_scene(target),
         }
+        self.scene_offscreen = offscreen_target.map(|k| (k, origin_x as i32));
         let loop_start = now();
         stats().begin_us += loop_start - begin_start;
         self.draw_draws(frame, range, framebuffer);
+        self.scene_offscreen = None;
         if is_last {
             draw::draw_tests(); // GPU tests, alpha log
         }
