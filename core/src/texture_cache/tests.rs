@@ -189,7 +189,7 @@ impl Host for FakeHost {
         let raw_shape = self.live[&raw.handle];
         assert!(raw_shape.format.is_16_bit());
         assert_eq!(raw_shape.bytes(), wanted.width as u32 * wanted.height as u32 * 2);
-        assert_eq!(self.live[&target.handle].format, GpuFormat::for_texture(wanted, false));
+        assert_eq!(self.live[&target.handle].format, GpuFormat::for_texture(wanted, false, false));
         self.gpu_unswizzles += 1;
         let hash = self.data_hash(wanted);
         self.contents.insert(target.handle, hash);
@@ -271,6 +271,8 @@ struct Test {
     render_count: u32,
     frame_number: u32,
     smooth: bool,
+    /// `FrameStart::wide`.
+    wide: bool,
     /// How long ago the display loop started when the frame's textures are
     /// looked up.
     late_us: u64,
@@ -285,6 +287,7 @@ impl Test {
             render_count: 0,
             frame_number: 100,
             smooth: false,
+            wide: false,
             late_us: 0,
         }
     }
@@ -297,6 +300,7 @@ impl Test {
             frame_number: self.frame_number,
             render_count: self.render_count,
             smooth: self.smooth,
+            wide: self.wide,
             trace_address: 0,
             loop_start_us: (self.host.now - self.late_us) as u32,
             render_targets: [0; MAX_RENDER_TARGETS],
@@ -576,6 +580,139 @@ fn index_textures_are_the_same_texture_with_another_palette() {
     let smooth = test.use_texture(&tile);
     tile.palette_hash = 2;
     assert_ne!(test.use_texture(&tile), smooth);
+}
+
+/// The wide mode (God of War, DESIGN "sixty-fifth session"): palette and
+/// 8888 textures of power-of-two sizes as `Wide16`, decoded with their
+/// palette (so the palette is part of the key); others as before.
+#[test]
+fn wide_mode_widens_palette_and_8888_textures() {
+    let mut test = Test::new();
+    test.host.arena_bytes = 6 * 1024 * 1024;
+    test.wide = true;
+    let mut tile = texture(RAM_START, 32, 64, format::CLUT8);
+    tile.palette_hash = 1;
+    let Lookup::Ready(first) = test.use_texture(&tile) else { panic!() };
+    assert_eq!(test.host.live[&first.handle].format, GpuFormat::Wide16);
+    assert_eq!(test.host.live[&first.handle].bytes(), 32 * 64 * 8);
+    tile.palette_hash = 2;
+    let Lookup::Ready(second) = test.use_texture(&tile) else { panic!() };
+    assert_ne!(second, first, "another palette: other colours");
+    let mut nibbles = texture(RAM_START + 0x10000, 16, 16, format::CLUT4);
+    nibbles.palette_hash = 3;
+    let Lookup::Ready(nibbles) = test.use_texture(&nibbles) else { panic!() };
+    assert_eq!(test.host.live[&nibbles.handle].format, GpuFormat::Wide16);
+    let Lookup::Ready(direct) = test.use_texture(&small_texture(RAM_START + 0x20000)) else { panic!() };
+    assert_eq!(test.host.live[&direct.handle].format, GpuFormat::Wide16);
+    // 16-bit, sizes that aren't powers of two, mip levels: as before.
+    let Lookup::Ready(sixteen) = test.use_texture(&texture(RAM_START + 0x30000, 64, 64, format::ABGR4444)) else { panic!() };
+    assert_eq!(test.host.live[&sixteen.handle].format, GpuFormat::Abgr4444);
+    let Lookup::Ready(odd) = test.use_texture(&texture(RAM_START + 0x40000, 48, 64, format::CLUT8)) else { panic!() };
+    assert_eq!(test.host.live[&odd.handle].format, GpuFormat::Palette8);
+    let mut levels = texture(RAM_START + 0x50000, 64, 64, format::CLUT8);
+    levels.flags = 1 << crate::frame::texture_flags::LEVELS_SHIFT;
+    assert!(!gpu::wide_texture(&levels));
+    // Bigger than WIDE_MAX_TEXELS: as before.
+    let Lookup::Ready(big) = test.use_texture(&texture(RAM_START + 0x60000, 256, 128, format::CLUT8)) else { panic!() };
+    assert_eq!(test.host.live[&big.handle].format, GpuFormat::Palette8);
+}
+
+/// Wide textures only while the arena keeps WIDE_ARENA_RESERVE free; then
+/// the next ones stay palette textures, and without an arena none is wide.
+#[test]
+fn wide_textures_leave_room_in_the_arena() {
+    let mut test = Test::new();
+    test.host.arena_bytes = WIDE_ARENA_RESERVE + 3 * 64 * 128 * 8;
+    test.wide = true;
+    let formats: Vec<GpuFormat> = (0..5)
+        .map(|i| {
+            let Lookup::Ready(made) = test.use_texture(&texture(RAM_START + i * 0x10000, 64, 128, format::CLUT8)) else { panic!() };
+            test.host.live[&made.handle].format
+        })
+        .collect();
+    assert_eq!(formats[..3], [GpuFormat::Wide16; 3]);
+    assert_eq!(formats[3..], [GpuFormat::Palette8; 2]);
+
+    let mut test = Test::new();
+    test.wide = true;
+    let Lookup::Ready(made) = test.use_texture(&texture(RAM_START, 64, 64, format::CLUT8)) else { panic!() };
+    assert_eq!(test.host.live[&made.handle].format, GpuFormat::Palette8, "no arena: no wide textures");
+}
+
+/// A texture kept as a palette texture for lack of room is widened once
+/// the arena has room again, at most WIDE_UPGRADES_PER_FRAME a frame.
+#[test]
+fn textures_kept_for_lack_of_room_are_widened_later() {
+    let mut test = Test::new();
+    // Room for four wide ones beside the reserve and the palette textures.
+    test.host.arena_bytes = WIDE_ARENA_RESERVE + 4 * 64 * 128 * 8 + 32 * 1024;
+    test.wide = true;
+    let tiles: Vec<TextureDescriptor> = (0..8).map(|i| texture(RAM_START + i * 0x10000, 64, 128, format::CLUT8)).collect();
+    let formats = |test: &mut Test, tiles: &[TextureDescriptor]| -> Vec<GpuFormat> {
+        test.frame(tiles)
+            .iter()
+            .map(|lookup| match lookup {
+                Lookup::Ready(made) => test.host.live[&made.handle].format,
+                _ => panic!(),
+            })
+            .collect()
+    };
+    let first = formats(&mut test, &tiles);
+    assert_eq!(first[..4], [GpuFormat::Wide16; 4]);
+    assert_eq!(first[4..], [GpuFormat::Palette8; 4]);
+    // The first half no longer used: once the arena lets them go, the
+    // others are widened, at most WIDE_UPGRADES_PER_FRAME a frame, also
+    // past the deadline (God of War's loop always is), never waited for.
+    test.late_us = TEXTURE_DEADLINE_US as u64 + 1_000;
+    let mut wide_before = 0;
+    for _ in 0..ARENA_IDLE_FRAMES + RETIRE_FRAMES + 8 {
+        let decodes = test.host.decodes;
+        let now = formats(&mut test, &tiles[4..]);
+        let wide = now.iter().filter(|&&f| f == GpuFormat::Wide16).count();
+        assert!(wide - wide_before <= WIDE_UPGRADES_PER_FRAME as usize && (test.host.decodes - decodes) as usize == wide - wide_before);
+        wide_before = wide;
+    }
+    assert_eq!(formats(&mut test, &tiles[4..]), [GpuFormat::Wide16; 4]);
+}
+
+/// A wide palette texture is as opaque as its palette table would be on
+/// the display side (`find_palettes`): worked out from the palette when
+/// decoded, so draws choose the same programs as with the palette texture.
+#[test]
+fn wide_palette_textures_are_opaque_as_their_palette() {
+    let mut test = Test::new();
+    test.host.arena_bytes = 6 * 1024 * 1024;
+    test.wide = true;
+    test.frame(&[]);
+    let mut tile = texture(RAM_START, 32, 32, format::CLUT4);
+    tile.clut_format = 3 | 0xFF << 8; // 8888 entries
+    tile.palette_word_count = 16;
+    tile.palette_hash = 1;
+    let opaque: Vec<u32> = (0..16).map(|i| 0xFF00_0000 | i * 0x0101).collect();
+    let Lookup::Ready(made) = test.cache.texture_for(&mut test.host, &mut test.staging, &opaque, &tile) else { panic!() };
+    assert_eq!(test.host.live[&made.handle].format, GpuFormat::Wide16);
+    assert_eq!(test.cache.last_opaque_rows, texture::ALL_ROWS_OPAQUE);
+    let mut see_through = opaque.clone();
+    see_through[7] &= 0x00FF_FFFF;
+    tile.palette_hash = 2;
+    test.cache.texture_for(&mut test.host, &mut test.staging, &see_through, &tile);
+    assert_eq!(test.cache.last_opaque_rows, 0);
+}
+
+#[test]
+fn switching_the_wide_mode_decodes_again() {
+    let mut test = Test::new();
+    test.host.arena_bytes = 6 * 1024 * 1024;
+    let tile = texture(RAM_START, 32, 32, format::CLUT8);
+    let Lookup::Ready(narrow) = test.use_texture(&tile) else { panic!() };
+    assert_eq!(test.host.live[&narrow.handle].format, GpuFormat::Palette8);
+    test.wide = true;
+    let Lookup::Ready(wide) = test.use_texture(&tile) else { panic!() };
+    assert_eq!(test.host.live[&wide.handle].format, GpuFormat::Wide16);
+    test.wide = false;
+    let Lookup::Ready(back) = test.use_texture(&tile) else { panic!() };
+    assert_eq!(test.host.live[&back.handle].format, GpuFormat::Palette8);
+    assert_eq!(test.host.decodes, 3);
 }
 
 #[test]
@@ -902,7 +1039,7 @@ fn big_swizzled_16_bit_textures_are_unswizzled_on_the_gpu() {
 /// With the smooth filter they are decoded into 8888 (it changes texels).
 #[test]
 fn textures_with_16_bit_texels_stay_16_bit() {
-    let gpu_format = |psp_format, smooth| GpuFormat::for_texture(&texture(RAM_START, 64, 64, psp_format), smooth);
+    let gpu_format = |psp_format, smooth| GpuFormat::for_texture(&texture(RAM_START, 64, 64, psp_format), smooth, false);
     assert_eq!(gpu_format(format::BGR5650, false), GpuFormat::Bgr565);
     assert_eq!(gpu_format(format::ABGR5551, false), GpuFormat::Abgr1555);
     assert_eq!(gpu_format(format::ABGR4444, false), GpuFormat::Abgr4444);

@@ -183,6 +183,28 @@ impl TextureCache {
         true
     }
 
+    /// Arena bytes a new texture can have: free pages, retired arena
+    /// textures' and those of textures no frame used for `ARENA_IDLE_FRAMES`
+    /// (`acquire` frees those two when the arena is full).
+    pub(super) fn arena_reclaimable(&self) -> u32 {
+        let retired: u32 = self
+            .retired
+            .iter()
+            .filter(|spare| spare.texture.is_some_and(|texture| texture.arena_offset.is_some()))
+            .map(|spare| spare.shape.bytes())
+            .sum();
+        let idle: u32 = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.texture.is_some_and(|texture| texture.arena_offset.is_some())
+                    && entry.last_used + ARENA_IDLE_FRAMES.max(RETIRE_FRAMES) < self.render_count
+            })
+            .map(|entry| entry.shape.bytes())
+            .sum();
+        self.arena.free_bytes() + retired + idle
+    }
+
     /// True if the arena has less than `ARENA_SLACK` free, counting the
     /// pages of retired arena textures as free (they are, a few frames on).
     fn arena_short(&self) -> bool {

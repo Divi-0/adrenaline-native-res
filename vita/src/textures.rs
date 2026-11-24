@@ -113,6 +113,9 @@ pub struct FrameInfo {
     pub render_count: u32,
     /// Menu "NativeRes Texture Filter": always bilinear.
     pub smooth: bool,
+    /// Palette and 8888 textures as U16x4 for the GE_WIDE programs (core
+    /// `FrameStart::wide`).
+    pub wide: bool,
     /// The texture address whose lookups are logged (0: none).
     pub trace_address: u32,
     /// When the display loop began (the texture work deadline counts from it).
@@ -143,6 +146,7 @@ pub fn for_frame(
         frame_number: frame.frame_number,
         render_count: info.render_count,
         smooth: info.smooth,
+        wide: info.wide,
         trace_address: info.trace_address,
         loop_start_us: info.loop_start_us,
         render_targets: info.render_targets,
@@ -419,6 +423,19 @@ impl Host for VitaHost {
         match format {
             GpuFormat::Palette8 => texture::decode_palette_indices(data, as_texture, bytes, stride),
             format if format.is_16_bit() => texture::decode_16_bit(data, as_texture, bytes, stride / 2),
+            GpuFormat::Wide16 => {
+                // RGBA into the second half (rows of stride / 8 texels), then
+                // widened in place from the front: texel i's 8 bytes end at
+                // 8 i + 8 <= 4 n + 4 i + 4 (n texels), never past a texel not
+                // yet read. Safe: word-aligned (page-aligned memory).
+                let texel_count = stride / 8 * height;
+                let pixels = unsafe { core::slice::from_raw_parts_mut(texels.add(texel_count * 4) as *mut u32, texel_count) };
+                texture::decode_texture(data, as_texture, palette, pixels, stride / 8)?;
+                // Safe: the whole level, 8 bytes a texel, u16-aligned.
+                let wide = unsafe { core::slice::from_raw_parts_mut(texels as *mut u16, texel_count * 4) };
+                texture::widen_rgba(wide, texel_count);
+                Ok(())
+            }
             _ => {
                 // Safe: GPU texture memory is page-aligned, so word-aligned.
                 let pixels = unsafe { core::slice::from_raw_parts_mut(texels as *mut u32, stride / 4 * height) };

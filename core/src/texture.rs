@@ -779,6 +779,22 @@ pub fn palette_rgba(texture: &TextureDescriptor, palette: &[u32], out: &mut [u32
     }
 }
 
+/// Widens `count` RGBA texels (0xAABBGGRR words) stored as u16 pairs in the
+/// second half of `texels` (from index 2 x `count`) into four u16 channels
+/// each from the front, k -> k x 257 (= k / 255 when the GPU reads them:
+/// `texture_cache::gpu::GpuFormat::Wide16`). In place: texel i is read
+/// before its 4 channels are written, and those end at 4 i + 4 <= 2 count +
+/// 2 i + 2, never past a texel not yet read.
+pub fn widen_rgba(texels: &mut [u16], count: usize) {
+    for i in 0..count {
+        let at = 2 * count + 2 * i;
+        let rgba = texels[at] as u32 | (texels[at + 1] as u32) << 16;
+        for channel in 0..4 {
+            texels[4 * i + channel] = ((rgba >> (8 * channel)) & 0xFF) as u16 * 257;
+        }
+    }
+}
+
 /// Gives fully transparent texels the average colour of their visible
 /// neighbours (alpha stays 0), so bilinear filtering doesn't blend a
 /// hidden colour into sprite edges (Final Fantasy's sprites have pink
@@ -942,6 +958,56 @@ mod tests {
         decode_texture(&data, &descriptor, &[], &mut out, 4).unwrap();
         // Row 1 starts at pixel 2 of memory, not pixel 4.
         assert_eq!(out[4], 3);
+    }
+
+    #[test]
+    fn widens_rgba_in_place() {
+        let words: Vec<u32> = (0..37u32).map(|i| i.wrapping_mul(0x9E37_79B9) ^ 0x00FF_0080).collect();
+        let mut texels = vec![0u16; words.len() * 4];
+        for (i, word) in words.iter().enumerate() {
+            texels[2 * words.len() + 2 * i] = *word as u16;
+            texels[2 * words.len() + 2 * i + 1] = (*word >> 16) as u16;
+        }
+        widen_rgba(&mut texels, words.len());
+        for (i, word) in words.iter().enumerate() {
+            for channel in 0..4 {
+                assert_eq!(texels[4 * i + channel], ((word >> (8 * channel)) & 0xFF) as u16 * 257, "texel {i} channel {channel}");
+            }
+        }
+    }
+
+    /// The wide textures' premise (DESIGN "sixty-fifth session"): a palette
+    /// texture decoded to RGBA with its palette has the colours the GPU
+    /// shows for its indices through the palette table (`palette_rgba`),
+    /// for every CLUT format (entry formats, shift, mask, start) and with
+    /// IGNORE_ALPHA.
+    #[test]
+    fn rgba_decode_of_palette_textures_matches_the_palette_tables() {
+        let mut seed = 0x1234_5678u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed
+        };
+        for round in 0..400 {
+            let format = if round % 2 == 0 { format::CLUT4 } else { format::CLUT8 };
+            let (width, height) = (16u16 << (round % 3), 8u16 << (round % 2));
+            let mut descriptor = texture(format, width, height);
+            descriptor.swizzled = (round % 4 >= 2) as u8;
+            descriptor.flags = if round % 5 == 0 { texture_flags::IGNORE_ALPHA } else { 0 };
+            let (entry_format, shift, mask, start) = (next() % 4, next() % 8, next() & 0xFF, next() % 32);
+            descriptor.clut_format = entry_format | shift << 2 | mask << 8 | start << 16;
+            let palette: Vec<u32> = (0..(next() % 300)).map(|_| next()).collect();
+            let data: Vec<u8> = (0..data_size(&descriptor).unwrap() as usize).map(|_| next() as u8).collect();
+            let mut rgba = vec![0u32; width as usize * height as usize];
+            decode_texture(&data, &descriptor, &palette, &mut rgba, width as usize).unwrap();
+            let mut indices = vec![0u8; width as usize * height as usize];
+            decode_palette_indices(&data, &descriptor, &mut indices, width as usize).unwrap();
+            let mut table = [0u32; 256];
+            palette_rgba(&descriptor, &palette, &mut table);
+            for (i, (color, index)) in rgba.iter().zip(&indices).enumerate() {
+                assert_eq!(*color, table[*index as usize], "round {round} texel {i}");
+            }
+        }
     }
 
     #[test]

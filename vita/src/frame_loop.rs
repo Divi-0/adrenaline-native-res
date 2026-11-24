@@ -41,6 +41,11 @@ use crate::{ext, frame_pool, gxm, options, palettes, render_log, sys, SingleThre
 /// upscaled original).
 pub static SMOOTH_TEXTURES: AtomicU8 = AtomicU8::new(0);
 
+/// Debug "widetex 0|1": with the PSP-depth programs (God of War), palette
+/// and 8888 textures as U16x4 for their GE_WIDE twins (1, the default;
+/// core `FrameStart::wide`, DESIGN "sixty-fifth session"), or as before (0).
+pub static WIDE_TEXTURES: AtomicU8 = AtomicU8::new(1);
+
 /// Only these draws of a frame are drawn (count 0 = off), to find which draw makes a part of the picture (pause
 /// the game: the frame is redrawn).
 pub static DRAW_ONLY_FIRST: AtomicU32 = AtomicU32::new(0);
@@ -454,6 +459,7 @@ impl FrameLoop {
         let mut info = FrameInfo {
             render_count,
             smooth: SMOOTH_TEXTURES.load(Ordering::Relaxed) != 0,
+            wide: WIDE_TEXTURES.load(Ordering::Relaxed) != 0 && crate::shaders::psp_depth() && crate::shaders::has_wide_twins(),
             trace_address: TRACE_TEXTURE.load(Ordering::Relaxed),
             loop_start_us: LOOP_START_US.load(Ordering::Relaxed),
             render_targets: [0; MAX_RENDER_TARGETS],
@@ -751,7 +757,8 @@ impl FrameLoop {
             if unsafe { gxm::sceGxmTextureGetFormat(&texture.gxm) } != gxm::TEXTURE_FORMAT_P8_ABGR {
                 // Direct colour (and DXT): the cache knows from the source
                 // (core texture::opaque_rows: 5650, ignored alpha, DXT1/5
-                // rows without transparent texels).
+                // rows without transparent texels); wide palette textures
+                // from their palette (worked out when decoded).
                 self.opaque_rows[i] = textures::opaque_rows(i);
                 continue;
             }

@@ -66,6 +66,76 @@ const RAW_PROGRAMS: usize = 32;
 /// Blend programs kept.
 const MAX_BLEND_PROGRAMS: usize = 96;
 
+/// GE-filtered fragment programs of the PSP-depth set that may get a wide
+/// sibling (`Programs::wide_program`): blend and frame-read programs.
+const MAX_WIDE_SIBLINGS: usize = 96;
+
+/// A GE_FILTER fragment program of the PSP-depth set and, made on first
+/// use, the same program from its GE_WIDE twin (nativeres_x_pspwide_f:
+/// two LINEAR reads of a U16x4 texture instead of four point samples;
+/// DESIGN "sixty-fifth session"), with the same blending and vertex
+/// program. Its uniforms are the point program's own (made only if their
+/// layout is the same: `same_uniforms`), so draws set them as before.
+#[derive(Clone, Copy)]
+struct WideSibling {
+    point: *mut gxm::FragmentProgram,
+    /// Null: not made (yet, or it couldn't be: `tried`).
+    wide: *mut gxm::FragmentProgram,
+    tried: bool,
+    fragment_gxp: *const gxm::Program,
+    vertex_gxp: *const gxm::Program,
+    info: Option<gxm::BlendInfo>,
+}
+
+const NO_WIDE_SIBLING: WideSibling = WideSibling {
+    point: null_mut(),
+    wide: null_mut(),
+    tried: false,
+    fragment_gxp: null(),
+    vertex_gxp: null(),
+    info: None,
+};
+
+/// True if programs `a` and `b` have the same parameters (names, kinds,
+/// places, sizes) and default uniform buffer: uniforms set through the
+/// parameters of `a` land where `b` reads them.
+fn same_uniforms(a: *const gxm::Program, b: *const gxm::Program) -> bool {
+    // Safe: checked programs; parameters and names come from them.
+    unsafe {
+        let count = gxm::sceGxmProgramGetParameterCount(a);
+        if count != gxm::sceGxmProgramGetParameterCount(b)
+            || gxm::sceGxmProgramGetDefaultUniformBufferSize(a) != gxm::sceGxmProgramGetDefaultUniformBufferSize(b)
+        {
+            return false;
+        }
+        (0..count).all(|index| {
+            let (p, q) = (gxm::sceGxmProgramGetParameter(a, index), gxm::sceGxmProgramGetParameter(b, index));
+            if p.is_null() || q.is_null() {
+                return false;
+            }
+            let same = gxm::sceGxmProgramParameterGetCategory(p) == gxm::sceGxmProgramParameterGetCategory(q)
+                && gxm::sceGxmProgramParameterGetResourceIndex(p) == gxm::sceGxmProgramParameterGetResourceIndex(q)
+                && gxm::sceGxmProgramParameterGetContainerIndex(p) == gxm::sceGxmProgramParameterGetContainerIndex(q)
+                && gxm::sceGxmProgramParameterGetComponentCount(p) == gxm::sceGxmProgramParameterGetComponentCount(q)
+                && gxm::sceGxmProgramParameterGetArraySize(p) == gxm::sceGxmProgramParameterGetArraySize(q);
+            let (mut x, mut y) = (gxm::sceGxmProgramParameterGetName(p), gxm::sceGxmProgramParameterGetName(q));
+            if !same || x.is_null() || y.is_null() {
+                return false;
+            }
+            loop {
+                if *x != *y {
+                    return false;
+                }
+                if *x == 0 {
+                    return true;
+                }
+                x = x.add(1);
+                y = y.add(1);
+            }
+        })
+    }
+}
+
 /// Where `format` is in `formats`. Looked up for every raw draw: as an
 /// iterator search, LLVM vectorized it into NEON compares whose results went
 /// back to ARM registers lane by lane (slow on the Cortex-A9; a set has a
@@ -875,28 +945,32 @@ impl ReadProgram {
             render_log::line(format_args!("16-bit target program ({label}, {variant:?}): parameters missing\n"));
             return false;
         }
-        // The "off" ones read no frame: GXM keeps the alpha by its colour
-        // mask; the precut ones get GXM's normal alpha blending (the others
-        // are made without GXM blending).
-        let rgb = gxm::COLOR_MASK_R | gxm::COLOR_MASK_G | gxm::COLOR_MASK_B;
-        let keep_rgb = gxm::BlendInfo::new(rgb, gxm::BLEND_FUNC_NONE, gxm::BLEND_FACTOR_ONE, gxm::BLEND_FACTOR_ZERO);
-        // GXM's factors and functions as in `blend_program` (source alpha
-        // 4, one minus source alpha 5, add 0 + 1).
-        let normal = |mask| gxm::BlendInfo::new(mask, 1, 4, 5);
-        let precut_keep = normal(rgb);
-        let precut = normal(gxm::COLOR_MASK_ALL);
-        let info = match variant {
-            ReadVariant::Fast { way: ReadWay::Off, keep_alpha: true, .. } => &keep_rgb as *const gxm::BlendInfo,
-            ReadVariant::Fast { way: ReadWay::Precut, keep_alpha: true, .. } => &precut_keep as *const gxm::BlendInfo,
-            ReadVariant::Fast { way: ReadWay::Precut, keep_alpha: false, .. } => &precut as *const gxm::BlendInfo,
-            _ => null(),
-        };
-        self.program = basic_programs::fragment_program(id, info, vertex_gxp);
+        let info = read_blend_info(variant);
+        let info_pointer = info.as_ref().map_or(null(), |info| info as *const gxm::BlendInfo);
+        self.program = basic_programs::fragment_program(id, info_pointer, vertex_gxp);
         render_log::line(format_args!(
             "16-bit target program ({label}, {variant:?}) {}\n",
             if self.program.is_null() { "failed" } else { "ready" }
         ));
         !self.program.is_null()
+    }
+}
+
+/// GXM's blending for frame-read program `variant`: the "off" ones read no
+/// frame: GXM keeps the alpha by its colour mask; the precut ones get GXM's
+/// normal alpha blending (the others are made without GXM blending).
+fn read_blend_info(variant: ReadVariant) -> Option<gxm::BlendInfo> {
+    let rgb = gxm::COLOR_MASK_R | gxm::COLOR_MASK_G | gxm::COLOR_MASK_B;
+    // GXM's factors and functions as in `blend_program` (source alpha
+    // 4, one minus source alpha 5, add 0 + 1).
+    let normal = |mask| gxm::BlendInfo::new(mask, 1, 4, 5);
+    match variant {
+        ReadVariant::Fast { way: ReadWay::Off, keep_alpha: true, .. } => {
+            Some(gxm::BlendInfo::new(rgb, gxm::BLEND_FUNC_NONE, gxm::BLEND_FACTOR_ONE, gxm::BLEND_FACTOR_ZERO))
+        }
+        ReadVariant::Fast { way: ReadWay::Precut, keep_alpha: true, .. } => Some(normal(rgb)),
+        ReadVariant::Fast { way: ReadWay::Precut, keep_alpha: false, .. } => Some(normal(gxm::COLOR_MASK_ALL)),
+        _ => None,
     }
 }
 
@@ -939,6 +1013,12 @@ pub struct Programs {
     read: [ReadProgram; READ_PROGRAMS],
     /// The generic programs' own parameters: untextured, textured.
     read_generic: [GenericUniforms; 2],
+    /// GE-filtered programs and their wide siblings (`wide_program`).
+    wide: [WideSibling; MAX_WIDE_SIBLINGS],
+    wide_count: usize,
+    /// The last `wide_program` answer (point, wide): consecutive draws
+    /// mostly share their program.
+    wide_last: (*mut gxm::FragmentProgram, *mut gxm::FragmentProgram),
 }
 
 const NO_BLEND_PROGRAM: BlendProgram = BlendProgram { kind: Kind::Color, blend: 0, alpha: AlphaOut::AsColor, program: null_mut() };
@@ -1276,6 +1356,9 @@ impl Programs {
             blend_count: 0,
             read: [const { ReadProgram::new() }; READ_PROGRAMS],
             read_generic: [const { GenericUniforms::new() }; 2],
+            wide: [NO_WIDE_SIBLING; MAX_WIDE_SIBLINGS],
+            wide_count: 0,
+            wide_last: (null_mut(), null_mut()),
         }
     }
 
@@ -1316,14 +1399,76 @@ impl Programs {
         for i in 0..2 {
             generic.add(i).write(GenericUniforms::new());
         }
+        let wide = addr_of_mut!((*place).wide) as *mut WideSibling;
+        for i in 0..MAX_WIDE_SIBLINGS {
+            wide.add(i).write(NO_WIDE_SIBLING);
+        }
+        addr_of_mut!((*place).wide_count).write(0);
+        addr_of_mut!((*place).wide_last).write((null_mut(), null_mut()));
+    }
+
+    /// Notes `point`, made from `fragment_gxp` with `info` for `vertex_gxp`,
+    /// as a program that may get a wide sibling: only GE_FILTER twins of the
+    /// PSP-depth set have one (`shaders::wide_twin`).
+    fn note_wide_candidate(
+        &mut self,
+        point: *mut gxm::FragmentProgram,
+        fragment_gxp: *const gxm::Program,
+        info: Option<gxm::BlendInfo>,
+        vertex_gxp: *const gxm::Program,
+    ) {
+        if point.is_null() || !shaders::psp_depth() || self.wide_count == MAX_WIDE_SIBLINGS || shaders::wide_twin(fragment_gxp).is_none() {
+            return;
+        }
+        self.wide[self.wide_count] = WideSibling { point, fragment_gxp, vertex_gxp, info, ..NO_WIDE_SIBLING };
+        self.wide_count += 1;
+    }
+
+    /// The wide sibling of fragment program `point` (for draws of a wide
+    /// texture, core `GpuFormat::Wide16`), made on first use; None if
+    /// `point` has none (not a GE-filtered program of the PSP-depth set, or
+    /// its twin couldn't be made or has other uniforms): the draw then keeps
+    /// `point`, whose four point samples of the wide texture give the same
+    /// pixels.
+    pub fn wide_program(&mut self, point: *mut gxm::FragmentProgram) -> Option<*mut gxm::FragmentProgram> {
+        if self.wide_last.0 == point && !point.is_null() {
+            return (!self.wide_last.1.is_null()).then_some(self.wide_last.1);
+        }
+        let index = (0..self.wide_count).find(|&i| self.wide[i].point == point)?;
+        let sibling = &mut self.wide[index];
+        if !sibling.tried {
+            sibling.tried = true;
+            let wide_gxp = shaders::wide_twin(sibling.fragment_gxp).unwrap_or(null());
+            let fits = !wide_gxp.is_null() && same_uniforms(sibling.fragment_gxp, wide_gxp);
+            if fits {
+                if let Some(id) = register(wide_gxp) {
+                    let info = sibling.info.as_ref().map_or(null(), |info| info as *const gxm::BlendInfo);
+                    sibling.wide = basic_programs::fragment_program(id, info, sibling.vertex_gxp);
+                }
+            }
+            render_log::line(format_args!(
+                "wide program {}: {}\n",
+                index,
+                if !fits { "other uniforms (not used)" } else if sibling.wide.is_null() { "failed" } else { "ready" }
+            ));
+        }
+        self.wide_last = (point, sibling.wide);
+        (!sibling.wide.is_null()).then_some(sibling.wide)
     }
 
     /// The frame-read program `variant` for a draw into a 16-bit PSP
     /// target (`textured` or not, `tested`: with the alpha test), or None
     /// if it can't be made.
     pub fn read_program(&mut self, textured: bool, tested: bool, variant: ReadVariant) -> Option<&ReadProgram> {
-        let program = &mut self.read[read_index(textured, tested, variant)];
-        program.ready(&mut self.read_generic[textured as usize], textured, tested, variant).then_some(&*program)
+        let index = read_index(textured, tested, variant);
+        let program = &mut self.read[index];
+        let first = !program.tried;
+        let ready = program.ready(&mut self.read_generic[textured as usize], textured, tested, variant);
+        if ready && first && textured {
+            let made = self.read[index].program;
+            self.note_wide_candidate(made, read_gxp(textured, tested, variant), read_blend_info(variant), gxp(&shaders::nativeres_textured_v));
+        }
+        ready.then_some(&self.read[index])
     }
 
     /// The generic frame-read program's own parameters (made with it,
@@ -1685,9 +1830,27 @@ impl Programs {
         if !program.is_null() {
             self.blend[self.blend_count] = BlendProgram { kind, blend, alpha, program };
             self.blend_count += 1;
+            if let Some(fragment_gxp) = textured_gxp(kind) {
+                self.note_wide_candidate(program, fragment_gxp, info, gxp(&shaders::nativeres_textured_v));
+            }
         }
         program
     }
+}
+
+/// The compiled fragment program of our textured `kind`
+/// (`Programs::textured_fragment_program`'s); None for the basic ones.
+fn textured_gxp(kind: Kind) -> Option<*const gxm::Program> {
+    Some(match kind {
+        Kind::Textured => gxp(&shaders::nativeres_textured_f),
+        Kind::TexturedFlat => gxp(&shaders::nativeres_textured_flat_f),
+        Kind::TexturedTest => gxp(&shaders::nativeres_textured_test_f),
+        Kind::TexturedFix => gxp(&shaders::nativeres_textured_fix_f),
+        Kind::TexturedTestFix => gxp(&shaders::nativeres_textured_test_fix_f),
+        Kind::TexturedGe => gxp(&shaders::nativeres_textured_ge_f),
+        Kind::TexturedFixGe => gxp(&shaders::nativeres_textured_fix_ge_f),
+        Kind::Color | Kind::TextureTint => return None,
+    })
 }
 
 /// Where a raw program reads aTexcoord for `format`: the texture

@@ -205,6 +205,31 @@ float4 GeShade(float4 texel, float4 vertexColor, float3 specular, float fog, flo
 // 2^13). Proof over all texel pairs and fractions, also one ulp off: DESIGN
 // "sixty-third session" (the old way rounded each texel first and went
 // through k / 255 again: 13 instructions more per pixel).
+#ifdef GE_WIDE
+// GE_WIDE (the "pspwide" twins, DESIGN "sixty-fifth session"; the four point
+// samples described above after #else): the texture is
+// the texture cache's U16x4 copy (GpuFormat::Wide16: k x 257, read as k / 255)
+// with the LINEAR filter, of power-of-two size. The texture unit does the
+// horizontal lerps (A (16 - f) + B f) / 16 at 16 bits (within 1/257 level;
+// at 8 bits it rounds to whole values, 1 off: tested), each row read at its
+// centre (vertical weight 0) and texel centre + f / 16 (exact coordinates:
+// the size is a power of two); + 1/32 floors to the GE's truncation as
+// below. 2 reads instead of 4 and 10 instructions less. Same pixels as the
+// four point samples (device test getexeltest, 0 of 262144 pixels differ).
+float4 GeTexel(sampler2D tex, float2 uv, float4 size)
+{
+	float2 step = 1.0f / size.xy;
+	float2 p = FLOOR(uv * size.xy * 16.0f) - size.z;
+	float2 m = p * (1.0f / 16.0f);
+	float2 fraction = frac(m); // f / 16, exact
+	float2 cell = m - fraction;
+	float x = (cell.x + 0.5f + fraction.x * size.w) * step.x; // f = 0 for the GE's nearest texel
+	float y = (cell.y + 0.5f) * step.y;
+	float4 top = FLOOR(tex2D<float4>(tex, float2(x, y)) * 255.0f + (1.0f / 32.0f));
+	float4 bottom = FLOOR(tex2D<float4>(tex, float2(x, y + step.y)) * 255.0f + (1.0f / 32.0f));
+	return FLOOR(top + (bottom - top) * (fraction.y * size.w));
+}
+#else
 float4 GeTexel(sampler2D tex, float2 uv, float4 size)
 {
 	float2 step = 1.0f / size.xy; // only lands the reads inside their texels
@@ -222,6 +247,7 @@ float4 GeTexel(sampler2D tex, float2 uv, float4 size)
 	float4 bottom = FLOOR((c + (d - c) * f.x) * 255.0f + (1.0f / 32.0f));
 	return FLOOR(top + (bottom - top) * f.y);
 }
+#endif // GE_WIDE
 #define SAMPLE(tex, uv) GeTexel(tex, uv, uTexSize)
 #else
 #define SAMPLE(tex, uv) tex2D(tex, uv)

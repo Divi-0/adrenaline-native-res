@@ -34,6 +34,12 @@ pub struct GpuTexture {
 /// The smooth filter needs RGBA: it changes individual texels (see
 /// `texture::bleed_transparent_texels`).
 ///
+/// `Wide16` (the cache's wide mode, `FrameStart::wide`): RGBA with 16 bits a
+/// channel, k x 257 (the same k / 255 when sampled), for the programs that
+/// filter as the GE from two LINEAR reads (GE_WIDE, DESIGN "sixty-fifth
+/// session": the texture unit lerps 16-bit channels exactly enough, 8-bit
+/// ones it rounds). 8 bytes a texel.
+///
 /// The numbers are what the C side's `NativeResCreateTexture` expects.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,14 +54,20 @@ pub enum GpuFormat {
     Abgr1555 = 3,
     /// SCE_GXM_TEXTURE_FORMAT_U4U4U4U4_ABGR (PSP ABGR4444)
     Abgr4444 = 4,
+    /// SCE_GXM_TEXTURE_FORMAT_U16U16U16U16_ABGR: RGBA, each channel k x 257
+    /// (`wide_texture`).
+    Wide16 = 5,
 }
 
 impl GpuFormat {
     /// The format a PSP texture is decoded into, with or without the smooth
-    /// texture filter.
-    pub fn for_texture(texture: &TextureDescriptor, smooth: bool) -> GpuFormat {
+    /// texture filter, in the cache's wide mode or not (`wide_texture`).
+    pub fn for_texture(texture: &TextureDescriptor, smooth: bool, wide: bool) -> GpuFormat {
         if smooth {
             return GpuFormat::Rgba8888;
+        }
+        if wide && wide_texture(texture) {
+            return GpuFormat::Wide16;
         }
         match texture.format {
             format::CLUT4 | format::CLUT8 => GpuFormat::Palette8,
@@ -81,6 +93,30 @@ impl GpuFormat {
     pub fn is_16_bit(self) -> bool {
         matches!(self, GpuFormat::Bgr565 | GpuFormat::Abgr1555 | GpuFormat::Abgr4444)
     }
+
+    /// Bytes per texel.
+    pub fn texel_bytes(self) -> u32 {
+        match self {
+            GpuFormat::Palette8 => 1,
+            format if format.is_16_bit() => 2,
+            GpuFormat::Wide16 => 8,
+            _ => 4,
+        }
+    }
+}
+
+/// True if `texture` is decoded as `GpuFormat::Wide16` in the cache's wide
+/// mode: the formats whose colours the RGBA decode gives exactly as the
+/// other ways do (palette and 8888 texels: `decode_texture` and the palette
+/// tables share `PaletteColors`, 8888 is copied), of power-of-two sizes (the
+/// GE_WIDE programs' coordinates are exact only then; PSP textures always
+/// are), without mip levels (the GPU would pick a level for its LINEAR
+/// reads). 16-bit ones stay as they are (God of War has few).
+pub fn wide_texture(texture: &TextureDescriptor) -> bool {
+    matches!(texture.format, format::CLUT4 | format::CLUT8 | format::ABGR8888)
+        && texture.width.is_power_of_two()
+        && texture.height.is_power_of_two()
+        && texture_level_count(texture) == 1
 }
 
 /// What a GPU texture is made as. Retired textures are only reused for a
@@ -108,11 +144,7 @@ impl TextureShape {
     /// The memory the host allocates for it: rows padded to 8 texels, whole
     /// 4 KiB pages, plus a page for the colour table of palette textures.
     pub fn bytes(&self) -> u32 {
-        let texel_bytes = match self.format {
-            GpuFormat::Palette8 => 1,
-            format if format.is_16_bit() => 2,
-            _ => 4,
-        };
+        let texel_bytes = self.format.texel_bytes();
         // All levels: the offset a level after the last would have.
         let texels = texture::mip_level_offset(self.width as u32, self.height as u32, texel_bytes, self.levels.max(1) as u32);
         let pages = (texels + 0xFFF) & !0xFFF;

@@ -105,11 +105,17 @@ done
 # psp_depth_twins.txt again with PSP_DEPTH (the PSP's whole-unit depth written
 # by the fragment programs; only for the games core game_quirks.rs lists) and
 # the defines listed after it (GE_FILTER: the GE's texture filter),
-# nativeres_x_f -> nativeres_x_pspdepth_f.
+# nativeres_x_f -> nativeres_x_pspdepth_f. The GE_FILTER ones also as
+# nativeres_x_pspwide_f with GE_WIDE: the GE's filter from the texture cache's
+# U16x4 copies (two LINEAR reads; DESIGN "sixty-fifth session"), drawn instead
+# of the pspdepth twin when the draw's texture is one.
 twins() {
   grep -v '^#' psp_depth_twins.txt | tr -d '\r' | while read -r stem defines; do
     [ -n "$stem" ] || continue
     variant "$stem" "PSP_DEPTH $defines" "${stem%_?}_pspdepth_${stem##*_}"
+    case " $defines " in
+      *" GE_FILTER "*) variant "$stem" "PSP_DEPTH $defines GE_WIDE" "${stem%_?}_pspwide_${stem##*_}" ;;
+    esac
   done
 }
 # 8-bit targets (God of War): the GE's normal / additive blend without a cut

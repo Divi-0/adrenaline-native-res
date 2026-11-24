@@ -111,6 +111,17 @@ pub struct RenderStats {
     /// Textured draws reading one of our targets through the GE_FILTER
     /// programs (the GE's bilinear filter; core `ge_filter_read`).
     pub ge_filter_draws: u32,
+    /// GE-filtered draws of a wide texture (core `GpuFormat::Wide16`)
+    /// through the GE_WIDE twin of their program (draw.rs; DESIGN
+    /// "sixty-fifth session"); ...
+    pub ge_wide_draws: u32,
+    /// ... ones whose program has no usable twin (drawn by the four point
+    /// samples: the same pixels, slower);
+    pub ge_wide_missed: u32,
+    /// ... and wide textures drawn by a program without the GE filter with
+    /// the GPU's LINEAR filter: its 16-bit lerps aren't the 8-bit texture's
+    /// (should stay 0 in God of War, whose set filters every texture as the GE).
+    pub ge_wide_inexact: u32,
     /// The display thread's time finding them (vertex alphas read).
     pub opaque_us: u64,
     /// Raw draws left out: no vertex program for their format (all
@@ -179,6 +190,9 @@ impl RenderStats {
         hidden_us: 0,
         flat_draws: 0,
         ge_filter_draws: 0,
+        ge_wide_draws: 0,
+        ge_wide_missed: 0,
+        ge_wide_inexact: 0,
         opaque_us: 0,
         lookup_us: 0,
         palette_us: 0,
@@ -265,7 +279,7 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
     );
     let _ = write!(
         text,
-        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} point_light_draws={} fixed_color_draws={} fix_b_draws={} cut_draws={} cut_fast_draws={} cut_off_draws={} wide_draws={} opaque_draws={} opaque_untested_draws={} opaque_rows_draws={} hidden_draws={} depth_only_draws={} hidden={}us flat_draws={} ge_filter_draws={} opaque={}us ",
+        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} point_light_draws={} fixed_color_draws={} fix_b_draws={} cut_draws={} cut_fast_draws={} cut_off_draws={} wide_draws={} opaque_draws={} opaque_untested_draws={} opaque_rows_draws={} hidden_draws={} depth_only_draws={} hidden={}us flat_draws={} ge_filter_draws={} ge_wide_draws={} ge_wide_missed={} ge_wide_inexact={} opaque={}us ",
         per_frame(s.begin_us),
         per_frame(s.loop_us),
         per_frame(s.convert_us),
@@ -293,6 +307,9 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
         per_frame(s.hidden_us),
         s.flat_draws / frames,
         s.ge_filter_draws / frames,
+        s.ge_wide_draws / frames,
+        s.ge_wide_missed / frames,
+        s.ge_wide_inexact,
         per_frame(s.opaque_us)
     );
     let _ = write!(

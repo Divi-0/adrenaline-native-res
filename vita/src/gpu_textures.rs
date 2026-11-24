@@ -77,6 +77,7 @@ pub fn gxm_format(format: GpuFormat) -> u32 {
         GpuFormat::Bgr565 => gxm::TEXTURE_FORMAT_U5U6U5_BGR,
         GpuFormat::Abgr1555 => gxm::TEXTURE_FORMAT_U1U5U5U5_ABGR,
         GpuFormat::Abgr4444 => gxm::TEXTURE_FORMAT_U4U4U4U4_ABGR,
+        GpuFormat::Wide16 => gxm::TEXTURE_FORMAT_U16U16U16U16_ABGR,
     }
 }
 
@@ -94,11 +95,7 @@ fn color_format(format: GpuFormat) -> Option<u32> {
 
 /// Bytes per texel in GPU memory.
 pub fn texel_bytes(format: GpuFormat) -> usize {
-    match format {
-        GpuFormat::Palette8 => 1,
-        format if format.is_16_bit() => 2,
-        _ => 4,
-    }
+    format.texel_bytes() as usize
 }
 
 /// The texture arena (texture_cache/arena.rs): one phycont block, mapped for

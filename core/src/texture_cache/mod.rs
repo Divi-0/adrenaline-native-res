@@ -75,6 +75,26 @@ const HINT_BUCKETS: usize = 4096;
 pub static QUICK_CHECKS: AtomicBool = AtomicBool::new(true);
 /// Re-check budget per frame.
 pub const VERIFY_BYTES_PER_FRAME: u32 = 128 * 1024;
+/// Wide textures (`FrameStart::wide`) take 8 bytes a texel (a palette
+/// texture 1): only textures up to this many texels are widened (64 KiB
+/// wide) ... God of War, GPU per frame by the limit (DESIGN "sixty-fifth
+/// session"): title none 266-273 ms, 4096 texels 253, 8192 246-248, 16384
+/// 247; gameplay none 278.5, 4096 276.3, 8192 273.8, 16384 306 (128x128
+/// wide textures thrash the texture cache: 8x a palette texture's bytes).
+pub const WIDE_MAX_TEXELS: u32 = 8192;
+/// The limit in use (debug "widemax"; `WIDE_MAX_TEXELS` by default).
+pub static WIDE_MAX: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(WIDE_MAX_TEXELS);
+/// ... and only while the texture arena keeps this much free for the
+/// others; else a texture stays as it was (the same pixels either way,
+/// only slower to draw). God of War's title as wide everywhere took 7.4 MiB
+/// of textures (1.1 as palette textures), more than the 6 MiB arena, and
+/// pushed the rest into main memory (free memory touched 0); its pixels sit
+/// on few small textures (title: 1 MiB of wide textures carries 87 % of
+/// them; DESIGN "sixty-fifth session").
+pub const WIDE_ARENA_RESERVE: u32 = 1536 * 1024;
+/// Textures kept as before for lack of room are widened once there is, at
+/// most this many per frame (each a decode on the display thread).
+pub const WIDE_UPGRADES_PER_FRAME: u32 = 2;
 /// Textures this big (and direct colour) are sampled at every use and
 /// re-checked by the worker; smaller ones take < 1 ms on the display thread.
 pub const BACKGROUND_MIN_BYTES: u32 = 64 * 1024;
@@ -241,6 +261,10 @@ pub struct FrameStart {
     pub render_count: u32,
     /// Menu option "NativeRes Texture Filter": 1 = smooth.
     pub smooth: bool,
+    /// Palette and 8888 textures as `GpuFormat::Wide16` (`gpu::wide_texture`):
+    /// the display side draws them with the GE_WIDE programs (God of War's
+    /// PSP-depth set, DESIGN "sixty-fifth session").
+    pub wide: bool,
     /// Log every lookup of the
     /// textures at this address. 0 = off, [`TRACE_VRAM`]: waits and decodes
     /// of all VRAM textures, and frames drawn again.
@@ -308,6 +332,8 @@ struct Entry {
     verified_at: u32,
     /// Decoded for the smooth filter.
     smooth: bool,
+    /// Decoded in the wide mode (`FrameStart::wide`).
+    wide: bool,
     /// Re-checks in a row that found new pixels.
     changes: u8,
     /// Decodes in a row without hashing.
@@ -348,6 +374,7 @@ const FREE_ENTRY: Entry = Entry {
     last_used: 0,
     verified_at: 0,
     smooth: false,
+    wide: false,
     changes: 0,
     unhashed: 0,
     sample_hash: 0,
@@ -385,6 +412,12 @@ pub struct TextureCache {
     frame_number: u32,
     render_count: u32,
     smooth: bool,
+    wide: bool,
+    /// Widenings left this frame (`WIDE_UPGRADES_PER_FRAME`).
+    wide_upgrades: u32,
+    /// Arena bytes wide textures may still take this frame
+    /// (`arena_reclaimable` at its start, less the wide ones made since).
+    wide_room: u32,
     trace_address: u32,
     loop_start_us: u32,
     /// Re-check bytes left this frame.
@@ -433,6 +466,9 @@ impl TextureCache {
             frame_number: 0,
             render_count: 0,
             smooth: false,
+            wide: false,
+            wide_upgrades: 0,
+            wide_room: 0,
             trace_address: 0,
             loop_start_us: 0,
             verify_budget: VERIFY_BYTES_PER_FRAME,
@@ -582,6 +618,8 @@ impl TextureCache {
             }
         }
         self.smooth = start.smooth;
+        self.wide = start.wide;
+        self.wide_upgrades = WIDE_UPGRADES_PER_FRAME;
         self.trace_address = start.trace_address;
         self.loop_start_us = start.loop_start_us;
         self.times = FrameTimes::default();
@@ -592,6 +630,7 @@ impl TextureCache {
         self.finish_refresh(host, start.frame_number);
         self.recheck_vram_textures_if_changed(host);
         self.trim(host);
+        self.wide_room = if self.wide { self.arena_reclaimable() } else { 0 };
         self.verify_budget = if after_gap { u32::MAX } else { VERIFY_BYTES_PER_FRAME };
         self.frame_hash_count = 0;
         self.times.trim_us = host.now_us() - begin_us;
@@ -673,8 +712,17 @@ impl TextureCache {
     /// chosen per draw, so the palette is no part of what makes them the
     /// same. Otherwise Final Fantasy's world map, which animates its water
     /// by switching palettes, decoded ~180 tiles again every 8 frames.
+    /// Not with the smooth filter or as `Wide16` (decoded with their palette).
     fn is_index_texture(&self, texture: &TextureDescriptor) -> bool {
-        !self.smooth && texture::is_vita_palette_format(texture.format)
+        !self.smooth && texture::is_vita_palette_format(texture.format) && !(self.wide && gpu::wide_texture(texture))
+    }
+
+    /// True if `wanted` may be widened now (`WIDE_MAX_TEXELS`,
+    /// `WIDE_ARENA_RESERVE`; never without an arena).
+    fn wide_fits(&self, wanted: &TextureDescriptor) -> bool {
+        let texels = wanted.width as u32 * wanted.height as u32;
+        let bytes = TextureShape::new(wanted, GpuFormat::Wide16, false).bytes();
+        texels <= WIDE_MAX.load(Ordering::Relaxed) && self.arena.exists() && self.wide_room >= bytes + WIDE_ARENA_RESERVE
     }
 
     fn same_texture(&self, a: &TextureDescriptor, b: &TextureDescriptor) -> bool {
@@ -813,9 +861,29 @@ impl TextureCache {
         let mut found = self.find(wanted);
         // Decoded for the other filter mode: decode again.
         if let Some(slot) = found {
-            if self.entries[slot].smooth != self.smooth {
+            if self.entries[slot].smooth != self.smooth || self.entries[slot].wide != self.wide {
                 self.evict(slot);
                 found = None;
+            }
+        }
+        // Kept as before for lack of room (`wide_fits`): widened once there
+        // is (God of War's title kept most of its textures from the boot
+        // screens' time, when the arena was full), a few per frame, also
+        // past the deadline (God of War's loop nearly always is): decoded
+        // at once, never waited for.
+        let mut widening = false;
+        if let Some(slot) = found {
+            if self.wide
+                && self.wide_upgrades > 0
+                && self.entries[slot].shape.format != GpuFormat::Wide16
+                && !is_in_vram(wanted)
+                && GpuFormat::for_texture(wanted, self.smooth, true) == GpuFormat::Wide16
+                && self.wide_fits(wanted)
+            {
+                self.wide_upgrades -= 1;
+                self.evict(slot);
+                found = None;
+                widening = true;
             }
         }
 
@@ -896,7 +964,7 @@ impl TextureCache {
                 self.verify_budget = self.verify_budget.saturating_sub(size);
             }
             self.entries[slot].verified_at = render_count;
-        } else if vram_pending || (self.past_deadline(host) && self.deferred_frames < MAX_DEFERRED_FRAMES) {
+        } else if vram_pending || (!widening && self.past_deadline(host) && self.deferred_frames < MAX_DEFERRED_FRAMES) {
             self.trace_vram(host, wanted, if vram_pending { "waiting (new, copy pending)" } else { "waiting (deadline)" });
             return Lookup::Waiting; // drawn from a following frame on
         }
@@ -967,7 +1035,14 @@ impl TextureCache {
             self.evict(slot);
         }
 
-        let format = GpuFormat::for_texture(wanted, self.smooth);
+        let mut format = GpuFormat::for_texture(wanted, self.smooth, self.wide);
+        if format == GpuFormat::Wide16 {
+            if self.wide_fits(wanted) {
+                self.wide_room -= TextureShape::new(wanted, format, false).bytes();
+            } else {
+                format = GpuFormat::for_texture(wanted, self.smooth, false);
+            }
+        }
         let allocate_start = host.now_us();
         let Some(slot) = self.make_room(host, TextureShape::new(wanted, format, false).bytes()) else {
             self.times.allocate_us += host.now_us() - allocate_start;
@@ -1012,6 +1087,15 @@ impl TextureCache {
             // Palette textures: their colours come per frame (palette tables).
             result = host.decode(texture, format, &layout.as_texture, data, palette, self.smooth, 0);
             opaque_rows = texture::opaque_rows(data, &layout.as_texture);
+            if format == GpuFormat::Wide16 && texture::is_vita_palette_format(wanted.format) {
+                // Decoded with its palette (part of the key): opaque as its
+                // palette table would be (the display side's palette
+                // textures, frame_loop `find_palettes`), worked out once.
+                let mut table = [0u32; 256];
+                texture::palette_rgba(wanted, palette, &mut table);
+                let entries = crate::opaque_source::opaque_table_entries(&table);
+                opaque_rows = if crate::opaque_source::palette_texture_opaque(wanted.format, entries) { texture::ALL_ROWS_OPAQUE } else { 0 };
+            }
             // Mip levels 1.. (menu "NativeRes Distant Textures"): each staged
             // from its own address and decoded into its place. Only level 0
             // is hashed: a game rewrites a texture's levels with it.
@@ -1064,7 +1148,7 @@ impl TextureCache {
         }
         log_texture(host, "decoded", wanted, 0);
         self.trace_vram(host, wanted, if found.is_some() { "decoded again" } else { "decoded new" });
-        host.log(format_args!("  in {} us, data hash {:08x}\n", decode_us, data_hash));
+        host.log(format_args!("  in {} us, data hash {:08x}, {:?}, wide room {} KiB\n", decode_us, data_hash, format, self.wide_room / 1024));
 
         let bucket = self.hint_bucket(wanted);
         let hints = &mut self.hints[bucket];
@@ -1077,6 +1161,7 @@ impl TextureCache {
             last_used: render_count,
             verified_at: render_count,
             smooth: self.smooth,
+            wide: self.wide,
             changes,
             unhashed,
             sample_hash: new_sample_hash,

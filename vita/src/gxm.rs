@@ -25,6 +25,8 @@ pub const TEXTURE_FORMAT_P8_ABGR: u32 = 0x9500_0000;
 pub const TEXTURE_FORMAT_U5U6U5_BGR: u32 = 0x0500_0000;
 pub const TEXTURE_FORMAT_U1U5U5U5_ABGR: u32 = 0x0400_0000;
 pub const TEXTURE_FORMAT_U4U4U4U4_ABGR: u32 = 0x0200_0000;
+/// 16 bits a channel, unsigned normalized (the wide textures, core `GpuFormat::Wide16`).
+pub const TEXTURE_FORMAT_U16U16U16U16_ABGR: u32 = 0x1C00_0000;
 
 /// SceGxmColorFormat values we use.
 pub const COLOR_FORMAT_A8B8G8R8: u32 = 0x0000_0000;
@@ -331,6 +333,14 @@ extern "C" {
     pub fn sceGxmProgramCheck(program: *const Program) -> i32;
     pub fn sceGxmProgramFindParameterByName(program: *const Program, name: *const u8) -> *const ProgramParameter;
     pub fn sceGxmProgramParameterGetResourceIndex(parameter: *const ProgramParameter) -> u32;
+    pub fn sceGxmProgramGetParameterCount(program: *const Program) -> u32;
+    pub fn sceGxmProgramGetParameter(program: *const Program, index: u32) -> *const ProgramParameter;
+    pub fn sceGxmProgramParameterGetName(parameter: *const ProgramParameter) -> *const u8;
+    pub fn sceGxmProgramParameterGetCategory(parameter: *const ProgramParameter) -> u32;
+    pub fn sceGxmProgramParameterGetContainerIndex(parameter: *const ProgramParameter) -> u32;
+    pub fn sceGxmProgramParameterGetComponentCount(parameter: *const ProgramParameter) -> u32;
+    pub fn sceGxmProgramParameterGetArraySize(parameter: *const ProgramParameter) -> u32;
+    pub fn sceGxmProgramGetDefaultUniformBufferSize(program: *const Program) -> u32;
     pub fn sceGxmShaderPatcherRegisterProgram(patcher: *mut ShaderPatcher, program: *const Program, id: *mut PatcherId) -> i32;
     pub fn sceGxmShaderPatcherCreateVertexProgram(
         patcher: *mut ShaderPatcher,

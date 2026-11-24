@@ -570,6 +570,11 @@ const SHADE_TESTS: [ShadeCase; 9] = [
 pub static MIP_TEST_BIAS: AtomicI32 = AtomicI32::new(-1);
 static MIP_TEST_DEFAULT_BIAS: AtomicU32 = AtomicU32::new(0);
 
+/// Debug "wideprograms 0|1": draws of wide textures through the GE_WIDE
+/// siblings (1, the default) or the programs' four point samples (0, the
+/// same pixels: for A/Bs).
+pub static WIDE_PROGRAMS: AtomicU32 = AtomicU32::new(1);
+
 fn smooth_textures() -> bool {
     crate::frame_loop::SMOOTH_TEXTURES.load(Ordering::Relaxed) != 0
 }
@@ -1909,6 +1914,24 @@ impl Draws {
                 stats().ge_filter_draws += 1;
             }
         }
+        // Wide textures (core `GpuFormat::Wide16`: God of War's palette and
+        // 8888 textures as U16x4): the GE filter by the program's GE_WIDE
+        // sibling, two LINEAR reads instead of four point samples, the same
+        // pixels (DESIGN "sixty-fifth session"). Without a sibling the
+        // program's point samples of the wide texture give them too.
+        // Safe: a texture description of ours.
+        let wide_texture = unsafe { gxm::sceGxmTextureGetFormat(&texture.gxm) } == gxm::TEXTURE_FORMAT_U16U16U16U16_ABGR;
+        let mut wide_filter = false;
+        if wide_texture && ge_size.is_some() && !ge_target_read {
+            match self.programs.wide_program(fragment) {
+                Some(program) if WIDE_PROGRAMS.load(Ordering::Relaxed) != 0 => {
+                    fragment = program;
+                    wide_filter = true;
+                    stats().ge_wide_draws += 1;
+                }
+                _ => stats().ge_wide_missed += 1,
+            }
+        }
         let read_stencil = if read { stencil_state } else { None };
         // Vertices in model space: the 3D program transforms them (raw
         // draws: their own blocks, `raw_transform_of` below).
@@ -2103,8 +2126,12 @@ impl Draws {
         // Filter and wrap mode are per draw on the PSP, so set them on a copy.
         if !skip(4) {
             let mut gxm_texture = texture.gxm;
-            // GE_FILTER programs filter themselves from point samples.
-            let linear = (draw.flags & draw_flags::LINEAR_FILTER != 0 || smooth_textures()) && ge_size.is_none();
+            // GE_FILTER programs filter themselves from point samples; their
+            // GE_WIDE siblings from the texture unit's 16-bit lerps.
+            let linear = wide_filter || ((draw.flags & draw_flags::LINEAR_FILTER != 0 || smooth_textures()) && ge_size.is_none());
+            if wide_texture && !wide_filter && linear {
+                stats().ge_wide_inexact += 1;
+            }
             let filter = if linear { gxm::TEXTURE_FILTER_LINEAR } else { gxm::TEXTURE_FILTER_POINT };
             let address = |clamp: u32| if draw.flags & clamp != 0 { gxm::TEXTURE_ADDR_CLAMP } else { gxm::TEXTURE_ADDR_REPEAT };
             // Safe: our copy of the texture state.

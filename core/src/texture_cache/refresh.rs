@@ -32,6 +32,8 @@ pub struct RefreshJob {
     /// The fresh texture the worker decodes into.
     pub texture: GpuTexture,
     pub smooth: bool,
+    /// The cache's wide mode when it was handed out.
+    pub wide: bool,
     /// Hash the data first; otherwise just decode (volatile textures).
     pub hash: bool,
     /// With `hash`: skip the decode if the data still has this hash ...
@@ -128,7 +130,8 @@ impl TextureCache {
         if self.refresh.is_some() {
             return false;
         }
-        let format = GpuFormat::for_texture(wanted, self.smooth);
+        // In the wide mode as the entry was made (`wide_fits` chose).
+        let format = if self.wide { self.entries[slot].shape.format } else { GpuFormat::for_texture(wanted, self.smooth, false) };
         let Some(texture) = self.acquire(host, TextureShape::new(wanted, format, false)) else {
             return false;
         };
@@ -138,6 +141,7 @@ impl TextureCache {
             format,
             texture,
             smooth: self.smooth,
+            wide: self.wide,
             // Volatile textures are hashed only every HASH_VOLATILE_EVERY-th
             // time, as on the display thread (see `look_up`).
             hash: entry.changes < VOLATILE_CHANGES || entry.unhashed as u32 + 1 >= HASH_VOLATILE_EVERY,
@@ -169,7 +173,8 @@ impl TextureCache {
         let current = entry.texture.is_some()
             && entry.texture == pending.old_texture
             && self.same_texture(&entry.key, &job.key)
-            && entry.smooth == job.smooth;
+            && entry.smooth == job.smooth
+            && entry.wide == job.wide;
         if current {
             self.stats.refreshes += 1;
             self.stats.refresh_us += result.work_us as u64;

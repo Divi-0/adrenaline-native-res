@@ -10,7 +10,7 @@ cargo; both are checked in, so a plain cargo build has them.
 
 Layout (little-endian u32s): "NRDP", version 1, entry count, FNV-1a hash of
 everything after the header; then per entry its name (64 bytes, NUL-padded:
-the twin's stem, e.g. nativeres_raw_pspdepth_v), offset and size; then the
+the twin's stem, e.g. nativeres_raw_pspdepth_v or nativeres_textured_pspwide_f), offset and size; then the
 programs, each at a 16-byte boundary (GXM wants them aligned).
 """
 import struct
@@ -28,10 +28,13 @@ def twin_names():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        stem = line.split()[0]
-        # As scripts/shader-variants.sh: nativeres_x_f -> nativeres_x_pspdepth_f.
+        stem, *defines = line.split()
+        # As scripts/shader-variants.sh: nativeres_x_f -> nativeres_x_pspdepth_f,
+        # the GE_FILTER ones also nativeres_x_pspwide_f (GE_WIDE).
         head, kind = stem.rsplit("_", 1)
         names.append(f"{head}_pspdepth_{kind}")
+        if "GE_FILTER" in defines:
+            names.append(f"{head}_pspwide_{kind}")
     return names
 
 

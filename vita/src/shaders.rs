@@ -101,6 +101,41 @@ fn depth_program(name: &[u8]) -> Option<*const u8> {
     })
 }
 
+/// The GE_WIDE twin (nativeres_x_pspwide_f) of the pack's program
+/// `program` (a nativeres_x_pspdepth_f: GE_FILTER fragment programs only),
+/// for drawing wide textures (core `GpuFormat::Wide16`, DESIGN "sixty-fifth
+/// session"); None for any other program, or before the pack is loaded.
+pub fn wide_twin(program: *const crate::gxm::Program) -> Option<*const crate::gxm::Program> {
+    // Safe: display thread only (programs are made there).
+    let pack = unsafe { *DEPTH_PACK.get() }?;
+    let name = (0..DEPTH_PACK_COUNT).find_map(|i| {
+        let entry = 16 + i * DEPTH_PACK_ENTRY_BYTES;
+        let at = word(pack, entry + DEPTH_PACK_NAME_BYTES) as usize;
+        (pack[at..].as_ptr() as *const crate::gxm::Program == program).then(|| {
+            let stored = &pack[entry..entry + DEPTH_PACK_NAME_BYTES];
+            &stored[..stored.iter().position(|&byte| byte == 0).unwrap_or(DEPTH_PACK_NAME_BYTES)]
+        })
+    })?;
+    const DEPTH: &[u8] = b"_pspdepth_";
+    const WIDE: &[u8] = b"_pspwide_";
+    let at = name.windows(DEPTH.len()).position(|part| part == DEPTH)?;
+    let mut wide = [0u8; DEPTH_PACK_NAME_BYTES];
+    let length = name.len() - DEPTH.len() + WIDE.len();
+    if length > wide.len() {
+        return None;
+    }
+    wide[..at].copy_from_slice(&name[..at]);
+    wide[at..at + WIDE.len()].copy_from_slice(WIDE);
+    wide[at + WIDE.len()..length].copy_from_slice(&name[at + DEPTH.len()..]);
+    depth_program(&wide[..length]).map(|start| start as *const crate::gxm::Program)
+}
+
+/// True once the loaded pack has the GE_WIDE twins (pspdepth.pak.z built
+/// with them).
+pub fn has_wide_twins() -> bool {
+    depth_program(b"nativeres_textured_pspwide_f").is_some()
+}
+
 /// Unpacks the pack (display thread, once: the first PSP-depth game) and
 /// checks it (size, hash). False if that fails (no memory): the float
 /// programs stay then.
