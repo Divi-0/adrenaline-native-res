@@ -29,6 +29,18 @@ pub const WIDTH: usize = 960;
 pub const HEIGHT: usize = 544;
 const SCALE: f32 = 2.0;
 
+thread_local! {
+    // Debugging: REPLAY_DEPTH_MODE=n draws with another depth model (`psp_depth`).
+    static DEPTH_MODE: u8 = std::env::var("REPLAY_DEPTH_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    // Debugging: REPLAY_TIE_STATS (`draw_triangle`).
+    static TIE_STATS: bool = std::env::var_os("REPLAY_TIE_STATS").is_some();
+    static DEPTH_CENTER: bool = std::env::var_os("REPLAY_DEPTH_CENTER").is_some();
+    static TIE_COUNTS: std::cell::RefCell<std::collections::BTreeMap<usize, u32>> = std::cell::RefCell::new(std::collections::BTreeMap::new());
+    static CURRENT_DRAW: std::cell::Cell<usize> = std::cell::Cell::new(0);
+    static TESTED: std::cell::Cell<u64> = std::cell::Cell::new(0);
+    static FLOAT_DEPTH: std::cell::RefCell<std::collections::HashMap<usize, Vec<f32>>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 /// A decoded texture, RGBA (0xAABBGGRR) row by row.
 struct Texture {
     width: usize,
@@ -80,6 +92,15 @@ impl Color {
 /// picture of the other framebuffer, if the dump has one (its original
 /// picture, see `other_framebuffer`).
 pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&OriginalPicture>) -> Vec<u32> {
+    nativeres_core::ge_math::GE_EXACT_DEPTH.store(
+        match DEPTH_MODE.with(|mode| *mode) {
+            8 => 1,
+            9 => 2,
+            10 => 3,
+            _ => 0,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let textures: Vec<Option<Texture>> = frame
         .textures()
         .iter()
@@ -220,10 +241,16 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
                 );
             }
         }
+        CURRENT_DRAW.with(|d| d.set(index));
+        // Debugging: REPLAY_SKIP=a,b,... leaves those draws out.
+        if std::env::var("REPLAY_SKIP").is_ok_and(|v| v.split(',').any(|d| d.trim().parse::<usize>() == Ok(index))) {
+            continue;
+        }
         if hidden.is_hidden(index) {
             continue;
         }
         let before = watched.map(|at| screen[at]);
+        let depth_before = watched.map(|at| depth[at]);
         // A texture reading an off-screen picture: that picture as drawn so far.
         let from_target = (draw.flags & draw_flags::TEXTURED != 0)
             .then(|| frame.textures().get(draw.texture as usize))
@@ -307,10 +334,27 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
             draw_one(picture, picture_depth, frame, draw_textures, draw);
         }
         if let (Some(at), Some(before)) = (watched, before) {
-            if screen[at] != before {
-                println!("pixel: draw {index} {before:08x} -> {:08x} texture {} {:x?}", screen[at], draw.texture, frame.textures().get(draw.texture as usize));
+            if screen[at] != before || Some(depth[at]) != depth_before {
+                println!("pixel: draw {index} {before:08x} -> {:08x} depth {:?} -> {} tests {:x} texture {} {:x?}", screen[at], depth_before, depth[at], draw.tests, draw.texture, frame.textures().get(draw.texture as usize));
             }
         }
+    }
+    if TIE_STATS.with(|on| *on) {
+        TIE_COUNTS.with(|counts| {
+            let counts = counts.borrow();
+            let total: u32 = counts.values().sum();
+            println!("tie stats: {} of {} draws, {total} fragments decided by whole units, {} depth-tested fragments (960x544)", counts.len(), frame.draws().len(), TESTED.with(|t| t.get()));
+            for (draw, count) in counts.iter() {
+                println!("  tie draw {draw}: {count}");
+            }
+        });
+    }
+    // Debugging: REPLAY_SAVE_DEPTH=<path> saves the screen's depth (960x544
+    // little-endian f32, 0..1 = PSP depth / 65535; logs/lab/gow-depth-cmp.py
+    // compares it with Sony's depth buffer read from the Vita).
+    if let Ok(path) = std::env::var("REPLAY_SAVE_DEPTH") {
+        let bytes: Vec<u8> = depth.iter().flat_map(|value| value.to_le_bytes()).collect();
+        let _ = std::fs::write(path, bytes);
     }
     // Debugging: REPLAY_SAVE_OFFSCREEN=<hex address>:<png> saves that
     // off-screen picture (as the Vita's debug `showtarget` shows its target).
@@ -375,6 +419,25 @@ fn draw_one(screen: &mut [u32], depth: &mut [f32], frame: &Frame, textures: &[Op
     let index = (draw as *const Draw as usize - frame.draws().as_ptr() as usize) / core::mem::size_of::<Draw>();
     let mut corners = frame.screen_corners(draw);
     while let (Some(a), Some(b), Some(c)) = (corners.next(), corners.next(), corners.next()) {
+        // Debugging: REPLAY_COVER=x,y (960x544) prints every triangle covering
+        // that pixel with its depth there, whether it passes or not.
+        if let Some((px, py)) = std::env::var("REPLAY_COVER").ok().and_then(|value| {
+            let (x, y) = value.split_once(',')?;
+            Some((x.trim().parse::<f32>().ok()? + 0.5, y.trim().parse::<f32>().ok()? + 0.5))
+        }) {
+            let p = |v: &FrameVertex| (v.x * SCALE, v.y * SCALE);
+            let (p0, p1, p2) = (p(&a), p(&b), p(&c));
+            let area = edge(p0, p1, p2);
+            if area != 0.0 {
+                let w0 = edge(p1, p2, (px, py)) / area;
+                let w1 = edge(p2, p0, (px, py)) / area;
+                let w2 = edge(p0, p1, (px, py)) / area;
+                if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
+                    let z = w0 * a.z + w1 * b.z + w2 * c.z;
+                    println!("cover: draw {index} z {z:.6} ({:.1}) tests {:x} flags {:x} blend {:x} texture {} area {area:.0}", z * 65535.0, draw.tests, draw.flags, draw.blend, draw.texture);
+                }
+            }
+        }
         draw_triangle(screen, depth, draw, texture, [a, b, c], frame.dither_matrix, frame.stencil_state_of(draw).filter(|_| {
             // Debugging: REPLAY_NO_STENCIL=<first>-<last> draws those draws
             // without their stencil state (which marks or tests matter).
@@ -527,11 +590,34 @@ fn draw_triangle(
             let linear = [w0 / area, w1 / area, w2 / area];
             // Depth is z / w, which is linear on the screen.
             let index = y as usize * WIDTH + x as usize;
-            // The PSP's depth buffer holds 16-bit values: compared as such,
-            // a draw over another at the same depth passes "<=" everywhere
-            // (in floats the interpolation's rounding made every other pixel
-            // fail: NFS UR's title cars over its black quad).
-            let z = ((linear[0] * corners[0].z + linear[1] * corners[1].z + linear[2] * corners[2].z) * 65535.0).round() / 65535.0;
+            // Debugging: REPLAY_DEPTH_CENTER=1 takes the depth at the PSP pixel's
+            // centre (the fragment program's plane from derivatives), coverage at 2x.
+            let z = if DEPTH_CENTER.with(|on| *on) {
+                let psp_center = ((x & !1) as f32 + 1.0, (y & !1) as f32 + 1.0);
+                let weights = [edge(p1, p2, psp_center) / area, edge(p2, p0, psp_center) / area, edge(p0, p1, psp_center) / area];
+                psp_depth(weights, &corners)
+            } else {
+                psp_depth(linear, &corners)
+            };
+            // Debugging: REPLAY_TIE_STATS=1 counts the fragments whose depth test
+            // the PSP's whole units decide differently from the GPU's own float
+            // depth (`TIE_COUNTS`, printed per draw at the frame's end).
+            // The float model keeps a depth buffer of its own (per target).
+            if depth_test && TIE_STATS.with(|on| *on) {
+                TESTED.with(|t| t.set(t.get() + 1));
+                let float_z = linear[0] * corners[0].z + linear[1] * corners[1].z + linear[2] * corners[2].z;
+                FLOAT_DEPTH.with(|buffers| {
+                    let mut buffers = buffers.borrow_mut();
+                    let buffer = buffers.entry(depth.as_ptr() as usize).or_insert_with(|| vec![1.0f32; WIDTH * HEIGHT]);
+                    let float_passes = passes(depth_function, float_z, buffer[index]);
+                    if passes(depth_function, z, depth[index]) != float_passes {
+                        TIE_COUNTS.with(|counts| *counts.borrow_mut().entry(CURRENT_DRAW.with(|d| d.get())).or_insert(0) += 1);
+                    }
+                    if float_passes && depth_write {
+                        buffer[index] = float_z;
+                    }
+                });
+            }
             if depth_test && !passes(depth_function, z, depth[index]) {
                 continue;
             }
@@ -589,6 +675,44 @@ fn draw_triangle(
 
 /// Twice the signed area of (a, b, c); positive if c is left of a->b.
 /// The fog factor at a pixel (1 without fog): linear on the screen.
+/// A pixel's depth (0..1) as the PSP's depth buffer holds it, from the
+/// screen weights `linear` of the triangle's corners. The GE (ppsspp-ref
+/// TransformUnit `GEScreenZ`, Rasterizer `ComputePlane`) floors each
+/// vertex's depth to a whole 16-bit unit, then floors the plane through
+/// them at the pixel; draws less than a unit apart tie and the later one
+/// passes "<=" (God of War's title fence, NFS UR's title cars over their
+/// black quad). The exact GE uses float24 vertex maths and a fixed-point
+/// plane: this model matches Sony's own depth buffer on 74 % of GoW's title
+/// pixels, the rest within 1 (2026-11-23; rounding the pixel instead: 38 %).
+/// Debugging: REPLAY_DEPTH_MODE 0 pixel rounded (the model before), 1 pixel
+/// floored (PPSSPP PixelDepthRounding), 2 vertex floored to even and the
+/// pixel unquantized (PPSSPP VertexDepthRounding), 4 vertex floored to even
+/// and the pixel rounded, 5 unquantized, 6 vertex floored and the pixel
+/// rounded, 7 vertex floored and the pixel unquantized (the GPU's own depth);
+/// 8 as 3 with raw vertices' depth from the GE's own arithmetic
+/// (`ge_math::GE_EXACT_DEPTH`), 9 the same with float clip coordinates and
+/// the GE's viewport steps, 10 the GE's clip coordinates and a float
+/// viewport; 3 (default) as above.
+fn psp_depth(linear: [f32; 3], corners: &[FrameVertex; 3]) -> f32 {
+    let mode = DEPTH_MODE.with(|mode| *mode);
+    let vertex = |corner: &FrameVertex| {
+        let z = corner.z * 65535.0;
+        match mode {
+            2 | 4 => (z * 0.5).floor() * 2.0,
+            3 | 6 | 7 | 8..=10 => z.floor(),
+            _ => z,
+        }
+    };
+    let plane = linear[0] * vertex(&corners[0]) + linear[1] * vertex(&corners[1]) + linear[2] * vertex(&corners[2]);
+    // + 0.01: a flat draw's plane lands on its whole value, give or take the
+    // float weights' rounding (PPSSPP's fragment rounding does the same).
+    (match mode {
+        1 | 3 | 8..=10 => (plane + 0.01).floor(),
+        2 | 5 | 7 => plane,
+        _ => plane.round(),
+    }) / 65535.0
+}
+
 fn fog_at(linear: [f32; 3], corners: &[FrameVertex; 3]) -> f32 {
     linear[0] * corners[0].fog + linear[1] * corners[1].fog + linear[2] * corners[2].fog
 }
@@ -950,6 +1074,43 @@ mod tests {
         // Red 100 at alpha 40 over 200: ((201 x 81) >> 10) + ((401 x 431) >> 10) = 15 + 168.
         assert_eq!(screen[20 * WIDTH + 20], 0x3000_00B7);
         assert_eq!(blend(draw.blend, Color::from_rgba(0x2800_0064), Color::from_rgba(0x3000_00C8)).to_rgba() & 0xFF, 184, "GXM's way");
+    }
+
+    /// God of War's title fence (2026-11-23): rail boxes and planks less
+    /// than a depth unit apart. The GE floors the plane at the pixel to 16
+    /// bits, so they tie and the later draw wins "<=" (Sony's depth buffer:
+    /// 64700 at the post); in floats the earlier box won everywhere.
+    #[test]
+    fn depth_ties_at_whole_psp_units() {
+        let mut screen = vec![0xFF00_0000u32; WIDTH * HEIGHT];
+        let mut depth = vec![1.0f32; WIDTH * HEIGHT];
+        let flat = |z: f32, color: u32| {
+            let corner = |x: f32, y: f32| FrameVertex { x, y, z: z / 65535.0, w: 1.0, color, ..FrameVertex::default() };
+            [corner(0.0, 0.0), corner(100.0, 0.0), corner(0.0, 100.0)]
+        };
+        let draw = Draw { tests: test_flags::DEPTH_TEST | 5 << test_flags::DEPTH_FUNCTION_SHIFT, scissor_right: 479, scissor_bottom: 271, ..Draw::default() };
+        draw_triangle(&mut screen, &mut depth, &draw, None, flat(64700.3, 0xFF00_00FF), 0, None);
+        draw_triangle(&mut screen, &mut depth, &draw, None, flat(64700.7, 0xFF00_FF00), 0, None);
+        assert_eq!(screen[20 * WIDTH + 20], 0xFF00_FF00, "the later draw wins the tie");
+    }
+
+    /// The GE floors each vertex's depth before the plane (ppsspp-ref
+    /// TransformUnit `GEScreenZ`): a triangle from 64700.9 to 64699.9 is
+    /// 64699.5 half way, not 64700.4, so a flat 64700 behind it fails "<=".
+    #[test]
+    fn vertex_depth_is_floored_before_the_plane() {
+        let mut screen = vec![0xFF00_0000u32; WIDTH * HEIGHT];
+        let mut depth = vec![1.0f32; WIDTH * HEIGHT];
+        let corner = |x: f32, y: f32, z: f32, color: u32| FrameVertex { x, y, z: z / 65535.0, w: 1.0, color, ..FrameVertex::default() };
+        let draw = Draw { tests: test_flags::DEPTH_TEST | 5 << test_flags::DEPTH_FUNCTION_SHIFT, scissor_right: 479, scissor_bottom: 271, ..Draw::default() };
+        let red = 0xFF00_00FF;
+        let sloped = [corner(0.0, 0.0, 64700.9, red), corner(100.0, 0.0, 64699.9, red), corner(0.0, 100.0, 64700.9, red)];
+        draw_triangle(&mut screen, &mut depth, &draw, None, sloped, 0, None);
+        let green = 0xFF00_FF00;
+        let behind = [corner(0.0, 0.0, 64700.0, green), corner(100.0, 0.0, 64700.0, green), corner(0.0, 100.0, 64700.0, green)];
+        draw_triangle(&mut screen, &mut depth, &draw, None, behind, 0, None);
+        // PSP x 50.25: 64700 - 0.5025 floored = 64699 < 64700.
+        assert_eq!(screen[10 * WIDTH + 100], red);
     }
 
     /// God of War's marks and its blur's test (core `blend::stencil`): a

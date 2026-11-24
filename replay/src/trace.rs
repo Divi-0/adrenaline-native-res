@@ -143,10 +143,10 @@ impl DrawTracer {
             "    world      {:?}{bones}
     view       {:?}
     projection {:?}
-    viewport scale {} {} centre {} {}, offset {} {}, tex scale {} {} offset {} {}, lighting {}, map mode {}",
+    viewport scale {} {} centre {} {} z {} {}, offset {} {}, tex scale {} {} offset {} {}, lighting {}, map mode {}",
             ge.matrices.world, ge.matrices.view, ge.matrices.projection,
             float(op::VIEWPORT_X_SCALE), float(op::VIEWPORT_Y_SCALE),
-            float(op::VIEWPORT_X_CENTER), float(op::VIEWPORT_Y_CENTER),
+            float(op::VIEWPORT_X_CENTER), float(op::VIEWPORT_Y_CENTER), float(op::VIEWPORT_Z_SCALE), float(op::VIEWPORT_Z_CENTER),
             (ge.register(op::SCREEN_OFFSET_X) & 0xFFFF) as f32 / 16.0, (ge.register(op::SCREEN_OFFSET_Y) & 0xFFFF) as f32 / 16.0,
             float(op::TEXTURE_SCALE_U), float(op::TEXTURE_SCALE_V), float(op::TEXTURE_OFFSET_U), float(op::TEXTURE_OFFSET_V),
             ge.register(op::LIGHTING_ENABLE) & 1, ge.register(op::TEXTURE_MAP_MODE) & 3,
@@ -163,7 +163,8 @@ impl DrawTracer {
         }
         let format = ge.vertex_format();
         let layout = ge.vertex_layout();
-        let shown = if count <= 4 { count } else { 1 };
+        // REPLAY_TRACE_ALL=1: every vertex (logs/lab/gow-gedepth-sim.py reads them).
+        let shown = if count <= 4 || std::env::var("REPLAY_TRACE_ALL").is_ok() { count } else { 1 };
         for index in 0..shown {
             let address = ge.vertex_address + index * layout.size;
             if let Some(vertex) = format.read(memory, address, layout) {
@@ -274,10 +275,19 @@ impl CommandVisitor for DrawTracer {
             let rows: Vec<String> = (0..4).map(|row| format!("{:04x}", register(op::DITHER_ROW_0 + row) & 0xFFFF)).collect();
             line += &format!(" | dither {}", rows.join(" "));
         }
-        line += &format!(" | material {:08x}", ge.material_color());
+        line += &format!(" | material {:08x} | zrange {:04x}-{:04x} clipen {} cull {}/{} zbp {:06x}/{:06x}", ge.material_color(), register(0xD6) & 0xFFFF, register(0xD7) & 0xFFFF, register(0x1C) & 1, register(0x1D) & 1, register(0x9B) & 1, register(0x9E) & 0xFFFFFF, register(0x9F) & 0xFFFFFF);
         println!("{line}");
         if !ge.is_through_mode() {
             self.trace_transform(ge, memory, data & 0xFFFF);
+        } else if register(op::CLEAR_MODE) & 1 != 0 {
+            // Through clears: their first vertices (the depth they write comes from them).
+            let format = ge.vertex_format();
+            let layout = ge.vertex_layout();
+            for index in 0..(data & 0xFFFF).min(8) {
+                if let Some(vertex) = format.read(memory, ge.vertex_address + index * layout.size, layout) {
+                    println!("    clear vertex {index} {:?}", vertex);
+                }
+            }
         }
         self.draw_number += 1;
     }
