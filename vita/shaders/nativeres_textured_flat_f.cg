@@ -30,11 +30,23 @@ float4 main(
 	float2 vTexcoord : TEXCOORD0,
 	float4 vColor : TEXCOORD1,
 	float2 vFog : TEXCOORD2,
+#ifdef PSP_DEPTH
+	float2 vDepth : TEXCOORD4,
+	out float depth : DEPTH,
+	float4 vPosition : WPOS,
+#endif
 	uniform sampler2D tex,
 	uniform float4 uFogAndScale) : COLOR
 {
 	// Colour came times w (screen-linear, nativeres_3d_v.cg).
 	float overW = 1.0f / vFog.y;
+	// The PSP depth: see "PSP depth" in nativeres_textured_f.cg.
+#ifdef PSP_DEPTH
+	float2 depthAt = vDepth * overW;
+	float2 toCentre = 1.0f - 2.0f * frac(vPosition.xy * 0.5f);
+	float distance = depthAt.x + ddx(depthAt.x) * toCentre.x + ddy(depthAt.x) * toCentre.y;
+	depth = 0.5f + floor((depthAt.y > 0.0f ? 65535.0f - distance : distance) + 0.01f) * (0.5f / 65535.0f);
+#endif
 	float4 t = FLOOR(tex2D<half4>(tex, vTexcoord) * 255.0f + 0.5f); // rounded: GeShade's comment
 	float4 p1 = FLOOR(vColor * overW * 255.0f + 1.01f); // p + 1
 	float4 c = FLOOR(p1 * t * (float4(uFogAndScale.aaa, 1.0f) * (1.0f / 256.0f)));

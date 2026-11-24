@@ -12,6 +12,11 @@
 // uFogRow: fog factor = uFogRow . position; (0, 0, 0, 1) without fog.
 // uViewport: origin x, y and scale x, y, in PSP pixels.
 // uDepth: x = depth centre, y = depth scale (PSP depth / 65535).
+// vDepth: the PSP depth for the fragment programs' depth writes (nativeres_textured_f.cg "PSP
+//   depth"): the vertex's depth floored to a whole 16-bit unit, as the GE does, sent as its
+//   distance from the far end (x; far = 65535 with a positive depth scale, 0 otherwise: after
+//   interpolation varyings keep only ~16 significant bits, measured 2026-11-23, and depths crowd
+//   at the far end) and the far end's side (y: 1 or -1), both times w (screen-linear).
 // wvp: our NativeMatrix (PSP pixels and depth to the Vita's clip space).
 // uUvScale: multiplies the texture coordinates (1, 1 but for textures from
 // our render targets; nativeres_textured_v.cg's draws get it on the CPU).
@@ -67,7 +72,11 @@ void main(
 	out float2 vTexcoord : TEXCOORD0,
 	out float4 vColor : TEXCOORD1,
 	out float2 vFog : TEXCOORD2,
-	out float3 vSpecular : TEXCOORD3)
+	out float3 vSpecular : TEXCOORD3
+#ifdef PSP_DEPTH
+	, out float2 vDepth : TEXCOORD4
+#endif
+	)
 {
 	// The separate specular colour (LIGHTMODE 1), added after texturing by
 	// the fragment program; 0 unless lit with it.
@@ -80,6 +89,11 @@ void main(
 	vPosition = mul(float4(screen, 1.0f), wvp) * clip.w;
 	vTexcoord = aTexcoord * uUvScale;
 	vFog = float2(dot(uFogRow, p), 1.0f) * clip.w;
+#ifdef PSP_DEPTH
+	float farSide = uDepth.y >= 0.0f ? 1.0f : -1.0f;
+	float pspDepth = floor(screen.z * 65535.0f);
+	vDepth = float2(farSide > 0.0f ? 65535.0f - pspDepth : pspDepth, farSide) * clip.w;
+#endif
 
 	float4 color = aColor;
 	if (uNormalRows[3].x > 0.5f) {

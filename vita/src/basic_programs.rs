@@ -190,8 +190,9 @@ pub fn patcher() -> *mut gxm::ShaderPatcher {
 pub const MULTISAMPLE_MODE: u32 = gxm::MULTISAMPLE_NONE as u32;
 
 /// A pointer to a GXP's bytes as GXM wants it.
-pub fn gxp<const N: usize>(program: &shaders::Gxp<N>) -> *const gxm::Program {
-    program as *const shaders::Gxp<N> as *const gxm::Program
+/// For a `Twin`, the one this game uses (`shaders::psp_depth`).
+pub fn gxp<P: shaders::Program>(program: &P) -> *const gxm::Program {
+    program.start() as *const gxm::Program
 }
 
 /// Checks and registers `program` with the shader patcher.

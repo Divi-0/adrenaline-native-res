@@ -146,10 +146,42 @@ pub fn set_copier_lag(jobs: u32) {
 
 /// Note every copied range and check at each frame's
 /// end whether the game rewrote it (`nativeres_core::copy_watch`; log
-/// `rewritten=`). Off by default.
-pub fn set_copy_watch(on: u32) {
-    nativeres_core::copy_watch::ON.store(on != 0, Ordering::Relaxed);
+/// `rewritten=`). Off by default. The watch's table (96 KiB) is made the
+/// first time it is switched on and kept (since 2026-11-24, to leave room for
+/// the depth-writing programs); false if there is no memory for it.
+pub fn set_copy_watch(on: u32) -> bool {
+    use nativeres_core::copy_watch;
+    if on != 0 && !copy_watch::has_table() {
+        // Safe: plain system calls; the block is never freed (set_table).
+        unsafe {
+            let block = sys::alloc_block(
+                b"NativeResCopyWatch\0".as_ptr(),
+                sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_RW,
+                copy_watch::TABLE_BYTES as u32,
+                core::ptr::null_mut(),
+            );
+            if block < 0 {
+                return false;
+            }
+            let mut base: *mut c_void = core::ptr::null_mut();
+            sys::sceKernelGetMemBlockBase(block, &mut base);
+            copy_watch::set_table(base as *mut u8);
+        }
+    }
+    copy_watch::ON.store(on != 0, Ordering::Relaxed);
+    true
 }
+
+/// The running game's title ID as the PSP plugin read it from the disc
+/// (`RingHeader::title_id`, `event_ring::unpack_title_id`; 0 if none):
+/// Adrenaline's own stays empty for games started by title ID.
+pub static GAME_TITLE: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+
+/// Main memory the copy watch's table takes once switched on (memcheck).
+#[no_mangle]
+#[used]
+#[allow(non_upper_case_globals)]
+pub static nativeres_plan_optin_copy_watch: u32 = sys::pages(nativeres_core::copy_watch::TABLE_BYTES);
 
 /// Debug `readwatch`: at the end of every event (the game still held at its
 /// GE sync) the lines the walk read through the block cache are read again
@@ -1549,6 +1581,10 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
             state.capture.set_direct_lists(lists);
         }
         let header = ring.header();
+        if header.magic == event_ring::MAGIC {
+            GAME_TITLE[0].store(header.title_id[0], Ordering::Relaxed);
+            GAME_TITLE[1].store(header.title_id[1], Ordering::Relaxed);
+        }
         if header.magic != event_ring::MAGIC || header.version != event_ring::VERSION {
             if header.magic == event_ring::MAGIC && !ring_version_reported {
                 // An older or newer PSP plugin: never captured from.

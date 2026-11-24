@@ -143,6 +143,12 @@ import_library!("SysclibForKernel", 0x00090000, 2,
     memcpy = 0xAB7592FF,
     memset = 0x10F3BB61,
 );
+// Not randomized in 6.61 (Adrenaline's CEF imports sceIoOpen by this NID too).
+import_library!("IoFileMgrForKernel", 0x00010000, 3,
+    sceIoOpen = 0x109F50BC,
+    sceIoRead = 0x6A638D83,
+    sceIoClose = 0x810C4BC3,
+);
 import_library!("SysMemForKernel", 0x00010000, 2,
     __nps_eabi_sceKernelAllocPartitionMemory = 0x237DBD4F,
     sceKernelGetBlockHeadAddr = 0x9D9A5BA1,
@@ -246,6 +252,10 @@ extern "C" {
     /// SysclibForKernel's memcpy (copy method `MEMCPY`).
     pub fn memcpy(to: *mut c_void, from: *const c_void, size: usize) -> *mut c_void;
 
+    pub fn sceIoOpen(path: *const u8, flags: i32, mode: i32) -> SceUID;
+    pub fn sceIoRead(fd: SceUID, data: *mut c_void, size: u32) -> i32;
+    pub fn sceIoClose(fd: SceUID) -> i32;
+
     pub fn sceKernelAllocPartitionMemory(partition: i32, name: *const u8, kind: i32, size: u32, address: *mut c_void) -> SceUID;
     pub fn sceKernelGetBlockHeadAddr(id: SceUID) -> *mut c_void;
 
@@ -263,6 +273,8 @@ pub struct ThreadInfo {
 
 const _: () = assert!(core::mem::size_of::<ThreadInfo>() == 104);
 
+/// PSP_O_RDONLY.
+pub const IO_RDONLY: i32 = 1;
 /// PSP_THREAD_ATTR_VFPU: the kernel saves the thread's VFPU state.
 pub const THREAD_ATTR_VFPU: u32 = 0x0000_4000;
 /// PSP_SMEM_High: a block at the top of the partition.

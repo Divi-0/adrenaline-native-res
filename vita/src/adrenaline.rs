@@ -68,7 +68,7 @@ const ADRENALINE_SIZE: u32 = 0x2000;
 const SAVESTATE_MODE_OFFSET: usize = 0;
 const NUM_OFFSET: usize = 4;
 const TITLE_ID_OFFSET: usize = 6 * 4 + 128;
-const TITLE_ID_BYTES: usize = 12;
+pub const TITLE_ID_BYTES: usize = 12;
 /// `SceAdrenaline::pops_mode` (a PS1 game runs) as a PSP address, read
 /// through CONVERT_ADDRESS as menu.c does.
 pub const POPS_MODE_ADDRESS: u32 = ADRENALINE_ADDRESS + 16;

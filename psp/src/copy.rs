@@ -670,7 +670,17 @@ const COPY_THREAD_STACK_SIZE: i32 = 0x1000;
 
 unsafe extern "C" fn copy_thread(_args: u32, _argp: *mut c_void) -> i32 {
     probe_copy_methods();
+    // The game's title ID for the Vita side; if the disc isn't readable
+    // yet, again every 64 wake-ups, 16 times at most (homebrew has none).
+    let mut has_title = crate::note_title_id();
+    let mut title_tries = 1u32;
+    let mut wakeups = 0u32;
     loop {
+        wakeups = wakeups.wrapping_add(1);
+        if !has_title && title_tries < 16 && wakeups % 64 == 0 {
+            has_title = crate::note_title_id();
+            title_tries += 1;
+        }
         let result = sceKernelWaitSema(COPY_WAKEUP.load(Relaxed), 1, core::ptr::null_mut());
         if result < 0 {
             set!(copy_thread_error, result as u32);

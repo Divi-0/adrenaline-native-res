@@ -99,6 +99,9 @@ pub struct Textured {
     fragment_id: PatcherId,
     pub vertex: *mut gxm::VertexProgram,
     pub wvp: *const ProgramParameter,
+    /// uDepthFar: which end of the PSP depth is far for the draw (1: 65535,
+    /// -1: 0), see nativeres_textured_v.cg; draw.rs `set_textured_depth_far`.
+    pub depth_far: *const ProgramParameter,
     pub fog_and_scale: *const ProgramParameter,
     /// nativeres_textured_flat_f.cg: without fog and specular.
     pub have_flat: bool,
@@ -372,6 +375,17 @@ fn raw_gxp(variant: RawVariant, color: RawColor) -> *const gxm::Program {
 /// The fixed-colour raw sets in `Programs::raw_fixed`'s order: per variant
 /// (`RawVariant::fixed_index`) its five colour formats.
 const fn fixed_raw_sets() -> [RawSet; FIXED_VARIANTS * FIXED_COLORS] {
+    let mut sets = [const { RawSet::new(RawVariant::Full, RawColor::Any) }; FIXED_VARIANTS * FIXED_COLORS];
+    let mut i = 0;
+    while i < sets.len() {
+        sets[i] = fixed_raw_set(i);
+        i += 1;
+    }
+    sets
+}
+
+/// Entry `i` of `fixed_raw_sets`.
+const fn fixed_raw_set(i: usize) -> RawSet {
     const VARIANTS: [RawVariant; FIXED_VARIANTS] = [
         RawVariant::Plain,
         RawVariant::Plain4,
@@ -382,13 +396,7 @@ const fn fixed_raw_sets() -> [RawSet; FIXED_VARIANTS * FIXED_COLORS] {
     ];
     const COLORS: [RawColor; FIXED_COLORS] =
         [RawColor::Material, RawColor::Bits5650, RawColor::Bits5551, RawColor::Bits4444, RawColor::Bits8888];
-    let mut sets = [const { RawSet::new(RawVariant::Full, RawColor::Any) }; FIXED_VARIANTS * FIXED_COLORS];
-    let mut i = 0;
-    while i < sets.len() {
-        sets[i] = RawSet::new(VARIANTS[i / FIXED_COLORS], COLORS[i % FIXED_COLORS]);
-        i += 1;
-    }
-    sets
+    RawSet::new(VARIANTS[i / FIXED_COLORS], COLORS[i % FIXED_COLORS])
 }
 
 /// A raw program's name in the log: variant and colour format.
@@ -444,6 +452,9 @@ pub struct RawUniforms {
     pub ambient: *const ProgramParameter,
     pub emissive: *const ProgramParameter,
     pub colors: *const ProgramParameter,
+    /// uDepth: the camera's depth centre and scale (`RawCamera::depth`), for
+    /// the PSP depth the fragment programs write (nativeres_textured_f.cg).
+    pub depth: *const ProgramParameter,
 }
 
 impl RawUniforms {
@@ -461,6 +472,7 @@ impl RawUniforms {
         ambient: null(),
         emissive: null(),
         colors: null(),
+        depth: null(),
     };
 
     fn find(program: *const gxm::Program) -> RawUniforms {
@@ -478,6 +490,7 @@ impl RawUniforms {
             ambient: parameter(program, b"uAmbient\0"),
             emissive: parameter(program, b"uEmissive\0"),
             colors: parameter(program, b"uColors\0"),
+            depth: parameter(program, b"uDepth\0"),
         }
     }
 
@@ -1159,49 +1172,56 @@ impl SpriteSet {
     }
 }
 
+impl Textured {
+    const fn new() -> Textured {
+        Textured {
+            tried: false,
+            vertex_id: null_mut(),
+            fragment_id: null_mut(),
+            vertex: null_mut(),
+            wvp: null(),
+            depth_far: null(),
+            fog_and_scale: null(),
+            have_flat: false,
+            fragment_flat_id: null_mut(),
+            fog_and_scale_flat: null(),
+            have_test: false,
+            fragment_test_id: null_mut(),
+            fog_and_scale_test: null(),
+            alpha_test: null(),
+            have_fix: false,
+            fragment_fix_id: null_mut(),
+            fragment_test_fix_id: null_mut(),
+            fog_and_scale_fix: null(),
+            blend_fix: null(),
+            fog_and_scale_test_fix: null(),
+            alpha_test_fix: null(),
+            have_ge: false,
+            fragment_ge_id: null_mut(),
+            fragment_fix_ge_id: null_mut(),
+            fog_and_scale_ge: null(),
+            tex_size_ge: null(),
+            fog_and_scale_fix_ge: null(),
+            blend_fix_ge: null(),
+            tex_size_fix_ge: null(),
+            blend_fix_test: null(),
+            vertex_3d: null_mut(),
+            wvp_3d: null(),
+            rows_3d: null(),
+            fog_row_3d: null(),
+            viewport_3d: null(),
+            depth_3d: null(),
+            uv_scale_3d: null(),
+            normal_rows_3d: null(),
+            lights_3d: null(),
+        }
+    }
+}
+
 impl Programs {
     pub const fn new() -> Programs {
         Programs {
-            textured: Textured {
-                tried: false,
-                vertex_id: null_mut(),
-                fragment_id: null_mut(),
-                vertex: null_mut(),
-                wvp: null(),
-                fog_and_scale: null(),
-                have_flat: false,
-                fragment_flat_id: null_mut(),
-                fog_and_scale_flat: null(),
-                have_test: false,
-                fragment_test_id: null_mut(),
-                fog_and_scale_test: null(),
-                alpha_test: null(),
-                have_fix: false,
-                fragment_fix_id: null_mut(),
-                fragment_test_fix_id: null_mut(),
-                fog_and_scale_fix: null(),
-                blend_fix: null(),
-                fog_and_scale_test_fix: null(),
-                alpha_test_fix: null(),
-                have_ge: false,
-                fragment_ge_id: null_mut(),
-                fragment_fix_ge_id: null_mut(),
-                fog_and_scale_ge: null(),
-                tex_size_ge: null(),
-                fog_and_scale_fix_ge: null(),
-                blend_fix_ge: null(),
-                tex_size_fix_ge: null(),
-                blend_fix_test: null(),
-                vertex_3d: null_mut(),
-                wvp_3d: null(),
-                rows_3d: null(),
-                fog_row_3d: null(),
-                viewport_3d: null(),
-                depth_3d: null(),
-                uv_scale_3d: null(),
-                normal_rows_3d: null(),
-                lights_3d: null(),
-            },
+            textured: Textured::new(),
             raw: RawSet::new(RawVariant::Full, RawColor::Any),
             raw_plain: RawSet::new(RawVariant::Plain, RawColor::Any),
             raw_plain4: RawSet::new(RawVariant::Plain4, RawColor::Any),
@@ -1217,6 +1237,45 @@ impl Programs {
             blend_count: 0,
             read: [const { ReadProgram::new() }; READ_PROGRAMS],
             read_generic: [const { GenericUniforms::new() }; 2],
+        }
+    }
+
+    /// Writes `Programs::new()` at `place` part by part: no 20 KB value on
+    /// the stack or in the image (draw.rs makes the second program set in a
+    /// memory block this way, `Draws::choose_programs`). Must write every
+    /// field `new` sets.
+    ///
+    /// # Safety
+    /// `place` must be valid for writing a `Programs` and aligned for it.
+    pub unsafe fn init_at(place: *mut Programs) {
+        use core::ptr::addr_of_mut;
+        addr_of_mut!((*place).textured).write(Textured::new());
+        addr_of_mut!((*place).raw).write(RawSet::new(RawVariant::Full, RawColor::Any));
+        addr_of_mut!((*place).raw_plain).write(RawSet::new(RawVariant::Plain, RawColor::Any));
+        addr_of_mut!((*place).raw_plain4).write(RawSet::new(RawVariant::Plain4, RawColor::Any));
+        addr_of_mut!((*place).raw_lit1).write(RawSet::new(RawVariant::Lit1, RawColor::Any));
+        addr_of_mut!((*place).raw_lit4).write(RawSet::new(RawVariant::Lit4, RawColor::Any));
+        addr_of_mut!((*place).raw_lit1_flat).write(RawSet::new(RawVariant::Lit1Flat, RawColor::Any));
+        addr_of_mut!((*place).raw_lit4_flat).write(RawSet::new(RawVariant::Lit4Flat, RawColor::Any));
+        addr_of_mut!((*place).raw_lit1_point).write(RawSet::new(RawVariant::Lit1Point, RawColor::Any));
+        addr_of_mut!((*place).raw_lit4_point).write(RawSet::new(RawVariant::Lit4Point, RawColor::Any));
+        let fixed = addr_of_mut!((*place).raw_fixed) as *mut RawSet;
+        for i in 0..FIXED_VARIANTS * FIXED_COLORS {
+            fixed.add(i).write(fixed_raw_set(i));
+        }
+        addr_of_mut!((*place).sprites).write(SpriteSet::new());
+        let blend = addr_of_mut!((*place).blend) as *mut BlendProgram;
+        for i in 0..MAX_BLEND_PROGRAMS {
+            blend.add(i).write(NO_BLEND_PROGRAM);
+        }
+        addr_of_mut!((*place).blend_count).write(0);
+        let read = addr_of_mut!((*place).read) as *mut ReadProgram;
+        for i in 0..READ_PROGRAMS {
+            read.add(i).write(ReadProgram::new());
+        }
+        let generic = addr_of_mut!((*place).read_generic) as *mut GenericUniforms;
+        for i in 0..2 {
+            generic.add(i).write(GenericUniforms::new());
         }
     }
 
@@ -1281,6 +1340,7 @@ impl Programs {
         let color = parameter(vertex_gxp, b"aColor\0");
         let fog = parameter(vertex_gxp, b"aFog\0");
         textured.wvp = parameter(vertex_gxp, b"wvp\0");
+        textured.depth_far = parameter(vertex_gxp, b"uDepthFar\0");
         textured.fog_and_scale = parameter(fragment_gxp, b"uFogAndScale\0");
         if [position, texcoord, color, fog, textured.wvp, textured.fog_and_scale].iter().any(|parameter| parameter.is_null()) {
             render_log::line(format_args!("our programs: parameters missing\n"));

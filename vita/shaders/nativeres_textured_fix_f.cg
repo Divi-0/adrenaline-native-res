@@ -112,6 +112,11 @@ float4 main(
 	float4 vColor : TEXCOORD1,
 	float2 vFog : TEXCOORD2,
 	float3 vSpecular : TEXCOORD3,
+#ifdef PSP_DEPTH
+	float2 vDepth : TEXCOORD4,
+	out float depth : DEPTH,
+	float4 vPosition : WPOS,
+#endif
 	uniform sampler2D tex,
 #ifdef BLEND_FIX
 	uniform float4 uBlendFix,
@@ -123,6 +128,23 @@ float4 main(
 {
 	// Colour, specular and fog came times w (screen-linear, nativeres_3d_v.cg).
 	float overW = 1.0f / vFog.y;
+	// PSP depth (2026-11-23, DESIGN "fifty-seventh session"; PPSSPP's VertexDepthRounding +
+	// PixelDepthRounding): the GE floors each vertex's depth and the plane at the pixel to whole
+	// 16-bit units, so draws less than a unit apart tie and "<=" lets the later one through
+	// (God of War's title fence). The vertex program sends the floored vertex depth as its
+	// distance from the far end (x) and the far end's side (y), times w; here the plane's value,
+	// taken at the PSP pixel's centre (a 2x2 quad of ours is one PSP pixel: the value plus half the
+	// quad's step along x and y towards its middle; 2x positions: 77-82 % exact, centres: 91 %, replay),
+	// floored (+ 0.01: a flat draw lands on its whole value give or take the interpolation), is
+	// written as the depth, which the GPU tests and stores instead of its own (WPOS.z is fp16,
+	// measured). Window depth = 0.5 + 0.5 x PSP depth / 65535 (draw.rs gpu_depth, the viewport).
+	// The PSP depth: see "PSP depth" in nativeres_textured_f.cg.
+#ifdef PSP_DEPTH
+	float2 depthAt = vDepth * overW;
+	float2 toCentre = 1.0f - 2.0f * frac(vPosition.xy * 0.5f);
+	float distance = depthAt.x + ddx(depthAt.x) * toCentre.x + ddy(depthAt.x) * toCentre.y;
+	depth = 0.5f + floor((depthAt.y > 0.0f ? 65535.0f - distance : distance) + 0.01f) * (0.5f / 65535.0f);
+#endif
 	// The separate specular colour after texturing, then the doubling (PPSSPP:
 	// v = p * t + s, then the colour doubling, clamped), then fog.
 	float4 color = GeShade(SAMPLE(tex, vTexcoord), vColor * overW, vSpecular * overW, vFog.x * overW, uFogAndScale) * (1.0f / 255.0f);

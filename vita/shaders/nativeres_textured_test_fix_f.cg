@@ -84,6 +84,11 @@ float4 main(
 	float4 vColor : TEXCOORD1,
 	float2 vFog : TEXCOORD2,
 	float3 vSpecular : TEXCOORD3,
+#ifdef PSP_DEPTH
+	float2 vDepth : TEXCOORD4,
+	out float depth : DEPTH,
+	float4 vPosition : WPOS,
+#endif
 	uniform sampler2D tex,
 #ifdef BLEND_FIX
 	uniform float4 uBlendFix,
@@ -93,6 +98,13 @@ float4 main(
 {
 	// Colour, specular and fog came times w (screen-linear, nativeres_3d_v.cg).
 	float overW = 1.0f / vFog.y;
+	// The PSP depth: see "PSP depth" in nativeres_textured_f.cg.
+#ifdef PSP_DEPTH
+	float2 depthAt = vDepth * overW;
+	float2 toCentre = 1.0f - 2.0f * frac(vPosition.xy * 0.5f);
+	float distance = depthAt.x + ddx(depthAt.x) * toCentre.x + ddy(depthAt.x) * toCentre.y;
+	depth = 0.5f + floor((depthAt.y > 0.0f ? 65535.0f - distance : distance) + 0.01f) * (0.5f / 65535.0f);
+#endif
 	// The separate specular colour after texturing, then the doubling (PPSSPP:
 	// v = p * t + s, then the colour doubling, clamped), then fog.
 	float4 c = GeShade(tex2D<half4>(tex, vTexcoord), vColor * overW, vSpecular * overW, vFog.x * overW, uFogAndScale);

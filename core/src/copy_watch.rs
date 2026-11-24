@@ -12,7 +12,6 @@
 //! Written by the copier and the producer (an index taken with fetch_add),
 //! read by the capture thread between frames, when no copy runs.
 
-use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
 /// Whether ranges are noted.
@@ -32,12 +31,29 @@ struct Entry {
     copied_at: u32,
 }
 
-struct Table(UnsafeCell<[Entry; ENTRIES]>);
-// Safe: each entry is written by the one thread that took its index, and
-// read only between frames (see the module documentation).
-unsafe impl Sync for Table {}
+/// The table: ENTRIES entries, made by the Vita side when the watch is first
+/// switched on (`set_table`; 96 KiB that only this measuring aid needs, kept
+/// out of the always-needed memory since 2026-11-24). Null: nothing noted.
+static TABLE: AtomicPtr<Entry> = AtomicPtr::new(core::ptr::null_mut());
 
-static TABLE: Table = Table(UnsafeCell::new([Entry { address: 0, word_count: 0, values: [0; 3], copied_at: 0 }; ENTRIES]));
+/// Bytes `set_table` needs.
+pub const TABLE_BYTES: usize = ENTRIES * core::mem::size_of::<Entry>();
+
+/// Hands over the table's memory (TABLE_BYTES, word-aligned, never freed:
+/// a copier may still be noting when the watch is switched off).
+///
+/// # Safety
+/// `memory` must be TABLE_BYTES of writable memory, aligned for `u32`, that
+/// lives as long as the process.
+pub unsafe fn set_table(memory: *mut u8) {
+    TABLE.store(memory as *mut Entry, Ordering::Release);
+}
+
+/// Whether the table is there (`set_table`).
+pub fn has_table() -> bool {
+    !TABLE.load(Ordering::Acquire).is_null()
+}
+
 static COUNT: AtomicU32 = AtomicU32::new(0);
 static CLOCK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
@@ -64,6 +80,10 @@ pub fn note(address: u32, words: &[u32]) {
     if !ON.load(Ordering::Relaxed) || words.is_empty() || crate::memory::physical(address) < crate::memory::RAM_START {
         return;
     }
+    let table = TABLE.load(Ordering::Acquire);
+    if table.is_null() {
+        return;
+    }
     let index = COUNT.fetch_add(1, Ordering::Relaxed) as usize;
     if index >= ENTRIES {
         return;
@@ -75,8 +95,8 @@ pub fn note(address: u32, words: &[u32]) {
         values: [words[0], words[last / 2], words[last]],
         copied_at: now(),
     };
-    // Safe: this index is ours alone (fetch_add).
-    unsafe { (*TABLE.0.get())[index] = entry };
+    // Safe: this index is ours alone (fetch_add), inside the table.
+    unsafe { table.add(index).write(entry) };
 }
 
 /// What `check` found for one frame.
@@ -98,11 +118,15 @@ pub struct Rewrites {
 /// `sample` (as `DeferredReader::sample`) and forgets the notes.
 pub fn check(sample: fn(address: u32, positions: &[usize], out: &mut [u32]) -> bool) -> Rewrites {
     let count = (COUNT.swap(0, Ordering::Acquire) as usize).min(ENTRIES);
+    let table = TABLE.load(Ordering::Acquire);
     let now = now();
+    if table.is_null() {
+        return Rewrites::default();
+    }
     let mut result = Rewrites { youngest_age_us: u32::MAX, ..Rewrites::default() };
     for index in 0..count {
         // Safe: between frames no copy writes the table.
-        let entry = unsafe { (*TABLE.0.get())[index] };
+        let entry = unsafe { table.add(index).read() };
         let last = entry.word_count as usize - 1;
         let positions = [0, last / 2, last];
         let mut now_values = [0u32; 3];

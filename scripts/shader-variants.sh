@@ -96,6 +96,16 @@ for dither in "" dither; do
   variant nativeres_textured_read_f "UNTEXTURED READ_INVISIBLE $DITHER" nativeres_color_read_invisible${dither}_f
   variant nativeres_textured_read_f "UNTEXTURED READ_INVISIBLE READ_KEEP_ALPHA $DITHER" nativeres_color_read_invisiblekeep${dither}_f
 done
+# PSP-depth twins last (they copy the variants above): each program in
+# psp_depth_twins.txt again with PSP_DEPTH (the PSP's whole-unit depth written
+# by the fragment programs; only for the games core game_quirks.rs lists),
+# nativeres_x_f -> nativeres_x_pspdepth_f.
+twins() {
+  grep -v '^#' psp_depth_twins.txt | tr -d '\r' | while read -r stem; do
+    [ -n "$stem" ] || continue
+    variant "$stem" PSP_DEPTH "${stem%_?}_pspdepth_${stem##*_}"
+  done
+}
 # 8-bit targets (God of War): the GE's normal / additive blend without a cut
 # (READ_WIDE, frame read; the target's alpha always kept: core frame.rs
 # `wide_variant`), with and without fog and alpha test.
@@ -107,3 +117,4 @@ for way in normal add; do
   variant nativeres_textured_read_f "$WAY READ_WIDE READ_KEEP_ALPHA NO_FOG READ_TEST" nativeres_textured_read_${way}widekeepnofogtest_f
   variant nativeres_textured_read_f "UNTEXTURED $WAY READ_WIDE READ_KEEP_ALPHA" nativeres_color_read_${way}widekeep_f
 done
+twins

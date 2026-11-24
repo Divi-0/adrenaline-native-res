@@ -598,6 +598,8 @@ struct GxmState {
     /// The dither matrix whose texture is on texture unit 1
     /// (`use_dither_texture`).
     dither_matrix: Option<u64>,
+    /// The textured program's uDepthFar as set (0: not yet).
+    textured_far: f32,
 }
 
 const FORGOTTEN: GxmState = GxmState {
@@ -615,6 +617,7 @@ const FORGOTTEN: GxmState = GxmState {
     bones: 0,
     raw_viewport: None,
     dither_matrix: None,
+    textured_far: 0.0,
 };
 
 const ALPHA_LOG_KINDS: usize = 32;
@@ -623,6 +626,14 @@ const ALPHA_LOG_KINDS: usize = 32;
 /// last set.
 pub struct Draws {
     pub programs: Programs,
+    /// The other program set (`choose_programs`): null until a game needs
+    /// the other kind; then a memory block, swapped with `programs` whenever
+    /// the game changes kind.
+    other_programs: *mut Programs,
+    /// No memory for `other_programs` (asked once).
+    other_programs_failed: bool,
+    /// `programs` is the PSP-depth set (shaders::psp_depth).
+    programs_psp_depth: bool,
     state: GxmState,
     /// This frame's decision: draws keep the target's alpha (the PSP's
     /// stencil) unless they write it.
@@ -655,6 +666,9 @@ pub struct Draws {
 
 static DRAWS: SingleThreaded<Draws> = SingleThreaded::new(Draws {
     programs: Programs::new(),
+    other_programs: null_mut(),
+    other_programs_failed: false,
+    programs_psp_depth: false,
     state: FORGOTTEN,
     keep_target_alpha: false,
     alpha_test_cache: [0; 4],
@@ -813,9 +827,64 @@ fn alpha_zero_changes_nothing(draw: &Draw) -> bool {
         && (destination == 5 || destination == 1) // one minus source alpha, one
 }
 
+/// Main memory the second program set takes, made only when a game needs
+/// the PSP-depth programs (`Draws::choose_programs`; memcheck: opt-in).
+#[no_mangle]
+#[used]
+#[allow(non_upper_case_globals)]
+pub static nativeres_plan_optin_psp_depth_programs: u32 = sys::pages(core::mem::size_of::<Programs>());
+
 impl Draws {
     fn forget_state(&mut self) {
         self.state = FORGOTTEN;
+    }
+
+    /// Before anything is drawn in a pass: the program set the running game
+    /// wants (shaders.rs `Twin`, core game_quirks.rs). GXM programs are
+    /// registered once and never released, so each kind keeps its own set:
+    /// the PSP's menu (no title ID yet) draws with the float-depth one, and
+    /// a PSP-depth game gets the second set, made in a memory block the
+    /// first time and swapped in. A set holds one kind only (`set_psp_depth`
+    /// switches with the swap), so vertex and fragment programs always match.
+    fn choose_programs(&mut self) {
+        let (wanted, title) = crate::shaders::game_wants_psp_depth();
+        if wanted == self.programs_psp_depth || self.other_programs_failed {
+            return;
+        }
+        if self.other_programs.is_null() {
+            let bytes = core::mem::size_of::<Programs>();
+            // Safe: plain system calls; the block is never freed (the
+            // registered programs live as long as the process).
+            unsafe {
+                let block = sys::alloc_block(
+                    b"NativeResPrograms2\0".as_ptr(),
+                    sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_RW,
+                    sys::pages(bytes),
+                    null_mut(),
+                );
+                if block < 0 {
+                    self.other_programs_failed = true;
+                    render_log::line(format_args!("programs: no memory for the second set ({bytes} bytes): float depth stays\n"));
+                    return;
+                }
+                let mut base: *mut c_void = null_mut();
+                sys::sceKernelGetMemBlockBase(block, &mut base);
+                let place = base as *mut Programs;
+                Programs::init_at(place);
+                self.other_programs = place;
+            }
+        }
+        // Safe: two distinct, initialized sets; swapped in chunks (no 20 KB
+        // temporary on the stack).
+        unsafe { core::ptr::swap_nonoverlapping(&mut self.programs as *mut Programs, self.other_programs, 1) };
+        self.programs_psp_depth = wanted;
+        crate::shaders::set_psp_depth(wanted);
+        self.forget_state();
+        render_log::line(format_args!(
+            "programs: {} depth (game {})\n",
+            if wanted { "PSP whole-unit" } else { "float" },
+            crate::shaders::title_text(&title)
+        ));
     }
 
     /// The matrix of our textured program: the projection (ORTHO) with what
@@ -844,7 +913,14 @@ impl Draws {
         if vertex != self.state.vertex_program {
             // Safe: programs made by the patcher, the display's context.
             unsafe { gxm::sceGxmSetVertexProgram(context(), vertex) };
-            set_uniform(reserve_vertex_uniforms(), wvp, 16, matrix);
+            let buffer = reserve_vertex_uniforms();
+            set_uniform(buffer, wvp, 16, matrix);
+            // PSP-depth programs only (the float ones have no uDepthFar).
+            if !self.programs.textured.depth_far.is_null() && vertex == self.programs.textured.vertex as *const c_void {
+                let far = if self.state.textured_far == 0.0 { 1.0 } else { self.state.textured_far };
+                self.state.textured_far = far;
+                set_uniform(buffer, self.programs.textured.depth_far, 1, &far);
+            }
             self.state.vertex_program = vertex;
         }
         if fragment != self.state.fragment_program {
@@ -852,6 +928,28 @@ impl Draws {
             unsafe { gxm::sceGxmSetFragmentProgram(context(), fragment) };
             self.state.fragment_program = fragment;
             self.state.tint = None; // its uniforms are set anew for the new program
+        }
+    }
+
+    /// The textured program's far end of the PSP depth (nativeres_textured_v.cg
+    /// uDepthFar) for `draw`: 0 for ">" and ">=" (MTX's cameras), else 65535.
+    /// CPU-made vertices carry no camera; the depth test tells which way the
+    /// game counts. A change needs a new uniform buffer (the matrix again).
+    fn set_textured_depth_far(&mut self, draw: &Draw) {
+        if self.programs.textured.depth_far.is_null() {
+            return; // the float-depth programs (shaders::psp_depth) have no uDepthFar
+        }
+        let function = (draw.tests >> test_flags::DEPTH_FUNCTION_SHIFT) & 0xF;
+        let far = if function == 6 || function == 7 { -1.0f32 } else { 1.0 };
+        if far == self.state.textured_far {
+            return;
+        }
+        self.state.textured_far = far;
+        if self.state.vertex_program == self.programs.textured.vertex as *const c_void {
+            let matrix = self.native_matrix();
+            let buffer = reserve_vertex_uniforms();
+            set_uniform(buffer, self.programs.textured.wvp, 16, matrix);
+            set_uniform(buffer, self.programs.textured.depth_far, 1, &far);
         }
     }
 
@@ -1866,6 +1964,7 @@ impl Draws {
                         let (vertex, wvp) = (self.programs.textured.vertex, self.programs.textured.wvp);
                         let matrix = self.native_matrix();
                         self.use_programs(vertex, wvp, matrix, fragment);
+                        self.set_textured_depth_far(draw);
                     }
                 }
                 if read {
@@ -1984,8 +2083,13 @@ impl Draws {
         }
         // Safe: the pool gave room for them.
         let out_slice = unsafe { core::slice::from_raw_parts_mut(out, vertices.len()) };
+        let floor = crate::shaders::psp_depth();
         for (out, vertex) in out_slice.iter_mut().zip(vertices) {
-            *out = basic_programs::ColorVertex { x: vertex.x * SCALE, y: vertex.y * SCALE, z: gpu_depth(vertex.z), color: vertex.color };
+            // PSP-depth games (shaders::psp_depth): the vertex depth floored to a
+            // whole PSP unit, as the GE does; the basic colour program doesn't
+            // floor the pixel (nativeres_textured_f.cg).
+            let depth = if floor { floored_depth(vertex.z) } else { vertex.z };
+            *out = basic_programs::ColorVertex { x: vertex.x * SCALE, y: vertex.y * SCALE, z: gpu_depth(depth), color: vertex.color };
         }
         stats().convert_us += draw_clock().wrapping_sub(convert_start);
         let mut choice = read_choice(frame, draw, self.keep_target_alpha);
@@ -2050,8 +2154,11 @@ impl Draws {
         }
         // Safe: the pool gave room for them.
         let out_slice = unsafe { core::slice::from_raw_parts_mut(out, vertices.len()) };
+        let floor = crate::shaders::psp_depth();
         for (out, vertex) in out_slice.iter_mut().zip(vertices) {
-            *out = basic_programs::ColorVertex { x: vertex.x * SCALE, y: vertex.y * SCALE, z: gpu_depth(vertex.z), color: 0 };
+            // The vertex depth floored as in `draw_colored` (no fragment program here).
+            let depth = if floor { floored_depth(vertex.z) } else { vertex.z };
+            *out = basic_programs::ColorVertex { x: vertex.x * SCALE, y: vertex.y * SCALE, z: gpu_depth(depth), color: 0 };
         }
         self.use_default_viewport();
         // A fragment program must be set; disabled, it doesn't run.
@@ -2541,6 +2648,7 @@ fn set_raw_uniforms(
     set_uniform(buffer, uniforms.projection, 16, floats(&camera.projection));
     set_uniform(buffer, uniforms.fog, 4, floats(&camera.fog));
     set_uniform(buffer, uniforms.viewport, 4, floats(&camera.viewport));
+    set_uniform(buffer, uniforms.depth, 4, floats(&camera.depth));
     set_uniform(buffer, uniforms.uv_scale, 2, uv_scale.as_ptr());
     set_uniform(buffer, uniforms.format, 4, format.as_ptr());
     set_uniform(buffer, uniforms.raw_uv, 4, raw_uv.as_ptr());
@@ -2575,6 +2683,12 @@ fn light_set_number(frame: &Frame, set: u32) -> Option<&GpuLights> {
 /// z into clip z = 1 - 2z (w = 1), so z = (1 - d) / 2 gives clip z / w = d.
 fn gpu_depth(psp_depth: f32) -> f32 {
     (1.0 - psp_depth) * 0.5
+}
+
+/// A PSP depth d / 65535 (0..1) floored to a whole 16-bit unit, as the GE
+/// floors each vertex's depth (the truncation is a floor: d is never negative).
+fn floored_depth(psp_depth: f32) -> f32 {
+    (psp_depth.clamp(0.0, 1.0) * 65535.0) as u32 as f32 * (1.0 / 65535.0)
 }
 
 /// The triangle corners of a draw's index runs (type, count, first vertex).
@@ -2777,7 +2891,9 @@ pub fn mip_test_default_bias() -> u32 {
 /// recorded every draw on the CPU, ~92 ms per frame, every GE sync timed
 /// out and every frame was dropped as torn, 602 of 602).
 pub fn make_programs() {
-    draws().programs.textured_ready();
+    let draws = draws();
+    draws.choose_programs();
+    draws.programs.textured_ready();
 }
 
 /// Makes the arenas the capture records into (once, at the display loop's

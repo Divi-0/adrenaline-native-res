@@ -113,7 +113,47 @@ pub struct RingHeader {
     /// while the game waits for the Vita side in its GE sync (a savestate
     /// brings back the plugin it was made with: older ones don't).
     pub plugin_features: u32,
-    pub reserved: [u32; 2],
+    /// The game's title ID as the plugin read it from the disc
+    /// (`pack_title_id`; 0 until then, and from plugins before 2026-11-24).
+    /// Adrenaline's own title ID stays empty for games started by title ID
+    /// (its CEF skips that boot path).
+    pub title_id: [u32; 2],
+}
+
+/// `RingHeader::title_id`'s second word has this bit once it is set.
+const TITLE_ID_SET: u32 = 0x8000_0000;
+
+/// A disc's title ID as UMD_DATA.BIN starts ("UCES-00842|..."): four
+/// letters, a delimiter, five digits; packed as the letters (bytes) and the
+/// number with `TITLE_ID_SET`. None if `umd_data` doesn't start that way.
+pub fn pack_title_id(umd_data: &[u8]) -> Option<[u32; 2]> {
+    if umd_data.len() < 10 || !umd_data[..4].iter().all(|byte| byte.is_ascii_uppercase()) {
+        return None;
+    }
+    let mut number = 0u32;
+    for &digit in &umd_data[5..10] {
+        if !digit.is_ascii_digit() {
+            return None;
+        }
+        number = number * 10 + (digit - b'0') as u32;
+    }
+    Some([u32::from_le_bytes([umd_data[0], umd_data[1], umd_data[2], umd_data[3]]), number | TITLE_ID_SET])
+}
+
+/// The title ID ("UCES00842", as Adrenaline writes them) from
+/// `RingHeader::title_id`, None if the plugin set none.
+pub fn unpack_title_id(words: [u32; 2]) -> Option<[u8; 9]> {
+    if words[1] & TITLE_ID_SET == 0 {
+        return None;
+    }
+    let mut title = [0u8; 9];
+    title[..4].copy_from_slice(&words[0].to_le_bytes());
+    let mut number = words[1] & !TITLE_ID_SET;
+    for slot in title[4..].iter_mut().rev() {
+        *slot = b'0' + (number % 10) as u8;
+        number /= 10;
+    }
+    Some(title)
 }
 
 /// NATIVERES_SYNC_WANTED.
@@ -240,6 +280,20 @@ impl RingReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn title_ids_go_through_the_header() {
+        // UMD_DATA.BIN starts "UCES-00842|..."; the header carries it packed.
+        let words = pack_title_id(b"UCES-00842|0001|G").unwrap();
+        assert_eq!(unpack_title_id(words), Some(*b"UCES00842"));
+        assert_eq!(unpack_title_id(pack_title_id(b"ULES-00318").unwrap()), Some(*b"ULES00318"));
+        // An older plugin (savestates) leaves the words zero: no title ID.
+        assert_eq!(unpack_title_id([0, 0]), None);
+        // Not a disc ID: nothing to pack.
+        assert_eq!(pack_title_id(b"HOME0000"), None);
+        assert_eq!(pack_title_id(b"UCES-0084"), None);
+        assert_eq!(pack_title_id(b"uc!s-00842"), None);
+    }
 
     fn ring() -> Box<Ring> {
         Box::new(Ring {

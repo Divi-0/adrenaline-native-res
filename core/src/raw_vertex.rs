@@ -302,6 +302,18 @@ impl<'a, I: Iterator<Item = u16>> RawCorners<'a, I> {
         Some(vertex)
     }
 
+    /// The GE's own screen depth of vertex `index` (`ge_math::screen_z`),
+    /// unskinned positions only; the camera's depth scale and centre back
+    /// to float24 values (they were divided by 65535).
+    fn exact_z(&self, index: u16) -> Option<f32> {
+        let offset = self.window + index as usize * self.stride;
+        let fields = decode_raw(self.bytes, offset, self.format, &self.layout)?;
+        let (model, _) = raw_blocks::model_space(self.format, self.bones, fields.position, &fields.weights, fields.normal);
+        let float24 = |value: f32| f32::from_bits((value.to_bits() + 0x80) & 0xFFFF_FF00);
+        let (center, scale) = (float24(self.camera.depth[0] * 65535.0), float24(self.camera.depth[1] * 65535.0));
+        crate::ge_math::screen_z(model, &self.transform.world, &self.camera.view, &self.camera.projection, scale, center)
+    }
+
     /// Corner `index % 4` of a raw sprite on the screen, as
     /// nativeres_raw_sprite_v.cg makes it (and the CPU path,
     /// `recorder::record_vertices_now`): x and u from B for corners 1 and 3,
@@ -329,6 +341,7 @@ impl<I: Iterator<Item = u16>> Iterator for RawCorners<'_, I> {
     fn next(&mut self) -> Option<FrameVertex> {
         while self.next == self.pending_count {
             let (a, b, c) = (self.indices.next()?, self.indices.next()?, self.indices.next()?);
+            let (a_index, b_index, c_index) = (a, b, c);
             self.next = 0;
             self.pending_count = 0;
             if self.sprites {
@@ -351,6 +364,14 @@ impl<I: Iterator<Item = u16>> Iterator for RawCorners<'_, I> {
             };
             for (slot, &corner) in order.iter().enumerate() {
                 self.pending[slot] = raw_blocks::clip_to_screen(&self.camera, &cut[corner]);
+            }
+            // Debugging (the replay): the GE's own depth for unclipped triangles.
+            if count == 3 && crate::ge_math::GE_EXACT_DEPTH.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+                for (slot, index) in [a_index, b_index, c_index].into_iter().enumerate() {
+                    if let Some(z) = self.exact_z(index) {
+                        self.pending[slot].z = z / 65535.0;
+                    }
+                }
             }
             self.pending_count = order.len();
         }

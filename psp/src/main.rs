@@ -151,6 +151,42 @@ macro_rules! header {
     };
 }
 
+/// Writes `RingHeader::title_id`.
+fn set_title_id(words: [u32; 2]) {
+    // Safe: the ring is fixed, mapped PSP memory; two words in its header.
+    unsafe {
+        let field = addr_of_mut!((*ring()).header.title_id) as *mut u32;
+        write_volatile(field, words[0]);
+        write_volatile(field.add(1), words[1]);
+    }
+}
+
+/// Reads the game's title ID from its disc as Adrenaline's CEF does
+/// (gameinfo.c readTitleIdFromDisc: disc0:/UMD_DATA.BIN starts
+/// "UCES-00842|") and hands it to the Vita side in the ring header (the
+/// renderer picks per-game programs by it: core game_quirks.rs). False if
+/// there is no disc (homebrew) or not yet. The copy thread calls it.
+pub fn note_title_id() -> bool {
+    let mut data = [0u8; 10];
+    // Safe: plain kernel calls; a NUL-terminated path, `data` holds 10 bytes.
+    let read = unsafe {
+        let fd = sceIoOpen(b"disc0:/UMD_DATA.BIN\0".as_ptr(), IO_RDONLY, 0);
+        if fd < 0 {
+            return false;
+        }
+        let read = sceIoRead(fd, data.as_mut_ptr() as *mut c_void, data.len() as u32);
+        sceIoClose(fd);
+        read
+    };
+    match nativeres_core::event_ring::pack_title_id(&data) {
+        Some(words) if read == data.len() as i32 => {
+            set_title_id(words);
+            true
+        }
+        _ => false,
+    }
+}
+
 pub fn now_us() -> u32 {
     // Safe: a plain kernel call.
     unsafe { sceKernelGetSystemTimeLow() }
@@ -494,6 +530,7 @@ fn init_ring() {
     header_set(header!(vita_state_request), 0);
     header_set(header!(state_answered), 0);
     header_set(header!(plugin_features), 0); // until the copy thread runs
+    set_title_id([0, 0]); // until the copy thread reads it (`note_title_id`)
     header_set(header!(sync_waits), 0);
     header_set(header!(sync_wait_us), 0);
     header_set(header!(sync_timeouts), 0);

@@ -247,6 +247,9 @@ void main(
 	uniform float4 uProj[4],
 	uniform float4 uFog,
 	uniform float4 uViewport,
+#ifdef PSP_DEPTH
+	uniform float4 uDepth,
+#endif
 	uniform float2 uUvScale,
 	uniform float4 uFormat,
 	uniform float4 uRawUv,
@@ -276,7 +279,11 @@ void main(
 	out float2 vTexcoord : TEXCOORD0,
 	out float4 vColor : TEXCOORD1,
 	out float2 vFog : TEXCOORD2,
-	out float3 vSpecular : TEXCOORD3)
+	out float3 vSpecular : TEXCOORD3
+#ifdef PSP_DEPTH
+	, out float2 vDepth : TEXCOORD4
+#endif
+	)
 {
 	// The separate specular colour (LIGHTMODE 1), added after texturing by
 	// the fragment program; 0 unless lit with it.
@@ -326,6 +333,13 @@ void main(
 	vTexcoord = (aTexcoord * uRawUv.xy + uRawUv.zw) * uUvScale;
 	// Colour, specular and fog times w (screen-linear, see nativeres_3d_v.cg).
 	vFog = float2((view.z * uFog.x + uFog.y) * uFog.z, 1.0f) * clip.w;
+	// The PSP depth (nativeres_3d_v.cg vDepth; uDepth: RawCamera::depth). Behind the camera
+	// (w <= 0, the GPU clips the triangle there) any finite value.
+#ifdef PSP_DEPTH
+	float farSide = uDepth.y >= 0.0f ? 1.0f : -1.0f;
+	float pspDepth = floor(saturate(uDepth.x + uDepth.y * clip.z / max(clip.w, 1.0e-6f)) * 65535.0f);
+	vDepth = float2(farSide > 0.0f ? 65535.0f - pspDepth : pspDepth, farSide) * clip.w;
+#endif
 
 	// The colour: raw_vertex.rs RawColors::color.
 #ifdef RAW_MODE

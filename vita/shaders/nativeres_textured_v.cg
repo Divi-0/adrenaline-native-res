@@ -18,11 +18,18 @@ void main(
 	float4 aColor,
 	float aFog,
 	uniform float4x4 wvp,
+#ifdef PSP_DEPTH
+	uniform float uDepthFar,
+#endif
 	out float4 vPosition : POSITION,
 	out float2 vTexcoord : TEXCOORD0,
 	out float4 vColor : TEXCOORD1,
 	out float2 vFog : TEXCOORD2,
-	out float3 vSpecular : TEXCOORD3)
+	out float3 vSpecular : TEXCOORD3
+#ifdef PSP_DEPTH
+	, out float2 vDepth : TEXCOORD4
+#endif
+	)
 {
 	// The separate specular colour (LIGHTMODE 1), added after texturing by
 	// the fragment program; 0 unless lit with it.
@@ -32,4 +39,9 @@ void main(
 	// Times w, see nativeres_3d_v.cg (screen-linear colour and fog).
 	vColor = aColor * aPosition.w;
 	vFog = float2(aFog, 1.0f) * aPosition.w;
+	// The PSP depth (nativeres_3d_v.cg vDepth); uDepthFar: 1 or -1 (draw.rs by the depth test).
+#ifdef PSP_DEPTH
+	float pspDepth = floor(saturate(aPosition.z) * 65535.0f);
+	vDepth = float2(uDepthFar > 0.0f ? 65535.0f - pspDepth : pspDepth, uDepthFar) * aPosition.w;
+#endif
 }
