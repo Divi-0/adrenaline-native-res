@@ -123,21 +123,23 @@ pub struct RingHeader {
 /// `RingHeader::title_id`'s second word has this bit once it is set.
 const TITLE_ID_SET: u32 = 0x8000_0000;
 
-/// A disc's title ID as UMD_DATA.BIN starts ("UCES-00842|..."): four
-/// letters, a delimiter, five digits; packed as the letters (bytes) and the
-/// number with `TITLE_ID_SET`. None if `umd_data` doesn't start that way.
-pub fn pack_title_id(umd_data: &[u8]) -> Option<[u32; 2]> {
-    if umd_data.len() < 10 || !umd_data[..4].iter().all(|byte| byte.is_ascii_uppercase()) {
+/// A title ID as UMD_DATA.BIN starts ("UCES-00842|...") or as PARAM.SFO's
+/// DISC_ID holds it ("NPUG80325", EBOOT.PBP games): four letters, an
+/// optional delimiter, five digits; packed as the letters (bytes) and the
+/// number with `TITLE_ID_SET`. None if `id` doesn't start that way.
+pub fn pack_title_id(id: &[u8]) -> Option<[u32; 2]> {
+    if id.len() < 9 || !id[..4].iter().all(|byte| byte.is_ascii_uppercase()) {
         return None;
     }
+    let digits = if id[4].is_ascii_digit() { &id[4..9] } else { id.get(5..10)? };
     let mut number = 0u32;
-    for &digit in &umd_data[5..10] {
+    for &digit in digits {
         if !digit.is_ascii_digit() {
             return None;
         }
         number = number * 10 + (digit - b'0') as u32;
     }
-    Some([u32::from_le_bytes([umd_data[0], umd_data[1], umd_data[2], umd_data[3]]), number | TITLE_ID_SET])
+    Some([u32::from_le_bytes([id[0], id[1], id[2], id[3]]), number | TITLE_ID_SET])
 }
 
 /// The title ID ("UCES00842", as Adrenaline writes them) from
@@ -287,6 +289,9 @@ mod tests {
         let words = pack_title_id(b"UCES-00842|0001|G").unwrap();
         assert_eq!(unpack_title_id(words), Some(*b"UCES00842"));
         assert_eq!(unpack_title_id(pack_title_id(b"ULES-00318").unwrap()), Some(*b"ULES00318"));
+        // PARAM.SFO's DISC_ID (EBOOT.PBP games, PSN downloads) has no delimiter.
+        assert_eq!(unpack_title_id(pack_title_id(b"NPUG80325").unwrap()), Some(*b"NPUG80325"));
+        assert_eq!(unpack_title_id(pack_title_id(b"NPEG00023\0\0\0").unwrap()), Some(*b"NPEG00023"));
         // An older plugin (savestates) leaves the words zero: no title ID.
         assert_eq!(unpack_title_id([0, 0]), None);
         // Not a disc ID: nothing to pack.

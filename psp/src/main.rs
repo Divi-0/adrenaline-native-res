@@ -165,26 +165,38 @@ fn set_title_id(words: [u32; 2]) {
 /// (gameinfo.c readTitleIdFromDisc: disc0:/UMD_DATA.BIN starts
 /// "UCES-00842|") and hands it to the Vita side in the ring header (the
 /// renderer picks per-game programs by it: core game_quirks.rs). False if
-/// there is no disc (homebrew) or not yet. The copy thread calls it.
+/// there is no disc (EBOOT.PBP games: the renderer falls back to
+/// Adrenaline's own title ID) or not yet. The copy thread calls it.
+///
+/// Not PARAM.SFO's DISC_ID through systemctrl's sctrlGetInitPARAM (NID
+/// 0xFCE44FB8): tried 2026-11-24, our PSP side never came up with it (MTX,
+/// cause unknown).
 pub fn note_title_id() -> bool {
+    match disc_title_id() {
+        Some(words) => {
+            set_title_id(words);
+            true
+        }
+        None => false,
+    }
+}
+
+fn disc_title_id() -> Option<[u32; 2]> {
     let mut data = [0u8; 10];
     // Safe: plain kernel calls; a NUL-terminated path, `data` holds 10 bytes.
     let read = unsafe {
         let fd = sceIoOpen(b"disc0:/UMD_DATA.BIN\0".as_ptr(), IO_RDONLY, 0);
         if fd < 0 {
-            return false;
+            return None;
         }
         let read = sceIoRead(fd, data.as_mut_ptr() as *mut c_void, data.len() as u32);
         sceIoClose(fd);
         read
     };
-    match nativeres_core::event_ring::pack_title_id(&data) {
-        Some(words) if read == data.len() as i32 => {
-            set_title_id(words);
-            true
-        }
-        _ => false,
+    if read != data.len() as i32 {
+        return None;
     }
+    nativeres_core::event_ring::pack_title_id(&data)
 }
 
 pub fn now_us() -> u32 {

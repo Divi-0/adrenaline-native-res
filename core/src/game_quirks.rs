@@ -13,9 +13,17 @@
 /// (God of War's title 81 -> 165 ms GPU, 2026-11-23), so only for games whose
 /// picture needs it (user, 2026-11-24). Every other game keeps the float depth.
 ///
-/// - UCES00842 God of War: Chains of Olympus (Europe): the title fence's rail
-///   boxes tie with the planks (z-fighting the PSP decides by whole units).
-const PSP_DEPTH_GAMES: &[&[u8]] = &[b"UCES00842"];
+/// - God of War: Chains of Olympus: the title fence's rail boxes tie with the
+///   planks (z-fighting the PSP decides by whole units). Every version PPSSPP's
+///   compat.ini lists (2026-11-24); only UCES00842 (Europe) tested on the Vita.
+const PSP_DEPTH_GAMES: &[&[u8]] = &[
+    // God of War: Chains of Olympus: discs (Europe, US, Asia, Japan, Korea).
+    b"UCES00842", b"UCET00844", b"UCUS98653", b"UCAS40198", b"UCAS40191", b"ULJM05348", b"ULJM05438", b"UCKS45084",
+    // ... PSN downloads (EBOOT.PBP: no disc to read the ID from, so only when
+    // Adrenaline shares its title ID, untested) and demos.
+    b"NPUG80325", b"NPEG00023", b"NPHG00027", b"NPHG00028", b"NPJH50170",
+    b"UCUS98705", b"UCUS98713", b"UCED00970", b"UCED00971",
+];
 
 /// Whether the game `title_id` (NUL-terminated or not) is drawn with the
 /// PSP's whole-unit depth (`PSP_DEPTH_GAMES`).
@@ -32,6 +40,14 @@ mod tests {
     fn only_listed_games_get_the_psp_depth() {
         assert!(psp_depth(b"UCES00842\0"));
         assert!(psp_depth(b"UCES00842"));
+        // Every version of God of War: Chains of Olympus PPSSPP's compat.ini lists.
+        for gow in [
+            &b"UCES00842"[..], b"UCET00844", b"UCUS98653", b"UCAS40198", b"UCAS40191", b"ULJM05348", b"ULJM05438",
+            b"UCKS45084", b"NPUG80325", b"NPEG00023", b"NPHG00027", b"NPHG00028", b"NPJH50170", b"UCUS98705",
+            b"UCUS98713", b"UCED00970", b"UCED00971",
+        ] {
+            assert!(psp_depth(gow), "{:?}", gow);
+        }
         for other in [&b"ULES00318\0"[..], b"ULES00581\0", b"ULES00986\0", b"ULES00987\0", b"ULES01213\0", b"ULES00025\0", b"\0", b""] {
             assert!(!psp_depth(other), "{:?}", other);
         }
