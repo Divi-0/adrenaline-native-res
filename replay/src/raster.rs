@@ -288,7 +288,9 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
                 stencil,
                 reads_target_alpha,
                 from_target.is_some(),
-                draw.framebuffer != frame.shown_framebuffer,
+                // Measuring: REPLAY_GE_FILTER_SCREEN=1 also for draws onto
+                // the screen (the Vita's `gefilter 2`).
+                draw.framebuffer != frame.shown_framebuffer || std::env::var_os("REPLAY_GE_FILTER_SCREEN").is_some(),
             ),
         };
         GE_FILTER_DRAW.store(ge_filter, std::sync::atomic::Ordering::Relaxed);
