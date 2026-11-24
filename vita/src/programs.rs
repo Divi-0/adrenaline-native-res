@@ -463,6 +463,11 @@ pub struct RawUniforms {
     /// uDepth: the camera's depth centre and scale (`RawCamera::depth`), for
     /// the PSP depth the fragment programs write (nativeres_textured_f.cg).
     pub depth: *const ProgramParameter,
+    /// uGeZ, uGeW, uGeDepth: the GE's own depth arithmetic (GE_DEPTH twins,
+    /// nativeres_raw_v.cg; draw.rs `ge_depth_uniforms`); null in the others.
+    pub ge_z: *const ProgramParameter,
+    pub ge_w: *const ProgramParameter,
+    pub ge_depth: *const ProgramParameter,
 }
 
 impl RawUniforms {
@@ -481,6 +486,9 @@ impl RawUniforms {
         emissive: null(),
         colors: null(),
         depth: null(),
+        ge_z: null(),
+        ge_w: null(),
+        ge_depth: null(),
     };
 
     fn find(program: *const gxm::Program) -> RawUniforms {
@@ -499,6 +507,9 @@ impl RawUniforms {
             emissive: parameter(program, b"uEmissive\0"),
             colors: parameter(program, b"uColors\0"),
             depth: parameter(program, b"uDepth\0"),
+            ge_z: parameter(program, b"uGeZ\0"),
+            ge_w: parameter(program, b"uGeW\0"),
+            ge_depth: parameter(program, b"uGeDepth\0"),
         }
     }
 

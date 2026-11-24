@@ -99,6 +99,8 @@
 //   ambient and diffuse parts); no specular for point lights (core
 //   `LightingRegisters::raw_ready`). God of War: ~700 draws a frame
 //   (2026-11-22).
+// - GE_DEPTH (PSP-depth twins God of War takes, psp_depth_twins.txt): the
+//   PSP depth from the GE's integer vertex arithmetic (see GE_DEPTH below).
 // - RAW_COLOR_NONE, _5650, _5551, _4444, _8888 (nativeres_raw_<variant>_<colour>_v.cg,
 //   with each of the variants above): the vertex colour format fixed
 //   (VERTEX_TYPE bits 2-4; none = the material colour), so the program
@@ -210,6 +212,143 @@ float3 Ge8(float3 c)
 }
 #endif
 
+#ifdef GE_DEPTH
+// GE_DEPTH (with PSP_DEPTH; God of War's twins, psp_depth_twins.txt): the PSP
+// depth from the GE's own vertex arithmetic, in 32-bit integer steps exactly
+// as core ge_math::integer::screen_z (equal to ge_math::screen_z, the GE as
+// ppsspp-ref GEMath.h has it; device test debug "gedepthtest": 4096 of 4096
+// bit for bit, 2026-11-24). Float24s: floats with the low 8 mantissa bits
+// clear. uGeZ / uGeW: the combined world-view-projection matrix's clip z
+// and w columns as the GE combines it (ge_math::combined; rows x, y, z,
+// translation), uGeDepth: x the viewport's depth scale, y its centre
+// (float24s). uRecip: the GE's reciprocal segments (start, slope; ge_math
+// RECIP), a uniform buffer of its own bound once (draw.rs). No int -> float
+// conversions of 17+ bit numbers: the GPU's are one low now and then
+// (gedepthtest stage 15), floats are made from bits (GdFloat24Of).
+uniform float2 uRecip[128] : BUFFER[0];
+
+int GdBits(float f) { return floatToRawIntBits(f); }
+float GdPow2(int e) { return intBitsToFloat((e + 127) << 23); }
+float GdTruncate24(float f) { return intBitsToFloat(floatToRawIntBits(f) & -256); }
+
+// (mantissa, bit weight) of the GE's truncated product; no term: (0, -100000).
+int2 GdProduct(float a, float b)
+{
+	int ba = GdBits(a);
+	int bb = GdBits(b);
+	int ea = (ba >> 23) & 255;
+	int eb = (bb >> 23) & 255;
+	if (ea == 0 || eb == 0)
+		return int2(0, -100000);
+	int fa = (ba >> 8) & 32767;
+	int fb = (bb >> 8) & 32767;
+	int m = 32768 + fa + fb + ((fa * fb) >> 15);
+	return int2((ba ^ bb) < 0 ? -m : m, ea + eb - 269);
+}
+
+int GdShifted(int2 term, int top)
+{
+	int shift = top - term.y;
+	if (term.x == 0 || shift >= 32)
+		return 0;
+	int a = (term.x < 0 ? -term.x : term.x) >> shift;
+	return term.x < 0 ? -a : a;
+}
+
+// sum x 2^weight truncated to 16 significant bits, made from bits.
+float GdFloat24Of(int sum, int weight)
+{
+	int a = sum < 0 ? -sum : sum;
+	int length = 1;
+	for (int b = 1; b < 24; b++)
+		if (a >= (1 << b))
+			length = b + 1;
+	int m16 = length > 16 ? (a >> (length - 16)) : (a << (16 - length));
+	int sign = sum < 0 ? (1 << 31) : 0;
+	return intBitsToFloat(sign | ((weight + length - 1 + 127) << 23) | ((m16 & 32767) << 8));
+}
+
+// A clip coordinate: the row's terms truncated to the largest's bit weight, summed.
+float GdClip(float3 model, float4 col)
+{
+	int2 t0 = GdProduct(GdTruncate24(model.x), col.x);
+	int2 t1 = GdProduct(GdTruncate24(model.y), col.y);
+	int2 t2 = GdProduct(GdTruncate24(model.z), col.z);
+	int2 t3 = GdProduct(1.0f, col.w);
+	int top01 = t0.y > t1.y ? t0.y : t1.y;
+	int top23 = t2.y > t3.y ? t2.y : t3.y;
+	int top = top01 > top23 ? top01 : top23;
+	if (top == -100000)
+		return 0.0f;
+	int sum = GdShifted(t0, top) + GdShifted(t1, top) + GdShifted(t2, top) + GdShifted(t3, top);
+	return sum == 0 ? 0.0f : GdFloat24Of(sum, top);
+}
+
+// a x b truncated to 16 significant bits (a, b in 2^15..2^17, a b >= 2^30): (mantissa, weight).
+int2 GdProduct16(int a, int b)
+{
+	int p8 = a * (b >> 8) + ((a * (b & 255)) >> 8);
+	int length = p8 >= 33554432 ? 26 : (p8 >= 16777216 ? 25 : (p8 >= 8388608 ? 24 : 23));
+	return int2(p8 >> (length - 16), length - 8);
+}
+
+int2 GdMantissa(float f)
+{
+	int b = GdBits(f);
+	return int2(32768 + ((b >> 8) & 32767), ((b >> 23) & 255) - 142);
+}
+
+// The GE's adder: the smaller term truncated to the larger's precision.
+float GdAdd(float a, float b)
+{
+	int ba = GdBits(a);
+	int bb = GdBits(b);
+	int ea = (ba >> 23) & 255;
+	int eb = (bb >> 23) & 255;
+	if (ea == 0)
+		return eb == 0 ? 0.0f : GdTruncate24(b);
+	if (eb == 0)
+		return GdTruncate24(a);
+	int emax = ea > eb ? ea : eb;
+	int na = 8 + emax - ea;
+	int nb = 8 + emax - eb;
+	ba = na >= 24 ? (ba & (1 << 31)) : (ba & -(1 << na));
+	bb = nb >= 24 ? (bb & (1 << 31)) : (bb & -(1 << nb));
+	return intBitsToFloat(ba) + intBitsToFloat(bb);
+}
+
+// x = the GE's screen depth 0..65535, y = 1 if it gives one (0: w zero,
+// denormal or huge; the float depth stands in).
+float2 GdScreenZ(float3 model, float4 geZ, float4 geW, float4 geDepth)
+{
+	float scale = geDepth.x;
+	float z = GdClip(model, geZ);
+	float w = GdClip(model, geW);
+	int ew = (GdBits(w) >> 23) & 255;
+	if (ew == 0 || ew >= 253)
+		return float2(0.0f, 0.0f);
+	int i = (GdBits(w) >> 8) & 32767;
+	float2 segment = uRecip[i >> 8];
+	int q = (64 * (int)segment.x + 63 + (int)segment.y * (i & 255)) >> 7;
+	bool negative = (GdBits(z) ^ GdBits(w)) < 0;
+	int ez = (GdBits(z) >> 23) & 255;
+	int es = (GdBits(scale) >> 23) & 255;
+	float scaled = 0.0f;
+	if (ez != 0 && es != 0) {
+		int2 mz = GdMantissa(z);
+		int2 n = GdProduct16(mz.x, q);
+		int ndcWeight = mz.y + (-16 - (ew - 127)) + n.y;
+		int2 ms = GdMantissa(scale);
+		int2 p = GdProduct16(n.x, ms.x);
+		int weight = ndcWeight + ms.y + p.y;
+		int halfWeight = weight / 2;
+		float value = (float)p.x * GdPow2(halfWeight) * GdPow2(weight - halfWeight);
+		scaled = negative != (GdBits(scale) < 0) ? -value : value;
+	}
+	return float2(clamp(floor(GdAdd(scaled, geDepth.y)), 0.0f, 65535.0f), 1.0f);
+}
+#endif
+
 // One bone's part of a skinned position and normal: weight x bone.
 void AddBone(inout float3 position, inout float3 normal, float weight, float4 r0, float4 r1, float4 r2, float4 p, float3 n)
 {
@@ -273,6 +412,11 @@ void main(
 	uniform float4 uViewport,
 #ifdef PSP_DEPTH
 	uniform float4 uDepth,
+#endif
+#ifdef GE_DEPTH
+	uniform float4 uGeZ,
+	uniform float4 uGeW,
+	uniform float4 uGeDepth,
 #endif
 	uniform float2 uUvScale,
 	uniform float4 uFormat,
@@ -362,6 +506,12 @@ void main(
 #ifdef PSP_DEPTH
 	float farSide = uDepth.y >= 0.0f ? 1.0f : -1.0f;
 	float pspDepth = floor(saturate(uDepth.x + uDepth.y * clip.z / max(clip.w, 1.0e-6f)) * 65535.0f);
+#ifdef GE_DEPTH
+	// The GE's own depth of the model position (GE_DEPTH above).
+	float2 geDepth = GdScreenZ(position, uGeZ, uGeW, uGeDepth);
+	if (geDepth.y > 0.5f)
+		pspDepth = geDepth.x;
+#endif
 	vDepth = float2(farSide > 0.0f ? 65535.0f - pspDepth : pspDepth, farSide) * clip.w;
 #endif
 

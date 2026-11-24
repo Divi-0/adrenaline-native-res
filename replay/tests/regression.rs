@@ -87,7 +87,8 @@ const MODES: [Mode; 2] = [
 /// - God of War: its program set on the Vita filters every texture as the
 ///   GE (core game_quirks.rs `PSP_DEPTH_GAMES`): `--ge-filter`; its lit
 ///   vertex programs light as the GE (core `lighting::GE_LIGHTING`):
-///   `--ge-light`.
+///   `--ge-light`; its raw vertex programs take the depth from the GE's
+///   arithmetic (core `ge_math`, GE_DEPTH): `--ge-depth`.
 /// - gow/title: compared with Sony's own picture in the dump's VRAM
 ///   (`--reference-vram`): the stored picture is another frame where the
 ///   title animates (the fire glow behind the fence, the menu highlight;
@@ -95,8 +96,8 @@ const MODES: [Mode; 2] = [
 ///   VRAM screen holds pieces of the next frame's HUD.
 fn scene_flags(name: &str) -> &'static [&'static str] {
     match name {
-        "gow/title" => &["--ge-filter", "--ge-light", "--reference-vram"],
-        _ if name.starts_with("gow/") => &["--ge-filter", "--ge-light"],
+        "gow/title" => &["--ge-filter", "--ge-light", "--ge-depth", "--reference-vram"],
+        _ if name.starts_with("gow/") => &["--ge-filter", "--ge-light", "--ge-depth"],
         _ => &[],
     }
 }

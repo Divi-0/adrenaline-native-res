@@ -92,11 +92,16 @@ impl Color {
 /// picture of the other framebuffer, if the dump has one (its original
 /// picture, see `other_framebuffer`).
 pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&OriginalPicture>) -> Vec<u32> {
+    // `--ge-depth`: raw vertices' depth from the GE's own arithmetic (as
+    // REPLAY_DEPTH_MODE 8), as God of War's raw vertex programs on the Vita
+    // (nativeres_raw_v.cg GE_DEPTH).
+    let ge_depth = std::env::args().any(|arg| arg == "--ge-depth");
     nativeres_core::ge_math::GE_EXACT_DEPTH.store(
         match DEPTH_MODE.with(|mode| *mode) {
             8 => 1,
             9 => 2,
             10 => 3,
+            3 if ge_depth => 1,
             _ => 0,
         },
         std::sync::atomic::Ordering::Relaxed,
@@ -244,6 +249,9 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
         CURRENT_DRAW.with(|d| d.set(index));
         // Lab: REPLAY_RAW_VARIANTS=1 tallies the raw vertex programs the
         // Vita would take for the lit draws (vita draw.rs's choice).
+        if std::env::var_os("REPLAY_RAW_VARIANTS").is_some() && draw.flags & draw_flags::RAW_VERTICES != 0 && draw.flags & draw_flags::RAW_SPRITES != 0 {
+            println!("rawvariant sprite");
+        }
         if std::env::var_os("REPLAY_RAW_VARIANTS").is_some() && draw.flags & draw_flags::RAW_VERTICES != 0 && draw.flags & draw_flags::RAW_SPRITES == 0 {
             let colors = match draw.raw_colors {
                 0 => None,
@@ -251,6 +259,15 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
                 _ => None,
             };
             let lit = !colors.is_some_and(|colors| colors.rules[0] < 2.5);
+            // Unlit draws too (the plain programs, vita draw.rs `raw_variant` with plain and variants on).
+            if !lit {
+                let weights = if (draw.vertex_format >> 9) & 3 != 0 { ((draw.vertex_format >> 14) & 7) + 1 } else { 0 };
+                let bones = match weights { 0..=1 => "plain", 2..=4 => "plain4", _ => "full" };
+                let color = if bones == "full" { "any" } else {
+                    match (draw.vertex_format >> 2) & 7 { 4 => "5650", 5 => "5551", 6 => "4444", 7 => "8888", _ => "none" }
+                };
+                println!("rawvariant {bones} {color}");
+            }
             if lit {
                 let weights = if (draw.vertex_format >> 9) & 3 != 0 { ((draw.vertex_format >> 14) & 7) + 1 } else { 0 };
                 let lights = frame.raw_transform_of(draw).and_then(|(transform, _)| {

@@ -45,8 +45,12 @@ better at the same speed, as long as the Vita's spare CPU time is enough to capt
 You need a PS Vita with HENkaku/taiHEN (tested: firmware 3.65 with Enso) and Adrenaline 8 from
 [isage/Adrenaline](https://github.com/isage/Adrenaline) installed and working.
 
-1. Download `adrenaline-native-res.suprx` from the [releases](../../releases).
-2. Copy it to `ur0:tai/adrenaline-native-res.suprx` (with VitaShell, for example).
+1. Download `adrenaline-native-res.suprx` and `pspdepth.pak` from the [releases](../../releases).
+2. Copy the plugin to `ur0:tai/adrenaline-native-res.suprx` (with VitaShell, for example) and
+   `pspdepth.pak` to `ux0:data/nativeres/pspdepth.pak`: the GPU programs for the games that need
+   the PSP's own depth arithmetic (God of War: Chains of Olympus), read only when such a game
+   starts. Without it those games are drawn with the normal programs. It must come from the same
+   release as the plugin (the plugin checks it).
 3. Add it to taiHEN's config, `ur0:tai/config.txt`, under Adrenaline's title id. If a
    `ux0:tai/config.txt` exists, taiHEN reads that one instead, so edit that one:
    ```

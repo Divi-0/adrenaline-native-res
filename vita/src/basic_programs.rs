@@ -67,6 +67,82 @@ const FRAGMENT_USSE_BYTES: usize = 64 * 1024;
 pub static nativeres_plan_fixed_shader_patcher: u32 =
     sys::pages(PATCHER_BUFFER_BYTES) + sys::pages(VERTEX_USSE_BYTES) + sys::pages(FRAGMENT_USSE_BYTES);
 
+/// More USSE memory when the fixed blocks are full (`usse_growth`; GXM takes
+/// either fixed USSE memory or callbacks, 0x805B0003 with both: the fixed
+/// blocks are the callbacks' first chunks): God of
+/// War's GE_DEPTH vertex programs are ~6 KB each once patched per vertex
+/// format; with the float set made earlier, 64 KB ran out (0x805B0023,
+/// Kratos's four-bone programs missing, 2026-11-24). Only a game that needs
+/// it takes it, in chunks of this size, at most USSE_GROWTH_CHUNKS per kind.
+const USSE_GROWTH_BYTES: usize = 64 * 1024;
+const USSE_GROWTH_CHUNKS: usize = 4;
+#[no_mangle]
+#[used]
+#[allow(non_upper_case_globals)]
+pub static nativeres_plan_optin_usse_growth: u32 = 2 * (USSE_GROWTH_CHUNKS * USSE_GROWTH_BYTES) as u32;
+
+/// One kind's grown USSE memory: the chunk in use and how much of it is taken.
+struct UsseGrowth {
+    base: *mut u8,
+    offset: u32,
+    used: usize,
+    /// The chunk's size (the first chunk: the fixed block).
+    bytes: usize,
+    chunks: usize,
+    vertex: bool,
+}
+
+static VERTEX_GROWTH: SingleThreaded<UsseGrowth> = SingleThreaded::new(UsseGrowth { base: null_mut(), offset: 0, used: 0, bytes: 0, chunks: 0, vertex: true });
+static FRAGMENT_GROWTH: SingleThreaded<UsseGrowth> = SingleThreaded::new(UsseGrowth { base: null_mut(), offset: 0, used: 0, bytes: 0, chunks: 0, vertex: false });
+
+/// `size` bytes of USSE memory from `growth`'s chunk (a new one when it is
+/// full), 16-byte aligned; its USSE offset in `usse_offset`. Null if no
+/// memory is left. Never freed (programs are never released).
+unsafe fn usse_growth(growth: &mut UsseGrowth, size: u32, usse_offset: *mut u32) -> *mut c_void {
+    let size = (size as usize).next_multiple_of(16);
+    if size > USSE_GROWTH_BYTES {
+        return null_mut();
+    }
+    if growth.base.is_null() || growth.used + size > growth.bytes {
+        if growth.chunks == USSE_GROWTH_CHUNKS {
+            render_log::line(format_args!("shader patcher: {} USSE memory full\n", if growth.vertex { "vertex" } else { "fragment" }));
+            return null_mut();
+        }
+        let base = usse_block(if growth.vertex { b"NativeResVertexUsse2\0" } else { b"NativeResFragmentUsse2\0" }, USSE_GROWTH_BYTES);
+        let mut offset = 0;
+        let mapped = !base.is_null()
+            && if growth.vertex {
+                gxm::sceGxmMapVertexUsseMemory(base, USSE_GROWTH_BYTES as u32, &mut offset) >= 0
+            } else {
+                gxm::sceGxmMapFragmentUsseMemory(base, USSE_GROWTH_BYTES as u32, &mut offset) >= 0
+            };
+        if !mapped {
+            render_log::line(format_args!("shader patcher: no more USSE memory\n"));
+            return null_mut();
+        }
+        growth.chunks += 1;
+        render_log::line(format_args!("shader patcher: {} USSE memory grown to chunk {}\n", if growth.vertex { "vertex" } else { "fragment" }, growth.chunks));
+        (growth.base, growth.offset, growth.used, growth.bytes) = (base as *mut u8, offset, 0, USSE_GROWTH_BYTES);
+    }
+    let memory = growth.base.add(growth.used);
+    *usse_offset = growth.offset + growth.used as u32;
+    growth.used += size;
+    memory as *mut c_void
+}
+
+unsafe extern "C" fn vertex_usse_alloc(_user_data: *mut c_void, size: u32, usse_offset: *mut u32) -> *mut c_void {
+    // Safe: the patcher runs on the display thread only.
+    usse_growth(VERTEX_GROWTH.get(), size, usse_offset)
+}
+
+unsafe extern "C" fn fragment_usse_alloc(_user_data: *mut c_void, size: u32, usse_offset: *mut u32) -> *mut c_void {
+    // Safe: the patcher runs on the display thread only.
+    usse_growth(FRAGMENT_GROWTH.get(), size, usse_offset)
+}
+
+/// Grown USSE memory is never given back (programs are never released).
+unsafe extern "C" fn usse_free(_user_data: *mut c_void, _memory: *mut c_void) {}
+
 /// The patcher's bookkeeping lives on our heap.
 unsafe extern "C" fn host_alloc(_user_data: *mut c_void, size: u32) -> *mut c_void {
     heap::alloc(size as usize)
@@ -112,6 +188,12 @@ fn make_patcher() -> *mut gxm::ShaderPatcher {
         render_log::line(format_args!("shader patcher: USSE memory not mapped\n"));
         return null_mut();
     }
+    // The fixed blocks: the USSE callbacks' first chunks.
+    // Safe: display thread only, before the patcher exists.
+    unsafe {
+        *VERTEX_GROWTH.get() = UsseGrowth { base: vertex_usse as *mut u8, offset: vertex_offset, used: 0, bytes: VERTEX_USSE_BYTES, chunks: 0, vertex: true };
+        *FRAGMENT_GROWTH.get() = UsseGrowth { base: fragment_usse as *mut u8, offset: fragment_offset, used: 0, bytes: FRAGMENT_USSE_BYTES, chunks: 0, vertex: false };
+    }
     let params = gxm::ShaderPatcherParams {
         user_data: null_mut(),
         host_alloc: Some(host_alloc),
@@ -120,16 +202,16 @@ fn make_patcher() -> *mut gxm::ShaderPatcher {
         buffer_free: 0,
         buffer_memory: buffer,
         buffer_bytes: PATCHER_BUFFER_BYTES as u32,
-        vertex_usse_alloc: 0,
-        vertex_usse_free: 0,
-        vertex_usse_memory: vertex_usse,
-        vertex_usse_bytes: VERTEX_USSE_BYTES as u32,
-        vertex_usse_offset: vertex_offset,
-        fragment_usse_alloc: 0,
-        fragment_usse_free: 0,
-        fragment_usse_memory: fragment_usse,
-        fragment_usse_bytes: FRAGMENT_USSE_BYTES as u32,
-        fragment_usse_offset: fragment_offset,
+        vertex_usse_alloc: Some(vertex_usse_alloc),
+        vertex_usse_free: Some(usse_free),
+        vertex_usse_memory: null_mut(),
+        vertex_usse_bytes: 0,
+        vertex_usse_offset: 0,
+        fragment_usse_alloc: Some(fragment_usse_alloc),
+        fragment_usse_free: Some(usse_free),
+        fragment_usse_memory: null_mut(),
+        fragment_usse_bytes: 0,
+        fragment_usse_offset: 0,
     };
     let mut patcher: *mut gxm::ShaderPatcher = null_mut();
     // Safe: valid parameters, memory that stays ours.
@@ -418,9 +500,26 @@ pub unsafe fn clear_screen() {
     gxm::sceGxmDraw(context, gxm::PRIMITIVE_TRIANGLES, gxm::INDEX_FORMAT_U16, indices as *const c_void, 3);
 }
 
+/// Where the GE's reciprocal segments lie in the clear triangle's page
+/// (`ge_recip_table`): its 48 bytes leave the rest of the page free.
+const GE_RECIP_OFFSET: usize = 1024;
+
+/// The GE's reciprocal segments (core ge_math `RECIP`: start, slope as
+/// 128 float2) for the raw vertex programs' GE_DEPTH (nativeres_raw_v.cg
+/// uRecip, uniform buffer 0); null without memory. They live in the clear
+/// triangle's page (made with the basic programs), so they cost no memory.
+pub fn ge_recip_table() -> *const c_void {
+    match get() {
+        Some(basic) if !basic.clear_triangle.is_null() => (basic.clear_triangle as *const u8).wrapping_add(GE_RECIP_OFFSET) as *const c_void,
+        _ => null(),
+    }
+}
+
 /// The clear's triangle in GPU memory: (-1, -1), (3, -1), (-1, 3) after
-/// the projection, twice the screen in both directions; opaque black.
+/// the projection, twice the screen in both directions; opaque black. The
+/// GE's reciprocal table goes into the same page (`ge_recip_table`).
 fn make_clear_triangle() -> *mut ColorVertex {
+    const _: () = assert!(GE_RECIP_OFFSET + 1024 <= 4096 && 3 * core::mem::size_of::<ColorVertex>() <= GE_RECIP_OFFSET);
     let Some(block) = crate::gpu_memory::gpu_input(b"NativeResClearTriangle\0", sys::pages(3 * core::mem::size_of::<ColorVertex>())) else {
         return null_mut();
     };
@@ -429,6 +528,14 @@ fn make_clear_triangle() -> *mut ColorVertex {
     for (i, (x, y)) in [(0.0, 544.0), (1920.0, 544.0), (0.0, -544.0)].into_iter().enumerate() {
         // Safe: inside the block.
         unsafe { vertices.add(i).write(ColorVertex { x, y, z: 0.0, color: BLACK }) };
+    }
+    let table = block.base.wrapping_add(GE_RECIP_OFFSET) as *mut f32;
+    for (i, (start, slope)) in nativeres_core::ge_math::RECIP.iter().enumerate() {
+        // Safe: 256 floats from GE_RECIP_OFFSET fit the page (checked above).
+        unsafe {
+            table.add(2 * i).write(*start as f32);
+            table.add(2 * i + 1).write(*slope as f32);
+        }
     }
     vertices
 }

@@ -12,8 +12,18 @@
 //! its title ID (core game_quirks.rs). draw.rs keeps one program set per
 //! kind (programs are registered once and never released) and switches
 //! between them when the game changes (`Draws::choose_programs`).
+//!
+//! The PSP-depth twins are not embedded: they come from pspdepth.pak next
+//! to the plugin (scripts/pack-depth-twins.py), read only when a game needs
+//! them (`load_depth_pack`), so they take no memory in other games
+//! (DESIGN "sixty-first session").
 
+use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, Ordering};
+
+use crate::{render_log, sys, SingleThreaded};
+
+include!("../shaders/psp_depth_pack.rs");
 
 /// A compiled program. GXM needs programs 16-byte aligned.
 #[repr(C, align(16))]
@@ -31,20 +41,100 @@ impl<const BYTES: usize> Program for Gxp<BYTES> {
     }
 }
 
-/// A program and its PSP-depth twin (scripts/shader-variants.sh `twins`).
+/// A program and its PSP-depth twin (scripts/shader-variants.sh `twins`):
+/// the twin by name from pspdepth.pak (`load_depth_pack`, which made sure
+/// every twin is there before `set_psp_depth` turns them on).
 #[repr(C)]
-pub struct Twin<const BASE: usize, const DEPTH: usize> {
+pub struct Twin<const BASE: usize> {
     pub base: Gxp<BASE>,
-    pub depth: Gxp<DEPTH>,
+    /// The twin's name (its stem, e.g. b"nativeres_raw_pspdepth_v").
+    pub depth: &'static [u8],
 }
 
-impl<const BASE: usize, const DEPTH: usize> Program for Twin<BASE, DEPTH> {
+impl<const BASE: usize> Program for Twin<BASE> {
     fn start(&self) -> *const u8 {
         if psp_depth() {
-            self.depth.start()
+            depth_program(self.depth).unwrap_or(self.base.start())
         } else {
             self.base.start()
         }
+    }
+}
+
+/// Where pspdepth.pak lies (deployed next to the plugin).
+const DEPTH_PACK_PATH: &[u8] = b"ux0:data/nativeres/pspdepth.pak\0";
+const DEPTH_PACK_NAME_BYTES: usize = 64;
+const DEPTH_PACK_ENTRY_BYTES: usize = DEPTH_PACK_NAME_BYTES + 8;
+
+/// Memory plan (tools/memcheck.py): the pack, read for PSP-depth games only.
+#[no_mangle]
+#[used]
+pub static nativeres_plan_optin_psp_depth_pack: u32 = sys::pages(DEPTH_PACK_BYTES);
+
+/// pspdepth.pak in memory once read and checked (never freed: GXM keeps
+/// pointers into it); None before (or if it couldn't be read).
+static DEPTH_PACK: SingleThreaded<Option<&'static [u8]>> = SingleThreaded::new(None);
+
+fn word(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+}
+
+fn fnv1a(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0x811C_9DC5u32, |hash, &byte| (hash ^ byte as u32).wrapping_mul(0x0100_0193))
+}
+
+/// The twin `name` in the loaded pack.
+fn depth_program(name: &[u8]) -> Option<*const u8> {
+    // Safe: display thread only (programs are made there).
+    let pack = unsafe { *DEPTH_PACK.get() }?;
+    (0..DEPTH_PACK_COUNT).find_map(|i| {
+        let entry = 16 + i * DEPTH_PACK_ENTRY_BYTES;
+        let stored = &pack[entry..entry + DEPTH_PACK_NAME_BYTES];
+        let length = stored.iter().position(|&byte| byte == 0).unwrap_or(DEPTH_PACK_NAME_BYTES);
+        (&stored[..length] == name).then(|| pack[word(pack, entry + DEPTH_PACK_NAME_BYTES) as usize..].as_ptr())
+    })
+}
+
+/// Reads pspdepth.pak (display thread, once: the first PSP-depth game) and
+/// checks it is this build's (size, hash, entries). False if it is missing
+/// or another build's: the float programs stay then.
+pub fn load_depth_pack() -> bool {
+    // Safe: display thread only.
+    let slot = unsafe { DEPTH_PACK.get() };
+    if slot.is_some() {
+        return true;
+    }
+    let bytes = DEPTH_PACK_BYTES;
+    // Safe: plain system calls; the block is ours, freed if the file is wrong.
+    unsafe {
+        let block = sys::alloc_block(b"NativeResDepthPack\0".as_ptr(), sys::SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, sys::pages(bytes), core::ptr::null_mut());
+        if block < 0 {
+            render_log::line(format_args!("depth pack: no memory ({bytes} bytes)\n"));
+            return false;
+        }
+        let mut base: *mut c_void = core::ptr::null_mut();
+        sys::sceKernelGetMemBlockBase(block, &mut base);
+        let file = sys::sceIoOpen(DEPTH_PACK_PATH.as_ptr(), sys::SCE_O_RDONLY, 0);
+        let mut read = -1;
+        if file >= 0 {
+            read = sys::sceIoRead(file, base, bytes as u32);
+            sys::sceIoClose(file);
+        }
+        let pack = core::slice::from_raw_parts(base as *const u8, bytes);
+        let fits = read == bytes as i32
+            && &pack[..4] == b"NRDP"
+            && word(pack, 4) == 1
+            && word(pack, 8) as usize == DEPTH_PACK_COUNT
+            && word(pack, 12) == DEPTH_PACK_HASH
+            && fnv1a(&pack[16..]) == DEPTH_PACK_HASH;
+        if !fits {
+            render_log::line(format_args!("depth pack: {} unreadable or another build's (read {read} of {bytes} bytes)\n", "ux0:data/nativeres/pspdepth.pak"));
+            sys::free_block(block);
+            return false;
+        }
+        *slot = Some(pack);
+        render_log::line(format_args!("depth pack: {DEPTH_PACK_COUNT} programs, {bytes} bytes\n"));
+        true
     }
 }
 
@@ -100,17 +190,14 @@ macro_rules! embed_gxp {
     };
 }
 
-/// Embeds `shaders/<name>.gxp` and its PSP-depth twin `<depth>.gxp` as the
-/// `Twin` static `<name>`.
+/// Embeds `shaders/<name>.gxp` as the `Twin` static `<name>`, its PSP-depth
+/// twin `<depth>` named (from pspdepth.pak).
 macro_rules! embed_twin {
     ($name:ident, $depth:ident) => {
         #[allow(non_upper_case_globals)]
-        pub static $name: Twin<
-            { include_bytes!(concat!("../shaders/", stringify!($name), ".gxp")).len() },
-            { include_bytes!(concat!("../shaders/", stringify!($depth), ".gxp")).len() },
-        > = Twin {
+        pub static $name: Twin<{ include_bytes!(concat!("../shaders/", stringify!($name), ".gxp")).len() }> = Twin {
             base: Gxp(*include_bytes!(concat!("../shaders/", stringify!($name), ".gxp"))),
-            depth: Gxp(*include_bytes!(concat!("../shaders/", stringify!($depth), ".gxp"))),
+            depth: stringify!($depth).as_bytes(),
         };
     };
 }

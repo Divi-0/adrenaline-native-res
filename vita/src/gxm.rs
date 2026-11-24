@@ -287,9 +287,15 @@ pub const TEXTURE_MIP_FILTER_ENABLED: u32 = 0x0000_0200;
 pub const TEXTURE_ADDR_REPEAT: u32 = 0;
 pub const TEXTURE_ADDR_CLAMP: u32 = 2;
 
+/// More USSE memory for the shader patcher: `size` bytes, their USSE offset
+/// in `usse_offset`; null if there is none.
+pub type UsseAlloc = unsafe extern "C" fn(user_data: *mut c_void, size: u32, usse_offset: *mut u32) -> *mut c_void;
+pub type UsseFree = unsafe extern "C" fn(user_data: *mut c_void, memory: *mut c_void);
+
 /// SceGxmShaderPatcherParams (0x44 bytes): the patcher's memory. Host
-/// memory (its own bookkeeping) through the callbacks; the buffer and the
-/// vertex/fragment USSE code memory as fixed blocks (no callbacks).
+/// memory (its own bookkeeping) through the callbacks; the buffer as a fixed
+/// block; the vertex/fragment USSE code memory as fixed blocks, grown
+/// through the USSE callbacks when they are full (basic_programs.rs).
 #[repr(C)]
 pub struct ShaderPatcherParams {
     pub user_data: *mut c_void,
@@ -299,13 +305,13 @@ pub struct ShaderPatcherParams {
     pub buffer_free: usize,
     pub buffer_memory: *mut c_void,
     pub buffer_bytes: u32,
-    pub vertex_usse_alloc: usize,
-    pub vertex_usse_free: usize,
+    pub vertex_usse_alloc: Option<UsseAlloc>,
+    pub vertex_usse_free: Option<UsseFree>,
     pub vertex_usse_memory: *mut c_void,
     pub vertex_usse_bytes: u32,
     pub vertex_usse_offset: u32,
-    pub fragment_usse_alloc: usize,
-    pub fragment_usse_free: usize,
+    pub fragment_usse_alloc: Option<UsseAlloc>,
+    pub fragment_usse_free: Option<UsseFree>,
     pub fragment_usse_memory: *mut c_void,
     pub fragment_usse_bytes: u32,
     pub fragment_usse_offset: u32,
@@ -363,6 +369,7 @@ extern "C" {
     pub fn sceGxmSetViewport(context: *mut Context, x_offset: f32, x_scale: f32, y_offset: f32, y_scale: f32, z_offset: f32, z_scale: f32);
     pub fn sceGxmSetFragmentTexture(context: *mut Context, index: u32, texture: *const Texture) -> i32;
     pub fn sceGxmSetVertexStream(context: *mut Context, index: u32, data: *const c_void) -> i32;
+    pub fn sceGxmSetVertexUniformBuffer(context: *mut Context, buffer_index: u32, data: *const c_void) -> i32;
     pub fn sceGxmDraw(context: *mut Context, primitive: u32, index_format: u32, indices: *const c_void, count: u32) -> i32;
 
     pub fn sceGxmTextureSetMinFilter(texture: *mut Texture, filter: u32) -> i32;

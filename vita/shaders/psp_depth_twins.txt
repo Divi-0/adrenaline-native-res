@@ -6,11 +6,15 @@
 # the GE's integer arithmetic (core lighting.rs GpuLights::ge_color, DESIGN "sixtieth session"); only those
 # God of War's dumped scenes take (memory: ~0.6 KB each; the flat ones ~1.2 KB): the 3D one, the full raw one,
 # lit1 / lit4 with 4444 or 8888 colours or any (generic), the point-light ones.
+# GE_DEPTH: the raw vertex programs take the PSP depth from the GE's integer vertex arithmetic (core
+# ge_math::integer, nativeres_raw_v.cg GE_DEPTH, DESIGN "sixty-first session"); only the raw programs God of
+# War's dumped scenes take (replay REPLAY_RAW_VARIANTS): plain 8888 / 4444, plain4 8888, lit1 / lit4 8888 /
+# 4444, the point-light ones and the full one. Others keep the float depth.
 nativeres_3d_v GE_LIGHT
-nativeres_raw_lit1_4444_v GE_LIGHT
+nativeres_raw_lit1_4444_v GE_LIGHT GE_DEPTH
 nativeres_raw_lit1_5551_v
 nativeres_raw_lit1_5650_v
-nativeres_raw_lit1_8888_v GE_LIGHT
+nativeres_raw_lit1_8888_v GE_LIGHT GE_DEPTH
 nativeres_raw_lit1_none_v
 nativeres_raw_lit1_v GE_LIGHT
 nativeres_raw_lit1flat_4444_v
@@ -19,11 +23,11 @@ nativeres_raw_lit1flat_5650_v
 nativeres_raw_lit1flat_8888_v
 nativeres_raw_lit1flat_none_v
 nativeres_raw_lit1flat_v
-nativeres_raw_lit1point_v GE_LIGHT
-nativeres_raw_lit4_4444_v GE_LIGHT
+nativeres_raw_lit1point_v GE_LIGHT GE_DEPTH
+nativeres_raw_lit4_4444_v GE_LIGHT GE_DEPTH
 nativeres_raw_lit4_5551_v
 nativeres_raw_lit4_5650_v
-nativeres_raw_lit4_8888_v GE_LIGHT
+nativeres_raw_lit4_8888_v GE_LIGHT GE_DEPTH
 nativeres_raw_lit4_none_v
 nativeres_raw_lit4_v GE_LIGHT
 nativeres_raw_lit4flat_4444_v
@@ -32,21 +36,21 @@ nativeres_raw_lit4flat_5650_v
 nativeres_raw_lit4flat_8888_v
 nativeres_raw_lit4flat_none_v
 nativeres_raw_lit4flat_v
-nativeres_raw_lit4point_v GE_LIGHT
+nativeres_raw_lit4point_v GE_LIGHT GE_DEPTH
 nativeres_raw_plain4_4444_v
 nativeres_raw_plain4_5551_v
 nativeres_raw_plain4_5650_v
-nativeres_raw_plain4_8888_v
+nativeres_raw_plain4_8888_v GE_DEPTH
 nativeres_raw_plain4_none_v
 nativeres_raw_plain4_v
-nativeres_raw_plain_4444_v
+nativeres_raw_plain_4444_v GE_DEPTH
 nativeres_raw_plain_5551_v
 nativeres_raw_plain_5650_v
-nativeres_raw_plain_8888_v
+nativeres_raw_plain_8888_v GE_DEPTH
 nativeres_raw_plain_none_v
 nativeres_raw_plain_v
 nativeres_raw_sprite_v
-nativeres_raw_v GE_LIGHT
+nativeres_raw_v GE_LIGHT GE_DEPTH
 nativeres_textured_f GE_FILTER
 nativeres_textured_fix_f GE_FILTER
 nativeres_textured_flat_f GE_FILTER

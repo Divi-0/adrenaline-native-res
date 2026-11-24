@@ -865,6 +865,11 @@ impl Draws {
         if wanted == self.programs_psp_depth || self.other_programs_failed {
             return;
         }
+        // The PSP-depth twins come from pspdepth.pak: without it, float depth stays.
+        if wanted && !crate::shaders::load_depth_pack() {
+            self.other_programs_failed = true;
+            return;
+        }
         if self.other_programs.is_null() {
             let bytes = core::mem::size_of::<Programs>();
             // Safe: plain system calls; the block is never freed (the
@@ -2746,6 +2751,65 @@ fn set_raw_uniforms(
     set_uniform(buffer, uniforms.ambient, 4, floats(&colors.ambient));
     set_uniform(buffer, uniforms.emissive, 4, floats(&colors.emissive));
     set_uniform(buffer, uniforms.colors, 4, floats(&colors.rules));
+    if !uniforms.ge_z.is_null() {
+        let mut ge = ge_depth_uniforms(transform, camera);
+        if GE_DEPTH_ON.load(Ordering::Relaxed) == 0 {
+            ge[1] = [0.0; 4]; // w 0: the programs' float depth (debug `gedepth 0`)
+        }
+        set_uniform(buffer, uniforms.ge_z, 4, ge[0].as_ptr());
+        set_uniform(buffer, uniforms.ge_w, 4, ge[1].as_ptr());
+        set_uniform(buffer, uniforms.ge_depth, 4, ge[2].as_ptr());
+        // The GE's reciprocal segments (uRecip, uniform buffer 0).
+        // Safe: a plain call; the table lives as long as the basic programs.
+        unsafe { gxm::sceGxmSetVertexUniformBuffer(context(), 0, basic_programs::ge_recip_table()) };
+    }
+}
+
+/// Debug `gedepth 0|1`: 0 gives the GE_DEPTH programs w 0, so they take
+/// their float depth (1, default: the GE's depth).
+pub static GE_DEPTH_ON: AtomicU8 = AtomicU8::new(1);
+
+/// The last transform and camera `ge_depth_uniforms` combined, and the result.
+struct GeDepthCache {
+    world: [[f32; 4]; 3],
+    view: [[f32; 4]; 3],
+    projection: [[f32; 4]; 4],
+    depth: [f32; 4],
+    uniforms: [[f32; 4]; 3],
+    valid: bool,
+}
+
+static GE_DEPTH_CACHE: SingleThreaded<GeDepthCache> = SingleThreaded::new(GeDepthCache {
+    world: [[0.0; 4]; 3],
+    view: [[0.0; 4]; 3],
+    projection: [[0.0; 4]; 4],
+    depth: [0.0; 4],
+    uniforms: [[0.0; 4]; 3],
+    valid: false,
+});
+
+/// uGeZ, uGeW, uGeDepth of a raw draw for the GE_DEPTH programs: the clip z
+/// and w columns of world x view x projection as the GE combines them
+/// (core `ge_math::combined`; rows x, y, z, translation), and the
+/// viewport's depth scale and centre as float24s (as core raw_vertex
+/// `exact_z`, the replay's `--ge-depth`). Remade only when the transform or
+/// the camera changes (compared by value: the tables are reused).
+fn ge_depth_uniforms(transform: &RawTransform, camera: &RawCamera) -> [[f32; 4]; 3] {
+    // Safe: display thread only; the reference ends in this function.
+    let cache = unsafe { GE_DEPTH_CACHE.get() };
+    if cache.valid && cache.world == transform.world && cache.view == camera.view && cache.projection == camera.projection && cache.depth == camera.depth {
+        return cache.uniforms;
+    }
+    let m = nativeres_core::ge_math::combined(&transform.world, &camera.view, &camera.projection);
+    let float24 = |value: f32| f32::from_bits((value.to_bits() + 0x80) & 0xFFFF_FF00);
+    let (center, scale) = (float24(camera.depth[0] * 65535.0), float24(camera.depth[1] * 65535.0));
+    cache.uniforms = [[m[2], m[6], m[10], m[14]], [m[3], m[7], m[11], m[15]], [scale, center, 0.0, 0.0]];
+    cache.world = transform.world;
+    cache.view = camera.view;
+    cache.projection = camera.projection;
+    cache.depth = camera.depth;
+    cache.valid = true;
+    cache.uniforms
 }
 
 /// Floats of one light set (`GpuLights`), the lights uniform's size.

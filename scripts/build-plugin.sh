@@ -8,6 +8,9 @@ mkdir -p "$OUT"
 
 # The PSP side first: the plugin carries it (vita/src/psp_plugin.rs).
 sh scripts/build-psp-plugin.sh
+# The PSP-depth programs go into a file of their own, loaded only for the
+# games that use them (vita/src/shaders.rs); the plugin checks its hash.
+python3 scripts/pack-depth-twins.py
 
 # The version the user log names (vita/src/user_log.rs): the git tag
 # (e.g. v0.3.0, or v0.3.0-2-gabc1234 two commits after it). safe.directory:
