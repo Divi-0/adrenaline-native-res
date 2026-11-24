@@ -187,6 +187,27 @@ float PspPow(float x, float e)
 	return x > 0.0f ? exp2(e * log2(x)) : 0.0f;
 }
 
+#ifdef GE_LIGHT
+// GE_LIGHT: the lighting in the GE's integer arithmetic, as nativeres_3d_v.cg
+// (core lighting.rs GpuLights::ge_color); point lights' ambient and diffuse
+// parts scaled by the attenuation as another factor.
+float3 GeProduct(float3 l, float3 m)
+{
+	return floor((2.0f * l + 1.0f) * (2.0f * m + 1.0f) * (1.0f / 1024.0f));
+}
+
+float3 GeScale(float3 x, float f)
+{
+	float s = clamp(floor(256.0f * f), 0.0f, 256.0f);
+	return floor((2.0f * x + 1.0f) * (2.0f * s + 1.0f) * (1.0f / 1024.0f));
+}
+
+float3 Ge8(float3 c)
+{
+	return floor(c * 255.0f + 0.5f);
+}
+#endif
+
 // One bone's part of a skinned position and normal: weight x bone.
 void AddBone(inout float3 position, inout float3 normal, float weight, float4 r0, float4 r1, float4 r2, float4 p, float3 n)
 {
@@ -376,6 +397,64 @@ void main(
 		float3 diffuseColor = lerp(uLights[19].rgb, base.rgb, fromVertex.y);
 		float3 specularColor = lerp(uLights[20].rgb, base.rgb, fromVertex.z);
 		float coefficient = uLights[17].a;
+#ifdef GE_LIGHT
+		float3 ambient8 = Ge8(ambientColor.rgb);
+		float3 diffuse8 = Ge8(diffuseColor);
+		float3 specular8 = Ge8(specularColor);
+		float3 sum = Ge8(uLights[17].rgb) + GeProduct(Ge8(uLights[16].rgb), ambient8);
+		float3 specularSum = float3(0.0f, 0.0f, 0.0f);
+#ifdef RAW_FLAT_LIGHTS
+		for (int i = 0; i < 3; i++) {
+#else
+		for (int i = 0; i < 4; i++) {
+#endif
+			float3 toLight = uLights[i].xyz;
+#ifdef RAW_POINT_LIGHTS
+			float attenuation = 1.0f;
+			if (uLights[i].w > 0.5f) {
+				toLight = uLights[i].xyz - world.xyz;
+				float distSq = dot(toLight, toLight);
+				float invDist = rsqrt(distSq);
+				float dist = distSq * invDist;
+				toLight *= invDist;
+				attenuation = saturate(1.0f / dot(uLights[4 + i].xyz, float3(1.0f, dist, distSq)));
+				sum += GeScale(GeProduct(Ge8(uLights[22 + i].rgb), ambient8), attenuation);
+			}
+#endif
+			float lightDot = dot(toLight, n);
+#ifdef RAW_FLAT_LIGHTS
+			if (uLights[8 + i].a > 0.5f)
+				lightDot = 1.0f;
+#else
+			if (uLights[8 + i].a > 0.5f)
+				lightDot = PspPow(lightDot, coefficient);
+#endif
+			float3 lightDiffuse = GeScale(GeProduct(Ge8(uLights[8 + i].rgb), diffuse8), lightDot);
+#ifdef RAW_POINT_LIGHTS
+			lightDiffuse = GeScale(lightDiffuse, attenuation);
+#endif
+			sum += lightDiffuse;
+			// Directional lights only (point lights have no specular here).
+			if (uLights[12 + i].a > 0.5f && lightDot >= 0.0f) {
+#ifdef RAW_FLAT_LIGHTS
+				float factor = 1.0f;
+#else
+				float factor = PspPow(dot(uLights[4 + i].xyz, n), coefficient);
+#endif
+				specularSum += GeScale(GeProduct(Ge8(uLights[12 + i].rgb), specular8), factor);
+			}
+		}
+		float4 lit;
+		if (uLights[20].a > 0.5f) {
+			// Separate specular: after texturing (vSpecular).
+			vSpecular = min(specularSum, 255.0f) * (1.0f / 255.0f) * clip.w;
+		} else {
+			sum += specularSum;
+		}
+		lit.rgb = min(sum, 255.0f) * (1.0f / 255.0f);
+		float ambientAlpha = GeProduct(Ge8(uLights[16].aaa), Ge8(ambientColor.aaa)).x;
+		lit.a = uLights[19].a > 0.5f ? 1.0f : ambientAlpha * (1.0f / 255.0f);
+#else
 		float3 diffuse = float3(0.0f, 0.0f, 0.0f);
 		float3 specular = float3(0.0f, 0.0f, 0.0f);
 #ifdef RAW_POINT_LIGHTS
@@ -437,6 +516,7 @@ void main(
 		lit.rgb = saturate(uLights[17].rgb + uLights[16].rgb * ambientColor.rgb + diffuse * diffuseColor + specularPart);
 #endif
 		lit.a = uLights[19].a > 0.5f ? 1.0f : saturate(uLights[16].a * ambientColor.a);
+#endif
 		if (uColors.y > 0.5f)
 			lit.a = 1.0f;
 		vColor = lit * clip.w;

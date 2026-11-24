@@ -359,9 +359,11 @@ pub fn read_variant(flags: u32, blend: u32, keep_target_alpha: bool, exact_norma
 /// The frame-read program for a draw into an 8-bit target with `flags`
 /// and packed `blend` (`Draw::blend`) that blends as the GE does: normal
 /// alpha blends and additive ones (source alpha, one), `ReadWay::Normal` /
-/// `Add` without the cut. None for GXM's blending as before: other blends,
-/// BLEND_FIX, dithered draws, draws that write an alpha the game reads
-/// (`keep_target_alpha` and `BLEND_WRITES_ALPHA`: the stencil's ways).
+/// `Add` without the cut; textured blends with FIX B (`BLEND_FIX_B_ALPHA`)
+/// the generic program, which blends any factors as the GE. None for GXM's
+/// blending as before: other blends, dithered draws, draws that write an
+/// alpha the game reads (`keep_target_alpha` and `BLEND_WRITES_ALPHA`: the
+/// stencil's ways).
 ///
 /// GXM rounds the whole blend once where the GE truncates each term
 /// (`ge_blend_term`): every normal alpha blend came out ~0.5 levels
@@ -372,14 +374,25 @@ pub fn read_variant(flags: u32, blend: u32, keep_target_alpha: bool, exact_norma
 /// Measured instead and dropped: the GE's source term by the program with
 /// GXM's rounded destination term (no frame read): half the gain at half
 /// the GPU cost (DESIGN, fifty-first session).
+///
+/// FIX B: God of War's bloom downsampling blends its small 1x targets as
+/// texel x 0x55 + target x FIX B 0x55; GXM's rounded target term left the
+/// bloom brighter (replay: title vs Sony's screen 2.87 -> 2.71, signed red
+/// +1.33 -> +0.91; Vita: signed green / blue -0.35 each; DESIGN, sixtieth
+/// session). The generic program costs GoW's title ~+5..10 ms GPU (its
+/// GE-filter twin; two passes into the small 1x targets).
 pub fn wide_variant(flags: u32, blend: u32, keep_target_alpha: bool) -> Option<ReadVariant> {
     use crate::blend::{BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_WRITES_ALPHA};
     let format = (flags & draw_flags::TARGET_FORMAT_MASK) >> draw_flags::TARGET_FORMAT_SHIFT;
-    if format != 0 || blend & BLEND_ENABLED == 0 || blend & BLEND_FIX_B_ALPHA != 0 || flags & draw_flags::DITHER != 0 {
+    if format != 0 || blend & BLEND_ENABLED == 0 || flags & draw_flags::DITHER != 0 {
         return None;
     }
     if keep_target_alpha && blend & BLEND_WRITES_ALPHA != 0 {
         return None;
+    }
+    if blend & BLEND_FIX_B_ALPHA != 0 {
+        // Textured only: the untextured way sets no uBlendFix.
+        return (flags & draw_flags::TEXTURED != 0).then_some(ReadVariant::Generic);
     }
     let way = match (blend & 0xF, (blend >> 4) & 0xF, (blend >> 8) & 7) {
         (4, 5, 0) => ReadWay::Normal,
@@ -429,7 +442,14 @@ pub fn ge_filter_read(
         && flags & draw_flags::LINEAR_FILTER != 0
         && target_channel_bits(flags).is_none()
         && tests & test_flags::ALPHA_TEST == 0
-        && wide_variant(flags, blend, keep_target_alpha).is_none()
+        && match wide_variant(flags, blend, keep_target_alpha) {
+            None => true,
+            // FIX B: the generic program only while the game reads its
+            // targets' alpha (the Vita's `BLEND_8888` 1); God of War's
+            // program set has its GE-filter twin.
+            Some(ReadVariant::Generic) => !keep_target_alpha,
+            Some(_) => false,
+        }
         && !matches!(stencil, crate::blend::StencilWay::FrameRead(_))
 }
 
@@ -2723,9 +2743,14 @@ mod tests {
         // 85: the screen into bloom target A, ONE ZERO; 87: A into B, blending off;
         // 89: FIX B through the alpha; 90: C added into B, ONE ONE.
         for (flags, blend) in [(0x43f, 0x8000_0001), (0x41d, 0), (0x41f, 0xc005_5041), (0x41f, 0x8000_0011)] {
-            assert!(ge_filter_read(flags, 0x20, blend, none, true, true, true), "{flags:x} {blend:x}");
-            assert!(!ge_filter_read(flags, 0x20, blend, none, true, false, true), "not our target: {flags:x}");
+            let keep = blend != 0xc005_5041; // 89 below
+            assert!(ge_filter_read(flags, 0x20, blend, none, keep, true, true), "{flags:x} {blend:x}");
+            assert!(!ge_filter_read(flags, 0x20, blend, none, keep, false, true), "not our target: {flags:x}");
         }
+        // 89 while the game reads its targets' alpha: the generic frame-read
+        // program blends it as the GE (`wide_variant`); its GE filter comes
+        // with God of War's program set, not this way.
+        assert!(!ge_filter_read(0x41f, 0x20, 0xc005_5041, none, true, true, true));
         // 93: B added onto the screen: the GPU's filter (cost).
         assert!(!ge_filter_read(0x41f, 0x20, 0x8000_0011, none, true, true, false));
         // 86: the bright pass, point-sampled, masked alpha test.
@@ -2823,10 +2848,18 @@ mod tests {
         assert_eq!(wide_variant(draw_flags::TEXTURED, normal, false), wide(ReadWay::Normal, true));
         assert_eq!(wide_variant(draw_flags::TEXTURED, normal | BLEND_WRITES_ALPHA, false), wide(ReadWay::Normal, true), "nobody reads it");
         assert_eq!(wide_variant(0, add, false), wide(ReadWay::Add, false), "untextured: never fogless");
-        // Not: blending off, FIX B, other factors, dithered, 16-bit targets,
+        // FIX B (God of War's bloom downsampling, d x 0x55): the generic
+        // program, which blends any factors as the GE (GXM rounded d x FIX B).
+        let fix_b = BLEND_ENABLED | BLEND_FIX_B_ALPHA | 1 | 4 << 4 | 0x55 << crate::blend::BLEND_FIX_B_SHIFT;
+        assert_eq!(wide_variant(fogged, fix_b, true), Some(ReadVariant::Generic));
+        assert_eq!(wide_variant(draw_flags::TEXTURED, fix_b, false), Some(ReadVariant::Generic));
+        assert_eq!(wide_variant(0, fix_b, true), None, "untextured: no uBlendFix there");
+        assert_eq!(wide_variant(fogged | draw_flags::DITHER, fix_b, true), None);
+        assert_eq!(wide_variant(fogged | 2 << draw_flags::TARGET_FORMAT_SHIFT, fix_b, true), None);
+        assert_eq!(wide_variant(fogged, fix_b | BLEND_WRITES_ALPHA, true), None);
+        // Not: blending off, other factors, dithered, 16-bit targets,
         // an alpha written that the game reads (its stencil).
         assert_eq!(wide_variant(fogged, 4 | 5 << 4, true), None);
-        assert_eq!(wide_variant(fogged, normal | BLEND_FIX_B_ALPHA, true), None);
         assert_eq!(wide_variant(fogged, BLEND_ENABLED | 1 | 1 << 4, true), None);
         assert_eq!(wide_variant(fogged | draw_flags::DITHER, normal, true), None);
         assert_eq!(wide_variant(fogged | draw_flags::TARGET_5551 << draw_flags::TARGET_FORMAT_SHIFT, normal, true), None);

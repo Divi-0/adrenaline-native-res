@@ -175,6 +175,10 @@ fn new_vertex_cache() -> Option<&'static mut VertexCache> {
     // 2026-11-22 (`lighting::POINT_LIGHTS_GPU`, on by default as on the Vita).
     let point_lights = std::env::var("NATIVERES_POINT_LIGHTS").map_or(true, |value| value != "0");
     nativeres_core::lighting::POINT_LIGHTS_GPU.store(point_lights, std::sync::atomic::Ordering::Relaxed);
+    // `--ge-light` (or REPLAY_GE_LIGHT=1): GPU-lit colours in the GE's
+    // integer arithmetic, as God of War's program set (`lighting::GE_LIGHTING`).
+    let ge_light = std::env::args().any(|arg| arg == "--ge-light") || std::env::var_os("REPLAY_GE_LIGHT").is_some();
+    nativeres_core::lighting::GE_LIGHTING.store(ge_light, std::sync::atomic::Ordering::Relaxed);
     // Like the Vita once its alpha-test program exists: textured draws are
     // alpha-tested in the shader (this rasterizer tests every draw).
     // NATIVERES_BLEND_ALPHA_TEST=1: blending stands in as before (A/B).
@@ -437,6 +441,7 @@ fn run(dump_path: &str, png_path: &str, trace: bool) -> Result<(), String> {
     }
 
     let image = raster::render_frame(&frame, &mut dump.memory, dump.original.as_ref());
+    raster::print_blend_stats();
     {
         // What debug skinwatch / dump-glitch measure on the Vita.
         let (edge, draw, triangles) = frame.longest_skinned_edge();

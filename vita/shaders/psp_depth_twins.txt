@@ -2,34 +2,37 @@
 # every program the PSP_DEPTH code changes. The untextured read programs have none (no depth code).
 # After a stem: more defines for its twin. GE_FILTER: the textured fragment programs of the PSP-depth set
 # also filter as the GE (core game_quirks.rs `PSP_DEPTH_GAMES`, DESIGN "fifty-ninth session"); not the dithered
-# ones (God of War, the only game with this set, never dithers).
-nativeres_3d_v
-nativeres_raw_lit1_4444_v
+# ones (God of War, the only game with this set, never dithers). GE_LIGHT: the lit vertex programs light in
+# the GE's integer arithmetic (core lighting.rs GpuLights::ge_color, DESIGN "sixtieth session"); only those
+# God of War's dumped scenes take (memory: ~0.6 KB each; the flat ones ~1.2 KB): the 3D one, the full raw one,
+# lit1 / lit4 with 4444 or 8888 colours or any (generic), the point-light ones.
+nativeres_3d_v GE_LIGHT
+nativeres_raw_lit1_4444_v GE_LIGHT
 nativeres_raw_lit1_5551_v
 nativeres_raw_lit1_5650_v
-nativeres_raw_lit1_8888_v
+nativeres_raw_lit1_8888_v GE_LIGHT
 nativeres_raw_lit1_none_v
-nativeres_raw_lit1_v
+nativeres_raw_lit1_v GE_LIGHT
 nativeres_raw_lit1flat_4444_v
 nativeres_raw_lit1flat_5551_v
 nativeres_raw_lit1flat_5650_v
 nativeres_raw_lit1flat_8888_v
 nativeres_raw_lit1flat_none_v
 nativeres_raw_lit1flat_v
-nativeres_raw_lit1point_v
-nativeres_raw_lit4_4444_v
+nativeres_raw_lit1point_v GE_LIGHT
+nativeres_raw_lit4_4444_v GE_LIGHT
 nativeres_raw_lit4_5551_v
 nativeres_raw_lit4_5650_v
-nativeres_raw_lit4_8888_v
+nativeres_raw_lit4_8888_v GE_LIGHT
 nativeres_raw_lit4_none_v
-nativeres_raw_lit4_v
+nativeres_raw_lit4_v GE_LIGHT
 nativeres_raw_lit4flat_4444_v
 nativeres_raw_lit4flat_5551_v
 nativeres_raw_lit4flat_5650_v
 nativeres_raw_lit4flat_8888_v
 nativeres_raw_lit4flat_none_v
 nativeres_raw_lit4flat_v
-nativeres_raw_lit4point_v
+nativeres_raw_lit4point_v GE_LIGHT
 nativeres_raw_plain4_4444_v
 nativeres_raw_plain4_5551_v
 nativeres_raw_plain4_5650_v
@@ -43,7 +46,7 @@ nativeres_raw_plain_8888_v
 nativeres_raw_plain_none_v
 nativeres_raw_plain_v
 nativeres_raw_sprite_v
-nativeres_raw_v
+nativeres_raw_v GE_LIGHT
 nativeres_textured_f GE_FILTER
 nativeres_textured_fix_f GE_FILTER
 nativeres_textured_flat_f GE_FILTER

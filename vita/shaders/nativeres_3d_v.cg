@@ -55,6 +55,33 @@ float PspPow(float x, float e)
 	return x > 0.0f ? exp2(e * log2(x)) : 0.0f;
 }
 
+#ifdef GE_LIGHT
+// GE_LIGHT (God of War's program set, psp_depth_twins.txt; core
+// lighting.rs GpuLights::ge_color is its CPU twin): the lighting in the
+// GE's integer arithmetic (ppsspp-ref GPU/Software/Lighting.cpp, GEMath.h
+// GELightColorProduct / GELightColorScale), colours as 0..255 integers:
+// light x material ((2l + 1)(2m + 1)) >> 10, a factor f (N.L, its power,
+// the attenuation) as s = floor(256 f) in 0..256, ((2x + 1)(2s + 1)) >> 10,
+// the terms summed, clamped at 255. Exact in fp32 (products below 2^18,
+// the / 1024 a power of two). The float lighting below was ~1 level
+// brighter per light.
+float3 GeProduct(float3 l, float3 m)
+{
+	return floor((2.0f * l + 1.0f) * (2.0f * m + 1.0f) * (1.0f / 1024.0f));
+}
+
+float3 GeScale(float3 x, float f)
+{
+	float s = clamp(floor(256.0f * f), 0.0f, 256.0f);
+	return floor((2.0f * x + 1.0f) * (2.0f * s + 1.0f) * (1.0f / 1024.0f));
+}
+
+float3 Ge8(float3 c)
+{
+	return floor(c * 255.0f + 0.5f);
+}
+#endif
+
 void main(
 	float3 aPosition,
 	float4 aNormal,
@@ -106,6 +133,30 @@ void main(
 		float3 diffuseColor = lerp(uLights[19].rgb, aColor.rgb, fromVertex.y);
 		float3 specularColor = lerp(uLights[20].rgb, aColor.rgb, fromVertex.z);
 		float coefficient = uLights[17].a;
+#ifdef GE_LIGHT
+		float3 ambient8 = Ge8(ambientColor.rgb);
+		float3 diffuse8 = Ge8(diffuseColor);
+		float3 specular8 = Ge8(specularColor);
+		float3 sum = Ge8(uLights[17].rgb) + GeProduct(Ge8(uLights[16].rgb), ambient8);
+		float3 specularSum = float3(0.0f, 0.0f, 0.0f);
+		for (int i = 0; i < 4; i++) {
+			float lightDot = dot(uLights[i].xyz, n);
+			if (uLights[8 + i].a > 0.5f)
+				lightDot = PspPow(lightDot, coefficient);
+			sum += GeScale(GeProduct(Ge8(uLights[8 + i].rgb), diffuse8), lightDot);
+			if (uLights[12 + i].a > 0.5f && lightDot >= 0.0f)
+				specularSum += GeScale(GeProduct(Ge8(uLights[12 + i].rgb), specular8), PspPow(dot(uLights[4 + i].xyz, n), coefficient));
+		}
+		if (uLights[20].a > 0.5f) {
+			// Separate specular: after texturing (vSpecular).
+			vSpecular = min(specularSum, 255.0f) * (1.0f / 255.0f) * clip.w;
+		} else {
+			sum += specularSum;
+		}
+		color.rgb = min(sum, 255.0f) * (1.0f / 255.0f);
+		float ambientAlpha = GeProduct(Ge8(uLights[16].aaa), Ge8(ambientColor.aaa)).x;
+		color.a = uLights[19].a > 0.5f ? 1.0f : ambientAlpha * (1.0f / 255.0f);
+#else
 		float3 diffuse = float3(0.0f, 0.0f, 0.0f);
 		float3 specular = float3(0.0f, 0.0f, 0.0f);
 		for (int i = 0; i < 4; i++) {
@@ -124,6 +175,7 @@ void main(
 		}
 		color.rgb = saturate(uLights[17].rgb + uLights[16].rgb * ambientColor.rgb + diffuse * diffuseColor + specularPart);
 		color.a = uLights[19].a > 0.5f ? 1.0f : saturate(uLights[16].a * ambientColor.a);
+#endif
 	}
 	vColor = color * clip.w;
 }

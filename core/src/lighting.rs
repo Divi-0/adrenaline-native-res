@@ -43,6 +43,13 @@ pub static LIGHTS_ON: AtomicBool = AtomicBool::new(true);
 /// specular and spot lights stay on the CPU.
 pub static POINT_LIGHTS_GPU: AtomicBool = AtomicBool::new(true);
 
+/// GPU-lit colours in the GE's integer arithmetic (`GpuLights::ge_color`),
+/// as the vertex programs of God of War's program set (GE_LIGHT, core
+/// game_quirks.rs `PSP_DEPTH_GAMES`; the Vita sets this with the set, the
+/// replay with `--ge-light`). Off: float, rounded once (`float_color`), as
+/// every other game's programs.
+pub static GE_LIGHTING: AtomicBool = AtomicBool::new(false);
+
 /// One enabled light, its registers decoded.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Light {
@@ -734,7 +741,19 @@ impl GpuLights {
     /// vertex's `world_position`: as PPSSPP's shader, towards the light
     /// times inversesqrt(distance^2), its diffuse and ambient parts times
     /// the attenuation clamp(1 / (a + b d + c d^2), 0, 1).
+    ///
+    /// `GE_LIGHTING` (God of War's program set): in the GE's integer
+    /// arithmetic (`ge_color`), else in float (`float_color`).
     pub fn color(&self, vertex: u32, normal: [f32; 3], normal_rows: &[[f32; 4]; 3], world_position: [f32; 3]) -> u32 {
+        if GE_LIGHTING.load(Ordering::Relaxed) {
+            self.ge_color(vertex, normal, normal_rows, world_position)
+        } else {
+            self.float_color(vertex, normal, normal_rows, world_position)
+        }
+    }
+
+    /// `color` in float, rounded once at the end (the normal programs).
+    pub fn float_color(&self, vertex: u32, normal: [f32; 3], normal_rows: &[[f32; 4]; 3], world_position: [f32; 3]) -> u32 {
         let row = |r: usize| [normal_rows[r][0], normal_rows[r][1], normal_rows[r][2]];
         let world = normalize_or_001([dot(row(0), normal), dot(row(1), normal), dot(row(2), normal)]);
         let vertex = channels(vertex);
@@ -791,6 +810,93 @@ impl GpuLights {
                     + (self.ambient[channel] + point_ambient[channel]) * ambient_color[channel]
                     + diffuse[channel] * diffuse_color[channel]
                     + specular[channel] * specular_color[channel])
+        });
+        if self.material_diffuse[3] > 0.5 {
+            value[3] = 255.0;
+        }
+        pack(value)
+    }
+}
+
+impl GpuLights {
+    /// `color` as the GE computes it (`GE_LIGHTING`; ppsspp-ref
+    /// GPU/Software/Lighting.cpp ProcessSIMD, GEMath.h GELightColorProduct /
+    /// GELightColorScale, probed on hardware), as the GE_LIGHT vertex
+    /// programs (nativeres_3d_v.cg, nativeres_raw_v.cg): colours as 8-bit
+    /// integers, each light colour x material colour ((2l + 1)(2m + 1)) >> 10,
+    /// each factor (N.L, its power, the attenuation) s = floor(256 f) applied
+    /// as ((2x + 1)(2s + 1)) >> 10, the terms summed and clamped; the alpha
+    /// the ambient alpha x material alpha the same way. The float lighting
+    /// was ~1 level brighter per light (God of War's title vs Sony's screen:
+    /// 2.72 -> 2.52, DESIGN sixtieth session). Not exact: the summed ambient
+    /// (global plus the directional lights') is one term (the GE truncates
+    /// each light's own; God of War's lights have none), and N.L is ours in
+    /// float, not the GE's float24.
+    pub fn ge_color(&self, vertex: u32, normal: [f32; 3], normal_rows: &[[f32; 4]; 3], world_position: [f32; 3]) -> u32 {
+        let row = |r: usize| [normal_rows[r][0], normal_rows[r][1], normal_rows[r][2]];
+        let world = normalize_or_001([dot(row(0), normal), dot(row(1), normal), dot(row(2), normal)]);
+        let to8 = |v: f32| ((v * 255.0 + 0.5) as i32).clamp(0, 255);
+        let vertex8 = bytes(vertex).map(|v| v as i32);
+        let material = |flag: f32, m: [f32; 4]| -> [i32; 4] { if flag > 0.5 { vertex8 } else { m.map(to8) } };
+        let mac = material(self.from_vertex[0], self.material_ambient);
+        let mdc = material(self.from_vertex[1], self.material_diffuse);
+        let msc = material(self.from_vertex[2], self.material_specular);
+        let product = |l: i32, m: i32| ((2 * l + 1) * (2 * m + 1)) >> 10;
+        let scale = |x: i32, f: f32| {
+            let s = ((256.0 * f) as i32).clamp(0, 256);
+            ((2 * x + 1) * (2 * s + 1)) >> 10
+        };
+        let coefficient = self.emissive[3];
+        let mut sum = [0i32; 3];
+        let mut specular = [0i32; 3];
+        for channel in 0..3 {
+            sum[channel] = to8(self.emissive[channel]) + product(to8(self.ambient[channel]), mac[channel]);
+        }
+        for light in 0..4 {
+            let xyz = |v: [f32; 4]| [v[0], v[1], v[2]];
+            let point = self.to_light[light][3] > 0.5;
+            let (l, att) = if point {
+                let towards: [f32; 3] = core::array::from_fn(|axis| self.to_light[light][axis] - world_position[axis]);
+                let distance2 = dot(towards, towards);
+                let inverse = inverse_sqrt(distance2);
+                let distance = distance2 * inverse;
+                let [a, b, c, _] = self.half[light];
+                let att = (1.0 / (a + b * distance + c * distance2)).clamp(0.0, 1.0);
+                (towards.map(|value| value * inverse), if att.is_nan() { 0.0 } else { att })
+            } else {
+                (xyz(self.to_light[light]), 1.0)
+            };
+            let mut light_dot = dot(l, world);
+            if self.diffuse[light][3] > 0.5 {
+                light_dot = psp_pow(light_dot, coefficient);
+            }
+            for channel in 0..3 {
+                if point {
+                    let ambient = product(to8(self.light_ambient[light][channel]), mac[channel]);
+                    sum[channel] += if att < 1.0 { scale(ambient, att) } else { ambient };
+                }
+                let mut diffuse = scale(product(to8(self.diffuse[light][channel]), mdc[channel]), light_dot);
+                if att < 1.0 {
+                    diffuse = scale(diffuse, att);
+                }
+                sum[channel] += diffuse;
+            }
+            if !point && self.specular[light][3] > 0.5 && light_dot >= 0.0 {
+                let factor = psp_pow(dot(xyz(self.half[light]), world), coefficient);
+                if factor > 0.0 {
+                    for channel in 0..3 {
+                        specular[channel] += scale(product(to8(self.specular[light][channel]), msc[channel]), factor);
+                    }
+                }
+            }
+        }
+        // (The separate specular colour, LIGHTMODE 1, is added here as the
+        // float `color` does: the programs send it apart.)
+        let mut value: [f32; 4] = core::array::from_fn(|channel| {
+            if channel == 3 {
+                return product(to8(self.ambient[3]), mac[3]) as f32;
+            }
+            (sum[channel] + specular[channel]) as f32
         });
         if self.material_diffuse[3] > 0.5 {
             value[3] = 255.0;
@@ -1014,6 +1120,26 @@ mod tests {
     /// The GPU's lighting (`GpuLights::color`, packed normals, normal
     /// rows with a bone) gives what `Lights::color` gives, within three
     /// steps (the packed normal's rounding).
+    #[test]
+    fn ge_lighting_truncates_each_term() {
+        // One directional light, white, N.L = 0.3; material diffuse and
+        // ambient 200, global ambient 64. The GE: ambient ((129 x 401) >> 10)
+        // = 50, diffuse ((511 x 401) >> 10) = 200 scaled by floor(0.3 x 256)
+        // = 76 as ((401 x 153) >> 10) = 59: 109. In float: 110.2 -> 110.
+        let grey = |value: f32| [value / 255.0, value / 255.0, value / 255.0, 1.0];
+        let mut lights = GpuLights::default();
+        lights.to_light[0] = [0.0, 0.0, 1.0, 0.0];
+        lights.diffuse[0] = [1.0, 1.0, 1.0, 0.0];
+        lights.ambient = grey(64.0);
+        lights.material_ambient = grey(200.0);
+        lights.material_diffuse = [200.0 / 255.0, 200.0 / 255.0, 200.0 / 255.0, 0.0];
+        let rows = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]];
+        let normal = [(1.0f32 - 0.09).sqrt(), 0.0, 0.3];
+        assert_eq!(lights.ge_color(0, normal, &rows, [0.0; 3]), 0xFF6D_6D6D);
+        assert_eq!(lights.float_color(0, normal, &rows, [0.0; 3]), 0xFF6E_6E6E);
+        // Alpha: ((2 x 255 + 1)(2 x 255 + 1)) >> 10 = 255.
+    }
+
     #[test]
     fn gpu_lighting_matches_cpu_lighting() {
         let mut ge = ge_with_one_light(DIFFUSE_AND_SPECULAR);

@@ -242,6 +242,34 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
             }
         }
         CURRENT_DRAW.with(|d| d.set(index));
+        // Lab: REPLAY_RAW_VARIANTS=1 tallies the raw vertex programs the
+        // Vita would take for the lit draws (vita draw.rs's choice).
+        if std::env::var_os("REPLAY_RAW_VARIANTS").is_some() && draw.flags & draw_flags::RAW_VERTICES != 0 && draw.flags & draw_flags::RAW_SPRITES == 0 {
+            let colors = match draw.raw_colors {
+                0 => None,
+                n if n <= frame.raw_colors_count => frame.raw_colors.get(n as usize - 1),
+                _ => None,
+            };
+            let lit = !colors.is_some_and(|colors| colors.rules[0] < 2.5);
+            if lit {
+                let weights = if (draw.vertex_format >> 9) & 3 != 0 { ((draw.vertex_format >> 14) & 7) + 1 } else { 0 };
+                let lights = frame.raw_transform_of(draw).and_then(|(transform, _)| {
+                    let set = transform.light_set as u32;
+                    (set != 0 && set <= frame.light_set_count).then(|| frame.light_sets[set as usize - 1])
+                });
+                let point = lights.is_some_and(|l| l.to_light.iter().any(|light| light[3] > 0.5));
+                let flat = lights.is_some_and(|l| {
+                    let zeros = |values: &[f32; 4]| values.iter().all(|value| value.to_bits() == 0);
+                    l.emissive[3] <= 0.0 && zeros(&l.to_light[3]) && zeros(&l.diffuse[3]) && zeros(&l.specular[3])
+                });
+                let bones = match weights { 0..=1 => "lit1", 2..=4 => "lit4", _ => "full" };
+                let kind = if point { "point" } else if flat { "flat" } else { "" };
+                let color = if point || bones == "full" { "any".to_string() } else {
+                    match (draw.vertex_format >> 2) & 7 { 4 => "5650", 5 => "5551", 6 => "4444", 7 => "8888", _ => "none" }.to_string()
+                };
+                println!("rawvariant {bones}{kind} {color}");
+            }
+        }
         // Debugging: REPLAY_SKIP=a,b,... leaves those draws out.
         if std::env::var("REPLAY_SKIP").is_ok_and(|v| v.split(',').any(|d| d.trim().parse::<usize>() == Ok(index))) {
             continue;
@@ -661,6 +689,24 @@ fn draw_triangle(
             let pixel = &mut screen[index];
             let destination = Color::from_rgba(*pixel);
             *pixel = if ge_exact { ge_blend(draw.blend, source, destination) } else { blend(draw.blend, source, destination) }.to_rgba();
+            if lab_blend_stats() && target_bits.is_none() && draw.blend & BLEND_ENABLED != 0 && !ge_exact {
+                let key = format!(
+                    "src{} dst{} eq{} fixb{} stencil{} writesA{} wide{}",
+                    draw.blend & 0xF,
+                    (draw.blend >> 4) & 0xF,
+                    (draw.blend >> 8) & 7,
+                    (draw.blend & BLEND_FIX_B_ALPHA != 0) as u8,
+                    stencil.is_some() as u8,
+                    (draw.blend & nativeres_core::blend::BLEND_WRITES_ALPHA != 0) as u8,
+                    wide_variant(draw.flags, draw.blend, true).is_some() as u8
+                );
+                BLEND_STATS.with(|stats| {
+                    let mut stats = stats.borrow_mut();
+                    let entry = stats.entry(key).or_insert((0u64, std::collections::BTreeSet::new()));
+                    entry.0 += 1;
+                    entry.1.insert(CURRENT_DRAW.with(|d| d.get()));
+                });
+            }
             if let Some(value) = stencil.and_then(|state| state.write()) {
                 *pixel = (*pixel & 0x00FF_FFFF) | (value as u32) << 24;
             }
@@ -790,19 +836,74 @@ fn blend(packed: u32, source: Color, destination: Color) -> Color {
     }
 }
 
-/// The GE's normal or additive blend (`wide_variant`'s ways) of 8-bit
-/// values, as nativeres_textured_read_f.cg READ_WIDE: each term ((2c +
-/// 1)(2f + 1)) >> 10 (`ge_blend_term`; a factor of 255 is the colour
-/// itself), added, clamped; the target's alpha kept. GXM's blending rounds
-/// the whole blend once instead: ~0.5 levels brighter per normal blend.
+thread_local! {
+    /// Lab: REPLAY_BLEND_STATS=1 counts the pixels of blends the Vita leaves to GXM, per kind.
+    static BLEND_STATS: std::cell::RefCell<std::collections::BTreeMap<String, (u64, std::collections::BTreeSet<usize>)>> = Default::default();
+}
+
+fn lab_blend_stats() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("REPLAY_BLEND_STATS").is_some())
+}
+
+/// Prints `BLEND_STATS` (REPLAY_BLEND_STATS).
+pub fn print_blend_stats() {
+    BLEND_STATS.with(|stats| {
+        for (key, (pixels, draws)) in stats.borrow().iter() {
+            let list: Vec<String> = draws.iter().take(30).map(|d| d.to_string()).collect();
+            println!("blendstat {key}: pixels {pixels} draws {} [{}]", draws.len(), list.join(","));
+        }
+    });
+}
+
+/// The GE's blend of 8-bit values (`wide_variant`'s draws), as the Vita's
+/// frame-read programs (nativeres_textured_read_f.cg READ_WIDE: normal and
+/// additive; the generic one: FIX B) and ppsspp-ref DrawPixel.cpp
+/// AlphaBlendingResult: each term ((2c + 1)(2f + 1)) >> 10 (`ge_blend_term`;
+/// a factor of 255 is the colour itself), min / max on the plain colours,
+/// clamped; FIX B through the alpha as `blend_channels` reads it; the
+/// target's alpha kept. GXM's blending rounds the whole blend once instead:
+/// ~0.5 levels brighter per normal blend.
 fn ge_blend(packed: u32, source: Color, destination: Color) -> Color {
-    let to8 = |value: f32| (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
-    let alpha = to8(source.a);
-    let additive = (packed >> 4) & 0xF == 1;
-    let channel = |s: f32, d: f32| {
-        let d = to8(d);
-        let term = if additive { d } else { ge_blend_term(d, 255 - alpha) };
-        (ge_blend_term(to8(s), alpha) + term).min(255) as f32 / 255.0
+    let to8 = |value: f32| (value.clamp(0.0, 1.0) * 255.0 + 0.5) as i32;
+    let (sa, da) = (to8(source.a), to8(destination.a));
+    let fix_b = (packed & BLEND_FIX_B_ALPHA != 0).then(|| ((packed >> BLEND_FIX_B_SHIFT) & 0xFF) as i32);
+    let factor8 = |code: u32, s: i32, d: i32| -> i32 {
+        match code {
+            0 => 0,
+            1 => 255,
+            2 => s,
+            3 => 255 - s,
+            4 => sa,
+            5 => 255 - sa,
+            6 => d,
+            7 => 255 - d,
+            8 => da,
+            _ => 255 - da,
+        }
+    };
+    let channel = |s: f32, d: f32| -> f32 {
+        let (s, d) = (to8(s), to8(d));
+        let (sf, df) = match fix_b {
+            Some(grey) => (
+                match (packed >> BLEND_PREMULTIPLY_SHIFT) & 3 {
+                    1 => sa,
+                    2 => 255 - sa,
+                    _ => 255,
+                },
+                grey,
+            ),
+            None => (factor8(packed & 0xF, s, d), factor8((packed >> 4) & 0xF, s, d)),
+        };
+        let term = |c: i32, f: i32| ge_blend_term(c as u32, f as u32) as i32;
+        let out = match (packed >> 8) & 7 {
+            1 => term(s, sf) - term(d, df),
+            2 => term(d, df) - term(s, sf),
+            3 => s.min(d),
+            4 => s.max(d),
+            _ => term(s, sf) + term(d, df),
+        };
+        out.clamp(0, 255) as f32 / 255.0
     };
     Color { r: channel(source.r, destination.r), g: channel(source.g, destination.g), b: channel(source.b, destination.b), a: destination.a }
 }
@@ -1089,6 +1190,28 @@ mod tests {
         // Red 100 at alpha 40 over 200: ((201 x 81) >> 10) + ((401 x 431) >> 10) = 15 + 168.
         assert_eq!(screen[20 * WIDTH + 20], 0x3000_00B7);
         assert_eq!(blend(draw.blend, Color::from_rgba(0x2800_0064), Color::from_rgba(0x3000_00C8)).to_rgba() & 0xFF, 184, "GXM's way");
+    }
+
+    /// FIX B into an 8-bit target (God of War's bloom downsampling: the
+    /// target x 0x55 plus the texel): the destination term truncated as
+    /// the GE's, as the Vita's generic frame-read program (`wide_variant`).
+    #[test]
+    fn eight_bit_targets_blend_fix_b_as_the_ge() {
+        let mut screen = vec![0x3000_00C8u32; WIDTH * HEIGHT]; // red 200, alpha (stencil) 0x30
+        let mut depth = vec![1.0f32; WIDTH * HEIGHT];
+        let corner = |x: f32, y: f32| FrameVertex { x, y, z: 0.5, w: 1.0, color: 0xFF00_0064, ..FrameVertex::default() };
+        let triangle = [corner(0.0, 0.0), corner(100.0, 0.0), corner(0.0, 100.0)];
+        let packed = BLEND_ENABLED | BLEND_FIX_B_ALPHA | 1 | 4 << 4 | 0x55 << BLEND_FIX_B_SHIFT;
+        let draw = Draw { blend: packed, flags: draw_flags::TEXTURED, scissor_right: 479, scissor_bottom: 271, ..Draw::default() };
+        assert!(wide_variant(draw.flags, draw.blend, true).is_some());
+        // A white texel: the source is the vertex colour (modulate).
+        let texture = Texture { width: 1, height: 1, pixels: vec![0xFFFF_FFFF] };
+        GE_BLEND_FRAME.store(true, std::sync::atomic::Ordering::Relaxed);
+        draw_triangle(&mut screen, &mut depth, &draw, Some(&texture), triangle, 0, None);
+        GE_BLEND_FRAME.store(false, std::sync::atomic::Ordering::Relaxed);
+        // 100 + ((401 x 171) >> 10) = 100 + 66; the target's alpha kept.
+        assert_eq!(screen[20 * WIDTH + 20], 0x3000_00A6);
+        assert_eq!(blend(draw.blend, Color::from_rgba(0xFF00_0064), Color::from_rgba(0x3000_00C8)).to_rgba() & 0xFF, 167, "GXM's way");
     }
 
     /// God of War's title fence (2026-11-23): rail boxes and planks less

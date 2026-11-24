@@ -893,6 +893,9 @@ impl Draws {
         unsafe { core::ptr::swap_nonoverlapping(&mut self.programs as *mut Programs, self.other_programs, 1) };
         self.programs_psp_depth = wanted;
         crate::shaders::set_psp_depth(wanted);
+        // The set's lit vertex programs light as the GE (GE_LIGHT); the
+        // CPU's copy of them follows (core `GpuLights::color`).
+        nativeres_core::lighting::GE_LIGHTING.store(wanted, Ordering::Relaxed);
         self.forget_state();
         render_log::line(format_args!(
             "programs: {} depth (game {})\n",
