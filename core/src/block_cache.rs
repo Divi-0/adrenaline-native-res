@@ -28,7 +28,7 @@ pub const BLOCK_WORDS: usize = BLOCK_SIZE as usize / 4;
 /// more than once (sub-lists called again, index buffers of models drawn
 /// several times): with 16 blocks the capture thread copied 409 KiB per
 /// frame out of uncached memory, with 128 blocks 266 KiB (256: 253 KiB;
-/// PC replay of tests/dumps/mhf/intro.bin with the copier, 2026-11-19).
+/// PC replay of tests/dumps/mhf_ULES00318/intro.bin with the copier, 2026-11-19).
 pub const CAPTURE_BLOCKS: usize = 128;
 
 /// Blocks in a store that lives on a thread's stack or in the module's data

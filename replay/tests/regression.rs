@@ -2,6 +2,7 @@
 //!
 //! The test directory is `tests/` at the repository root, or the one named
 //! by `NATIVERES_TESTS`. In it, `dumps/<game>/<scene>.bin` are frame dumps
+//! (`<game>` = short name + title ID, e.g. `ff1_ULES00986`)
 //! taken on the Vita (a development build of the plugin records them);
 //! `expected.txt` holds, per dump, what the replay made of it when it was
 //! last accepted:
@@ -16,7 +17,7 @@
 //! intended improvement: accept it) or further away (a regression), and
 //! also if only the picture changed (same hash, `diff` moved by more than
 //! `DIFF_TOLERANCE`: a change in how the replay draws, e.g. blending or a
-//! sampled framebuffer; mtx/hill-blur is MTX's motion blur, slot 8).
+//! sampled framebuffer; mtx_ULES00581/hill-blur is MTX's motion blur, slot 8).
 //! Accept the current results with
 //!
 //! ```text
@@ -89,15 +90,15 @@ const MODES: [Mode; 2] = [
 ///   vertex programs light as the GE (core `lighting::GE_LIGHTING`):
 ///   `--ge-light`; its raw vertex programs take the depth from the GE's
 ///   arithmetic (core `ge_math`, GE_DEPTH): `--ge-depth`.
-/// - gow/title: compared with Sony's own picture in the dump's VRAM
+/// - gow_UCES00842/title: compared with Sony's own picture in the dump's VRAM
 ///   (`--reference-vram`): the stored picture is another frame where the
 ///   title animates (the fire glow behind the fence, the menu highlight;
-///   DESIGN "fifty-ninth session"). gow/game keeps its stored picture: its
+///   DESIGN "fifty-ninth session"). gow_UCES00842/game keeps its stored picture: its
 ///   VRAM screen holds pieces of the next frame's HUD.
 fn scene_flags(name: &str) -> &'static [&'static str] {
     match name {
-        "gow/title" => &["--ge-filter", "--ge-light", "--ge-depth", "--reference-vram"],
-        _ if name.starts_with("gow/") => &["--ge-filter", "--ge-light", "--ge-depth"],
+        "gow_UCES00842/title" => &["--ge-filter", "--ge-light", "--ge-depth", "--reference-vram"],
+        _ if name.starts_with("gow_UCES00842/") => &["--ge-filter", "--ge-light", "--ge-depth"],
         _ => &[],
     }
 }

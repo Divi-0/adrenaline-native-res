@@ -366,7 +366,7 @@ mod tests {
         const LEVEL_0: u32 = 0x0416_2000;
         const LEVEL_1: u32 = 0x0416_2400;
         const LEVEL_2: u32 = 0x0416_2600;
-        // Read as in the title's dump (tests/dumps/gow/title.bin).
+        // Read as in the title's dump (tests/dumps/gow_UCES00842/title.bin).
         let sized = |address, format, width, height, buffer_width| TextureDescriptor { width, height, buffer_width, ..texture(address, format) };
         let textures = vec![
             sized(BLUR_A, format::BGR5650, 64, 64, 1024),

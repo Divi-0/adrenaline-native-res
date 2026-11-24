@@ -31,7 +31,7 @@ fn replay(dump: &Path, picture: &Path, on: &str) -> String {
 
 #[test]
 fn black_texel_triangles_change_nothing_in_god_of_wars_shadows() {
-    let dump = tests_dir().join("dumps/gow/game.bin");
+    let dump = tests_dir().join("dumps/gow_UCES00842/game.bin");
     if !dump.exists() {
         eprintln!("skipped: no {}", dump.display());
         return;

@@ -4,7 +4,7 @@
 //! raw vertices' depth from the GE's arithmetic (core `ge_math`, the raw
 //! vertex programs' GE_DEPTH twins); the replay models that with
 //! `--ge-depth`. Checked against Sony's own depth buffer of the left fence
-//! post (read live on the Vita, `dumps/gow/title-fence-depth.u16`: 70 x 100
+//! post (read live on the Vita, `dumps/gow_UCES00842/title-fence-depth.u16`: 70 x 100
 //! little-endian u16, PSP x 0..70, y 130..230). Skipped without the
 //! private test directory's files (see regression.rs).
 
@@ -20,7 +20,7 @@ fn tests_dir() -> PathBuf {
 
 #[test]
 fn the_gow_fence_takes_the_ges_own_depth() {
-    let dir = tests_dir().join("dumps/gow");
+    let dir = tests_dir().join("dumps/gow_UCES00842");
     let (dump, sony) = (dir.join("title.bin"), dir.join("title-fence-depth.u16"));
     if !dump.exists() || !sony.exists() {
         eprintln!("skipped: no {} or {}", dump.display(), sony.display());

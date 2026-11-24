@@ -2745,7 +2745,7 @@ pub fn new_boxed_frame() -> Box<Frame> {
 
 #[cfg(test)]
 mod tests {
-    /// God of War's title bloom chain (dump tests/dumps/gow/title.bin,
+    /// God of War's title bloom chain (dump tests/dumps/gow_UCES00842/title.bin,
     /// replay REPLAY_LIST_TARGET_READS): its target reads into off-screen
     /// targets filter as the GE does; the add onto the screen, point-sampled
     /// ones, those into 16-bit targets, frame-read stencil states and
