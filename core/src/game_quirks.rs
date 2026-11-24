@@ -19,8 +19,8 @@
 const PSP_DEPTH_GAMES: &[&[u8]] = &[
     // God of War: Chains of Olympus: discs (Europe, US, Asia, Japan, Korea).
     b"UCES00842", b"UCET00844", b"UCUS98653", b"UCAS40198", b"UCAS40191", b"ULJM05348", b"ULJM05438", b"UCKS45084",
-    // ... PSN downloads (EBOOT.PBP: no disc to read the ID from, so only when
-    // Adrenaline shares its title ID, untested) and demos.
+    // ... PSN downloads (EBOOT.PBP: the ID from its PARAM.SFO, psp/src/main.rs
+    // sfo_title_id; no EBOOT tested) and demos.
     b"NPUG80325", b"NPEG00023", b"NPHG00027", b"NPHG00028", b"NPJH50170",
     b"UCUS98705", b"UCUS98713", b"UCED00970", b"UCED00971",
 ];

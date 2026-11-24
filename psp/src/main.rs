@@ -161,18 +161,15 @@ fn set_title_id(words: [u32; 2]) {
     }
 }
 
-/// Reads the game's title ID from its disc as Adrenaline's CEF does
-/// (gameinfo.c readTitleIdFromDisc: disc0:/UMD_DATA.BIN starts
-/// "UCES-00842|") and hands it to the Vita side in the ring header (the
-/// renderer picks per-game programs by it: core game_quirks.rs). False if
-/// there is no disc (EBOOT.PBP games: the renderer falls back to
-/// Adrenaline's own title ID) or not yet. The copy thread calls it.
-///
-/// Not PARAM.SFO's DISC_ID through systemctrl's sctrlGetInitPARAM (NID
-/// 0xFCE44FB8): tried 2026-11-24, our PSP side never came up with it (MTX,
-/// cause unknown).
+/// Reads the game's title ID as Adrenaline's CEF does (gameinfo.c) and hands
+/// it to the Vita side in the ring header (the renderer picks per-game
+/// programs by it: core game_quirks.rs): from the disc (disc0:/UMD_DATA.BIN
+/// starts "UCES-00842|"), else PARAM.SFO's DISC_ID through systemctrl's
+/// sctrlGetInitPARAM (EBOOT.PBP games such as PSN downloads; it reads ISOs'
+/// too: 5 of 5 boots of GoW and MTX through it alone, 2026-11-24). False if
+/// neither has one (yet). The copy thread calls it.
 pub fn note_title_id() -> bool {
-    match disc_title_id() {
+    match disc_title_id().or_else(sfo_title_id) {
         Some(words) => {
             set_title_id(words);
             true
@@ -194,6 +191,31 @@ fn disc_title_id() -> Option<[u32; 2]> {
         read
     };
     if read != data.len() as i32 {
+        return None;
+    }
+    nativeres_core::event_ring::pack_title_id(&data)
+}
+
+/// sctrlGetInitPARAM(name, type out, length in/out, buffer): the running
+/// game's PARAM.SFO (an ISO's disc0:/PSP_GAME/PARAM.SFO, an EBOOT.PBP's own).
+type GetInitParamFn = unsafe extern "C" fn(*const u8, *mut u16, *mut u32, *mut c_void) -> i32;
+const NID_GET_INIT_PARAM: u32 = 0xFCE4_4FB8;
+
+fn sfo_title_id() -> Option<[u32; 2]> {
+    // Looked up, not imported: a systemctrl without it must not keep the
+    // plugin from loading.
+    // Safe: NUL-terminated names.
+    let address = unsafe { sctrlHENFindFunction(b"SystemControl\0".as_ptr(), b"SystemCtrlForKernel\0".as_ptr(), NID_GET_INIT_PARAM) };
+    if address == 0 {
+        return None;
+    }
+    // Safe: systemctrl's function at that address, of this type.
+    let get_init_param: GetInitParamFn = unsafe { core::mem::transmute(address as usize) };
+    let mut data = [0u8; 16];
+    let mut length = data.len() as u32;
+    // Safe: a NUL-terminated name; `data` holds `length` bytes.
+    let result = unsafe { get_init_param(b"DISC_ID\0".as_ptr(), core::ptr::null_mut(), &mut length, data.as_mut_ptr() as *mut c_void) };
+    if result < 0 {
         return None;
     }
     nativeres_core::event_ring::pack_title_id(&data)
