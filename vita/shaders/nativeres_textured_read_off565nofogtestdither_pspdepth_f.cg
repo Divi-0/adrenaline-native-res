@@ -162,7 +162,11 @@
 #define FLOOR(x) ((x) - frac(x))
 float4 GeShade(float4 texel, float4 vertexColor, float3 specular, float fog, float4 fogAndScale)
 {
+#ifdef GE_FILTER
+	float4 t = texel; // GeTexel's whole values
+#else
 	float4 t = FLOOR(texel * 255.0f + 0.5f);
+#endif
 	float4 p1 = FLOOR(vertexColor * 255.0f + 1.01f); // p + 1
 	float4 c = FLOOR(p1 * t * (float4(fogAndScale.aaa, 1.0f) * (1.0f / 256.0f)));
 #ifdef NO_SPECULAR
@@ -189,24 +193,31 @@ float4 GeShade(float4 texel, float4 vertexColor, float3 specular, float fog, flo
 // frame.rs `dither_value`): its row and column picked by one-hot weights.
 // GE_FILTER: the GE's filter (nativeres_textured_f.cg's comment; keep GeTexel the same).
 #ifdef GE_FILTER
-// The GE's bilinear filter of a point-filtered texture: the texel as k / 255
-// (GeShade takes it as it is). Point samples of 8-bit texels are exact
-// k / 255; all sums stay below 2^13: exact in fp32.
+// The GE's bilinear filter of a point-filtered texture, as the GE's whole
+// values 0..255 (GeShade and the flat program take them as they are). Point
+// samples of 8-bit texels are k / 255 in fp32 (tex2D<float4>; within an ulp:
+// within 0.0001 levels). The horizontal lerps on them unrounded: the GE's
+// value (A (16 - f) + B f) / 16 is a multiple of 1/16, so + 1/32 floors it to
+// the GE's truncation; the vertical lerp on whole values is exact (sums below
+// 2^13). Proof over all texel pairs and fractions, also one ulp off: DESIGN
+// "sixty-third session" (the old way rounded each texel first and went
+// through k / 255 again: 13 instructions more per pixel).
 float4 GeTexel(sampler2D tex, float2 uv, float4 size)
 {
 	float2 step = 1.0f / size.xy; // only lands the reads inside their texels
 	float2 p = FLOOR(uv * size.xy * 16.0f) - size.z;
-	float2 cell = FLOOR(p * (1.0f / 16.0f));
-	float2 f = (p - cell * 16.0f) * size.w;
-	float2 at = (cell + 0.5f) * step;
+	float2 m = p * (1.0f / 16.0f);
+	float2 fraction = frac(m); // f / 16, exact
+	float2 at = (m - fraction + 0.5f) * step;
 	float2 next = at + step;
-	float4 a = FLOOR(tex2D(tex, at) * 255.0f + 0.5f);
-	float4 b = FLOOR(tex2D(tex, float2(next.x, at.y)) * 255.0f + 0.5f);
-	float4 c = FLOOR(tex2D(tex, float2(at.x, next.y)) * 255.0f + 0.5f);
-	float4 d = FLOOR(tex2D(tex, next) * 255.0f + 0.5f);
-	float4 top = FLOOR((a * (16.0f - f.x) + b * f.x) * (1.0f / 16.0f));
-	float4 bottom = FLOOR((c * (16.0f - f.x) + d * f.x) * (1.0f / 16.0f));
-	return FLOOR((top * (16.0f - f.y) + bottom * f.y) * (1.0f / 16.0f)) * (1.0f / 255.0f);
+	float2 f = fraction * size.w; // 0 for the GE's nearest texel
+	float4 a = tex2D<float4>(tex, at);
+	float4 b = tex2D<float4>(tex, float2(next.x, at.y));
+	float4 c = tex2D<float4>(tex, float2(at.x, next.y));
+	float4 d = tex2D<float4>(tex, next);
+	float4 top = FLOOR((a + (b - a) * f.x) * 255.0f + (1.0f / 32.0f));
+	float4 bottom = FLOOR((c + (d - c) * f.x) * 255.0f + (1.0f / 32.0f));
+	return FLOOR(top + (bottom - top) * f.y);
 }
 #define SAMPLE(tex, uv) GeTexel(tex, uv, uTexSize)
 #else
