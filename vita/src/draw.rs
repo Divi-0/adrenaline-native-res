@@ -40,7 +40,18 @@ use crate::capture::{RAW_ARENA, RAW_ARENA_BYTES, VERTEX_ARENA, VERTEX_ARENA_VERT
 use crate::frame_pool::alloc as frame_pool_alloc;
 use crate::gpu_textures::TextureObject;
 use crate::gxm::{self, ProgramParameter};
-use crate::programs::{AlphaOut, Kind, Programs, RawColor, RawUniforms, RawVariant, SPRITE_CORNERS};
+use crate::programs::{AlphaOut, Kind, Programs, RawColor, RawUniforms, RawVariant, GE_DEPTH_STRIDE, SPRITE_CORNERS};
+use nativeres_core::ge_depth_stream::{RawDrawVertices, SkinRounding};
+
+/// Index runs of a draw that `Draws::ge_depth_stream` keeps apart (more:
+/// one range from the lowest to the highest vertex).
+const GE_DEPTH_RANGES: usize = 256;
+
+/// Cached scratch for `Draws::ge_depth_stream`'s copies out of PSP RAM.
+const GE_DEPTH_SCRATCH_BYTES: usize = 16 * 1024;
+#[repr(align(16))]
+struct GeDepthScratch([u8; GE_DEPTH_SCRATCH_BYTES]);
+static GE_DEPTH_SCRATCH: SingleThreaded<GeDepthScratch> = SingleThreaded::new(GeDepthScratch([0; GE_DEPTH_SCRATCH_BYTES]));
 use crate::render_stats::stats;
 use crate::{basic_programs, render_log, sys, SingleThreaded};
 
@@ -1594,6 +1605,129 @@ impl Draws {
     /// rest) and skin where uSkin.x is 1; the one-bone programs get bone 0
     /// and add uSkin.z to the weight, so formats without weights get weight 1
     /// and the identity.
+    /// The GE depth stream of a raw draw for the GE_DEPTH programs (their
+    /// aGeDepth, vertex stream 1; core ge_depth_stream.rs): one float per
+    /// vertex the draw uses, in the frame pool, worked out here once per
+    /// vertex instead of by the program once per index (`GE_DEPTH_CPU`).
+    /// `bytes`: the draw's vertices from vertex 0 (what stream 0 reads).
+    /// Returns the stream's address for vertex 0: it may lie before the
+    /// block, as only the used vertices from the lowest on are kept (the
+    /// GPU reads only those). Null if the frame pool is full.
+    #[allow(clippy::too_many_arguments)]
+    fn ge_depth_stream(
+        &mut self,
+        frame: &Frame,
+        draw: &Draw,
+        variant: RawVariant,
+        (transform, camera): (&RawTransform, &RawCamera),
+        bytes: &[u8],
+        uncached: bool,
+        indices: *const u16,
+        index_count: u32,
+    ) -> *const c_void {
+        let start = draw_clock();
+        // The vertices the draw uses: its runs' ranges, or its index list.
+        let mut ranges = [(0u32, 0u32); GE_DEPTH_RANGES];
+        let mut range_count = 0;
+        let (mut lowest, mut end) = (u32::MAX, 0u32);
+        let first_run = draw.first_index as usize;
+        let runs = (draw.flags & draw_flags::INDEX_RUNS != 0)
+            .then(|| frame.indices.get(first_run..first_run + draw.index_count as usize))
+            .flatten();
+        if let Some(runs) = runs {
+            for run in runs.chunks_exact(3) {
+                if run[1] != 0 && run[0] as u32 != nativeres_core::command::primitive::RECTANGLES {
+                    lowest = lowest.min(run[2] as u32);
+                    end = end.max(run[2] as u32 + run[1] as u32);
+                }
+            }
+            if runs.len() / 3 <= GE_DEPTH_RANGES {
+                range_count = nativeres_core::ge_depth_stream::run_ranges(runs, &mut ranges);
+            }
+        } else if index_count > 0 {
+            // Safe: the draw's index buffer (draw_indices), index_count long.
+            let list = unsafe { core::slice::from_raw_parts(indices, index_count as usize) };
+            for &index in list {
+                lowest = lowest.min(index as u32);
+                end = end.max(index as u32 + 1);
+            }
+        }
+        if lowest >= end {
+            return null();
+        }
+        if range_count == 0 {
+            ranges[0] = (lowest, end); // all of them (gaps worked out too)
+            range_count = 1;
+        }
+        let block = frame_pool_alloc((end - lowest) * GE_DEPTH_STRIDE, 4) as *mut f32;
+        if block.is_null() {
+            return null();
+        }
+        // Safe: the block just allocated, end - lowest floats.
+        let values = unsafe { core::slice::from_raw_parts_mut(block, (end - lowest) as usize) };
+        let mode = GE_DEPTH_CPU.load(Ordering::Relaxed);
+        if mode == 0 {
+            values.fill(nativeres_core::ge_depth_stream::ON_GPU);
+        } else {
+            // The bones the program skins with (as set_raw_bones: none when
+            // it doesn't skin, which the one-bone identity equals).
+            let weight_type = (draw.vertex_format >> 9) & 3;
+            let bone_count = (((draw.vertex_format >> 14) & 7) + 1).min(variant.bones());
+            let first = draw.bones as usize;
+            let wanted = 12 * bone_count as usize;
+            let skinned = draw.bones != 0 && weight_type != 0 && first - 1 + wanted <= (frame.bone_float_count as usize).min(frame.bone_floats.len());
+            let bones: &[f32] = if skinned { &frame.bone_floats[first - 1..first - 1 + wanted] } else { &[] };
+            let vertices = RawDrawVertices::new(bytes, draw.vertex_format, bones);
+            let inputs = nativeres_core::ge_depth_stream::GeDepthInputs::new(transform, camera);
+            let rounding = if mode == 2 { SkinRounding::SingleRounding } else { SkinRounding::Sequential };
+            let stride = vertices.layout.size as usize;
+            let ranges = &ranges[..range_count];
+            for &(first, range_end) in ranges {
+                stats().ge_depth_vertices += range_end - first;
+            }
+            if !uncached {
+                for &(first, range_end) in ranges {
+                    vertices.fill(first, &mut values[(first - lowest) as usize..(range_end - lowest) as usize], &inputs, rounding);
+                }
+            } else {
+                // PSP RAM is uncached for the CPU and costs per load, not
+                // per byte (~5 MB/s a word at a time): the draw's whole
+                // vertex span comes over in VLDM bursts (platform psp_copy,
+                // ~160 MB/s) into cached scratch, a part at a time, gaps
+                // between runs included (one long copy beats many short
+                // ones: GoW's runs are ~6 vertices).
+                // Safe: display thread only; the reference ends in this block.
+                let scratch = unsafe { &mut GE_DEPTH_SCRATCH.get().0 };
+                let per_part = ((GE_DEPTH_SCRATCH_BYTES - 4) / stride.max(1)) as u32;
+                let mut at = lowest;
+                while at < end {
+                    let count = (end - at).min(per_part).max(1);
+                    let start = at as usize * stride;
+                    let lead = (bytes.as_ptr() as usize + start) & 3; // copied from a word boundary
+                    let size = (count as usize * stride + lead).min(bytes.len().saturating_sub(start) + lead).min(GE_DEPTH_SCRATCH_BYTES);
+                    // Safe: `size` bytes from a word boundary at or before
+                    // vertex `at`, inside `bytes` (clamped) but for the up to
+                    // 3 lead bytes before it, which lie in the same block.
+                    unsafe { crate::platform::psp_copy(scratch.as_mut_ptr(), bytes.as_ptr().add(start - lead), size as u32) };
+                    let part = RawDrawVertices::new(&scratch[lead..size], draw.vertex_format, bones);
+                    // The ranges' vertices in this part.
+                    let part_end = at + count;
+                    for &(first, range_end) in ranges {
+                        let (from, to) = (first.max(at), range_end.min(part_end));
+                        if from < to {
+                            part.fill(from - at, &mut values[(from - lowest) as usize..(to - lowest) as usize], &inputs, rounding);
+                        }
+                    }
+                    at = part_end;
+                }
+            }
+        }
+        stats().ge_depth_draws += 1;
+        stats().ge_depth_us += draw_clock().wrapping_sub(start);
+        // Vertex 0's place: `lowest` floats before the block.
+        block.cast::<u8>().wrapping_sub((lowest * GE_DEPTH_STRIDE) as usize) as *const c_void
+    }
+
     fn set_raw_bones(&mut self, frame: &Frame, draw: &Draw, buffer: *mut c_void, skinning: &RawSkinning) {
         const WEIGHT_SCALES: [f32; 4] = [1.0, 1.0 / 128.0, 1.0 / 32768.0, 1.0];
         const IDENTITY_ROWS: [f32; 12] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
@@ -1982,6 +2116,8 @@ impl Draws {
         let mut check_tail = 0u32;
         let checks = DRAW_CHECKS.load(Ordering::Relaxed) != 0;
         let mut sprite_stride = 0u32;
+        // The GE_DEPTH programs' second stream (aGeDepth), null for the others.
+        let mut ge_depths: *const c_void = null();
         if !fragment.is_null() && draw.flags & draw_flags::RAW_VERTICES != 0 {
             // Raw PSP vertices in the raw arena or PSP RAM: drawn from there as they are.
             sprites = draw.flags & draw_flags::RAW_SPRITES != 0;
@@ -2073,6 +2209,23 @@ impl Draws {
                 out = unsafe { frame.raw_vertices.add(draw.first_vertex as usize) } as *const c_void;
                 check_region = RAW_ARENA.load(Ordering::Relaxed);
                 check_region_bytes = RAW_ARENA_BYTES.load(Ordering::Relaxed);
+            }
+            if let RawSetChoice::Raw(variant, color) = set {
+                if self.programs.raw_set(variant, color).reads_ge_depth() {
+                    // What stream 0 reads, from vertex 0 to the end of its block.
+                    let available = if in_psp_ram {
+                        let ram = arenas::PSP_RAM_FOR_GPU.load(Ordering::Acquire);
+                        arenas::PSP_RAM_FOR_GPU_BYTES.load(Ordering::Acquire) as usize - (out as usize - ram as usize)
+                    } else {
+                        (frame.raw_vertices_len - draw.first_vertex) as usize
+                    };
+                    // Safe: `out` and the bytes after it lie in the block checked above.
+                    let bytes = unsafe { core::slice::from_raw_parts(out as *const u8, available) };
+                    ge_depths = self.ge_depth_stream(frame, draw, variant, blocks, bytes, in_psp_ram, indices, index_count);
+                    if ge_depths.is_null() {
+                        return; // the frame pool is full
+                    }
+                }
             }
             // The format's stride only where needed (layout() is not free).
             let stride = if sprites || checks { VertexFormat(draw.vertex_format).layout().size } else { 0 };
@@ -2232,6 +2385,9 @@ impl Draws {
         // programs set above.
         unsafe {
             gxm::sceGxmSetVertexStream(context(), 0, out);
+            if !ge_depths.is_null() {
+                gxm::sceGxmSetVertexStream(context(), 1, ge_depths);
+            }
             if sprites {
                 // B one stride after A; the corner numbers (SpriteSet::program_for).
                 gxm::sceGxmSetVertexStream(context(), 1, (out as *const u8).add(sprite_stride as usize) as *const c_void);
@@ -2866,6 +3022,15 @@ fn set_raw_uniforms(
 /// Debug `gedepth 0|1`: 0 gives the GE_DEPTH programs w 0, so they take
 /// their float depth (1, default: the GE's depth).
 pub static GE_DEPTH_ON: AtomicU8 = AtomicU8::new(1);
+
+/// Debug `gedepthcpu 0|1|2`: who works out the GE_DEPTH programs' GE depth
+/// (core ge_depth_stream.rs). 0: the program, per index (the old way);
+/// 1: the display thread once per vertex, skinning in sequential f32 steps;
+/// 2: the same, each bone row's dot product rounded once. Both 1 and 2 give
+/// the program's pictures (0 px in GoW gameplay) and -35 ms GPU, but cost the
+/// display thread ~77 ms a gameplay frame (generic per-vertex code, ~1,000
+/// instructions): 0 by default until that is cut (DESIGN "sixty-ninth session").
+pub static GE_DEPTH_CPU: AtomicU8 = AtomicU8::new(0);
 
 /// The last transform and camera `ge_depth_uniforms` combined, and the result.
 struct GeDepthCache {

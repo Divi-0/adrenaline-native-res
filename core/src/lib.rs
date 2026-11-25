@@ -48,6 +48,7 @@ pub mod frame_gate;
 pub mod frame_pool;
 pub mod game_fps;
 pub mod game_quirks;
+pub mod ge_depth_stream;
 pub mod ge_math;
 pub mod ge_context;
 pub mod ge_state;

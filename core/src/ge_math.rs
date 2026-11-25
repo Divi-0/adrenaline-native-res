@@ -311,15 +311,71 @@ pub mod integer {
     /// low now and then (a device test of the program, 2026-11-24).
     fn float24_of(sum: i32, weight: i32) -> f32 {
         let a = sum.abs();
-        let mut length = 1;
-        for b in 1..24 {
-            if a >= 1 << b {
-                length = b + 1;
-            }
-        }
+        // The leading bit's place + 1 (1 for 0 and 1, at most 24), as the
+        // program's 23 comparisons (`GdFloat24Of`) find it.
+        let length = (32 - a.leading_zeros() as i32).clamp(1, 24);
         let m16 = if length > 16 { a >> (length - 16) } else { a << (16 - length) };
         let sign = if sum < 0 { i32::MIN } else { 0 };
         float(sign | ((weight + length - 1 + 127) << 23) | ((m16 & 32767) << 8))
+    }
+
+    /// `Prepared::screen_z` is `screen_z`, bit for bit: random columns and
+    /// models over wide exponent ranges, with zeros, denormals and huge values.
+    #[test]
+    fn prepared_is_screen_z() {
+        let mut state = 0x2468_ACE1u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        let mut value = |next: &mut dyn FnMut() -> u32| -> f32 {
+            match next() % 16 {
+                0 => 0.0,
+                1 => f32::from_bits(next() & 0x807F_FFFF), // denormal or zero
+                2 => f32::from_bits((next() & 0x80FF_FFFF) | 0x7E00_0000), // huge
+                _ => {
+                    let exponent = 127 + (next() % 40) as i32 - 20;
+                    f32::from_bits((next() & 0x807F_FFFF) | ((exponent as u32) << 23))
+                }
+            }
+        };
+        let mut with_depth = 0;
+        for round in 0..200_000 {
+            let column_z = [value(&mut next), value(&mut next), value(&mut next), value(&mut next)];
+            let column_w = [value(&mut next), value(&mut next), value(&mut next), value(&mut next)];
+            let scale = truncate24(value(&mut next));
+            let center = truncate24(f32::from_bits(next() % 0x4780_0000));
+            let prepared = Prepared::new(column_z, column_w, scale, center);
+            for _ in 0..4 {
+                let model = [value(&mut next), value(&mut next), value(&mut next)];
+                let expected = screen_z(model, column_z, column_w, scale, center);
+                let got = prepared.screen_z(model);
+                assert_eq!(got.map(f32::to_bits), expected.map(f32::to_bits), "round {round}: {model:?} {column_z:?} {column_w:?} {scale} {center}");
+                with_depth += expected.is_some() as u32;
+            }
+        }
+        assert!(with_depth > 100_000, "{with_depth}");
+    }
+
+    /// `float24_of`'s leading-bit length equals the program's 23
+    /// comparisons for every magnitude up to 2^25 (and some beyond).
+    #[test]
+    fn length_is_the_programs() {
+        let by_comparisons = |a: i32| {
+            let mut length = 1;
+            for b in 1..24 {
+                if a >= 1 << b {
+                    length = b + 1;
+                }
+            }
+            length
+        };
+        let samples = (0..1 << 25).step_by(7).chain([0, 1, 2, 3, 1 << 23, (1 << 24) - 1, 1 << 24, 1 << 30, i32::MAX]);
+        for a in samples {
+            assert_eq!((32 - a.leading_zeros() as i32).clamp(1, 24), by_comparisons(a), "{a}");
+        }
     }
 
     /// The four terms of a clip row (for device tests of the programs).
@@ -379,6 +435,69 @@ pub mod integer {
         float(ba) + float(bb)
     }
 
+    /// `screen_z` for many vertices of one transform (core
+    /// ge_depth_stream.rs, once per raw vertex): what the columns give to
+    /// each product worked out once, and each model coordinate's bits taken
+    /// apart once for both rows. The same arithmetic as `screen_z` step by
+    /// step (test `prepared_is_screen_z`).
+    #[derive(Clone, Copy, Debug)]
+    pub struct Prepared {
+        z: PreparedRow,
+        w: PreparedRow,
+        scale: f32,
+        center: f32,
+    }
+
+    /// A clip row's columns as `product` takes them apart: per model
+    /// coordinate (fraction bits, exponent, sign bit) with exponent 0 for
+    /// "no term", and the translation's term (`product(1.0, column[3])`).
+    #[derive(Clone, Copy, Debug)]
+    struct PreparedRow {
+        factors: [(i32, i32, i32); 3],
+        translation: (i32, i32),
+    }
+
+    impl PreparedRow {
+        fn new(column: [f32; 4]) -> Self {
+            let factor = |value: f32| {
+                let b = bits(value);
+                ((b >> 8) & 32767, (b >> 23) & 255, b & i32::MIN)
+            };
+            PreparedRow { factors: [factor(column[0]), factor(column[1]), factor(column[2])], translation: product(1.0, column[3]) }
+        }
+
+        /// `clip(model, column)` from the model's parts (`model_parts`).
+        fn clip(&self, parts: &[(i32, i32, i32); 3]) -> f32 {
+            let term = |k: usize| {
+                let (fa, ea, sa) = parts[k];
+                let (fb, eb, sb) = self.factors[k];
+                if ea == 0 || eb == 0 {
+                    return NONE;
+                }
+                let m = 32768 + fa + fb + ((fa * fb) >> 15);
+                (if (sa ^ sb) != 0 { -m } else { m }, ea + eb - 269)
+            };
+            row_sum([term(0), term(1), term(2), self.translation])
+        }
+    }
+
+    impl Prepared {
+        pub fn new(column_z: [f32; 4], column_w: [f32; 4], scale: f32, center: f32) -> Self {
+            Prepared { z: PreparedRow::new(column_z), w: PreparedRow::new(column_w), scale, center }
+        }
+
+        /// `screen_z(model, column_z, column_w, scale, center)`.
+        #[inline]
+        pub fn screen_z(&self, model: [f32; 3]) -> Option<f32> {
+            // Each coordinate truncated to a float24, taken apart as `product` does.
+            let parts = model.map(|value| {
+                let b = bits(truncate24(value));
+                ((b >> 8) & 32767, (b >> 23) & 255, b & i32::MIN)
+            });
+            depth_of(truncate24(self.z.clip(&parts)), truncate24(self.w.clip(&parts)), self.scale, self.center).0
+        }
+    }
+
     /// `super::screen_z` in integer steps; `None` where it gives none.
     pub fn screen_z(model: [f32; 3], column_z: [f32; 4], column_w: [f32; 4], scale: f32, center: f32) -> Option<f32> {
         screen_z_steps(model, column_z, column_w, scale, center).0
@@ -387,9 +506,15 @@ pub mod integer {
     /// `screen_z` and its intermediates (for device tests of the programs):
     /// clip z bits, clip w bits, q, scaled bits, sum bits.
     pub fn screen_z_steps(model: [f32; 3], column_z: [f32; 4], column_w: [f32; 4], scale: f32, center: f32) -> (Option<f32>, [i32; 5]) {
-        let mut steps = [0i32; 5];
         let z = truncate24(clip(model, column_z));
         let w = truncate24(clip(model, column_w));
+        depth_of(z, w, scale, center)
+    }
+
+    /// The screen depth from clip z and w (float24s): `screen_z_steps`
+    /// from the clip rows on.
+    fn depth_of(z: f32, w: f32, scale: f32, center: f32) -> (Option<f32>, [i32; 5]) {
+        let mut steps = [0i32; 5];
         steps[0] = bits(z);
         steps[1] = bits(w);
         let ew = (bits(w) >> 23) & 255;

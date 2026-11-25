@@ -26,6 +26,8 @@
 //   2..4): 0 none, 4 5650, 5 5551, 6 4444, 7 8888.
 // aNormal: the raw normal (s8, s16 or float, as numbers; (byte 0..2) for
 //   formats without one, unused then): only for lighting 3.
+// aGeDepth (GE_DEPTH only): the GE's depth of the vertex from the CPU, a
+//   second vertex stream (core ge_depth_stream.rs; see GE_DEPTH below).
 // aWeights0, aWeights1: the raw skinning weights 1-4 and 5-8 (u8, u16 or
 //   float; read from byte 0 for formats with fewer, unused then: their bones
 //   are zero). uSkin: x > 0.5 = skinned (frame.rs Draw::bones), y = what the
@@ -403,6 +405,9 @@ void main(
 #ifndef RAW_NO_LIGHTS
 	float3 aNormal,
 #endif
+#ifdef GE_DEPTH
+	float aGeDepth,
+#endif
 	uniform float4x4 wvp,
 	uniform float4 uWorld[3],
 	uniform float4 uView[3],
@@ -506,10 +511,19 @@ void main(
 	float farSide = uDepth.y >= 0.0f ? 1.0f : -1.0f;
 	float pspDepth = floor(saturate(uDepth.x + uDepth.y * clip.z / max(clip.w, 1.0e-6f)) * 65535.0f);
 #ifdef GE_DEPTH
-	// The GE's own depth of the model position (GE_DEPTH above).
-	float2 geDepth = GdScreenZ(position, uGeZ, uGeW, uGeDepth);
-	if (geDepth.y > 0.5f)
-		pspDepth = geDepth.x;
+	// The GE's own depth of the model position (GE_DEPTH above), worked out
+	// by the CPU once per vertex (core ge_depth_stream.rs: aGeDepth 0..65535;
+	// -1: the GE gives none, the float depth stands in) or here (-2, the old
+	// way: debug `gedepthcpu 0`). A real branch: vertices with the CPU's
+	// depth skip GdScreenZ's ~700 instructions.
+	if (aGeDepth > -1.5f) {
+		if (aGeDepth >= 0.0f)
+			pspDepth = aGeDepth;
+	} else {
+		float2 geDepth = GdScreenZ(position, uGeZ, uGeW, uGeDepth);
+		if (geDepth.y > 0.5f)
+			pspDepth = geDepth.x;
+	}
 #endif
 	vDepth = float2(farSide > 0.0f ? 65535.0f - pspDepth : pspDepth, farSide) * clip.w;
 #endif

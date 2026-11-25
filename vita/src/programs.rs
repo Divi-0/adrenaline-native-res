@@ -487,6 +487,9 @@ impl core::fmt::Display for Label {
     }
 }
 
+/// Bytes per vertex of the GE depth stream (aGeDepth: one f32).
+pub const GE_DEPTH_STRIDE: u32 = 4;
+
 /// A raw program (nativeres_raw_v.cg or a variant) and its programs per PSP
 /// vertex format.
 pub struct RawSet {
@@ -504,6 +507,10 @@ pub struct RawSet {
     weights1: *const ProgramParameter,
     /// The one-bone programs' first weight (aWeight).
     weight: *const ProgramParameter,
+    /// aGeDepth: the GE's depth of each vertex from the CPU, a second
+    /// stream (`GE_DEPTH_STRIDE`; core ge_depth_stream.rs). Only in the
+    /// GE_DEPTH programs (God of War's PSP-depth twins), else null.
+    ge_depth: *const ProgramParameter,
     pub uniforms: RawUniforms,
     pub lights: *const ProgramParameter,
     pub skin: *const ProgramParameter,
@@ -1039,6 +1046,7 @@ impl RawSet {
             weights0: null(),
             weights1: null(),
             weight: null(),
+            ge_depth: null(),
             uniforms: RawUniforms::NONE,
             lights: null(),
             skin: null(),
@@ -1075,6 +1083,7 @@ impl RawSet {
         self.weights0 = parameter(program, b"aWeights0\0");
         self.weights1 = parameter(program, b"aWeights1\0");
         self.weight = parameter(program, b"aWeight\0");
+        self.ge_depth = parameter(program, b"aGeDepth\0");
         self.skin = parameter(program, b"uSkin\0");
         self.bones = parameter(program, b"uBones\0");
         self.scale = parameter(program, b"uScale\0");
@@ -1106,6 +1115,12 @@ impl RawSet {
         true
     }
 
+    /// Whether this set's programs read the GE depth stream (aGeDepth,
+    /// vertex stream 1): the GE_DEPTH twins.
+    pub fn reads_ge_depth(&mut self) -> bool {
+        self.ready() && !self.ge_depth.is_null()
+    }
+
     /// The program patched for VERTEX_TYPE `format`, made at its first use;
     /// null if it can't be made. VERTEX_TYPE fields: texture coordinates
     /// bits 0-1 (none, u8, u16, float), colour bits 2-4 (4 5650, 5 5551,
@@ -1134,7 +1149,7 @@ impl RawSet {
         let weights1_offset = if weights > 4 { 4 * WEIGHT_SIZES[weight_type] } else { 0 };
         let weights1_format = if weights > 4 { WEIGHT_FORMATS[weight_type] } else { gxm::ATTRIBUTE_FORMAT_U8 };
         let position = attribute(0, layout.position_offset, POSITION_FORMATS[((format >> 7) & 3) as usize], 3, self.position);
-        let mut attributes = [position; 7];
+        let mut attributes = [position; 8];
         attributes[1] = attribute(0, texcoord_offset, texcoord_format, 2, self.texcoord);
         let mut used = 2;
         if self.color.reads_bytes() {
@@ -1163,11 +1178,20 @@ impl RawSet {
             attributes[used] = attribute(0, normal_offset, POSITION_FORMATS[((format >> 5) & 3) as usize], 3, self.normal);
             used += 1;
         }
-        let stream = [VertexStream { stride: layout.size as u16, index_source: gxm::INDEX_SOURCE_INDEX_16BIT }];
+        let vertices = VertexStream { stride: layout.size as u16, index_source: gxm::INDEX_SOURCE_INDEX_16BIT };
+        let mut streams = [vertices, vertices];
+        let mut stream_count = 1;
+        if !self.ge_depth.is_null() {
+            // Stream 1: one float per vertex, indexed like the vertices.
+            attributes[used] = attribute(1, 0, gxm::ATTRIBUTE_FORMAT_F32, 1, self.ge_depth);
+            used += 1;
+            streams[1] = VertexStream { stride: GE_DEPTH_STRIDE as u16, index_source: gxm::INDEX_SOURCE_INDEX_16BIT };
+            stream_count = 2;
+        }
         let program = vertex_program(
             self.id,
             &attributes[..used],
-            &stream,
+            &streams[..stream_count],
             format_args!("raw program{} for format {:08x}", self.label(), format),
         );
         if !program.is_null() {

@@ -141,6 +141,12 @@ pub struct RenderStats {
     pub strip_draws: u32,
     pub strip_indices: u32,
     pub strip_corners: u32,
+    /// Raw draws whose GE depth the CPU worked out (`gedepthcpu`, core
+    /// ge_depth_stream.rs), its vertices, and the display thread's time on
+    /// it (with `drawtiming 1` only, else 0).
+    pub ge_depth_draws: u32,
+    pub ge_depth_vertices: u32,
+    pub ge_depth_us: u64,
     /// The display thread's time finding them (vertex alphas read).
     pub opaque_us: u64,
     /// Raw draws left out: no vertex program for their format (all
@@ -222,6 +228,9 @@ impl RenderStats {
         strip_draws: 0,
         strip_indices: 0,
         strip_corners: 0,
+        ge_depth_draws: 0,
+        ge_depth_vertices: 0,
+        ge_depth_us: 0,
         opaque_us: 0,
         lookup_us: 0,
         palette_us: 0,
@@ -308,7 +317,7 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
     );
     let _ = write!(
         text,
-        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} point_light_draws={} fixed_color_draws={} fix_b_draws={} cut_draws={} cut_fast_draws={} cut_off_draws={} wide_draws={} opaque_draws={} opaque_untested_draws={} opaque_rows_draws={} hidden_draws={} depth_only_draws={} hidden={}us flat_draws={} ge_filter_draws={} ge_wide_draws={} ge_wide_missed={} ge_wide_inexact={} wide_target_textures={} wide_copies={} wide_copy_scenes={} black_draws={} black_culled={} black_kept={} black_skipped={} strip_draws={} strip_indices={} strip_corners={} opaque={}us ",
+        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} point_light_draws={} fixed_color_draws={} fix_b_draws={} cut_draws={} cut_fast_draws={} cut_off_draws={} wide_draws={} opaque_draws={} opaque_untested_draws={} opaque_rows_draws={} hidden_draws={} depth_only_draws={} hidden={}us flat_draws={} ge_filter_draws={} ge_wide_draws={} ge_wide_missed={} ge_wide_inexact={} wide_target_textures={} wide_copies={} wide_copy_scenes={} black_draws={} black_culled={} black_kept={} black_skipped={} strip_draws={} strip_indices={} strip_corners={} ge_depth_draws={} ge_depth_vertices={} ge_depth={}us opaque={}us ",
         per_frame(s.begin_us),
         per_frame(s.loop_us),
         per_frame(s.convert_us),
@@ -349,6 +358,9 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
         s.strip_draws / frames,
         s.strip_indices / frames,
         s.strip_corners / frames,
+        s.ge_depth_draws / frames,
+        s.ge_depth_vertices / frames,
+        per_frame(s.ge_depth_us),
         per_frame(s.opaque_us)
     );
     let _ = write!(
