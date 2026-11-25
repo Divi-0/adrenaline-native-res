@@ -2229,7 +2229,7 @@ struct RunColor<'a> {
 }
 
 impl RunColor<'_> {
-    #[inline]
+    #[inline(always)]
     fn of(&self, color: Option<u32>) -> u32 {
         self.prepared.frame_color(self.prepared.base_color(color, self.material_color))
     }
@@ -3394,14 +3394,16 @@ struct RunDecode<'a> {
 #[inline(never)]
 fn decode_run(geometry: &mut Geometry, decoding: &RunDecode, words: &[u32], gpu_transform: bool, rows: &RowTransform) -> Run {
     let RunDecode { used, skew, stride, first_vertex, format, layout, transform, direct, common, gpu_lit, color } = *decoding;
-    let color_of = |raw: Option<u32>| color.of(raw);
-    let color_of = &color_of;
+    // The colour by a plain type, not a closure: in this one big function
+    // LLVM outlined a colour closure, a call per vertex (GoW recorder +1 ms,
+    // 2026-11-25); `RunColor::of` is always inlined.
+    let run_color = &color;
     let run = RunInput { words, used, skew, stride, first_vertex };
     if let Some(common) = direct {
         return if gpu_transform {
-            store_direct_run_as::<true>(geometry, &run, format, transform, rows, &common, color_of)
+            store_direct_run_as::<true>(geometry, &run, format, transform, rows, &common, run_color)
         } else {
-            store_direct_run_as::<false>(geometry, &run, format, transform, rows, &common, color_of)
+            store_direct_run_as::<false>(geometry, &run, format, transform, rows, &common, run_color)
         };
     }
     if gpu_transform && gpu_lit {
@@ -3409,16 +3411,16 @@ fn decode_run(geometry: &mut Geometry, decoding: &RunDecode, words: &[u32], gpu_
     }
     if let Some(lighting) = &transform.vertex_lighting() {
         return if gpu_transform {
-            store_lit_run::<true>(geometry, &run, format, layout, transform, rows, lighting, color_of)
+            store_lit_run::<true>(geometry, &run, format, layout, transform, rows, lighting, run_color)
         } else {
-            store_lit_run::<false>(geometry, &run, format, layout, transform, rows, lighting, color_of)
+            store_lit_run::<false>(geometry, &run, format, layout, transform, rows, lighting, run_color)
         };
     }
     // One loop per decoder (each call is inlined and compiled on its own).
     if gpu_transform {
-        store_decoded_run::<true>(geometry, &run, format, layout, common, transform, rows, color_of)
+        store_decoded_run::<true>(geometry, &run, format, layout, common, transform, rows, run_color)
     } else {
-        store_decoded_run::<false>(geometry, &run, format, layout, common, transform, rows, color_of)
+        store_decoded_run::<false>(geometry, &run, format, layout, common, transform, rows, run_color)
     }
 }
 
@@ -3446,7 +3448,7 @@ fn store_direct_run<const COLOR: u32, const SKINNED: bool, const GPU: bool>(
     transform: &Transform,
     rows: &RowTransform,
     common: &CommonLayout,
-    color_of: &impl Fn(Option<u32>) -> u32,
+    run_color: &RunColor,
 ) -> Run {
     let start = run.words.as_ptr() as *const u8;
     for index in 0..run.used as u32 {
@@ -3457,7 +3459,7 @@ fn store_direct_run<const COLOR: u32, const SKINNED: bool, const GPU: bool>(
             let vertex = start.add((run.skew + run.stride * index) as usize);
             (vertex, VertexFormat::read_common_unskinned::<COLOR>(vertex, common))
         };
-        let color = color_of(color);
+        let color = run_color.of(color);
         let screen = if SKINNED {
             // Safe: as above.
             let weight = unsafe { VertexFormat::read_first_weight(vertex) } as f32 * (1.0 / 128.0);
@@ -3548,17 +3550,17 @@ fn store_direct_run_as<const GPU: bool>(
     transform: &Transform,
     rows: &RowTransform,
     common: &CommonLayout,
-    color_of: &impl Fn(Option<u32>) -> u32,
+    run_color: &RunColor,
 ) -> Run {
     match (format.has_weights(), format.color_format_bits()) {
-        (false, 4) => store_direct_run::<4, false, GPU>(geometry, run, transform, rows, common, color_of),
-        (false, 5) => store_direct_run::<5, false, GPU>(geometry, run, transform, rows, common, color_of),
-        (false, 6) => store_direct_run::<6, false, GPU>(geometry, run, transform, rows, common, color_of),
-        (false, _) => store_direct_run::<0, false, GPU>(geometry, run, transform, rows, common, color_of),
-        (true, 4) => store_direct_run::<4, true, GPU>(geometry, run, transform, rows, common, color_of),
-        (true, 5) => store_direct_run::<5, true, GPU>(geometry, run, transform, rows, common, color_of),
-        (true, 6) => store_direct_run::<6, true, GPU>(geometry, run, transform, rows, common, color_of),
-        (true, _) => store_direct_run::<0, true, GPU>(geometry, run, transform, rows, common, color_of),
+        (false, 4) => store_direct_run::<4, false, GPU>(geometry, run, transform, rows, common, run_color),
+        (false, 5) => store_direct_run::<5, false, GPU>(geometry, run, transform, rows, common, run_color),
+        (false, 6) => store_direct_run::<6, false, GPU>(geometry, run, transform, rows, common, run_color),
+        (false, _) => store_direct_run::<0, false, GPU>(geometry, run, transform, rows, common, run_color),
+        (true, 4) => store_direct_run::<4, true, GPU>(geometry, run, transform, rows, common, run_color),
+        (true, 5) => store_direct_run::<5, true, GPU>(geometry, run, transform, rows, common, run_color),
+        (true, 6) => store_direct_run::<6, true, GPU>(geometry, run, transform, rows, common, run_color),
+        (true, _) => store_direct_run::<0, true, GPU>(geometry, run, transform, rows, common, run_color),
     }
 }
 
@@ -3571,9 +3573,9 @@ fn store_decoded_run<const GPU: bool>(
     common: Option<CommonLayout>,
     transform: &Transform,
     rows: &RowTransform,
-    color_of: &impl Fn(Option<u32>) -> u32,
+    run_color: &RunColor,
 ) -> Run {
-    let color = |_: &VertexBytes, raw: &Raw3d| Some(color_of(raw.color));
+    let color = |_: &VertexBytes, raw: &Raw3d| Some(run_color.of(raw.color));
     match (common, format.color_format_bits()) {
         (Some(common), 4) => store_run::<GPU>(geometry, run, transform, rows, color, |bytes| Some(VertexFormat::decode_common::<4>(bytes, &common))),
         (Some(common), 5) => store_run::<GPU>(geometry, run, transform, rows, color, |bytes| Some(VertexFormat::decode_common::<5>(bytes, &common))),
@@ -3714,12 +3716,12 @@ fn store_lit_run<const GPU: bool>(
     transform: &Transform,
     rows: &RowTransform,
     lighting: &VertexLighting,
-    color_of: &impl Fn(Option<u32>) -> u32,
+    run_color: &RunColor,
 ) -> Run {
     let has_normals = layout.normal_offset.is_some();
     let color = |bytes: &VertexBytes, raw: &Raw3d| {
         let normal = if has_normals { Some(format.decode_normal(bytes, layout)?) } else { None };
-        Some(color_of(Some(lighting.color(raw, normal))))
+        Some(run_color.of(Some(lighting.color(raw, normal))))
     };
     store_run::<GPU>(geometry, run, transform, rows, color, |bytes| format.decode_3d(bytes, layout))
 }
