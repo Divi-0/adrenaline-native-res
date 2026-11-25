@@ -444,13 +444,27 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
     if std::env::var_os("REPLAY_RUN_STATS").is_some() {
         let mut stats = std::collections::BTreeMap::<u16, (u32, u32, u32)>::new();
         let mut plain = (0u32, 0u32);
-        for draw in frame.draws() {
+        let per_draw = std::env::var("REPLAY_RUN_STATS").as_deref() == Ok("2");
+        for (index, draw) in frame.draws().iter().enumerate() {
             if draw.flags & draw_flags::INDEX_RUNS == 0 {
                 plain.0 += 1;
                 plain.1 += draw.index_count;
+                if per_draw {
+                    println!("run draw {index} flags {:x} runs 0 corners {} stitched 0", draw.flags, draw.index_count);
+                }
                 continue;
             }
             let runs = &frame.indices()[draw.first_index as usize..(draw.first_index + draw.index_count) as usize];
+            if per_draw {
+                let corners: u32 = runs.chunks_exact(3).map(|run| 3 * nativeres_core::frame::run_triangles(run[0], run[1])).sum();
+                let stitched = nativeres_core::frame::stitched_strip_count(runs).unwrap_or(0);
+                println!(
+                    "run draw {index} flags {:x} runs {} corners {corners} stitched {stitched} key tex={} fb={:x} blend={:x} tests={:x} sc={},{},{},{} fog={:x} fmt={:x} colors={} transform={} bones={} first={:x}",
+                    draw.flags, runs.len() / 3, draw.texture, draw.framebuffer, draw.blend, draw.tests,
+                    draw.scissor_left, draw.scissor_top, draw.scissor_right, draw.scissor_bottom,
+                    draw.fog_color, draw.vertex_format, draw.raw_colors, draw.transform, draw.bones, draw.first_vertex
+                );
+            }
             for run in runs.chunks_exact(3) {
                 let entry = stats.entry(run[0]).or_default();
                 entry.0 += 1;
@@ -463,7 +477,7 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
         }
         println!("run stats: draws without runs {} corners {}", plain.0, plain.1);
         // Raw draws of strips only, stitched as the Vita's `stripdraws`.
-        let (mut draws, mut stitched, mut corners) = (0u32, 0u32, 0u32);
+        let (mut draws, mut stitched, mut corners, mut unique, mut slots) = (0u32, 0u32, 0u32, 0u32, 0u32);
         for draw in frame.draws() {
             if draw.flags & draw_flags::INDEX_RUNS == 0 || draw.flags & draw_flags::RAW_VERTICES == 0 {
                 continue;
@@ -475,8 +489,17 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
             draws += 1;
             corners += runs.chunks_exact(3).map(|run| 3 * nativeres_core::frame::run_triangles(run[0], run[1])).sum::<u32>();
             stitched += nativeres_core::frame::stitched_strip_count(runs).unwrap_or(0);
+            // Vertices the draw's runs use, each once (runs are ranges of vertices).
+            let mut used: Vec<(u32, u32)> = runs.chunks_exact(3).map(|run| (run[2] as u32, run[2] as u32 + run[1] as u32)).collect();
+            used.sort_unstable();
+            let mut end = 0u32;
+            for (first, last) in used {
+                unique += last.saturating_sub(first.max(end));
+                end = end.max(last);
+            }
+            slots += draw.vertex_count;
         }
-        println!("run stats: strip-only raw draws {draws} stitched indices {stitched} corners {corners}");
+        println!("run stats: strip-only raw draws {draws} stitched indices {stitched} corners {corners} unique vertices {unique} vertex slots {slots}");
     }
     if FRAG_STATS.with(|on| *on) {
         FRAG_COUNTS.with(|counts| {

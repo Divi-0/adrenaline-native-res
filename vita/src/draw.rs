@@ -2239,6 +2239,7 @@ impl Draws {
             }
             let primitive = self.index_primitive;
             note_draw_result(gxm::sceGxmDraw(context(), primitive, gxm::INDEX_FORMAT_U16, indices as *const c_void, index_count));
+            nativeres_core::debug_hooks::call(nativeres_core::debug_hooks::Point::Draw, indices as u32, index_count | primitive);
             for _ in 0..DRAW_REPEAT.load(Ordering::Relaxed).clamp(0, 8) {
                 gxm::sceGxmDraw(context(), primitive, gxm::INDEX_FORMAT_U16, indices as *const c_void, index_count);
             }

@@ -19,6 +19,7 @@
 //! | `Texture` | texture worker refreshes a texture (`textures`) | `BEGIN`/`END` | 0 / begin's value | begin: a token |
 //! | `PartStart` | a measuring part of `cycles` starts | part | - | the value `PartEnd` gets |
 //! | `PartEnd` | that part ends | part | `PartStart`'s value (0: started before the hook) | - |
+//! | `Draw` | display thread, a textured frame draw just issued (`draw.rs`, after its `sceGxmDraw`) | index address | index count \| primitive type (bits 24..31) | - |
 //!
 //! Times are the process time in us (low 32 bits). A hook on `PartStart` /
 //! `PartEnd` takes over the `cycles` parts that are measured
@@ -35,9 +36,10 @@ pub enum Point {
     Texture,
     PartStart,
     PartEnd,
+    Draw,
 }
 
-pub const POINTS: usize = 7;
+pub const POINTS: usize = 8;
 /// `a` of a `span` point at its begin and end.
 pub const BEGIN: u32 = 0;
 pub const END: u32 = 1;
