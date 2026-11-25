@@ -39,6 +39,10 @@ thread_local! {
     static TIE_COUNTS: std::cell::RefCell<std::collections::BTreeMap<usize, u32>> = std::cell::RefCell::new(std::collections::BTreeMap::new());
     static CURRENT_DRAW: std::cell::Cell<usize> = std::cell::Cell::new(0);
     static TESTED: std::cell::Cell<u64> = std::cell::Cell::new(0);
+    // Debugging: REPLAY_FRAG_STATS=1 counts per draw [fragments, depth-tested
+    // against the untouched start depth 1.0, failing depth, failing stencil].
+    static FRAG_STATS: bool = std::env::var_os("REPLAY_FRAG_STATS").is_some();
+    static FRAG_COUNTS: std::cell::RefCell<std::collections::BTreeMap<usize, [u32; 4]>> = std::cell::RefCell::new(std::collections::BTreeMap::new());
     static FLOAT_DEPTH: std::cell::RefCell<std::collections::HashMap<usize, Vec<f32>>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
@@ -435,6 +439,57 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
     if black_texels {
         println!("black texels: {black_kept} triangles kept, {black_culled} culled");
     }
+    // Debugging: REPLAY_RUN_STATS=1: index runs per primitive type (raw draws):
+    // runs, vertices, triangles.
+    if std::env::var_os("REPLAY_RUN_STATS").is_some() {
+        let mut stats = std::collections::BTreeMap::<u16, (u32, u32, u32)>::new();
+        let mut plain = (0u32, 0u32);
+        for draw in frame.draws() {
+            if draw.flags & draw_flags::INDEX_RUNS == 0 {
+                plain.0 += 1;
+                plain.1 += draw.index_count;
+                continue;
+            }
+            let runs = &frame.indices()[draw.first_index as usize..(draw.first_index + draw.index_count) as usize];
+            for run in runs.chunks_exact(3) {
+                let entry = stats.entry(run[0]).or_default();
+                entry.0 += 1;
+                entry.1 += run[1] as u32;
+                entry.2 += nativeres_core::frame::run_triangles(run[0], run[1]);
+            }
+        }
+        for (primitive, (runs, vertices, triangles)) in &stats {
+            println!("run stats: primitive {primitive} runs {runs} vertices {vertices} triangles {triangles} corners {}", 3 * triangles);
+        }
+        println!("run stats: draws without runs {} corners {}", plain.0, plain.1);
+        // Raw draws of strips only, stitched as the Vita's `stripdraws`.
+        let (mut draws, mut stitched, mut corners) = (0u32, 0u32, 0u32);
+        for draw in frame.draws() {
+            if draw.flags & draw_flags::INDEX_RUNS == 0 || draw.flags & draw_flags::RAW_VERTICES == 0 {
+                continue;
+            }
+            let runs = &frame.indices()[draw.first_index as usize..(draw.first_index + draw.index_count) as usize];
+            if runs.chunks_exact(3).any(|run| run[0] != 4) || runs.is_empty() {
+                continue;
+            }
+            draws += 1;
+            corners += runs.chunks_exact(3).map(|run| 3 * nativeres_core::frame::run_triangles(run[0], run[1])).sum::<u32>();
+            stitched += nativeres_core::frame::stitched_strip_count(runs).unwrap_or(0);
+        }
+        println!("run stats: strip-only raw draws {draws} stitched indices {stitched} corners {corners}");
+    }
+    if FRAG_STATS.with(|on| *on) {
+        FRAG_COUNTS.with(|counts| {
+            for (index, [fragments, at_start, depth_fails, stencil_fails]) in counts.borrow().iter() {
+                let draw = &frame.draws()[*index];
+                let address = frame.textures().get(draw.texture as usize).map_or(0, |texture| texture.address);
+                println!(
+                    "frag stats: draw {index} fragments {fragments} at_start_depth {at_start} depth_fail {depth_fails} stencil_fail {stencil_fails} fb {:08x} tex {address:08x} blend {:08x} tests {:x} flags {:x} verts {} idx {}",
+                    draw.framebuffer, draw.blend, draw.tests, draw.flags, draw.vertex_count, draw.index_count
+                );
+            }
+        });
+    }
     if TIE_STATS.with(|on| *on) {
         TIE_COUNTS.with(|counts| {
             let counts = counts.borrow();
@@ -733,6 +788,18 @@ fn draw_triangle(
                     if float_passes && depth_write {
                         buffer[index] = float_z;
                     }
+                });
+            }
+            if FRAG_STATS.with(|on| *on) {
+                let depth_fails = depth_test && !passes(depth_function, z, depth[index]);
+                let stencil_fails = !depth_fails && stencil.is_some_and(|state| !state.passes((screen[index] >> 24) as u8));
+                FRAG_COUNTS.with(|counts| {
+                    let mut counts = counts.borrow_mut();
+                    let entry = counts.entry(CURRENT_DRAW.with(|d| d.get())).or_insert([0; 4]);
+                    entry[0] += 1;
+                    entry[1] += (depth_test && depth[index] == 1.0) as u32;
+                    entry[2] += depth_fails as u32;
+                    entry[3] += stencil_fails as u32;
                 });
             }
             if depth_test && !passes(depth_function, z, depth[index]) {
