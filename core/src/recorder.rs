@@ -1045,7 +1045,7 @@ fn record_batch_vertices(
     calls: &[PrimCall],
     mut cache: Option<&mut VertexCache>,
 ) {
-    let color_of = |color: Option<u32>| prepared.frame_color(prepared.base_color(color, material_color));
+    let color_of = RunColor { prepared, material_color };
     let colors = prepared.color_key(material_color);
     // Raw PSP vertices for the GPU (`raw_arena`), where the draw allows it.
     let inputs = job_transform.inputs;
@@ -1075,7 +1075,7 @@ fn record_batch_vertices(
         let run = if prepared.texgen.is_some() {
             Run::NotHandled
         } else {
-            record_3d_run(geometry, memory, format, layout, transform, chunk, draw.first_vertex, &color_of, gpu)
+            record_3d_run(geometry, memory, format, layout, transform, chunk, draw.first_vertex, color_of, gpu)
         };
         crate::phase::recorder::leave(previous);
         match run {
@@ -1479,9 +1479,9 @@ fn record_on_cpu(
     // transform the whole run at once.
     if let Some(transform) = transform {
         if primitive_type != primitive::RECTANGLES && format.index_format() == IndexFormat::None && prepared.texgen.is_none() {
-            let run_color = |color: Option<u32>| frame_color(prepared.base_color(color, material_color));
+            let run_color = RunColor { prepared, material_color };
             let gpu = GpuRun { wanted: prepared.gpu_transform, cache, colors: prepared.color_key(material_color), lighting: prepared.gpu_lighting() };
-            match record_3d_run(geometry, memory, format, layout, transform, &[call], first_vertex, &run_color, gpu) {
+            match record_3d_run(geometry, memory, format, layout, transform, &[call], first_vertex, run_color, gpu) {
                 Run::Recorded { transform, cached } => {
                     draw.transform = transform;
                     draw.flags |= draw_flags::INDEX_RUNS;
@@ -2217,6 +2217,24 @@ pub(crate) fn triangle_count(primitive_type: u32, count: u32) -> u32 {
 /// alone (for measuring, `cycles::RUNS_QUICK`).
 static LAST_RUN_QUICK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// The frame colour of a run's vertex from its PSP colour (`None`: the
+/// material colour). One named type for every caller of `record_3d_run`,
+/// instead of a closure per caller: closures defined in functions generic
+/// over the PSP memory are a type of their own per memory type, and each
+/// such type compiled the run decoders (`decode_run`, ~35 KiB) once more.
+#[derive(Clone, Copy)]
+struct RunColor<'a> {
+    prepared: &'a Prepared,
+    material_color: u32,
+}
+
+impl RunColor<'_> {
+    #[inline]
+    fn of(&self, color: Option<u32>) -> u32 {
+        self.prepared.frame_color(self.prepared.base_color(color, self.material_color))
+    }
+}
+
 /// `record_3d_run_now`, measured by outcome (`cycles::RUNS_*`).
 #[allow(clippy::too_many_arguments)]
 fn record_3d_run(
@@ -2227,11 +2245,11 @@ fn record_3d_run(
     transform: &Transform,
     calls: &[PrimCall],
     first_vertex: u32,
-    color_of: &impl Fn(Option<u32>) -> u32,
+    color: RunColor,
     gpu: GpuRun,
 ) -> Run {
     let started = crate::cycles::start(crate::cycles::RUNS_CACHED);
-    let run = record_3d_run_now(geometry, memory, format, layout, transform, calls, first_vertex, color_of, gpu);
+    let run = record_3d_run_now(geometry, memory, format, layout, transform, calls, first_vertex, color, gpu);
     let quick = LAST_RUN_QUICK.load(core::sync::atomic::Ordering::Relaxed);
     let part = match run {
         Run::Recorded { cached: Some(_), .. } if quick => crate::cycles::RUNS_QUICK,
@@ -2252,7 +2270,7 @@ fn record_3d_run_now(
     transform: &Transform,
     calls: &[PrimCall],
     first_vertex: u32,
-    color_of: &impl Fn(Option<u32>) -> u32,
+    color: RunColor,
     gpu: GpuRun,
 ) -> Run {
     // All vertices up to the last PRIM's last whole triangle.
@@ -2302,31 +2320,9 @@ fn record_3d_run_now(
     // Single-weight formats likewise (MTX: most of its skinned vertices
     // hang on one bone with weight 1.0).
     let direct = common.filter(|_| (!format.has_weights() || format.weight_count() == 1) && skew % 2 == 0 && !lit);
+    let decoding = RunDecode { used, skew, stride, first_vertex, format, layout, transform, direct, common, gpu_lit: gpu_lit.is_some(), color };
     let decode_as = |geometry: &mut Geometry, words: &[u32], gpu_transform: bool, rows: &RowTransform| -> Run {
-        let run = RunInput { words, used, skew, stride, first_vertex };
-        if let Some(common) = direct {
-            return if gpu_transform {
-                store_direct_run_as::<true>(geometry, &run, format, transform, rows, &common, color_of)
-            } else {
-                store_direct_run_as::<false>(geometry, &run, format, transform, rows, &common, color_of)
-            };
-        }
-        if gpu_transform && gpu_lit.is_some() {
-            return store_gpu_lit_run(geometry, &run, format, layout, transform, rows);
-        }
-        if let Some(lighting) = &transform.vertex_lighting() {
-            return if gpu_transform {
-                store_lit_run::<true>(geometry, &run, format, layout, transform, rows, lighting, color_of)
-            } else {
-                store_lit_run::<false>(geometry, &run, format, layout, transform, rows, lighting, color_of)
-            };
-        }
-        // One loop per decoder (each call is inlined and compiled on its own).
-        if gpu_transform {
-            store_decoded_run::<true>(geometry, &run, format, layout, common, transform, rows, color_of)
-        } else {
-            store_decoded_run::<false>(geometry, &run, format, layout, common, transform, rows, color_of)
-        }
+        decode_run(geometry, &decoding, words, gpu_transform, rows)
     };
     // For the GPU if it can take the whole run (no vertex skinned on the
     // CPU, none behind the near plane), else the CPU's fast path as before.
@@ -3370,6 +3366,60 @@ enum RawPlace {
     Arena(u32),
     /// Left in PSP RAM (zero copy): the PSP address of its first vertex.
     PspRam(u32),
+}
+
+/// What `decode_run` needs of a run besides its memory and rows (worked
+/// out by `record_3d_run_now`).
+struct RunDecode<'a> {
+    used: usize,
+    skew: u32,
+    stride: u32,
+    first_vertex: u32,
+    format: VertexFormat,
+    layout: &'a VertexLayout,
+    transform: &'a Transform,
+    /// Fields read directly (`store_direct_run_as`).
+    direct: Option<CommonLayout>,
+    common: Option<CommonLayout>,
+    /// Lit on the GPU (`store_gpu_lit_run`) when transformed there.
+    gpu_lit: bool,
+    color: RunColor<'a>,
+}
+
+/// `record_3d_run_now`'s decoding of a run's words into the geometry, for
+/// the GPU (`gpu_transform`) or the CPU. Generic over nothing, and never
+/// inlined: the decoders it inlines (~35 KiB) are compiled once, not once
+/// per PSP memory type and caller (2026-11-25: 4 copies in the release
+/// plugin, 6 in the debug one).
+#[inline(never)]
+fn decode_run(geometry: &mut Geometry, decoding: &RunDecode, words: &[u32], gpu_transform: bool, rows: &RowTransform) -> Run {
+    let RunDecode { used, skew, stride, first_vertex, format, layout, transform, direct, common, gpu_lit, color } = *decoding;
+    let color_of = |raw: Option<u32>| color.of(raw);
+    let color_of = &color_of;
+    let run = RunInput { words, used, skew, stride, first_vertex };
+    if let Some(common) = direct {
+        return if gpu_transform {
+            store_direct_run_as::<true>(geometry, &run, format, transform, rows, &common, color_of)
+        } else {
+            store_direct_run_as::<false>(geometry, &run, format, transform, rows, &common, color_of)
+        };
+    }
+    if gpu_transform && gpu_lit {
+        return store_gpu_lit_run(geometry, &run, format, layout, transform, rows);
+    }
+    if let Some(lighting) = &transform.vertex_lighting() {
+        return if gpu_transform {
+            store_lit_run::<true>(geometry, &run, format, layout, transform, rows, lighting, color_of)
+        } else {
+            store_lit_run::<false>(geometry, &run, format, layout, transform, rows, lighting, color_of)
+        };
+    }
+    // One loop per decoder (each call is inlined and compiled on its own).
+    if gpu_transform {
+        store_decoded_run::<true>(geometry, &run, format, layout, common, transform, rows, color_of)
+    } else {
+        store_decoded_run::<false>(geometry, &run, format, layout, common, transform, rows, color_of)
+    }
 }
 
 /// Where a run's vertices are (see `record_3d_run`).
