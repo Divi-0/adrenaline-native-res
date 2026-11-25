@@ -185,6 +185,13 @@ mod tests {
         // Other parts stay off.
         cycles::add(cycles::WALK, cycles::start(cycles::WALK));
         assert!(taken().is_empty());
+        // A part that started before recording did (started = 0) ends
+        // without a span (2026-11-25, GoW: recorder jobs of "122 s").
+        TIMELINE.store(0, Ordering::Relaxed);
+        let before = cycles::start(cycles::JOBS);
+        TIMELINE.store(1 << cycles::JOBS, Ordering::Relaxed);
+        cycles::add(cycles::JOBS, before);
+        assert!(taken().is_empty());
 
         // No sink: nothing, and no crash.
         set(None, None);

@@ -216,7 +216,10 @@ pub fn add(part: usize, started: u32) {
 #[inline(never)]
 fn add_measured(part: usize, started: u32) {
     if crate::timeline::part_on(part) {
-        crate::timeline::emit(part as u32, started, crate::timeline::now_us());
+        // 0: the part started before it was on the timeline (no start time).
+        if started != 0 {
+            crate::timeline::emit(part as u32, started, crate::timeline::now_us());
+        }
         return;
     }
     let cycles = now().wrapping_sub(started);
