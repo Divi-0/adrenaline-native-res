@@ -215,107 +215,91 @@ float3 Ge8(float3 c)
 
 #ifdef GE_DEPTH
 // GE_DEPTH (with PSP_DEPTH; God of War's twins, psp_depth_twins.txt): the PSP
-// depth from the GE's own vertex arithmetic, in 32-bit integer steps exactly
-// as core ge_math::integer::screen_z (equal to ge_math::screen_z, the GE as
-// ppsspp-ref GEMath.h has it; device test debug "gedepthtest": 4096 of 4096
-// bit for bit, 2026-11-24). Float24s: floats with the low 8 mantissa bits
-// clear. uGeZ / uGeW: the combined world-view-projection matrix's clip z
-// and w columns as the GE combines it (ge_math::combined; rows x, y, z,
+// depth from the GE's own vertex arithmetic (float24s: floats with the low 8
+// mantissa bits clear; products cut at a fixed bit weight, a row's terms cut
+// to the largest's weight and summed, a table reciprocal, an adder without
+// guard bits: ppsspp-ref GEMath.h), step for step as core
+// ge_math::float_steps, which the PC tests equal to ge_math::integer::screen_z
+// and ge_math::screen_z. Device test debug "gedepthtest 1000..1005": 4096 of
+// 4096 bit for bit, the depth and five intermediates (2026-11-25).
+//
+// Float32 adds and multiplies and a few bit masks, no mantissa or exponent
+// bookkeeping (the 32-bit integer steps before this took 3.7 times the
+// instructions). Exact whatever way the GPU rounds, as long
+// as an add gives one of the two floats next to the true sum and an exact
+// result as it is (this GPU's adds mostly cut toward zero, its multiplies
+// round: debug "floattest"):
+// - every product is formed in two parts that fit 24 bits (one factor's top 8
+//   bits, and the rest), so no multiply rounds;
+// - GdCut rounds by (x + c) - c, then x - rounded (exact) tells which way;
+// - GdProduct24 takes the sum's rounding error (exact) the same way.
+// uGeZ / uGeW: the combined world-view-projection matrix's clip z and w
+// columns as the GE combines it (ge_math::combined; rows x, y, z,
 // translation), uGeDepth: x the viewport's depth scale, y its centre
-// (float24s). uRecip: the GE's reciprocal segments (start, slope; ge_math
-// RECIP), a uniform buffer of its own bound once (draw.rs). No int -> float
-// conversions of 17+ bit numbers: the GPU's are one low now and then
-// (gedepthtest stage 15), floats are made from bits (GdFloat24Of).
+// (float24s); what the program takes from them alone (halves, units) it works
+// out once per draw. uRecip: the GE's reciprocal segments (start, slope;
+// ge_math RECIP), a uniform buffer of its own bound once (draw.rs).
 uniform float2 uRecip[128] : BUFFER[0];
 
-int GdBits(float f) { return floatToRawIntBits(f); }
-float GdPow2(int e) { return intBitsToFloat((e + 127) << 23); }
+// A float's sign and power of two: its bits without the mantissa (0 for zero).
+float GdUnit(float f) { return intBitsToFloat(floatToRawIntBits(f) & -8388608); }
+float4 GdUnit4(float4 f) { return float4(GdUnit(f.x), GdUnit(f.y), GdUnit(f.z), GdUnit(f.w)); }
+// The top 8 of a float24's 16 significant bits.
+float GdHigh(float f) { return intBitsToFloat(floatToRawIntBits(f) & -65536); }
+float4 GdHigh4(float4 f) { return float4(GdHigh(f.x), GdHigh(f.y), GdHigh(f.z), GdHigh(f.w)); }
 float GdTruncate24(float f) { return intBitsToFloat(floatToRawIntBits(f) & -256); }
 
-// (mantissa, bit weight) of the GE's truncated product; no term: (0, -100000).
-int2 GdProduct(float a, float b)
+// x cut toward zero to a multiple of |grid|. c = 3 x 2^22 grids (floats of its
+// size are one grid apart); c, grid and sgn (+-1) carry x's sign.
+float4 GdCut(float4 x, float4 c, float4 grid, float4 sgn)
 {
-	int ba = GdBits(a);
-	int bb = GdBits(b);
-	int ea = (ba >> 23) & 255;
-	int eb = (bb >> 23) & 255;
-	if (ea == 0 || eb == 0)
-		return int2(0, -100000);
-	int fa = (ba >> 8) & 32767;
-	int fb = (bb >> 8) & 32767;
-	int m = 32768 + fa + fb + ((fa * fb) >> 15);
-	return int2((ba ^ bb) < 0 ? -m : m, ea + eb - 269);
+	float4 rounded = (x + c) - c;
+	float4 error = x - rounded;
+	return rounded - (error * sgn < 0.0f ? grid : float4(0.0f, 0.0f, 0.0f, 0.0f));
 }
 
-int GdShifted(int2 term, int top)
+// A clip coordinate: v = the model position as float24s and 1, vUnit their
+// units, col the matrix column.
+float GdClip(float4 v, float4 vUnit, float4 col)
 {
-	int shift = top - term.y;
-	if (term.x == 0 || shift >= 32)
-		return 0;
-	int a = (term.x < 0 ? -term.x : term.x) >> shift;
-	return term.x < 0 ? -a : a;
+	float4 colHigh = GdHigh4(col);
+	float4 colLow = col - colHigh;
+	// sign x 2^(both exponents): the term lies in [1, 4) of it.
+	float4 weight = vUnit * GdUnit4(col);
+	float4 sgn = weight < 0.0f ? float4(-1.0f, -1.0f, -1.0f, -1.0f) : float4(1.0f, 1.0f, 1.0f, 1.0f);
+	// The small part cut to the large part's grid: their sum is exact.
+	float4 low = GdCut(v * colLow, 3.0f * weight, weight * (1.0f / 4194304.0f), sgn);
+	float4 terms = v * colHigh + low;
+	// Every term cut at the largest term's 15th fraction bit, summed exactly.
+	float4 size = abs(weight);
+	float4 grid = sgn * (max(max(size.x, size.y), max(size.z, size.w)) * (1.0f / 32768.0f));
+	float4 cutTerms = GdCut(terms, grid * 12582912.0f, grid, sgn);
+	return GdTruncate24((cutTerms.x + cutTerms.y) + (cutTerms.z + cutTerms.w));
 }
 
-// sum x 2^weight truncated to 16 significant bits, made from bits.
-float GdFloat24Of(int sum, int weight)
+// a x b cut to 16 significant bits toward zero (float24s, none zero).
+float GdProduct24(float a, float b)
 {
-	int a = sum < 0 ? -sum : sum;
-	int length = 1;
-	for (int b = 1; b < 24; b++)
-		if (a >= (1 << b))
-			length = b + 1;
-	int m16 = length > 16 ? (a >> (length - 16)) : (a << (16 - length));
-	int sign = sum < 0 ? (1 << 31) : 0;
-	return intBitsToFloat(sign | ((weight + length - 1 + 127) << 23) | ((m16 & 32767) << 8));
+	float bHigh = GdHigh(b);
+	float high = a * bHigh;
+	float low = a * (b - bHigh);
+	float sum = high + low;
+	// Exact: what the sum's rounding left out. Opposite signs: the sum lies
+	// beyond the true product; one float step back (a step of the sum's own
+	// size: still inside the 16-bit cell before it) gives the right top 16 bits.
+	float error = low - (sum - high);
+	float back = error * sum < 0.0f ? GdUnit(sum) * (1.0f / 8388608.0f) : 0.0f;
+	return GdTruncate24(sum - back);
 }
 
-// A clip coordinate: the row's terms truncated to the largest's bit weight, summed.
-float GdClip(float3 model, float4 col)
-{
-	int2 t0 = GdProduct(GdTruncate24(model.x), col.x);
-	int2 t1 = GdProduct(GdTruncate24(model.y), col.y);
-	int2 t2 = GdProduct(GdTruncate24(model.z), col.z);
-	int2 t3 = GdProduct(1.0f, col.w);
-	int top01 = t0.y > t1.y ? t0.y : t1.y;
-	int top23 = t2.y > t3.y ? t2.y : t3.y;
-	int top = top01 > top23 ? top01 : top23;
-	if (top == -100000)
-		return 0.0f;
-	int sum = GdShifted(t0, top) + GdShifted(t1, top) + GdShifted(t2, top) + GdShifted(t3, top);
-	return sum == 0 ? 0.0f : GdFloat24Of(sum, top);
-}
-
-// a x b truncated to 16 significant bits (a, b in 2^15..2^17, a b >= 2^30): (mantissa, weight).
-int2 GdProduct16(int a, int b)
-{
-	int p8 = a * (b >> 8) + ((a * (b & 255)) >> 8);
-	int length = p8 >= 33554432 ? 26 : (p8 >= 16777216 ? 25 : (p8 >= 8388608 ? 24 : 23));
-	return int2(p8 >> (length - 16), length - 8);
-}
-
-int2 GdMantissa(float f)
-{
-	int b = GdBits(f);
-	return int2(32768 + ((b >> 8) & 32767), ((b >> 23) & 255) - 142);
-}
-
-// The GE's adder: the smaller term truncated to the larger's precision.
+// The GE's adder: both terms cut at the larger one's 15th fraction bit, added.
 float GdAdd(float a, float b)
 {
-	int ba = GdBits(a);
-	int bb = GdBits(b);
-	int ea = (ba >> 23) & 255;
-	int eb = (bb >> 23) & 255;
-	if (ea == 0)
-		return eb == 0 ? 0.0f : GdTruncate24(b);
-	if (eb == 0)
-		return GdTruncate24(a);
-	int emax = ea > eb ? ea : eb;
-	int na = 8 + emax - ea;
-	int nb = 8 + emax - eb;
-	ba = na >= 24 ? (ba & (1 << 31)) : (ba & -(1 << na));
-	bb = nb >= 24 ? (bb & (1 << 31)) : (bb & -(1 << nb));
-	return intBitsToFloat(ba) + intBitsToFloat(bb);
+	float4 x = float4(a, b, 0.0f, 0.0f);
+	float4 sgn = x < 0.0f ? float4(-1.0f, -1.0f, -1.0f, -1.0f) : float4(1.0f, 1.0f, 1.0f, 1.0f);
+	float4 grid = sgn * (max(abs(GdUnit(a)), abs(GdUnit(b))) * (1.0f / 32768.0f));
+	float4 parts = GdCut(x, grid * 12582912.0f, grid, sgn);
+	return parts.x + parts.y;
 }
 
 // x = the GE's screen depth 0..65535, y = 1 if it gives one (0: w zero,
@@ -323,29 +307,26 @@ float GdAdd(float a, float b)
 float2 GdScreenZ(float3 model, float4 geZ, float4 geW, float4 geDepth)
 {
 	float scale = geDepth.x;
-	float z = GdClip(model, geZ);
-	float w = GdClip(model, geW);
-	int ew = (GdBits(w) >> 23) & 255;
+	float4 v = float4(GdTruncate24(model.x), GdTruncate24(model.y), GdTruncate24(model.z), 1.0f);
+	float4 vUnit = float4(GdUnit(v.x), GdUnit(v.y), GdUnit(v.z), 1.0f);
+	float z = GdClip(v, vUnit, geZ);
+	float w = GdClip(v, vUnit, geW);
+	int wBits = floatToRawIntBits(w);
+	int ew = (wBits >> 23) & 255;
 	if (ew == 0 || ew >= 253)
 		return float2(0.0f, 0.0f);
-	int i = (GdBits(w) >> 8) & 32767;
-	float2 segment = uRecip[i >> 8];
-	int q = (64 * (int)segment.x + 63 + (int)segment.y * (i & 255)) >> 7;
-	bool negative = (GdBits(z) ^ GdBits(w)) < 0;
-	int ez = (GdBits(z) >> 23) & 255;
-	int es = (GdBits(scale) >> 23) & 255;
+	// sign x 2^-e of w: its exponent mirrored.
+	float inverseUnit = intBitsToFloat((wBits & (1 << 31)) | (2130706432 - (wBits & 2139095040)));
+	// The reciprocal's table step in whole numbers below 2^24: i = w's 15
+	// fraction bits, q = (64 start + 63 + slope (i & 255)) >> 7.
+	float i = (w * inverseUnit - 1.0f) * 32768.0f;
+	float high = floor(i * (1.0f / 256.0f));
+	float2 segment = uRecip[(int)high];
+	float q = floor((64.0f * segment.x + 63.0f + segment.y * (i - 256.0f * high)) * (1.0f / 128.0f));
 	float scaled = 0.0f;
-	if (ez != 0 && es != 0) {
-		int2 mz = GdMantissa(z);
-		int2 n = GdProduct16(mz.x, q);
-		int ndcWeight = mz.y + (-16 - (ew - 127)) + n.y;
-		int2 ms = GdMantissa(scale);
-		int2 p = GdProduct16(n.x, ms.x);
-		int weight = ndcWeight + ms.y + p.y;
-		int halfWeight = weight / 2;
-		float value = (float)p.x * GdPow2(halfWeight) * GdPow2(weight - halfWeight);
-		scaled = negative != (GdBits(scale) < 0) ? -value : value;
-	}
+	// ndc = z x reciprocal (q x 2^(-16 - e), w's sign), cut; then x scale, cut.
+	if (((floatToRawIntBits(z) >> 23) & 255) != 0 && ((floatToRawIntBits(scale) >> 23) & 255) != 0)
+		scaled = GdProduct24(GdProduct24(z, q * (inverseUnit * (1.0f / 65536.0f))), scale);
 	return float2(clamp(floor(GdAdd(scaled, geDepth.y)), 0.0f, 65535.0f), 1.0f);
 }
 #endif

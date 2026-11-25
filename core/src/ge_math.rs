@@ -554,6 +554,313 @@ pub mod integer {
     }
 }
 
+/// The GE's screen depth from float32 steps: plain adds and multiplies
+/// rounded to nearest (ties to even, IEEE 754), a few bit masks, no
+/// mantissa or exponent bookkeeping and no loops. Same results as
+/// `integer::screen_z` (tests `float_steps_are_the_integer_way`,
+/// `a_float_row_is_the_ges_row`) for inputs that are zero or normal floats
+/// (no denormals: the integer way takes them as zero, here they would
+/// stay tiny numbers) and wherever no product leaves the float range.
+/// Written as the vertex program does it (nativeres_raw_v.cg GE_DEPTH):
+/// no special cases, most steps four values wide.
+///
+/// The tools, from numerical analysis (error-free transformations: Dekker,
+/// Veltkamp, Rump, Ogita, Oishi):
+/// - A float24 has 16 significant bits. Split one factor into its top 8
+///   bits and the rest: both partial products have at most 24 bits, so
+///   float32 forms them exactly.
+/// - `(x + c) - c` rounds x to the spacing of floats near c (a power of
+///   two we choose through c); `x - rounded` is exact and tells which way
+///   it went, so one step back turns "nearest" into "toward zero" (`cut`).
+/// - Cutting each term at its own bit weight and then at the row's is the
+///   same as cutting it once at the row's (both toward zero), so a row
+///   needs one grid: the largest term's.
+/// - A sum's rounding error is exact too (`low - (sum - high)`), which
+///   says whether the nearest float lies beyond the true value.
+pub mod float_steps {
+    use super::RECIP;
+
+    /// `f` with the low 8 mantissa bits cleared.
+    fn truncate24(f: f32) -> f32 {
+        f32::from_bits(f.to_bits() & 0xFFFF_FF00)
+    }
+
+    /// A float's sign and power of two: its bits without the mantissa.
+    /// Zero for zero and denormals, which give the GE no term.
+    fn unit(f: f32) -> f32 {
+        f32::from_bits(f.to_bits() & 0xFF80_0000)
+    }
+
+    /// The top 8 of a float24's 16 significant bits, and the rest (exact).
+    fn halves(f: f32) -> (f32, f32) {
+        let high = f32::from_bits(f.to_bits() & 0xFFFF_0000);
+        (high, f - high)
+    }
+
+    fn sign_of(f: f32) -> f32 {
+        if f < 0.0 {
+            -1.0
+        } else {
+            1.0
+        }
+    }
+
+    /// `x` cut toward zero to a multiple of `step`'s size. `c` is
+    /// 3 x 2^22 steps (floats of its size are one step apart, and x + c
+    /// stays in that range for |x| below 2^22 steps); `c`, `step` and
+    /// `sign` (+-1) carry x's sign.
+    #[inline]
+    fn cut(x: f32, c: f32, step: f32, sign: f32) -> f32 {
+        let rounded = (x + c) - c;
+        // Exact: at most half a step, on x's own grid.
+        let error = x - rounded;
+        if error * sign < 0.0 {
+            rounded - step
+        } else {
+            rounded
+        }
+    }
+
+    /// One clip row's column, per coordinate: the entry's two halves and
+    /// its unit (a vertex program works these out once per draw).
+    #[derive(Clone, Copy, Debug)]
+    struct Row {
+        high: [f32; 4],
+        low: [f32; 4],
+        unit: [f32; 4],
+    }
+
+    impl Row {
+        fn new(column: [f32; 4]) -> Row {
+            let mut row = Row { high: [0.0; 4], low: [0.0; 4], unit: [0.0; 4] };
+            for (k, &entry) in column.iter().enumerate() {
+                (row.high[k], row.low[k]) = halves(entry);
+                row.unit[k] = unit(entry);
+            }
+            row
+        }
+
+        /// The GE's clip coordinate (`integer`'s `clip`): `v` = the model
+        /// position as float24s and 1, `v_unit` their units.
+        fn clip(&self, v: [f32; 4], v_unit: [f32; 4]) -> f32 {
+            let mut terms = [0.0f32; 4];
+            let mut weights = [0.0f32; 4];
+            let mut top = 0.0f32;
+            for k in 0..4 {
+                // sign x 2^(both exponents): the term lies in [1, 4) of it.
+                let weight = v_unit[k] * self.unit[k];
+                // The product in two exact parts; the small one cut to the
+                // large one's grid (2^-22 of the weight), so their sum is exact.
+                let low = cut(v[k] * self.low[k], 3.0 * weight, weight * (1.0 / 4_194_304.0), sign_of(weight));
+                terms[k] = v[k] * self.high[k] + low;
+                weights[k] = weight;
+                top = top.max(weight.abs());
+            }
+            // Every term cut at the largest term's 15th fraction bit, summed exactly.
+            let grid = top * (1.0 / 32_768.0);
+            let mut sum = 0.0f32;
+            for k in 0..4 {
+                let sign = sign_of(weights[k]);
+                sum += cut(terms[k], sign * grid * 12_582_912.0, sign * grid, sign);
+            }
+            truncate24(sum)
+        }
+    }
+
+    /// `a x b` cut to 16 significant bits toward zero, for float24s a and
+    /// b = `b_high` + `b_low` (`halves`), none zero (`ProductToFloat24`).
+    fn product24(a: f32, b_high: f32, b_low: f32) -> f32 {
+        let (high, low) = (a * b_high, a * b_low);
+        let sum = high + low;
+        // Exact (|high| >= |low|): what the sum's rounding left out.
+        let error = low - (sum - high);
+        // Opposite signs: rounded away from zero, the true product lies
+        // before `sum`. One float step back (a step of the sum's own size:
+        // at a power of two that is two floats, still inside the 16-bit cell
+        // before it) gives the right top 16 bits. A product so small that
+        // `error * sum` underflows would miss the step: far below any depth.
+        let back = if error * sum < 0.0 { unit(sum) * (1.0 / 8_388_608.0) } else { 0.0 };
+        truncate24(sum - back)
+    }
+
+    /// The GE's adder (`GEAdd`) for float24s: both terms cut at the larger
+    /// one's 15th fraction bit, then added (exact). A zero term leaves the
+    /// other as it is.
+    fn add(a: f32, b: f32) -> f32 {
+        let grid = unit(a).abs().max(unit(b).abs()) * (1.0 / 32_768.0);
+        let part = |x: f32| {
+            let sign = sign_of(x);
+            cut(x, sign * grid * 12_582_912.0, sign * grid, sign)
+        };
+        part(a) + part(b)
+    }
+
+    /// `integer::Prepared` in float steps: what the columns, the scale and
+    /// the centre give, worked out once per transform.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Prepared {
+        z: Row,
+        w: Row,
+        scale_high: f32,
+        scale_low: f32,
+        scale_is_zero: bool,
+        center: f32,
+    }
+
+    impl Prepared {
+        pub fn new(column_z: [f32; 4], column_w: [f32; 4], scale: f32, center: f32) -> Self {
+            let (scale_high, scale_low) = halves(scale);
+            Prepared { z: Row::new(column_z), w: Row::new(column_w), scale_high, scale_low, scale_is_zero: unit(scale) == 0.0, center }
+        }
+
+        /// `integer::screen_z(model, column_z, column_w, scale, center)`.
+        pub fn screen_z(&self, model: [f32; 3]) -> Option<f32> {
+            let v = [truncate24(model[0]), truncate24(model[1]), truncate24(model[2]), 1.0];
+            let v_unit = v.map(unit);
+            self.depth_of(self.z.clip(v, v_unit), self.w.clip(v, v_unit))
+        }
+
+        /// The screen depth from clip z and w (float24s).
+        fn depth_of(&self, z: f32, w: f32) -> Option<f32> {
+            let w_bits = w.to_bits();
+            let exponent = (w_bits >> 23) & 0xFF;
+            if exponent == 0 || exponent >= 253 {
+                return None;
+            }
+            // sign x 2^-e of w: its exponent mirrored.
+            let inverse_unit = f32::from_bits((w_bits & 0x8000_0000) | (0x7F00_0000 - (w_bits & 0x7F80_0000)));
+            // The reciprocal's table step, in whole numbers below 2^24:
+            // i = w's 15 fraction bits, q = (64 start + 63 + slope (i & 255)) >> 7.
+            let i = (w * inverse_unit - 1.0) * 32_768.0;
+            let segment = super::floor(i * (1.0 / 256.0));
+            let (start, slope) = RECIP[segment as usize];
+            let q = super::floor((64.0 * start as f32 + 63.0 + slope as f32 * (i - 256.0 * segment)) * (1.0 / 128.0));
+            // q x 2^(-16 - e), with w's sign.
+            let reciprocal = q * (inverse_unit * (1.0 / 65_536.0));
+            let scaled = if unit(z) == 0.0 || self.scale_is_zero {
+                0.0
+            } else {
+                // ndc = z x reciprocal, cut; then x scale, cut.
+                let (reciprocal_high, reciprocal_low) = halves(reciprocal);
+                product24(product24(z, reciprocal_high, reciprocal_low), self.scale_high, self.scale_low)
+            };
+            Some(super::floor(add(scaled, self.center)).clamp(0.0, 65535.0))
+        }
+    }
+
+    /// `integer::screen_z` in float steps; `None` where it gives none.
+    pub fn screen_z(model: [f32; 3], column_z: [f32; 4], column_w: [f32; 4], scale: f32, center: f32) -> Option<f32> {
+        Prepared::new(column_z, column_w, scale, center).screen_z(model)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn generator(seed: u32) -> impl FnMut() -> u32 {
+            let mut state = seed;
+            move || {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state
+            }
+        }
+
+        /// Zero (either sign) or a float24 within `range` powers of two of 1;
+        /// now and then a mantissa of all zeros, all ones or a clear low
+        /// byte. No denormals: the float steps take none (see the module).
+        fn float24(next: &mut impl FnMut() -> u32, range: u32) -> f32 {
+            match next() % 16 {
+                0 => 0.0,
+                1 => -0.0,
+                kind => {
+                    let exponent = 127 + (next() % (2 * range + 1)) as i32 - range as i32;
+                    let mantissa = match kind {
+                        2 => 0,
+                        3 => 0x007F_FF00,
+                        4 => next() & 0x007F_0000,
+                        _ => next() & 0x007F_FF00,
+                    };
+                    f32::from_bits((next() & 0x8000_0000) | ((exponent as u32) << 23) | mantissa)
+                }
+            }
+        }
+
+        /// A clip row from float steps is the GE's row, bit for bit: random
+        /// float24 columns and positions up to 30 powers of two from 1.
+        #[test]
+        fn a_float_row_is_the_ges_row() {
+            let mut next = generator(0x1357_9BDF);
+            for range in [3, 8, 20, 30] {
+                for round in 0..400_000 {
+                    let column = [float24(&mut next, range), float24(&mut next, range), float24(&mut next, range), float24(&mut next, range)];
+                    // Positions with all 24 bits: the row truncates them itself.
+                    let model = [0, 1, 2].map(|_| f32::from_bits(float24(&mut next, range).to_bits() | (next() & 0xFF)));
+                    let mut matrix = [0.0f32; 16];
+                    for k in 0..4 {
+                        matrix[4 * k + 2] = column[k];
+                    }
+                    let expected = crate::ge_math::clip_component(model, &matrix, 2);
+                    let v = [truncate24(model[0]), truncate24(model[1]), truncate24(model[2]), 1.0];
+                    let got = Row::new(column).clip(v, v.map(unit));
+                    assert!(got == expected, "range {range} round {round}: {model:?} {column:?}: {got} ({:08x}), the GE's {expected} ({:08x})", got.to_bits(), expected.to_bits());
+                }
+            }
+        }
+
+        /// The whole depth from float steps is `integer::screen_z`: random
+        /// columns, positions, scales and centres, with zeros and denormals.
+        #[test]
+        fn float_steps_are_the_integer_way() {
+            let mut next = generator(0x2468_ACE1);
+            let mut with_depth = 0;
+            for round in 0..300_000 {
+                let range = [4, 10, 20][round % 3];
+                let column_z = [float24(&mut next, range), float24(&mut next, range), float24(&mut next, range), float24(&mut next, range)];
+                let column_w = [float24(&mut next, range), float24(&mut next, range), float24(&mut next, range), float24(&mut next, range)];
+                let scale = float24(&mut next, 16);
+                let center = truncate24(f32::from_bits(next() % 0x4780_0000));
+                let prepared = Prepared::new(column_z, column_w, scale, center);
+                for _ in 0..4 {
+                    let model = [0, 1, 2].map(|_| f32::from_bits(float24(&mut next, range).to_bits() | (next() & 0xFF)));
+                    let expected = crate::ge_math::integer::screen_z(model, column_z, column_w, scale, center);
+                    let got = prepared.screen_z(model);
+                    assert!(got == expected, "round {round}: {model:?} z {column_z:?} w {column_w:?} scale {scale} center {center}: {got:?}, the integer way {expected:?}");
+                    with_depth += expected.is_some() as u32;
+                }
+            }
+            assert!(with_depth > 600_000, "{with_depth}");
+        }
+
+        /// God of War's title camera, as `the_integer_way_is_the_ges_way`.
+        #[test]
+        fn float_steps_are_the_ges_way_for_a_game_camera() {
+            let view = [[-0.9155426, 0.0, 0.40221405, 0.0], [0.0, 1.0, 0.0, 0.0], [-0.40221405, 0.0, -0.9155426, 0.0]];
+            let projection = [[3.569519, 0.0, 0.0, 0.0], [0.0, 6.2991943, 0.0, 0.0], [0.0, 0.0, -1.0039978, -0.40079498], [0.0, 0.0, -1.0, 0.0]];
+            let float24 = |value: f32| f32::from_bits((value.to_bits() + 0x80) & 0xFFFF_FF00);
+            let (scale, center) = (float24(32767.5), float24(32767.5));
+            let mut seed = 0x1234_5678u32;
+            let mut random = move |range: f32| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((seed >> 8) as f32 / 16_777_216.0 - 0.5) * 2.0 * range
+            };
+            for set in 0..256 {
+                let s = 1.0 + random(0.5);
+                let world = [[s, random(0.2), 0.0, random(20.0)], [0.0, s, random(0.2), random(10.0)], [random(0.2), 0.0, s, 40.0 + random(60.0) + 5.0 * set as f32]];
+                let matrix = crate::ge_math::combined(&world, &view, &projection);
+                let column = |c: usize| [matrix[c], matrix[4 + c], matrix[8 + c], matrix[12 + c]];
+                let prepared = Prepared::new(column(2), column(3), scale, center);
+                for _ in 0..4000 {
+                    let model = [random(60.0), random(60.0), random(60.0)];
+                    let exact = crate::ge_math::screen_z(model, &world, &view, &projection, scale, center);
+                    assert_eq!(prepared.screen_z(model), exact, "model {model:?} set {set}");
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

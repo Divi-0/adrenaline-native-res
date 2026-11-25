@@ -1107,6 +1107,13 @@ fn psp_filter_mode() -> Option<bool> {
     })
 }
 
+/// `REPLAY_ONE_READ`, read once: draws that filter as the GE take the
+/// one-read model instead (`sample`).
+fn one_read_filter() -> bool {
+    static MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| std::env::var_os("REPLAY_ONE_READ").is_some())
+}
+
 /// Whether the draw being drawn is shaded at 1x (`native_mode`).
 static NATIVE_DRAW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1189,6 +1196,24 @@ fn sample(texture: &Texture, draw: &Draw, u: f32, v: f32, filter: Filter) -> Col
     let y = v * texture.height as f32;
     if draw.flags & draw_flags::LINEAR_FILTER == 0 {
         return texel(x.floor() as i64, y.floor() as i64);
+    }
+    if filter == Filter::Ge && one_read_filter() {
+        // Measuring (REPLAY_ONE_READ=1): the GE's truncation without its 1/16
+        // steps, as one LINEAR read of a 16-bit copy of the texture would
+        // give it (the texture unit's lerp is exact there; its fractions
+        // taken as 8 bits), cut to 8 bits once at the end.
+        let (x, y) = (x - 0.5, y - 0.5);
+        let (x0, y0) = (x.floor(), y.floor());
+        let (fx, fy) = (((x - x0) * 256.0) as u32, ((y - y0) * 256.0) as u32);
+        let (x0, y0) = (x0 as i64, y0 as i64);
+        let raw = |x: i64, y: i64| texture.pixels[wrap(y, texture.height, clamp_v) * texture.width + wrap(x, texture.width, clamp_u)];
+        let texels = [raw(x0, y0), raw(x0 + 1, y0), raw(x0, y0 + 1), raw(x0 + 1, y0 + 1)];
+        let channel = |c: u32| {
+            let [a, b, lower_a, lower_b] = texels.map(|texel| (texel >> (8 * c)) & 0xFF);
+            let (top, bottom) = (a * (256 - fx) + b * fx, lower_a * (256 - fx) + lower_b * fx);
+            (top * (256 - fy) + bottom * fy) >> 16 << (8 * c)
+        };
+        return Color::from_rgba(channel(0) | channel(1) | channel(2) | channel(3));
     }
     if filter == Filter::Ge {
         let fixed = |value: f32| (value * 16.0) as i64 - 8;
