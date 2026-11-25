@@ -1060,6 +1060,20 @@ pub struct Frame {
 /// `Frame::draw_ring_index` of a draw whose list isn't in the ring.
 pub const NO_RING_INDICES: u32 = u32::MAX;
 
+/// `Frame::draw_ring_index` bit: the draw's ring entry is one triangle strip
+/// (`stitched_strip`), not a triangle list.
+pub const RING_STRIP: u32 = 1 << 31;
+
+/// Raw draws whose index runs are all triangle strips go to the GPU as one
+/// triangle strip (`stitched_strip`; debug `stripdraws`, default on): the
+/// Vita's GPU shades a vertex once per index, so a strip vertex once instead
+/// of up to three times as a triangle-list corner (God of War's gameplay:
+/// ~87k indices instead of ~131k corners a frame, vertex-only GPU time
+/// 71 -> 60 ms, same pixels; 68th session). The capture writes them so
+/// into the index ring (`write_ring_indices`); the display draws ring strips
+/// as strips and builds whichever way this says for draws it builds itself.
+pub static STRIP_RUNS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
 // The sizes the dumps and the GPU uniform layouts rely on.
 const _: () = assert!(core::mem::size_of::<FrameVertex>() == 32);
 const _: () = assert!(core::mem::size_of::<Draw>() == 64);
@@ -1409,7 +1423,8 @@ impl Frame {
     }
 
     /// Writes the corners of every draw with index runs or raw vertices into
-    /// `ring` as a triangle list (index runs written out in the display's
+    /// `ring` as a triangle list, or for raw draws of strips only as one
+    /// triangle strip marked `RING_STRIP` (`STRIP_RUNS`) (index runs written out in the display's
     /// `DrawIndices` order, `run_indices`; a raw draw's plain indices, the
     /// converted ones of indexed PRIMs, copied as they are), notes where in
     /// `draw_ring_index` and points `ring_indices` at the ring, so the GPU
@@ -1430,10 +1445,22 @@ impl Frame {
             if corners == 0 {
                 continue;
             }
-            let Some((placed, out)) = ring.reserve(corners * 2, 2) else {
+            let strip = if runs && draw.flags & draw_flags::RAW_VERTICES != 0 && STRIP_RUNS.load(core::sync::atomic::Ordering::Relaxed) {
+                stitched_strip_count(stored)
+            } else {
+                None
+            };
+            let Some((placed, out)) = ring.reserve(strip.unwrap_or(corners) * 2, 2) else {
                 full += 1;
                 continue;
             };
+            if strip.is_some() {
+                for (bytes, index) in out.chunks_exact_mut(2).zip(stitched_strip(stored)) {
+                    bytes.copy_from_slice(&index.to_le_bytes());
+                }
+                self.draw_ring_index[i] = placed.offset / 2 | RING_STRIP;
+                continue;
+            }
             if runs {
                 let mut at = 0;
                 for run in stored.chunks_exact(3) {
@@ -1747,8 +1774,14 @@ impl Frame {
             add(0, draw.flags & !draw_flags::INDEX_RUNS);
             add(0, draw.vertex_format);
             add(0, draw.raw_colors);
-            let corners = self.draw_index_count(draw) as usize;
-            let at = self.draw_ring_index[index];
+            let mut corners = self.draw_index_count(draw) as usize;
+            let mut at = self.draw_ring_index[index];
+            if at != NO_RING_INDICES && at & RING_STRIP != 0 {
+                // One strip: the same corner values, fewer of them.
+                at &= !RING_STRIP;
+                let runs = &self.indices[draw.first_index as usize..][..draw.index_count as usize];
+                corners = stitched_strip_count(runs).unwrap_or(0) as usize;
+            }
             let in_ring = at != NO_RING_INDICES && !self.ring_indices.is_null() && at as usize + corners <= self.ring_indices_len as usize;
             let ring: &[u16] = if in_ring {
                 // Safe: inside the ring the frame's draws were written to
@@ -2521,6 +2554,50 @@ pub fn run_indices(run: &[u16]) -> impl Iterator<Item = u16> {
     })
 }
 
+/// How many indices `stitched_strip` gives for `runs`; None unless every
+/// run is a triangle strip and one of them has a triangle.
+pub fn stitched_strip_count(runs: &[u16]) -> Option<u32> {
+    let mut count = 0u32;
+    for run in runs.chunks_exact(3) {
+        if run[0] as u32 != crate::command::primitive::TRIANGLE_STRIP {
+            return None;
+        }
+        if run[1] < 3 {
+            continue; // no triangle
+        }
+        if count > 0 {
+            count += 2;
+            count += count % 2;
+        }
+        count += run[1] as u32;
+    }
+    (count > 0).then_some(count)
+}
+
+/// Triangle-strip runs as ONE triangle strip with the same triangles in the
+/// same order and winding as `run_indices` gives them as a list. Strips turn
+/// every second triangle around (i + 1, i, i + 2 for odd i, as
+/// `strip_triangle`), so each run starts at an even position: runs are
+/// joined by repeating the last index before the join and the first after
+/// it (plus the first once more where the length so far is odd). Every
+/// triangle across a join has a repeated corner: no area, nothing drawn.
+/// Runs of fewer than three vertices have no triangles and are left out.
+/// Only for runs that are all strips (`stitched_strip_count`).
+pub fn stitched_strip(runs: &[u16]) -> impl Iterator<Item = u16> + '_ {
+    let (mut length, mut last) = (0u32, 0u16);
+    runs.chunks_exact(3).filter(|run| run[1] >= 3).flat_map(move |run| {
+        let (count, base) = (run[1], run[2]);
+        let (mut join, mut joins) = ([0u16; 3], 0usize);
+        if length > 0 {
+            join = [last, base, base];
+            joins = if length % 2 == 0 { 2 } else { 3 };
+        }
+        length += joins as u32 + count as u32;
+        last = base.wrapping_add(count - 1);
+        join.into_iter().take(joins).chain((0..count).map(move |k| base.wrapping_add(k)))
+    })
+}
+
 /// A frame's textures and palettes while recording (`Frame::split`).
 pub struct Catalog<'a> {
     texture_count: &'a mut u32,
@@ -2785,6 +2862,44 @@ mod tests {
         assert_eq!([0, 1, 2, 3].map(strip_triangle), [[0, 1, 2], [2, 1, 3], [2, 3, 4], [4, 3, 5]]);
         let run = [crate::command::primitive::TRIANGLE_STRIP as u16, 5, 10];
         assert_eq!(run_indices(&run).collect::<Vec<_>>(), [10, 11, 12, 12, 11, 13, 12, 13, 14]);
+    }
+
+    #[test]
+    fn stitched_strips_draw_the_runs_triangles_in_order() {
+        use super::{run_indices, stitched_strip, stitched_strip_count};
+        let strip = crate::command::primitive::TRIANGLE_STRIP as u16;
+        // A strip's triangles as the GPU reads them, joins (repeated corners) left out.
+        let triangles = |indices: &[u16]| -> Vec<[u16; 3]> {
+            (0..indices.len().saturating_sub(2))
+                .map(|i| if i % 2 == 0 { [indices[i], indices[i + 1], indices[i + 2]] } else { [indices[i + 1], indices[i], indices[i + 2]] })
+                .filter(|t| t[0] != t[1] && t[1] != t[2] && t[0] != t[2])
+                .collect()
+        };
+        let mut seed = 0x2545_F491u32;
+        let mut next = move |range: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed % range
+        };
+        for _ in 0..2000 {
+            let mut runs = Vec::new();
+            for _ in 0..1 + next(12) {
+                // Counts 0..=9 (0-2: no triangle), bases anywhere (runs may share vertices).
+                runs.extend_from_slice(&[strip, next(10) as u16, next(200) as u16]);
+            }
+            let list: Vec<u16> = runs.chunks_exact(3).flat_map(run_indices).collect();
+            let expected: Vec<[u16; 3]> = list.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+            let stitched: Vec<u16> = stitched_strip(&runs).collect();
+            assert_eq!(stitched_strip_count(&runs), (!stitched.is_empty()).then_some(stitched.len() as u32), "{runs:?}");
+            assert_eq!(triangles(&stitched), expected, "{runs:?}");
+        }
+        // Not only strips, or no triangle: none.
+        assert_eq!(stitched_strip_count(&[strip, 4, 0, crate::command::primitive::TRIANGLES as u16, 3, 10]), None);
+        assert_eq!(stitched_strip_count(&[strip, 2, 0]), None);
+        // Two runs: the second starts at an even position.
+        assert_eq!(stitched_strip(&[strip, 3, 0, strip, 3, 10]).collect::<Vec<_>>(), [0, 1, 2, 2, 10, 10, 10, 11, 12]);
+        assert_eq!(stitched_strip(&[strip, 4, 0, strip, 3, 10]).collect::<Vec<_>>(), [0, 1, 2, 3, 3, 10, 10, 11, 12]);
     }
 
     #[test]
@@ -3174,6 +3289,19 @@ mod tests {
         let plain: Vec<u16> = ring.bytes()[2 * at..2 * (at + 3)].chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
         assert_eq!(plain, [0, 1, 2]);
         assert_eq!(frame.ring_indices, ring.bytes().as_ptr() as *const u16);
+        // A raw draw of strips only: one strip, marked.
+        let strip = crate::command::primitive::TRIANGLE_STRIP as u16;
+        frame.indices[15..21].copy_from_slice(&[strip, 4, 0, strip, 3, 10]);
+        frame.draws[2] = Draw { first_index: 15, index_count: 6, flags: draw_flags::INDEX_RUNS | draw_flags::RAW_VERTICES, ..Draw::default() };
+        frame.draw_count = 3;
+        frame.index_count = 21;
+        assert_eq!(frame.write_ring_indices(&mut ring), 0);
+        let marked = frame.draw_ring_index[2];
+        assert_ne!(marked & RING_STRIP, 0);
+        let at = (marked & !RING_STRIP) as usize;
+        let written: Vec<u16> = ring.bytes()[2 * at..2 * (at + 9)].chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+        assert_eq!(written, [0, 1, 2, 3, 3, 10, 10, 11, 12]);
+        assert_eq!(frame.draw_ring_index[0] & RING_STRIP, 0, "not raw: a list");
     }
 
     #[test]

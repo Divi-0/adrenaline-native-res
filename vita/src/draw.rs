@@ -26,7 +26,7 @@ use nativeres_core::black_texels::BlackOutside;
 use nativeres_core::blend::{self, StencilState, StencilWay, BLEND_ALPHA_ONLY, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_WRITES_ALPHA};
 use nativeres_core::frame::{
     draw_flags, read_variant, test_flags, Draw, Frame, DIRECTIONAL_LIGHT_FLOATS, FrameVertex, GpuLights, GpuTransform, RawCamera, RawColors, RawTransform, ReadVariant,
-    ReadWay, NO_RING_INDICES,
+    ReadWay, NO_RING_INDICES, RING_STRIP, STRIP_RUNS, stitched_strip, stitched_strip_count,
 };
 use nativeres_core::texture;
 use nativeres_core::opaque_source::{
@@ -699,6 +699,9 @@ pub struct Draws {
     /// tile drawn into a wider off-screen framebuffer (core
     /// `offscreen::placement`).
     origin_x: u32,
+    /// The primitive of the indices `draw_indices` gave last: triangles,
+    /// or a triangle strip (core `stitched_strip`).
+    index_primitive: u32,
 }
 
 static DRAWS: SingleThreaded<Draws> = SingleThreaded::new(Draws {
@@ -718,6 +721,7 @@ static DRAWS: SingleThreaded<Draws> = SingleThreaded::new(Draws {
     target_size: (TARGET_WIDTH, TARGET_HEIGHT),
     surface_size: (TARGET_WIDTH, TARGET_HEIGHT),
     origin_x: 0,
+    index_primitive: gxm::PRIMITIVE_TRIANGLES,
 });
 
 /// The 960x544 targets' size (targets.rs `TARGET_WIDTH` / `TARGET_HEIGHT`).
@@ -1621,34 +1625,53 @@ impl Draws {
     /// built in the frame pool (index runs written out in the order frame.rs
     /// run_indices gives; plain indices copied). None if the pool is full or
     /// the draw's indices lie outside the frame.
-    fn draw_indices(&mut self, frame: &Frame, draw: &Draw, draw_index: usize) -> Option<(*const u16, u32)> {
+    fn draw_indices(&mut self, frame: &Frame, draw: &Draw, draw_index: usize, strips: bool) -> Option<(*const u16, u32)> {
         let start = draw_clock();
         let first = draw.first_index as usize;
         let stored = frame.indices.get(first..first.checked_add(draw.index_count as usize)?)?;
         let stats = stats();
         let runs = draw.flags & draw_flags::INDEX_RUNS != 0;
         let corners = if runs { run_corners(stored) } else { draw.index_count };
-        // Written out by the capture already (the index ring).
-        let at = if frame.ring_indices.is_null() { NO_RING_INDICES } else { *frame.draw_ring_index.get(draw_index)? };
-        if at != NO_RING_INDICES && at as u64 + corners as u64 <= frame.ring_indices_len as u64 {
+        // Raw draws of strips only: one GPU triangle strip (core
+        // `stitched_strip`, `STRIP_RUNS`), only where the caller draws with
+        // `index_primitive`.
+        let strip = if strips && runs && draw.flags & draw_flags::RAW_VERTICES != 0 && STRIP_RUNS.load(Ordering::Relaxed) {
+            stitched_strip_count(stored)
+        } else {
+            None
+        };
+        self.index_primitive = if strip.is_some() { gxm::PRIMITIVE_TRIANGLE_STRIP } else { gxm::PRIMITIVE_TRIANGLES };
+        let count = strip.unwrap_or(corners);
+        if strip.is_some() {
+            stats.strip_draws += 1;
+            stats.strip_indices += count;
+            stats.strip_corners += corners;
+        }
+        // Written out by the capture already (the index ring), if in the
+        // form wanted (a frozen frame redrawn with the other `stripdraws`).
+        let marked = if frame.ring_indices.is_null() { NO_RING_INDICES } else { *frame.draw_ring_index.get(draw_index)? };
+        let (at, ring_strip) = (marked & !RING_STRIP, marked & RING_STRIP != 0);
+        if marked != NO_RING_INDICES && ring_strip == strip.is_some() && at as u64 + count as u64 <= frame.ring_indices_len as u64 {
             stats.ring_draws += 1;
             stats.indices_us += draw_clock().wrapping_sub(start);
             // Safe: inside the ring (checked above).
-            return Some((unsafe { frame.ring_indices.add(at as usize) }, corners));
+            return Some((unsafe { frame.ring_indices.add(at as usize) }, count));
         }
-        let out = frame_pool_alloc(corners * 2, 2) as *mut u16;
+        let out = frame_pool_alloc(count * 2, 2) as *mut u16;
         if !out.is_null() {
-            // Safe: the pool gave `corners` u16s.
-            let out = unsafe { core::slice::from_raw_parts_mut(out, corners as usize) };
-            if runs {
+            // Safe: the pool gave `count` u16s.
+            let out = unsafe { core::slice::from_raw_parts_mut(out, count as usize) };
+            if strip.is_some() {
+                out.iter_mut().zip(stitched_strip(stored)).for_each(|(slot, index)| *slot = index);
+            } else if runs {
                 write_runs(stored, out);
             } else {
                 out.copy_from_slice(stored);
             }
         }
         stats.indices_us += draw_clock().wrapping_sub(start);
-        stats.pool_kb += (corners * 2 + draw.vertex_count * core::mem::size_of::<FrameVertex>() as u32) / 1024;
-        (!out.is_null()).then_some((out as *const u16, corners))
+        stats.pool_kb += (count * 2 + draw.vertex_count * core::mem::size_of::<FrameVertex>() as u32) / 1024;
+        (!out.is_null()).then_some((out as *const u16, count))
     }
 
     /// The frame's vertices of `draw`, copied into the frame pool so the GPU
@@ -1738,7 +1761,7 @@ impl Draws {
         black: Option<BlackOutside>,
     ) {
         let convert_start = draw_clock();
-        let Some((indices, index_count)) = self.draw_indices(frame, draw, draw_index) else {
+        let Some((indices, index_count)) = self.draw_indices(frame, draw, draw_index, true) else {
             return; // the frame pool is full
         };
         let (mut indices, mut index_count) = (indices, index_count);
@@ -2214,9 +2237,10 @@ impl Draws {
                 gxm::sceGxmSetVertexStream(context(), 1, (out as *const u8).add(sprite_stride as usize) as *const c_void);
                 gxm::sceGxmSetVertexStream(context(), 2, self.programs.sprites.corners as *const c_void);
             }
-            note_draw_result(gxm::sceGxmDraw(context(), gxm::PRIMITIVE_TRIANGLES, gxm::INDEX_FORMAT_U16, indices as *const c_void, index_count));
+            let primitive = self.index_primitive;
+            note_draw_result(gxm::sceGxmDraw(context(), primitive, gxm::INDEX_FORMAT_U16, indices as *const c_void, index_count));
             for _ in 0..DRAW_REPEAT.load(Ordering::Relaxed).clamp(0, 8) {
-                gxm::sceGxmDraw(context(), gxm::PRIMITIVE_TRIANGLES, gxm::INDEX_FORMAT_U16, indices as *const c_void, index_count);
+                gxm::sceGxmDraw(context(), primitive, gxm::INDEX_FORMAT_U16, indices as *const c_void, index_count);
             }
         }
     }
@@ -2224,7 +2248,7 @@ impl Draws {
     /// An untextured draw: the basic colour program, per-vertex colour.
     fn draw_colored(&mut self, frame: &Frame, draw: &Draw, draw_index: usize) {
         let convert_start = draw_clock();
-        let indices = self.draw_indices(frame, draw, draw_index);
+        let indices = self.draw_indices(frame, draw, draw_index, false);
         if skip(8) {
             return;
         }
@@ -2298,7 +2322,7 @@ impl Draws {
     /// program disabled, so depth test and writes as set (`draw_state`),
     /// no colour, no alpha, no frame read.
     fn draw_depth_only(&mut self, frame: &Frame, draw: &Draw, draw_index: usize) {
-        let indices = self.draw_indices(frame, draw, draw_index);
+        let indices = self.draw_indices(frame, draw, draw_index, false);
         let first = draw.first_vertex as usize;
         let Some(vertices) = first.checked_add(draw.vertex_count as usize).and_then(|end| frame.vertices.get(first..end)) else {
             return;
@@ -2992,7 +3016,7 @@ fn cull_black_triangles(
 }
 
 /// Writes index runs (type, count, first vertex) out as triangle lists, in
-/// the order frame.rs run_indices gives.
+/// the order frame.rs run_indices gives (strips only: core `stitched_strip`).
 fn write_runs(runs: &[u16], out: &mut [u16]) {
     let mut at = 0;
     for run in runs.chunks_exact(3) {
