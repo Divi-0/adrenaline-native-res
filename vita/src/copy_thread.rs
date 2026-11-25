@@ -177,7 +177,7 @@ unsafe extern "C" fn copy_thread(_args: u32, _argp: *mut c_void) -> i32 {
                 if (*stream).copy_published() {
                     let end = sys::now_us();
                     BUSY_US.fetch_add((end - start) as u32, Ordering::Relaxed);
-                    nativeres_core::timeline::span(nativeres_core::timeline::COPY, start as u32, end as u32);
+                    nativeres_core::debug_hooks::call(nativeres_core::debug_hooks::Point::Copy, start as u32, end as u32);
                     idle_polls = 0;
                 } else {
                     idle_polls += 1;

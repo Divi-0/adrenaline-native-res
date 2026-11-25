@@ -14,6 +14,10 @@ description = "PSP graphics engine (GE) display list handling, independent of th
 # frame (2026-11-21). The development plugin's profiling build and the PC
 # replay tool turn it on.
 instrument = []
+# Debug hooks (debug_hooks.rs): points where the development plugin runs its
+# own code (its thread timeline). Off (the release plugin), none of it is in
+# the binary.
+debug-hooks = []
 
 [lib]
 name = "nativeres_core"

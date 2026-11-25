@@ -170,11 +170,10 @@ fn now() -> u32 {
     clock()
 }
 
-/// Whether `part` is being measured (or recorded as a timeline span,
-/// `timeline::TIMELINE`).
+/// Whether `part` is being measured.
 #[inline(always)]
 fn measured(part: usize) -> bool {
-    crate::bench::INSTRUMENTED && (MEASURED.load(Ordering::Relaxed) | crate::timeline::TIMELINE.load(Ordering::Relaxed)) & (1 << part) != 0
+    crate::bench::INSTRUMENTED && MEASURED.load(Ordering::Relaxed) & (1 << part) != 0
 }
 
 /// The counter now if `part` is measured, else 0. (Parts measured by
@@ -194,12 +193,13 @@ pub fn start(part: usize) -> u32 {
     }
 }
 
-/// The counter, or the timeline's clock for a part on the timeline.
+/// The counter, or what a `PartStart` debug hook returns (it takes over).
 #[cold]
 #[inline(never)]
 fn start_measured(part: usize) -> u32 {
-    if crate::timeline::part_on(part) {
-        return crate::timeline::now_us();
+    use crate::debug_hooks::{self, Point};
+    if debug_hooks::hooked(Point::PartStart) {
+        return debug_hooks::call(Point::PartStart, part as u32, 0);
     }
     now()
 }
@@ -215,11 +215,9 @@ pub fn add(part: usize, started: u32) {
 #[cold]
 #[inline(never)]
 fn add_measured(part: usize, started: u32) {
-    if crate::timeline::part_on(part) {
-        // 0: the part started before it was on the timeline (no start time).
-        if started != 0 {
-            crate::timeline::emit(part as u32, started, crate::timeline::now_us());
-        }
+    use crate::debug_hooks::{self, Point};
+    if debug_hooks::hooked(Point::PartEnd) {
+        debug_hooks::call(Point::PartEnd, part as u32, started);
         return;
     }
     let cycles = now().wrapping_sub(started);
