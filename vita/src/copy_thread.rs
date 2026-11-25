@@ -175,7 +175,9 @@ unsafe extern "C" fn copy_thread(_args: u32, _argp: *mut c_void) -> i32 {
                 // Safe: the served streams live in statics; `DrawStream`
                 // is made for one copier (`copy_published`).
                 if (*stream).copy_published() {
-                    BUSY_US.fetch_add((sys::now_us() - start) as u32, Ordering::Relaxed);
+                    let end = sys::now_us();
+                    BUSY_US.fetch_add((end - start) as u32, Ordering::Relaxed);
+                    nativeres_core::timeline::span(nativeres_core::timeline::COPY, start as u32, end as u32);
                     idle_polls = 0;
                 } else {
                     idle_polls += 1;

@@ -366,7 +366,9 @@ unsafe extern "C" fn worker_thread(_args: u32, _argp: *mut c_void) -> i32 {
         }
         // Safe: RUNNING, so the job is ours.
         let Some(job) = *WORKER.job.get() else { continue };
+        let zone = nativeres_core::timeline::zone(nativeres_core::timeline::TEXTURE);
         *WORKER.result.get() = Some(run_refresh(&mut VitaHost, &job, staging));
+        drop(zone);
         WORKER.state.store(DONE, Ordering::Release); // the texels and result before the state
     }
     sys::sceKernelExitDeleteThread(0)

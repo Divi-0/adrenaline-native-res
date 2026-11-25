@@ -35,6 +35,7 @@ pub mod color;
 pub mod copy_tasks;
 pub mod copy_watch;
 pub mod cycles;
+pub mod timeline;
 pub mod command;
 pub mod display_list;
 pub mod display_loop;

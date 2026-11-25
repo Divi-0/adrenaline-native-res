@@ -170,10 +170,11 @@ fn now() -> u32 {
     clock()
 }
 
-/// Whether `part` is being measured.
+/// Whether `part` is being measured (or recorded as a timeline span,
+/// `timeline::TIMELINE`).
 #[inline(always)]
 fn measured(part: usize) -> bool {
-    crate::bench::INSTRUMENTED && MEASURED.load(Ordering::Relaxed) & (1 << part) != 0
+    crate::bench::INSTRUMENTED && (MEASURED.load(Ordering::Relaxed) | crate::timeline::TIMELINE.load(Ordering::Relaxed)) & (1 << part) != 0
 }
 
 /// The counter now if `part` is measured, else 0. (Parts measured by
@@ -187,15 +188,19 @@ fn measured(part: usize) -> bool {
 #[inline(always)]
 pub fn start(part: usize) -> u32 {
     if measured(part) {
-        start_measured()
+        start_measured(part)
     } else {
         0
     }
 }
 
+/// The counter, or the timeline's clock for a part on the timeline.
 #[cold]
 #[inline(never)]
-fn start_measured() -> u32 {
+fn start_measured(part: usize) -> u32 {
+    if crate::timeline::part_on(part) {
+        return crate::timeline::now_us();
+    }
     now()
 }
 
@@ -210,6 +215,10 @@ pub fn add(part: usize, started: u32) {
 #[cold]
 #[inline(never)]
 fn add_measured(part: usize, started: u32) {
+    if crate::timeline::part_on(part) {
+        crate::timeline::emit(part as u32, started, crate::timeline::now_us());
+        return;
+    }
     let cycles = now().wrapping_sub(started);
     if cycles >= IMPLAUSIBLE {
         DROPPED.store(DROPPED.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);

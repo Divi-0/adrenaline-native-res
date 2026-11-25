@@ -629,6 +629,7 @@ impl FrameLoop {
         let end = now();
         RENDER_START_US.store(start as u32, Ordering::Relaxed);
         RENDER_END_US.store(end as u32, Ordering::Relaxed);
+        nativeres_core::timeline::span(nativeres_core::timeline::RENDER, start as u32, end as u32);
         let total_us = end - start;
         {
             let stats = stats();

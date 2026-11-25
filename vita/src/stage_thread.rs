@@ -317,7 +317,9 @@ unsafe extern "C" fn stage_thread(_args: u32, _argp: *mut c_void) -> i32 {
                 if run == StageBRun::Nothing || ACTIVE.load(Ordering::SeqCst) != capture {
                     break;
                 }
-                BUSY_US.fetch_add((sys::now_us() - start) as u32, Ordering::Relaxed);
+                let end = sys::now_us();
+                BUSY_US.fetch_add((end - start) as u32, Ordering::Relaxed);
+                nativeres_core::timeline::span(nativeres_core::timeline::STAGE_B, start as u32, end as u32);
             }
         }
         IN_USE.store(core::ptr::null_mut(), Ordering::SeqCst);

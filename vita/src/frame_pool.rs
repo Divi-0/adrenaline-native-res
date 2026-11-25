@@ -124,6 +124,7 @@ impl State {
     /// Waits until the GPU has finished segment `id`. False if it didn't
     /// within `WAIT_US`.
     fn wait_for(&mut self, id: u32) -> bool {
+        let _zone = nativeres_core::timeline::zone(nativeres_core::timeline::POOL_WAIT);
         let start = sys::now_us();
         WAITS.fetch_add(1, Ordering::Relaxed);
         while !segment_done(self.done(), id) {
