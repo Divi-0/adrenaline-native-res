@@ -34,6 +34,7 @@ use nativeres_core::opaque_source::{
 };
 use nativeres_core::texture::ALL_ROWS_OPAQUE;
 use nativeres_core::vertex::VertexFormat;
+use nativeres_core::zero_alpha;
 
 use crate::arenas;
 use crate::capture::{RAW_ARENA, RAW_ARENA_BYTES, VERTEX_ARENA, VERTEX_ARENA_VERTICES};
@@ -213,6 +214,88 @@ fn flat_shading(frame: &Frame, draw: &Draw) -> bool {
     draw.flags & draw_flags::FOG == 0 && FLAT_SHADING.load(Ordering::Relaxed) != 0 && !separate_specular(frame, draw)
 }
 
+/// Debug "zeroalpha 0|1|2": blended draws leave out the triangles whose
+/// three corners have alpha 0, where such a fragment keeps the target (1,
+/// the default; core zero_alpha: God of War's cloud layer, most of which
+/// is faded out), or draw them all (0). The same picture either way. 2: as
+/// 1 with every zero-copy draw read every frame (no `zero_alpha::Memo`),
+/// to measure what the memo saves.
+pub static ZERO_ALPHA: AtomicI32 = AtomicI32::new(1);
+
+/// The longest index list `cull_zero_alpha` looks at (its room; God of
+/// War's cloud layer is one strip of ~1,800 indices). Longer draws are
+/// drawn whole.
+const ZERO_ALPHA_MOST_INDICES: usize = 4096;
+
+/// Raw vertices' alphas in PSP RAM (zero copy), read through a window of
+/// them copied in bursts. PSP RAM is not cached: a single load costs ~0.8 us
+/// under load, a burst of 128 bytes about the same and 256 bytes ~1.75 us
+/// (docs/vita-performance.md "PSP RAM seen from the Vita"), so whole
+/// vertices 256 bytes at a time are several times cheaper than one alpha
+/// byte each (God of War's cloud layer, ~1,800 vertices of 24 bytes: 1.5 ms
+/// a frame byte by byte). Not more at a time: most of its strips are ~6
+/// vertices, and the next one is somewhere else.
+struct AlphaWindow<'a> {
+    /// The vertices in PSP RAM, vertex 0 at the start.
+    source: &'a [u8],
+    alphas: zero_alpha::RawAlphas<'a>,
+    /// The copy (words, so that the burst copy finds it aligned): `skip`
+    /// bytes before vertex `first`, then `count` whole vertices.
+    room: [u32; ALPHA_WINDOW_BYTES / 4],
+    skip: usize,
+    first: u32,
+    count: u32,
+}
+
+const ALPHA_WINDOW_BYTES: usize = 256;
+
+impl<'a> AlphaWindow<'a> {
+    fn new(alphas: zero_alpha::RawAlphas<'a>, source: &'a [u8]) -> Self {
+        Self { source, alphas, room: [0; ALPHA_WINDOW_BYTES / 4], skip: 0, first: 0, count: 0 }
+    }
+
+    /// True if vertex number `vertex` has alpha 0 (a vertex outside the
+    /// block: no). Vertices asked for in rising order (a strip's) are
+    /// copied once.
+    fn is_zero(&mut self, vertex: u16) -> bool {
+        let vertex = vertex as u32;
+        if vertex.wrapping_sub(self.first) >= self.count && !self.fill(vertex) {
+            return false;
+        }
+        // Safe: `room` is plain words; `skip` + `count` vertices lie inside it (`fill`).
+        let bytes = unsafe { core::slice::from_raw_parts(self.room.as_ptr() as *const u8, ALPHA_WINDOW_BYTES) };
+        self.alphas.over(&bytes[self.skip..]).is_zero((vertex - self.first) as u16)
+    }
+
+    /// Copies the vertices from `vertex` on, as many as fit; false if there is none.
+    fn fill(&mut self, vertex: u32) -> bool {
+        let stride = self.alphas.stride();
+        let start = vertex as usize * stride;
+        if stride == 0 || start >= self.source.len() {
+            return false;
+        }
+        // From the word the vertex starts in (the burst copy wants both ends aligned).
+        let skip = (self.source.as_ptr() as usize + start) & 3;
+        let count = ((ALPHA_WINDOW_BYTES - skip) / stride).min((self.source.len() - start) / stride);
+        if count == 0 {
+            return false;
+        }
+        // Safe: `count` whole vertices from `start` lie in `source`; the up to 3 bytes
+        // before them are still PSP RAM (its mapping starts at a page); the room holds them.
+        unsafe {
+            crate::platform::psp_copy(self.room.as_mut_ptr() as *mut u8, self.source.as_ptr().add(start).sub(skip), (skip + count * stride) as u32);
+        }
+        (self.skip, self.first, self.count) = (skip, vertex, count as u32);
+        true
+    }
+}
+
+/// `cull_zero_alpha`'s room: a draw's runs written out as a triangle list,
+/// and the new list; the display thread only. (Not on the stack yet: 16 KiB
+/// of the display thread's 64 KiB, and how deep the draw path already is
+/// there has not been measured.)
+static ZERO_ALPHA_ROOM: SingleThreaded<[[u16; ZERO_ALPHA_MOST_INDICES]; 2]> = SingleThreaded::new([[0; ZERO_ALPHA_MOST_INDICES]; 2]);
+
 /// Flat draws whose vertices all have one colour and that need no PSP depth
 /// go through the constant-colour program (nativeres_textured_const_f.cg:
 /// the colour as a uniform; God of War's bloom add over the whole screen 54
@@ -274,6 +357,29 @@ fn samples_opaque_rows(frame: &Frame, draw: &Draw, rows: u16) -> bool {
     only
 }
 
+/// Where raw `draw` (`draw_flags::RAW_VERTICES`) reads its vertices from:
+/// the address of its window's vertex 0 and the end of the block the GPU
+/// reads it from (PSP RAM as mapped for the GPU, or the raw arena). None
+/// if that isn't there.
+fn raw_window(frame: &Frame, draw: &Draw) -> Option<(usize, usize)> {
+    if draw.flags & draw_flags::RAW_PSP_RAM != 0 {
+        let ram = arenas::PSP_RAM_FOR_GPU.load(Ordering::Acquire);
+        let ram_bytes = arenas::PSP_RAM_FOR_GPU_BYTES.load(Ordering::Acquire) as usize;
+        let offset = (draw.first_vertex & 0x1FFF_FFFF).wrapping_sub(PSP_RAM_GPU_BASE) as usize;
+        if ram.is_null() || offset >= ram_bytes {
+            return None;
+        }
+        Some((ram as usize + offset, ram as usize + ram_bytes))
+    } else {
+        let arena = RAW_ARENA.load(Ordering::Relaxed) as usize;
+        let arena_bytes = RAW_ARENA_BYTES.load(Ordering::Relaxed) as usize;
+        if frame.raw_vertices.is_null() || draw.first_vertex >= frame.raw_vertices_len {
+            return None;
+        }
+        Some((frame.raw_vertices as usize + draw.first_vertex as usize, arena + arena_bytes))
+    }
+}
+
 /// True if every vertex of textured `draw` ends up with alpha 255: raw
 /// vertices by their lowest alpha and colour rules, screen-space ones as
 /// they are. False where that isn't known cheaply (vertices in model space
@@ -299,22 +405,8 @@ fn vertices_opaque(frame: &Frame, draw: &Draw) -> bool {
     let Some((first, end)) = raw_vertex_span(frame, draw) else {
         return false;
     };
-    // The window's start and the end of its block, as the draw reads them.
-    let (base, region_end) = if draw.flags & draw_flags::RAW_PSP_RAM != 0 {
-        let ram = arenas::PSP_RAM_FOR_GPU.load(Ordering::Acquire);
-        let ram_bytes = arenas::PSP_RAM_FOR_GPU_BYTES.load(Ordering::Acquire) as usize;
-        let offset = (draw.first_vertex & 0x1FFF_FFFF).wrapping_sub(PSP_RAM_GPU_BASE) as usize;
-        if ram.is_null() || offset >= ram_bytes {
-            return false;
-        }
-        (ram as usize + offset, ram as usize + ram_bytes)
-    } else {
-        let arena = RAW_ARENA.load(Ordering::Relaxed) as usize;
-        let arena_bytes = RAW_ARENA_BYTES.load(Ordering::Relaxed) as usize;
-        if frame.raw_vertices.is_null() || draw.first_vertex >= frame.raw_vertices_len {
-            return false;
-        }
-        (frame.raw_vertices as usize + draw.first_vertex as usize, arena + arena_bytes)
+    let Some((base, region_end)) = raw_window(frame, draw) else {
+        return false;
     };
     let format = VertexFormat(draw.vertex_format);
     let stride = format.layout().size as usize;
@@ -756,6 +848,8 @@ pub struct Draws {
     /// The primitive of the indices `draw_indices` gave last: triangles,
     /// or a triangle strip (core `stitched_strip`).
     index_primitive: u32,
+    /// Which zero-copy draws `cull_zero_alpha` reads (core `zero_alpha::Memo`).
+    zero_alpha_memo: zero_alpha::Memo,
 }
 
 static DRAWS: SingleThreaded<Draws> = SingleThreaded::new(Draws {
@@ -776,6 +870,7 @@ static DRAWS: SingleThreaded<Draws> = SingleThreaded::new(Draws {
     surface_size: (TARGET_WIDTH, TARGET_HEIGHT),
     origin_x: 0,
     index_primitive: gxm::PRIMITIVE_TRIANGLES,
+    zero_alpha_memo: zero_alpha::Memo::new(),
 });
 
 /// The 960x544 targets' size (targets.rs `TARGET_WIDTH` / `TARGET_HEIGHT`).
@@ -1821,6 +1916,119 @@ impl Draws {
         set_uniform(buffer, skinning.skin, 4, skin.as_ptr());
     }
 
+    /// Textured `draw`'s index buffer (`indices`, `index_count` from
+    /// `draw_indices`, drawn as `self.index_primitive`) without the
+    /// triangles whose three corners end up with alpha 0, built in the frame
+    /// pool, where a fragment of alpha 0 leaves the target as it is (core
+    /// `zero_alpha::keeps_target`): the same picture. Raw vertices by their
+    /// own alpha bytes, where the colour rules keep 0 at 0 (God of War's
+    /// cloud layer, ~40 short strips), the frame's screen-space vertices as
+    /// they are. Raw vertices left in PSP RAM (zero copy) are in memory that
+    /// is not cached: reading one alpha byte each of God of War's ~45 such
+    /// draws cost the display thread 3.1 ms a frame for no triangle worth
+    /// leaving out (2026-11-26, a frozen gameplay frame: 32.2 -> 35.3 ms),
+    /// so those are read only while it pays (`zero_alpha::Memo`).
+    /// None if the draw is not such a one (or has more than
+    /// `ZERO_ALPHA_MOST_INDICES` indices), no triangle goes, or the strip
+    /// without them would be longer than it was
+    /// (`zero_alpha::cull_strip_runs`); a count of 0 if they all go.
+    fn cull_zero_alpha(&mut self, frame: &Frame, draw: &Draw, indices: *const u16, index_count: u32) -> Option<(*const u16, u32)> {
+        if ZERO_ALPHA.load(Ordering::Relaxed) == 0
+            || index_count == 0
+            || index_count as usize > ZERO_ALPHA_MOST_INDICES
+            || !zero_alpha::keeps_target(frame, draw)
+        {
+            return None;
+        }
+        let start = draw_clock();
+        let list = self.zero_alpha_list(frame, draw, indices, index_count);
+        stats().alpha0_us += draw_clock().wrapping_sub(start);
+        list
+    }
+
+    /// `cull_zero_alpha` for a draw that keeps the target where its alpha is 0.
+    fn zero_alpha_list(&mut self, frame: &Frame, draw: &Draw, indices: *const u16, index_count: u32) -> Option<(*const u16, u32)> {
+        let first = draw.first_index as usize;
+        let stored = frame.indices.get(first..first.checked_add(draw.index_count as usize)?)?;
+        let runs = draw.flags & draw_flags::INDEX_RUNS != 0;
+        let strip = self.index_primitive == gxm::PRIMITIVE_TRIANGLE_STRIP;
+        // Whose alphas: raw vertices' bytes or the frame's vertices.
+        let raw = if draw.flags & draw_flags::RAW_VERTICES != 0 {
+            if draw.flags & draw_flags::RAW_SPRITES != 0 || !frame.raw_colors_of(draw).is_some_and(zero_alpha::raw_zero_stays_zero) {
+                return None;
+            }
+            let (base, region_end) = raw_window(frame, draw)?;
+            // Safe: the block the GPU reads the draw's vertices from, from its vertex 0 on.
+            let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, region_end - base) };
+            Some((zero_alpha::RawAlphas::new(VertexFormat(draw.vertex_format), bytes)?, bytes))
+        } else if draw.transform != 0 || draw.flags & draw_flags::CACHED_VERTICES != 0 {
+            return None; // model space: the GPU may light them
+        } else {
+            None
+        };
+        let first_vertex = draw.first_vertex as usize;
+        let own = if raw.is_none() { frame.vertices.get(first_vertex..first_vertex.checked_add(draw.vertex_count as usize)?)? } else { &[] };
+        // (In PSP RAM: through a window copied in bursts.)
+        let mut window = raw.filter(|_| draw.flags & draw_flags::RAW_PSP_RAM != 0).map(|(alphas, bytes)| AlphaWindow::new(alphas, bytes));
+        let zero = |vertex: u16| match (&mut window, &raw) {
+            (Some(window), _) => window.is_zero(vertex),
+            (None, Some((alphas, _))) => alphas.is_zero(vertex),
+            (None, None) => own.get(vertex as usize).is_some_and(|vertex| vertex.color >> 24 == 0),
+        };
+        // A raw draw that had too little to leave out waits some frames
+        // (`zero_alpha::Memo`): known by its vertices' PSP address, or in the
+        // arena (another place every frame) by its texture's.
+        let remembered = raw.is_some() && ZERO_ALPHA.load(Ordering::Relaxed) != 2;
+        let key = if draw.flags & draw_flags::RAW_PSP_RAM != 0 {
+            draw.first_vertex
+        } else {
+            !frame.textures().get(draw.texture as usize).map_or(0, |texture| texture.address)
+        };
+        if remembered && !self.zero_alpha_memo.due(key, draw.index_count) {
+            return None;
+        }
+        // The new list is put together in memory of our own and copied into
+        // the frame pool in one go: the pool (and the index ring) is slow to
+        // write and read index by index (as `cull_black_triangles` found).
+        stats().alpha0_read += 1;
+        // Safe: the display thread's, used only here.
+        let [written, local] = unsafe { ZERO_ALPHA_ROOM.get() };
+        let local = &mut local[..index_count as usize];
+        let culled = if strip {
+            // One strip of the draw's runs (`draw_indices`): made again from them.
+            zero_alpha::cull_strip_runs(stored, zero, local)
+        } else if runs {
+            // Its runs written out as a triangle list, as `draw_indices` did.
+            let list = &mut written[..index_count as usize];
+            write_runs(stored, list);
+            zero_alpha::cull_list(list, zero, local)
+        } else {
+            // The frame's own triangle list.
+            zero_alpha::cull_list(stored, zero, local)
+        };
+        if remembered {
+            // (No cull made: as if none of its triangles went.)
+            let (gone, kept) = culled.map_or((0, 1), |culled| (culled.culled, culled.kept));
+            self.zero_alpha_memo.note(key, draw.index_count, gone, kept);
+        }
+        let culled = culled?;
+        let stats = stats();
+        stats.alpha0_draws += 1;
+        stats.alpha0_culled += culled.culled;
+        stats.alpha0_kept += culled.kept;
+        if culled.kept == 0 {
+            stats.alpha0_skipped += 1;
+            return Some((indices, 0));
+        }
+        let out = frame_pool_alloc(culled.indices as u32 * 2, 2) as *mut u16;
+        if out.is_null() {
+            return None;
+        }
+        // Safe: the pool gave `culled.indices` u16s.
+        unsafe { core::ptr::copy_nonoverlapping(local.as_ptr(), out, culled.indices) };
+        Some((out as *const u16, culled.indices as u32))
+    }
+
     /// The draw's triangle corners as an index buffer the GPU can read and
     /// their count: the index ring's list (written by the capture), or
     /// built in the frame pool (index runs written out in the order frame.rs
@@ -1968,6 +2176,17 @@ impl Draws {
         let (mut indices, mut index_count) = (indices, index_count);
         if skip(8) {
             return;
+        }
+        // Triangles whose corners all have alpha 0 in a blend that then
+        // keeps the target: left out (core zero_alpha). (Not next to the
+        // black-texel cull below, which reads the draw's own index list.)
+        if black.is_none() {
+            if let Some((list, count)) = self.cull_zero_alpha(frame, draw, indices, index_count) {
+                if count == 0 {
+                    return; // nothing of the draw is left
+                }
+                (indices, index_count) = (list, count);
+            }
         }
         // The alpha test in the fragment program where the draw has one.
         let programs_ready = self.programs.textured_ready();

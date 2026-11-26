@@ -147,6 +147,17 @@ pub struct RenderStats {
     pub black_culled: u32,
     pub black_kept: u32,
     pub black_skipped: u32,
+    /// Blended draws with triangles whose three corners have alpha 0 (core
+    /// zero_alpha, DESIGN "seventy-eighth session"), those triangles left
+    /// out and the others kept, and the draws left out whole.
+    pub alpha0_draws: u32,
+    pub alpha0_culled: u32,
+    pub alpha0_kept: u32,
+    pub alpha0_skipped: u32,
+    /// The draws whose vertex alphas were read for it, and the display
+    /// thread's time in it (with `drawtiming 1` only, else 0).
+    pub alpha0_read: u32,
+    pub alpha0_us: u64,
     /// Raw draws drawn as one triangle strip (`stripdraws`), their indices
     /// and the triangle-list corners they replaced.
     pub strip_draws: u32,
@@ -240,6 +251,12 @@ impl RenderStats {
         black_culled: 0,
         black_kept: 0,
         black_skipped: 0,
+        alpha0_draws: 0,
+        alpha0_culled: 0,
+        alpha0_kept: 0,
+        alpha0_skipped: 0,
+        alpha0_read: 0,
+        alpha0_us: 0,
         strip_draws: 0,
         strip_indices: 0,
         strip_corners: 0,
@@ -332,7 +349,7 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
     );
     let _ = write!(
         text,
-        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} point_light_draws={} fixed_color_draws={} fix_b_draws={} cut_draws={} cut_fast_draws={} cut_off_draws={} wide_draws={} opaque_draws={} opaque_untested_draws={} opaque_rows_draws={} hidden_draws={} depth_only_draws={} hidden={}us flat_draws={} const_draws={} nodepth_draws={} ge_filter_draws={} ge_wide_draws={} ge_wide_missed={} ge_wide_inexact={} ge_gather_draws={} ge_gather_missed={} wide_target_textures={} wide_copies={} wide_copy_scenes={} black_draws={} black_culled={} black_kept={} black_skipped={} strip_draws={} strip_indices={} strip_corners={} ge_depth_draws={} ge_depth_vertices={} ge_depth={}us opaque={}us ",
+        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} point_light_draws={} fixed_color_draws={} fix_b_draws={} cut_draws={} cut_fast_draws={} cut_off_draws={} wide_draws={} opaque_draws={} opaque_untested_draws={} opaque_rows_draws={} hidden_draws={} depth_only_draws={} hidden={}us flat_draws={} const_draws={} nodepth_draws={} ge_filter_draws={} ge_wide_draws={} ge_wide_missed={} ge_wide_inexact={} ge_gather_draws={} ge_gather_missed={} wide_target_textures={} wide_copies={} wide_copy_scenes={} black_draws={} black_culled={} black_kept={} black_skipped={} alpha0_draws={} alpha0_culled={} alpha0_kept={} alpha0_skipped={} alpha0_read={} alpha0={}us strip_draws={} strip_indices={} strip_corners={} ge_depth_draws={} ge_depth_vertices={} ge_depth={}us opaque={}us ",
         per_frame(s.begin_us),
         per_frame(s.loop_us),
         per_frame(s.convert_us),
@@ -374,6 +391,12 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
         s.black_culled / frames,
         s.black_kept / frames,
         s.black_skipped / frames,
+        s.alpha0_draws / frames,
+        s.alpha0_culled / frames,
+        s.alpha0_kept / frames,
+        s.alpha0_skipped / frames,
+        s.alpha0_read / frames,
+        per_frame(s.alpha0_us),
         s.strip_draws / frames,
         s.strip_indices / frames,
         s.strip_corners / frames,

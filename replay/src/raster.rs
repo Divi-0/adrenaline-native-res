@@ -44,6 +44,12 @@ thread_local! {
     static FRAG_STATS: bool = std::env::var_os("REPLAY_FRAG_STATS").is_some();
     static FRAG_COUNTS: std::cell::RefCell<std::collections::BTreeMap<usize, [u32; 4]>> = std::cell::RefCell::new(std::collections::BTreeMap::new());
     static FLOAT_DEPTH: std::cell::RefCell<std::collections::HashMap<usize, Vec<f32>>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    // REPLAY_ZERO_ALPHA=1: triangles whose three corners have alpha 0, in draws
+    // that keep the target there, are left out (core zero_alpha, as the Vita's
+    // draw loop does); the picture must be the same. `ZERO_ALPHA_COUNTS`: the
+    // triangles of those draws kept and left out.
+    static ZERO_ALPHA: bool = std::env::var("REPLAY_ZERO_ALPHA").is_ok_and(|value| value == "1");
+    static ZERO_ALPHA_COUNTS: std::cell::Cell<(u32, u32)> = std::cell::Cell::new((0, 0));
 }
 
 /// A decoded texture, RGBA (0xAABBGGRR) row by row.
@@ -449,6 +455,10 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
     if black_texels {
         println!("black texels: {black_kept} triangles kept, {black_culled} culled");
     }
+    if ZERO_ALPHA.with(|on| *on) {
+        let (kept, culled) = ZERO_ALPHA_COUNTS.with(|counts| counts.replace((0, 0)));
+        println!("zero alpha: {kept} triangles kept, {culled} culled");
+    }
     // Debugging: REPLAY_RUN_STATS=1: index runs per primitive type (raw draws):
     // runs, vertices, triangles.
     if std::env::var_os("REPLAY_RUN_STATS").is_some() {
@@ -616,11 +626,22 @@ fn draw_one_black(
         None
     };
     let index = (draw as *const Draw as usize - frame.draws().as_ptr() as usize) / core::mem::size_of::<Draw>();
+    let zero_alpha = ZERO_ALPHA.with(|on| *on) && culls_zero_alpha(frame, draw);
     let mut corners = frame.screen_corners(draw);
     while let (Some(a), Some(b), Some(c)) = (corners.next(), corners.next(), corners.next()) {
         if black.is_some_and(|black| !black.keeps_triangle([&a, &b, &c])) {
             culled += 1;
             continue;
+        }
+        if zero_alpha {
+            let gone = [&a, &b, &c].iter().all(|corner| corner.color >> 24 == 0);
+            ZERO_ALPHA_COUNTS.with(|counts| {
+                let (kept, culled) = counts.get();
+                counts.set(if gone { (kept, culled + 1) } else { (kept + 1, culled) });
+            });
+            if gone {
+                continue;
+            }
         }
         kept += 1;
         // Debugging: REPLAY_COVER=x,y (960x544) prints every triangle covering
@@ -653,6 +674,25 @@ fn draw_one_black(
         }));
     }
     (kept, culled)
+}
+
+/// True where the Vita's draw loop leaves `draw`'s triangles with three
+/// corners of alpha 0 out (draw.rs `cull_zero_alpha`): the draw keeps the
+/// target there (core `zero_alpha::keeps_target`), and its vertices' final
+/// alphas are known: raw vertices with a colour of their own that the colour
+/// rules leave at 0, or screen-space vertices of the frame.
+fn culls_zero_alpha(frame: &Frame, draw: &Draw) -> bool {
+    use nativeres_core::zero_alpha;
+    if !zero_alpha::keeps_target(frame, draw) {
+        return false;
+    }
+    if draw.flags & draw_flags::RAW_VERTICES != 0 {
+        draw.flags & draw_flags::RAW_SPRITES == 0
+            && frame.raw_colors_of(draw).is_some_and(zero_alpha::raw_zero_stays_zero)
+            && zero_alpha::RawAlphas::new(nativeres_core::vertex::VertexFormat(draw.vertex_format), &[]).is_some()
+    } else {
+        draw.transform == 0 && draw.flags & draw_flags::CACHED_VERTICES == 0
+    }
 }
 
 /// A texture that is the PSP framebuffer the frame doesn't draw into: a

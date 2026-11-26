@@ -84,3 +84,4 @@ pub mod vertex;
 pub mod vertex_cache;
 pub mod vram_requests;
 pub mod walk_stream;
+pub mod zero_alpha;
