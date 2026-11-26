@@ -22,8 +22,12 @@
 //! - 0..65535: the GE's screen depth of the vertex;
 //! - `NO_DEPTH` (-1): the GE gives none there (w zero, denormal or huge):
 //!   the program's float depth stands in, as `GdScreenZ`'s y = 0 did;
-//! - `ON_GPU` (-2): work it out in the program (the old way; debug
-//!   `gedepthcpu 0`).
+//! - `ON_GPU` (-2): what the stream is filled with while the program works
+//!   the depth out itself (debug `gedepthcpu 0`, the default). The program
+//!   does not read the stream then: its uGeDepth.z (0: the program, 1: this
+//!   stream) says so per draw. It jumped on the stream's value before, and a
+//!   jump on a per-vertex value slows the rest of a vertex program on this
+//!   GPU (nativeres_raw_v.cg "No per-vertex jumps").
 
 use crate::frame::{RawCamera, RawTransform};
 use crate::ge_math;
@@ -77,7 +81,8 @@ impl GeDepthInputs {
         ge_math::integer::Prepared::new(self.column_z, self.column_w, self.scale, self.center)
     }
 
-    /// As the program's uniforms: uGeZ, uGeW, uGeDepth.
+    /// As the program's uniforms: uGeZ, uGeW, uGeDepth (its z 0: the program
+    /// works the depth out; the Vita's draw path sets 1 with a depth stream).
     pub fn uniforms(&self) -> [[f32; 4]; 3] {
         [self.column_z, self.column_w, [self.scale, self.center, 0.0, 0.0]]
     }

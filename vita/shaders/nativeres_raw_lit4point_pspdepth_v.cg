@@ -31,7 +31,8 @@
 // aNormal: the raw normal (s8, s16 or float, as numbers; (byte 0..2) for
 //   formats without one, unused then): only for lighting 3.
 // aGeDepth (GE_DEPTH only): the GE's depth of the vertex from the CPU, a
-//   second vertex stream (core ge_depth_stream.rs; see GE_DEPTH below).
+//   second vertex stream (core ge_depth_stream.rs; see GE_DEPTH below); read
+//   only where uGeDepth.z is 1 (debug `gedepthcpu`).
 // aWeights0, aWeights1: the raw skinning weights 1-4 and 5-8 (u8, u16 or
 //   float; read from byte 0 for formats with fewer, unused then: their bones
 //   are zero). uSkin: x > 0.5 = skinned (frame.rs Draw::bones), y = what the
@@ -86,6 +87,9 @@
 //   `raw_variant`): the unlit draws' colour rules are left out (52
 //   instructions per vertex, 2026-11-18). The GPU runs a part switched by
 //   a uniform whether it is on or not, so only the full program keeps both.
+//   (That holds for parts the compiler predicates. A part it puts behind a
+//   real jump on a per-draw value is skipped for free, measured 2026-11-26:
+//   see "No per-vertex jumps" in main for what a jump may depend on.)
 // - RAW_LIT1_FLAT, RAW_LIT4_FLAT (nativeres_raw_lit1flat_v.cg, _lit4flat_v):
 //   as RAW_LIT1 / RAW_LIT4 for light sets whose specular coefficient is 0
 //   or less and whose fourth light is all zeros (RAW_FLAT_LIGHTS, draw.rs
@@ -188,12 +192,15 @@ float High(float value, float inverse)
 	return floor(value * inverse + inverse * 0.5f);
 }
 
-// The GE's pow for lighting, as nativeres_3d_v.cg.
+// The GE's pow for lighting, as nativeres_3d_v.cg. e is a per-draw value (a
+// jump on it is free); x is the vertex's, so its sign selects (the power is
+// worked out either way; see "No per-vertex jumps" in main).
 float PspPow(float x, float e)
 {
 	if (e <= 0.0f)
 		return 1.0f;
-	return x > 0.0f ? exp2(e * log2(x)) : 0.0f;
+	float power = exp2(e * log2(x));
+	return x > 0.0f ? power : 0.0f;
 }
 
 #ifdef GE_LIGHT
@@ -240,8 +247,9 @@ float3 Ge8(float3 c)
 // uGeZ / uGeW: the combined world-view-projection matrix's clip z and w
 // columns as the GE combines it (ge_math::combined; rows x, y, z,
 // translation), uGeDepth: x the viewport's depth scale, y its centre
-// (float24s); what the program takes from them alone (halves, units) it works
-// out once per draw. uRecip: the GE's reciprocal segments (start, slope;
+// (float24s), z who works the depth out (0: this program; 1: the CPU, read
+// from aGeDepth); what the program takes from them alone (halves, units) it
+// works out once per draw. uRecip: the GE's reciprocal segments (start, slope;
 // ge_math RECIP), a uniform buffer of its own bound once (draw.rs).
 uniform float2 uRecip[128] : BUFFER[0];
 
@@ -292,7 +300,8 @@ float GdProduct24(float a, float b)
 	// beyond the true product; one float step back (a step of the sum's own
 	// size: still inside the 16-bit cell before it) gives the right top 16 bits.
 	float error = low - (sum - high);
-	float back = error * sum < 0.0f ? GdUnit(sum) * (1.0f / 8388608.0f) : 0.0f;
+	float step = GdUnit(sum) * (1.0f / 8388608.0f);
+	float back = error * sum < 0.0f ? step : 0.0f;
 	return GdTruncate24(sum - back);
 }
 
@@ -315,23 +324,29 @@ float2 GdScreenZ(float3 model, float4 geZ, float4 geW, float4 geDepth)
 	float4 vUnit = float4(GdUnit(v.x), GdUnit(v.y), GdUnit(v.z), 1.0f);
 	float z = GdClip(v, vUnit, geZ);
 	float w = GdClip(v, vUnit, geW);
-	int wBits = floatToRawIntBits(w);
-	int ew = (wBits >> 23) & 255;
-	if (ew == 0 || ew >= 253)
-		return float2(0.0f, 0.0f);
+	// No GE depth for a w that is zero, denormal or huge. No jump for it (see
+	// "No per-vertex jumps" at main's GE_DEPTH part): the steps below then
+	// run on 1 instead (a normal number keeps the table index inside the
+	// table), and y = 0 has the caller drop their result.
+	int ew = (floatToRawIntBits(w) >> 23) & 255;
+	float has = (ew == 0 || ew >= 253) ? 0.0f : 1.0f;
+	float wUsed = has > 0.5f ? w : 1.0f;
+	int wBits = floatToRawIntBits(wUsed);
 	// sign x 2^-e of w: its exponent mirrored.
 	float inverseUnit = intBitsToFloat((wBits & (1 << 31)) | (2130706432 - (wBits & 2139095040)));
 	// The reciprocal's table step in whole numbers below 2^24: i = w's 15
 	// fraction bits, q = (64 start + 63 + slope (i & 255)) >> 7.
-	float i = (w * inverseUnit - 1.0f) * 32768.0f;
+	float i = (wUsed * inverseUnit - 1.0f) * 32768.0f;
 	float high = floor(i * (1.0f / 256.0f));
 	float2 segment = uRecip[(int)high];
 	float q = floor((64.0f * segment.x + 63.0f + segment.y * (i - 256.0f * high)) * (1.0f / 128.0f));
-	float scaled = 0.0f;
-	// ndc = z x reciprocal (q x 2^(-16 - e), w's sign), cut; then x scale, cut.
-	if (((floatToRawIntBits(z) >> 23) & 255) != 0 && ((floatToRawIntBits(scale) >> 23) & 255) != 0)
-		scaled = GdProduct24(GdProduct24(z, q * (inverseUnit * (1.0f / 65536.0f))), scale);
-	return float2(clamp(floor(GdAdd(scaled, geDepth.y)), 0.0f, 65535.0f), 1.0f);
+	// ndc = z x reciprocal (q x 2^(-16 - e), w's sign), cut; then x scale, cut;
+	// 0 where z or the scale is zero or denormal (the products are worked
+	// out all the same: finite numbers, dropped by the select).
+	float product = GdProduct24(GdProduct24(z, q * (inverseUnit * (1.0f / 65536.0f))), scale);
+	float factors = (((floatToRawIntBits(z) >> 23) & 255) != 0 && ((floatToRawIntBits(scale) >> 23) & 255) != 0) ? 1.0f : 0.0f;
+	float scaled = factors > 0.5f ? product : 0.0f;
+	return float2(clamp(floor(GdAdd(scaled, geDepth.y)), 0.0f, 65535.0f), has);
 }
 #endif
 
@@ -497,17 +512,27 @@ void main(
 	float pspDepth = floor(saturate(uDepth.x + uDepth.y * clip.z / max(clip.w, 1.0e-6f)) * 65535.0f);
 #ifdef GE_DEPTH
 	// The GE's own depth of the model position (GE_DEPTH above), worked out
-	// by the CPU once per vertex (core ge_depth_stream.rs: aGeDepth 0..65535;
-	// -1: the GE gives none, the float depth stands in) or here (-2, the old
-	// way: debug `gedepthcpu 0`). A real branch: vertices with the CPU's
-	// depth skip GdScreenZ's ~700 instructions.
-	if (aGeDepth > -1.5f) {
-		if (aGeDepth >= 0.0f)
-			pspDepth = aGeDepth;
+	// here (uGeDepth.z 0, the default) or by the CPU once per
+	// vertex (uGeDepth.z 1, debug `gedepthcpu 1|2`; core ge_depth_stream.rs:
+	// aGeDepth 0..65535; -1: the GE gives none, the float depth stands in).
+	//
+	// No per-vertex jumps: the jump on uGeDepth.z is free (a per-draw value;
+	// draws with the CPU's depth skip GdScreenZ). But once a vertex program
+	// has run a jump whose condition comes from the vertex (an attribute, or
+	// anything worked out from one), the GPU runs everything after it about
+	// 1.46 times slower, whichever way the jump went (measured 2026-11-26,
+	// DESIGN "seventy-fifth session": 80 rounds of a multiply-add and a frac
+	// for a million vertices 50.4 ms, 69.4 ms behind such a jump, 51.9 ms
+	// with a select instead). So per-vertex choices here are selects of
+	// values worked out either way. (Free as well, same lab: a jump on a
+	// uniform read from memory, a loop with a counter, a predicated
+	// instruction, bit masks, and GdScreenZ's table read at a per-vertex
+	// place, which costs its own ~4 ns and no more.)
+	if (uGeDepth.z > 0.5f) {
+		pspDepth = aGeDepth >= 0.0f ? aGeDepth : pspDepth;
 	} else {
 		float2 geDepth = GdScreenZ(position, uGeZ, uGeW, uGeDepth);
-		if (geDepth.y > 0.5f)
-			pspDepth = geDepth.x;
+		pspDepth = geDepth.y > 0.5f ? geDepth.x : pspDepth;
 	}
 #endif
 	vDepth = float2(farSide > 0.0f ? 65535.0f - pspDepth : pspDepth, farSide) * clip.w;
@@ -541,7 +566,9 @@ void main(
 		float sign = 1.0f - 2.0f * uLights[21].w;
 		float3 n = sign * float3(dot(uWorld[0].xyz, normal), dot(uWorld[1].xyz, normal), dot(uWorld[2].xyz, normal));
 		float length2 = dot(n, n);
-		n = length2 > 0.0f ? n * rsqrt(length2) : float3(0.0f, 0.0f, 1.0f);
+		// (Selected, not jumped over: "No per-vertex jumps".)
+		float3 unitNormal = n * rsqrt(length2);
+		n = length2 > 0.0f ? unitNormal : float3(0.0f, 0.0f, 1.0f);
 		float4 fromVertex = uLights[21];
 		float4 ambientColor = lerp(uLights[18], base, fromVertex.x);
 		float3 diffuseColor = lerp(uLights[19].rgb, base.rgb, fromVertex.y);
@@ -585,13 +612,16 @@ void main(
 #endif
 			sum += lightDiffuse;
 			// Directional lights only (point lights have no specular here).
-			if (uLights[12 + i].a > 0.5f && lightDot >= 0.0f) {
+			// Only where the light faces the vertex (lightDot >= 0): a
+			// select of the part or 0, added either way.
+			if (uLights[12 + i].a > 0.5f) {
 #ifdef RAW_FLAT_LIGHTS
 				float factor = 1.0f;
 #else
 				float factor = PspPow(dot(uLights[4 + i].xyz, n), coefficient);
 #endif
-				specularSum += GeScale(GeProduct(Ge8(uLights[12 + i].rgb), specular8), factor);
+				float3 specularPart = GeScale(GeProduct(Ge8(uLights[12 + i].rgb), specular8), factor);
+				specularSum += lightDot >= 0.0f ? specularPart : float3(0.0f, 0.0f, 0.0f);
 			}
 		}
 		float4 lit;
@@ -626,9 +656,12 @@ void main(
 			if (uLights[8 + i].a > 0.5f)
 				lightDot = PspPow(lightDot, coefficient);
 			diffuse += uLights[8 + i].rgb * max(lightDot, 0.0f) * lightScale;
-			// Directional lights only (point lights have no specular here).
-			if (uLights[12 + i].a > 0.5f && lightDot >= 0.0f)
-				specular += uLights[12 + i].rgb * PspPow(dot(uLights[4 + i].xyz, n), coefficient);
+			// Directional lights only (point lights have no specular here);
+			// where the light faces the vertex: selected, added either way.
+			if (uLights[12 + i].a > 0.5f) {
+				float3 lightSpecular = uLights[12 + i].rgb * PspPow(dot(uLights[4 + i].xyz, n), coefficient);
+				specular += lightDot >= 0.0f ? lightSpecular : float3(0.0f, 0.0f, 0.0f);
+			}
 		}
 #else
 #ifdef RAW_FLAT_LIGHTS
@@ -639,6 +672,7 @@ void main(
 			if (uLights[8 + i].a > 0.5f)
 				lightDot = 1.0f;
 			diffuse += uLights[8 + i].rgb * max(lightDot, 0.0f);
+			// (The compiler predicates this add: no jump.)
 			if (uLights[12 + i].a > 0.5f && lightDot >= 0.0f)
 				specular += uLights[12 + i].rgb;
 		}
@@ -648,8 +682,10 @@ void main(
 			if (uLights[8 + i].a > 0.5f)
 				lightDot = PspPow(lightDot, coefficient);
 			diffuse += uLights[8 + i].rgb * max(lightDot, 0.0f);
-			if (uLights[12 + i].a > 0.5f && lightDot >= 0.0f)
-				specular += uLights[12 + i].rgb * PspPow(dot(uLights[4 + i].xyz, n), coefficient);
+			if (uLights[12 + i].a > 0.5f) {
+				float3 lightSpecular = uLights[12 + i].rgb * PspPow(dot(uLights[4 + i].xyz, n), coefficient);
+				specular += lightDot >= 0.0f ? lightSpecular : float3(0.0f, 0.0f, 0.0f);
+			}
 		}
 #endif
 #endif

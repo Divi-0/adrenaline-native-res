@@ -1680,6 +1680,7 @@ impl Draws {
         let values = unsafe { core::slice::from_raw_parts_mut(block, (end - lowest) as usize) };
         let mode = GE_DEPTH_CPU.load(Ordering::Relaxed);
         if mode == 0 {
+            // Not read by the program then (its uGeDepth.z is 0); a defined value all the same.
             values.fill(nativeres_core::ge_depth_stream::ON_GPU);
         } else {
             // The bones the program skins with (as set_raw_bones: none when
@@ -3057,6 +3058,11 @@ fn set_raw_uniforms(
         if GE_DEPTH_ON.load(Ordering::Relaxed) == 0 {
             ge[1] = [0.0; 4]; // w 0: the programs' float depth (debug `gedepth 0`)
         }
+        // uGeDepth.z: 1 = the depth stream holds the CPU's depths (debug
+        // `gedepthcpu 1|2`), 0 = the program works the depth out. A per-draw
+        // value on purpose: a jump on the stream's own values (the way before)
+        // made the GPU run the rest of the vertex program ~1.46 times slower.
+        ge[2][2] = if GE_DEPTH_CPU.load(Ordering::Relaxed) != 0 { 1.0 } else { 0.0 };
         set_uniform(buffer, uniforms.ge_z, 4, ge[0].as_ptr());
         set_uniform(buffer, uniforms.ge_w, 4, ge[1].as_ptr());
         set_uniform(buffer, uniforms.ge_depth, 4, ge[2].as_ptr());
