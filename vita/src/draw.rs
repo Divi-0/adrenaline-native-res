@@ -361,6 +361,18 @@ pub static CONST_COLOR: AtomicI32 = AtomicI32::new(1);
 /// depth-writing program. Debug `nodepthtwins`.
 pub static NO_DEPTH_TWINS: AtomicI32 = AtomicI32::new(1);
 
+/// A masked alpha test (`masked_alpha_test_uniform`) of a draw that GXM
+/// blends (no frame-read program chosen for it, no FIX B, no stencil state)
+/// takes the alpha-test program with the mask (`Kind::TexturedTestMask`,
+/// the PSP-depth set) instead of the generic frame-read program: the same
+/// test on (alpha & mask), the same shading, and GXM's blend where the
+/// generic program would blend in its float arithmetic the way GXM does for
+/// such a draw anyway (God of War's bright pass: ONE, ONE into an 8-bit
+/// target, exact in both: the GE's term for factor 255 is the colour
+/// itself). 219 -> 78 instructions a fragment. 1 = on (default), 0 = the
+/// generic program. Debug `maskedtest`.
+pub static MASKED_TEST: AtomicI32 = AtomicI32::new(1);
+
 /// The one vertex colour of textured `draw` if it may take the
 /// constant-colour program in place of the flat one (`flat_shading` holds):
 /// vertices of ours (not raw or cached ones, whose colours the vertex
@@ -1454,7 +1466,8 @@ impl Draws {
     /// Our textured fragment program's uniforms: fog colour and colour
     /// scale, for the alpha-test program its range, for the BLEND_FIX ones
     /// FIX B. Set into a fresh default uniform buffer only when something
-    /// changed. `flat`: the draw took the flat program (`Kind::TexturedFlat`).
+    /// changed. `mask`: the alpha-test program is the one with the mask
+    /// (`Kind::TexturedTestMask`). `flat`: the draw took the flat program (`Kind::TexturedFlat`).
     /// `const_tint`: it took the constant-colour one (`Kind::TexturedConst`,
     /// only with `ge_size`): its uTint, in place of fog and colour scale.
     ///
@@ -1469,6 +1482,7 @@ impl Draws {
     fn textured_fragment_uniforms(
         &mut self,
         tested: bool,
+        mask: bool,
         flat: bool,
         const_tint: Option<[f32; 4]>,
         fog_and_scale: [f32; 4],
@@ -1507,6 +1521,8 @@ impl Draws {
                 (textured.fog_and_scale_test_fix, textured.alpha_test_fix, textured.blend_fix_test, textured.tex_size_test_fix)
             } else if fixed {
                 (textured.fog_and_scale_fix, null(), textured.blend_fix, textured.tex_size_fix)
+            } else if tested && mask {
+                (textured.fog_and_scale_test_mask, textured.alpha_test_mask, null(), textured.tex_size_test_mask)
             } else if tested {
                 (textured.fog_and_scale_test, textured.alpha_test, null(), textured.tex_size_test)
             } else if flat {
@@ -1561,8 +1577,8 @@ impl Draws {
             self.use_fragment_color(parameter, fog_and_scale);
             return;
         }
-        let parameter = textured.fog_and_scale_test;
-        let alpha_test = textured.alpha_test;
+        let (parameter, alpha_test) =
+            if mask { (textured.fog_and_scale_test_mask, textured.alpha_test_mask) } else { (textured.fog_and_scale_test, textured.alpha_test) };
         let (fog_bits, range_bits) = (bits(&fog_and_scale), bits(&alpha_range));
         if self.tint_is(parameter, &fog_bits) && same_words(&self.alpha_test_cache, &range_bits) {
             return;
@@ -2204,7 +2220,14 @@ impl Draws {
         // A masked alpha test (`masked_alpha_test_uniform`): the generic
         // frame-read program only, also into 8-bit targets.
         let masked = tested && is_masked(alpha_range);
-        if masked {
+        let fix_b_blend = draw.blend & BLEND_ENABLED != 0 && draw.blend & BLEND_FIX_B_ALPHA != 0;
+        let mask_program = masked
+            && choice.is_none()
+            && !fix_b_blend
+            && (!keep || frame.stencil_state_of(draw).is_none())
+            && self.programs.textured.have_test_mask
+            && MASKED_TEST.load(Ordering::Relaxed) != 0;
+        if masked && !mask_program {
             choice = Some(ReadVariant::Generic);
         }
         // (An 8-bit target's normal blend of an opaque source: GXM's normal
@@ -2270,6 +2293,9 @@ impl Draws {
         } else if programs_ready {
             let kind = if stencil_value.is_some() {
                 if tested { Kind::TexturedTestFix } else { Kind::TexturedFix }
+            } else if tested && mask_program {
+                stats().mask_test_draws += 1;
+                Kind::TexturedTestMask
             } else if tested {
                 Kind::TexturedTest
             } else if self.programs.textured.have_flat && flat_shading(frame, draw) {
@@ -2567,7 +2593,7 @@ impl Draws {
                 if read {
                     self.read_fragment_uniforms(frame, draw, read_variant, tested, Some((fog_and_scale(draw), read_alpha_range)), read_stencil, ge_size);
                 } else {
-                    self.textured_fragment_uniforms(tested, flat, const_tint, fog_and_scale(draw), alpha_range, draw.blend, stencil_value, ge_size, ge_target_read);
+                    self.textured_fragment_uniforms(tested, mask_program, flat, const_tint, fog_and_scale(draw), alpha_range, draw.blend, stencil_value, ge_size, ge_target_read);
                 }
             }
         } else if !fragment.is_null() {
@@ -2624,7 +2650,7 @@ impl Draws {
                 if read {
                     self.read_fragment_uniforms(frame, draw, read_variant, tested, Some((fog_and_scale(draw), read_alpha_range)), read_stencil, ge_size);
                 } else {
-                    self.textured_fragment_uniforms(tested, flat, const_tint, fog_and_scale(draw), alpha_range, draw.blend, stencil_value, ge_size, ge_target_read);
+                    self.textured_fragment_uniforms(tested, mask_program, flat, const_tint, fog_and_scale(draw), alpha_range, draw.blend, stencil_value, ge_size, ge_target_read);
                 }
             }
         } else {
@@ -3081,8 +3107,8 @@ impl Draws {
         let ge = |tex_size: *const ProgramParameter| if tex_size.is_null() { None } else { nearest };
         let (eight_bit_ge, flat_ge) = (ge(if tested { textured.tex_size_test } else { textured.tex_size }), ge(textured.tex_size_flat));
         match program {
-            ShadeProgram::EightBit => self.textured_fragment_uniforms(tested, false, None, case.fog_and_scale, alpha_test, 0, None, eight_bit_ge, false),
-            ShadeProgram::Flat => self.textured_fragment_uniforms(false, true, None, case.fog_and_scale, alpha_test, 0, None, flat_ge, false),
+            ShadeProgram::EightBit => self.textured_fragment_uniforms(tested, false, false, None, case.fog_and_scale, alpha_test, 0, None, eight_bit_ge, false),
+            ShadeProgram::Flat => self.textured_fragment_uniforms(false, false, true, None, case.fog_and_scale, alpha_test, 0, None, flat_ge, false),
             ShadeProgram::Cut5551 | ShadeProgram::Wide => {
                 let read = self.programs.made_read_program(true, tested, off);
                 let (fog_and_scale, alpha) = (read.fog_and_scale, read.alpha_test);

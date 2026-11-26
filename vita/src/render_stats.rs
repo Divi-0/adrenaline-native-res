@@ -80,6 +80,9 @@ pub struct RenderStats {
     /// Textured draws whose alpha test has a mask other than 0xFF (done by
     /// the generic frame-read program, draw.rs `masked_alpha_test_uniform`).
     pub masked_alpha_tests: u32,
+    /// Of those, the draws GXM blends that took the alpha-test program with
+    /// the mask (draw.rs `MASKED_TEST`) instead of the generic one.
+    pub mask_test_draws: u32,
     /// Draws into 16-bit PSP targets with the frame-read programs
     /// (draw.rs `TARGET_CUT`).
     pub cut_draws: u32,
@@ -226,6 +229,7 @@ impl RenderStats {
         stencil_read_draws: 0,
         stencil_missing_draws: 0,
         masked_alpha_tests: 0,
+        mask_test_draws: 0,
         cut_draws: 0,
         cut_fast_draws: 0,
         wide_draws: 0,
@@ -426,12 +430,13 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
     }
     let _ = write!(
         text,
-        " stencil_fix_draws={} stencil_zero_draws={} stencil_read_draws={} stencil_missing_draws={} masked_alpha_tests={}",
+        " stencil_fix_draws={} stencil_zero_draws={} stencil_read_draws={} stencil_missing_draws={} masked_alpha_tests={} mask_test_draws={}",
         s.stencil_fix_draws / frames,
         s.stencil_zero_draws / frames,
         s.stencil_read_draws / frames,
         s.stencil_missing_draws / frames,
-        s.masked_alpha_tests / frames
+        s.masked_alpha_tests / frames,
+        s.mask_test_draws / frames
     );
     let _ = write!(text, " ");
     crate::heap::report(&mut text);

@@ -55,6 +55,9 @@ pub enum Kind {
     /// uniform, the same pixels, half the work again.
     TexturedConst,
     TexturedTest,
+    /// `TexturedTest` with the GE's alpha-test mask (nativeres_textured_testmask_f.cg,
+    /// ALPHA_MASK; only in the PSP-depth set): masked tests of draws GXM blends.
+    TexturedTestMask,
     TexturedFix,
     TexturedTestFix,
     /// `Textured` / `TexturedFix` with the GE's bilinear filter
@@ -196,6 +199,7 @@ pub struct Textured {
     pub tex_size_test: *const ProgramParameter,
     pub tex_size_fix: *const ProgramParameter,
     pub tex_size_test_fix: *const ProgramParameter,
+    pub tex_size_test_mask: *const ProgramParameter,
     /// nativeres_textured_flat_f.cg: without fog and specular.
     pub have_flat: bool,
     fragment_flat_id: PatcherId,
@@ -210,6 +214,12 @@ pub struct Textured {
     fragment_test_id: PatcherId,
     pub fog_and_scale_test: *const ProgramParameter,
     pub alpha_test: *const ProgramParameter,
+    /// nativeres_textured_testmask_f.cg: the alpha test on the alpha ANDed
+    /// with the GE's mask (uAlphaTest.w); the PSP-depth set only.
+    pub have_test_mask: bool,
+    fragment_test_mask_id: PatcherId,
+    pub fog_and_scale_test_mask: *const ProgramParameter,
+    pub alpha_test_mask: *const ProgramParameter,
     /// nativeres_textured_(test_)fix_f.cg: grey FIX B blending through the alpha.
     pub have_fix: bool,
     fragment_fix_id: PatcherId,
@@ -1332,10 +1342,15 @@ impl Textured {
             tex_size_test: null(),
             tex_size_fix: null(),
             tex_size_test_fix: null(),
+            tex_size_test_mask: null(),
             have_test: false,
             fragment_test_id: null_mut(),
             fog_and_scale_test: null(),
             alpha_test: null(),
+            have_test_mask: false,
+            fragment_test_mask_id: null_mut(),
+            fog_and_scale_test_mask: null(),
+            alpha_test_mask: null(),
             have_fix: false,
             fragment_fix_id: null_mut(),
             fragment_test_fix_id: null_mut(),
@@ -1660,6 +1675,7 @@ impl Programs {
         self.make_flat_program();
         self.make_const_program();
         self.make_alpha_test_program();
+        self.make_alpha_mask_program();
         self.make_blend_fix_programs();
         self.make_ge_filter_programs();
         self.make_3d_program();
@@ -1723,6 +1739,33 @@ impl Programs {
         textured.have_test = true;
         crate::capture::set_alpha_test_ready(1);
         render_log::line(format_args!("alpha test program ready\n"));
+    }
+
+    /// The alpha-test variant with the GE's mask (nativeres_textured_testmask_f.cg),
+    /// only where its program filters as the GE (the PSP-depth set: its twins
+    /// are in the depth pack); elsewhere masked tests keep the generic
+    /// frame-read program.
+    fn make_alpha_mask_program(&mut self) {
+        if !crate::shaders::psp_depth() || !self.textured.have_test {
+            return;
+        }
+        let textured = &mut self.textured;
+        let program = gxp(&shaders::nativeres_textured_testmask_f);
+        let Some(id) = register(program) else {
+            render_log::line(format_args!("alpha mask program: invalid GXP
+"));
+            return;
+        };
+        textured.fragment_test_mask_id = id;
+        textured.fog_and_scale_test_mask = parameter(program, b"uFogAndScale ");
+        textured.alpha_test_mask = parameter(program, b"uAlphaTest ");
+        textured.tex_size_test_mask = parameter(program, b"uTexSize ");
+        if textured.fog_and_scale_test_mask.is_null() || textured.alpha_test_mask.is_null() || textured.tex_size_test_mask.is_null() {
+            render_log::line(format_args!("alpha mask program: parameters missing
+"));
+            return;
+        }
+        textured.have_test_mask = true;
     }
 
     /// The BLEND_FIX variants (grey FIX B through the alpha, core blend.rs).
@@ -1860,6 +1903,7 @@ impl Programs {
         let textured = &self.textured;
         let id = match kind {
             Kind::TexturedTest if textured.have_test => textured.fragment_test_id,
+            Kind::TexturedTestMask if textured.have_test_mask => textured.fragment_test_mask_id,
             Kind::TexturedFix if textured.have_fix => textured.fragment_fix_id,
             Kind::TexturedTestFix if textured.have_test && textured.have_fix => textured.fragment_test_fix_id,
             Kind::Textured => textured.fragment_id,
@@ -1980,6 +2024,7 @@ fn textured_gxp(kind: Kind) -> Option<*const gxm::Program> {
         Kind::TexturedFlat => gxp(&shaders::nativeres_textured_flat_f),
         Kind::TexturedConst => gxp(&shaders::nativeres_textured_const_f),
         Kind::TexturedTest => gxp(&shaders::nativeres_textured_test_f),
+        Kind::TexturedTestMask => gxp(&shaders::nativeres_textured_testmask_f),
         Kind::TexturedFix => gxp(&shaders::nativeres_textured_fix_f),
         Kind::TexturedTestFix => gxp(&shaders::nativeres_textured_test_fix_f),
         Kind::TexturedGe => gxp(&shaders::nativeres_textured_ge_f),

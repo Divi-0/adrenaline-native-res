@@ -13,7 +13,8 @@
 # NO_DEPTH (no define: a mark for the scripts): the GE_FILTER twins also WITHOUT the PSP depth, nativeres_x_nodepth_f,
 # nativeres_x_nodepthwide_f (GE_WIDE) and nativeres_x_nodepthgather_f (GE_GATHER), for draws without depth test, which
 # do not use the depth their program writes (vita/src/draw.rs `NO_DEPTH_TWINS`, DESIGN "seventy-sixth session"); only
-# the frame-read programs God of War's draws without depth test take (its depth-of-field pass, bright pass and HUD).
+# the frame-read programs God of War's draws without depth test take (its depth-of-field pass, bright pass and HUD),
+# and the masked alpha test (the bright pass, without frame read since the eightieth session).
 nativeres_3d_v GE_LIGHT
 nativeres_raw_lit1_4444_v GE_LIGHT GE_DEPTH
 nativeres_raw_lit1_5551_v
@@ -115,4 +116,5 @@ nativeres_textured_read_offtest_f GE_FILTER
 nativeres_textured_read_offtestdither_f
 nativeres_textured_test_f GE_FILTER
 nativeres_textured_test_fix_f GE_FILTER
+nativeres_textured_testmask_f GE_FILTER NO_DEPTH
 nativeres_textured_v

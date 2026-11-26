@@ -288,6 +288,8 @@ embed_twin!(nativeres_textured_flat_f, nativeres_textured_flat_pspdepth_f);
 embed_twin!(nativeres_textured_const_f, nativeres_textured_const_pspdepth_f);
 // The same with the PSP's alpha test (discard).
 embed_twin!(nativeres_textured_test_f, nativeres_textured_test_pspdepth_f);
+// With the GE's alpha-test mask (used in the PSP-depth set only).
+embed_twin!(nativeres_textured_testmask_f, nativeres_textured_testmask_pspdepth_f);
 // Grey FIX B blending through the alpha, without and with the alpha test.
 embed_twin!(nativeres_textured_fix_f, nativeres_textured_fix_pspdepth_f);
 embed_twin!(nativeres_textured_test_fix_f, nativeres_textured_test_fix_pspdepth_f);

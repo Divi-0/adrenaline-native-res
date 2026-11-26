@@ -13,6 +13,7 @@
 #                                   5551, 4444, 8888: the vertex colour format fixed)
 #   nativeres_textured_fix_f.cg     nativeres_textured_f.cg + BLEND_FIX (grey FIX B blending)
 #   nativeres_textured_test_fix_f.cg nativeres_textured_test_f.cg + BLEND_FIX
+#   nativeres_textured_testmask_f.cg nativeres_textured_test_f.cg + ALPHA_MASK (the GE's alpha-test mask)
 #   nativeres_textured_ge_f.cg      nativeres_textured_f.cg + GE_FILTER (the GE's bilinear filter,
 #                                   draws reading our targets; no PSP-depth twin: that set's
 #                                   textured programs all filter as the GE)
@@ -67,6 +68,7 @@ variant nativeres_textured_f BLEND_FIX nativeres_textured_fix_f
 variant nativeres_textured_f GE_FILTER nativeres_textured_ge_f
 variant nativeres_textured_f "BLEND_FIX GE_FILTER" nativeres_textured_fix_ge_f
 variant nativeres_textured_test_f BLEND_FIX nativeres_textured_test_fix_f
+variant nativeres_textured_test_f ALPHA_MASK nativeres_textured_testmask_f
 variant nativeres_textured_read_f UNTEXTURED nativeres_color_read_f
 for dither in "" dither; do
   DITHER=$([ -n "$dither" ] && echo READ_DITHER)

@@ -37,6 +37,20 @@ thread_local! {
     // Debugging: REPLAY_TIE_STATS (`draw_triangle`).
     static TIE_STATS: bool = std::env::var_os("REPLAY_TIE_STATS").is_some();
     static DEPTH_CENTER: bool = std::env::var_os("REPLAY_DEPTH_CENTER").is_some();
+    // Debugging: REPLAY_LAYER_DEPTH=1 (with REPLAY_DEPTH_CENTER): draws that
+    // test depth without writing it take the GPU's own test instead of the
+    // PSP depth program's: the plane of the floored vertex depths at each
+    // 2x pixel's centre (not the PSP pixel's), "floor(plane + 0.01) <=
+    // stored" (a "<" with one unit of bias): how far that picture lies
+    // from Sony's (God of War: farther; DESIGN "eightieth session").
+    // 2: plus a slope bias toward passing of the plane's largest step per 2x
+    // pixel (GXM's depth bias factor 1); 3: of half its two steps (the most
+    // the PSP centre lies away), so every fragment the PSP centre passes
+    // passes too.
+    static LAYER_DEPTH: u8 = std::env::var("REPLAY_LAYER_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    static LAYER_DRAWS: std::cell::RefCell<std::collections::BTreeMap<usize, [u32; 2]>> = std::cell::RefCell::new(std::collections::BTreeMap::new());
+    // [fragments that took the layer test, those it decided otherwise than the PSP centre's]
+    static LAYER_COUNTS: std::cell::Cell<[u64; 2]> = const { std::cell::Cell::new([0; 2]) };
     static TIE_COUNTS: std::cell::RefCell<std::collections::BTreeMap<usize, u32>> = std::cell::RefCell::new(std::collections::BTreeMap::new());
     static CURRENT_DRAW: std::cell::Cell<usize> = std::cell::Cell::new(0);
     static TESTED: std::cell::Cell<u64> = std::cell::Cell::new(0);
@@ -542,6 +556,16 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
             }
         });
     }
+    if LAYER_DEPTH.with(|on| *on) > 0 {
+        let [n, d] = LAYER_COUNTS.with(|c| c.get());
+        println!("layer depth: {n} fragments of draws that only test depth, {d} decided otherwise than at the PSP pixel's centre");
+        LAYER_DRAWS.with(|draws| {
+            for (index, [fragments, differ]) in draws.borrow().iter().filter(|(_, [_, d])| *d > 0) {
+                let draw = &frame.draws()[*index];
+                println!("layer draw {index}: {differ} of {fragments} fb {:08x} blend {:08x} tests {:x} flags {:x}", draw.framebuffer, draw.blend, draw.tests, draw.flags);
+            }
+        });
+    }
     if TIE_STATS.with(|on| *on) {
         TIE_COUNTS.with(|counts| {
             let counts = counts.borrow();
@@ -895,13 +919,40 @@ fn draw_triangle(
             let index = y as usize * WIDTH + x as usize;
             // Debugging: REPLAY_DEPTH_CENTER=1 takes the depth at the PSP pixel's
             // centre (the fragment program's plane from derivatives), coverage at 2x.
-            let z = if DEPTH_CENTER.with(|on| *on) {
+            let layer_mode = LAYER_DEPTH.with(|mode| *mode);
+            let layer = depth_test && !depth_write && layer_mode > 0;
+            let z = if DEPTH_CENTER.with(|on| *on) && !layer {
                 let psp_center = ((x & !1) as f32 + 1.0, (y & !1) as f32 + 1.0);
                 let weights = [edge(p1, p2, psp_center) / area, edge(p2, p0, psp_center) / area, edge(p0, p1, psp_center) / area];
                 psp_depth(weights, &corners)
+            } else if layer && layer_mode >= 2 {
+                // The plane's steps per 2x pixel, then the bias toward passing.
+                let at = |point: (f32, f32)| psp_depth_plane([edge(p1, p2, point) / area, edge(p2, p0, point) / area, edge(p0, p1, point) / area], &corners);
+                let here = at(center);
+                let step_x = (at((center.0 + 1.0, center.1)) - here).abs();
+                let step_y = (at((center.0, center.1 + 1.0)) - here).abs();
+                let bias = if layer_mode == 2 { step_x.max(step_y) } else { 0.5 * (step_x + step_y) };
+                let toward = if depth_function & 7 >= 6 { bias } else { -bias };
+                (here + toward + 0.01).floor() / 65535.0
             } else {
                 psp_depth(linear, &corners)
             };
+            if layer && DEPTH_CENTER.with(|on| *on) {
+                let psp_center = ((x & !1) as f32 + 1.0, (y & !1) as f32 + 1.0);
+                let weights = [edge(p1, p2, psp_center) / area, edge(p2, p0, psp_center) / area, edge(p0, p1, psp_center) / area];
+                let centre_z = psp_depth(weights, &corners);
+                let differs = passes(depth_function, z, depth[index]) != passes(depth_function, centre_z, depth[index]);
+                LAYER_COUNTS.with(|c| {
+                    let [n, d] = c.get();
+                    c.set([n + 1, d + differs as u64]);
+                });
+                LAYER_DRAWS.with(|draws| {
+                    let mut draws = draws.borrow_mut();
+                    let entry = draws.entry(CURRENT_DRAW.with(|d| d.get())).or_insert([0; 2]);
+                    entry[0] += 1;
+                    entry[1] += differs as u32;
+                });
+            }
             // Debugging: REPLAY_TIE_STATS=1 counts the fragments whose depth test
             // the PSP's whole units decide differently from the GPU's own float
             // depth (`TIE_COUNTS`, printed per draw at the frame's end).
@@ -1044,6 +1095,11 @@ fn psp_depth(linear: [f32; 3], corners: &[FrameVertex; 3]) -> f32 {
         2 | 5 | 7 => plane,
         _ => plane.round(),
     }) / 65535.0
+}
+
+/// The plane of the floored vertex depths (mode 3), in whole units, unfloored.
+fn psp_depth_plane(linear: [f32; 3], corners: &[FrameVertex; 3]) -> f32 {
+    (0..3).map(|i| linear[i] * (corners[i].z * 65535.0).floor()).sum()
 }
 
 fn fog_at(linear: [f32; 3], corners: &[FrameVertex; 3]) -> f32 {
