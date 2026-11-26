@@ -822,6 +822,7 @@ pub fn reserve_vertex_uniforms() -> *mut c_void {
     let mut buffer = null_mut();
     // Safe: the display thread's context.
     unsafe { gxm::sceGxmReserveVertexDefaultUniformBuffer(context(), &mut buffer) };
+    nativeres_core::debug_hooks::call(nativeres_core::debug_hooks::Point::VertexUniforms, buffer as u32, 0);
     buffer
 }
 
@@ -979,8 +980,13 @@ impl Draws {
 
     pub fn use_programs(&mut self, vertex: *const c_void, wvp: *const ProgramParameter, matrix: *const f32, fragment: *const c_void) {
         if vertex != self.state.vertex_program {
+            // A debugging tool may draw with another program in its place.
+            let set = match nativeres_core::debug_hooks::call(nativeres_core::debug_hooks::Point::VertexSet, vertex as u32, 0) {
+                0 => vertex,
+                other => other as _,
+            };
             // Safe: programs made by the patcher, the display's context.
-            unsafe { gxm::sceGxmSetVertexProgram(context(), vertex) };
+            unsafe { gxm::sceGxmSetVertexProgram(context(), set) };
             let buffer = reserve_vertex_uniforms();
             set_uniform(buffer, wvp, 16, matrix);
             // PSP-depth programs only (the float ones have no uDepthFar).

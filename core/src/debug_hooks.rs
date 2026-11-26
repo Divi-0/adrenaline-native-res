@@ -22,6 +22,9 @@
 //! | `Draw` | display thread, a textured frame draw just issued (`draw.rs`, after its `sceGxmDraw`) | index address | index count \| primitive type (bits 24..31) | - |
 //! | `FragmentMade` | a fragment program was made (`basic_programs::fragment_program`) | the program | address of three words: its patcher id, its blend info (or null), the vertex program's GXP it is linked to | - |
 //! | `FragmentSet` | display thread, a frame draw is about to set its fragment program (`draw.rs`) | the program | 0 | 0, or another fragment program to set in its place |
+//! | `VertexMade` | a vertex program was made (`basic_programs::vertex_program`) | the program | address of five words: its patcher id, its attributes (address, count), its streams (address, count) | - |
+//! | `VertexSet` | display thread, a frame draw is about to set its vertex program (`draw.rs`) | the program | 0 | 0, or another vertex program to set in its place |
+//! | `VertexUniforms` | display thread, a default uniform buffer was reserved for the vertex program that is set (`draw.rs`); the renderer writes all of that program's uniforms right after | the buffer | 0 | - |
 //!
 //! Times are the process time in us (low 32 bits). A hook on `PartStart` /
 //! `PartEnd` takes over the `cycles` parts that are measured
@@ -41,9 +44,12 @@ pub enum Point {
     Draw,
     FragmentMade,
     FragmentSet,
+    VertexMade,
+    VertexSet,
+    VertexUniforms,
 }
 
-pub const POINTS: usize = 10;
+pub const POINTS: usize = 13;
 /// `a` of a `span` point at its begin and end.
 pub const BEGIN: u32 = 0;
 pub const END: u32 = 1;

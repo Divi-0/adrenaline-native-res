@@ -324,6 +324,8 @@ pub fn vertex_program(id: PatcherId, attributes: &[VertexAttribute], streams: &[
     if result < 0 {
         Err(result)
     } else {
+        let made = [id as u32, attributes.as_ptr() as u32, attributes.len() as u32, streams.as_ptr() as u32, streams.len() as u32];
+        nativeres_core::debug_hooks::call(nativeres_core::debug_hooks::Point::VertexMade, program as u32, made.as_ptr() as u32);
         Ok(program)
     }
 }
