@@ -20,6 +20,8 @@
 //! | `PartStart` | a measuring part of `cycles` starts | part | - | the value `PartEnd` gets |
 //! | `PartEnd` | that part ends | part | `PartStart`'s value (0: started before the hook) | - |
 //! | `Draw` | display thread, a textured frame draw just issued (`draw.rs`, after its `sceGxmDraw`) | index address | index count \| primitive type (bits 24..31) | - |
+//! | `FragmentMade` | a fragment program was made (`basic_programs::fragment_program`) | the program | address of three words: its patcher id, its blend info (or null), the vertex program's GXP it is linked to | - |
+//! | `FragmentSet` | display thread, a frame draw is about to set its fragment program (`draw.rs`) | the program | 0 | 0, or another fragment program to set in its place |
 //!
 //! Times are the process time in us (low 32 bits). A hook on `PartStart` /
 //! `PartEnd` takes over the `cycles` parts that are measured
@@ -37,9 +39,11 @@ pub enum Point {
     PartStart,
     PartEnd,
     Draw,
+    FragmentMade,
+    FragmentSet,
 }
 
-pub const POINTS: usize = 8;
+pub const POINTS: usize = 10;
 /// `a` of a `span` point at its begin and end.
 pub const BEGIN: u32 = 0;
 pub const END: u32 = 1;

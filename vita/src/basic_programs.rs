@@ -352,6 +352,8 @@ pub fn fragment_program(id: PatcherId, blend: *const gxm::BlendInfo, vertex_gxp:
 ", result));
         null_mut()
     } else {
+        let made = [id as u32, blend as u32, vertex_gxp as u32];
+        nativeres_core::debug_hooks::call(nativeres_core::debug_hooks::Point::FragmentMade, program as u32, made.as_ptr() as u32);
         program
     }
 }

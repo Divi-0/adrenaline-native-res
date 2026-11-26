@@ -984,8 +984,13 @@ impl Draws {
             self.state.vertex_program = vertex;
         }
         if fragment != self.state.fragment_program {
+            // A debugging tool may draw with another program in its place.
+            let set = match nativeres_core::debug_hooks::call(nativeres_core::debug_hooks::Point::FragmentSet, fragment as u32, 0) {
+                0 => fragment,
+                other => other as _,
+            };
             // Safe: as above.
-            unsafe { gxm::sceGxmSetFragmentProgram(context(), fragment) };
+            unsafe { gxm::sceGxmSetFragmentProgram(context(), set) };
             self.state.fragment_program = fragment;
             self.state.tint = None; // its uniforms are set anew for the new program
         }
