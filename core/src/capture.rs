@@ -6,7 +6,7 @@
 //! stall address, so we only ever walk the list at the front of the queue.
 
 use crate::command::{op, Command};
-use crate::display_list::{walk, CommandVisitor, DisplayList, PlainActions, WalkResult};
+use crate::display_list::{walk, CommandVisitor, DisplayList, WalkResult};
 use crate::draw_stream::DrawStream;
 use crate::frame::Frame;
 use crate::frame_builder::FrameBuilder;
@@ -17,9 +17,6 @@ use crate::memory::{physical, PspMemory};
 use crate::recorder::{DrawStateCache, LoadedPalette, Recorder};
 use crate::snapshot::{Reader, Writer, SNAPSHOT_VERSION};
 use crate::stats::{DisplayedFramebuffer, FrameStats};
-use crate::walk_stream::{self, StreamWriter, WalkHooks, WalkStream, WriteFilter};
-
-use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 /// How many lists can be queued at once. The PSP allows 64.
 const QUEUE_CAPACITY: usize = 64;
@@ -110,28 +107,6 @@ pub struct Capture {
     /// Only follow the lists, without statistics or recording draws. For
     /// timing the walk on its own (`bench`); wrong for anything else.
     pub walk_only: bool,
-    /// The capture in two stages (`walk_stream`): the walk above (stage A)
-    /// only follows the lists and writes what it executed into
-    /// `walk_stream`; stage B (the `stage_*` fields with `palette`,
-    /// `draw_states` and `stream`) works out the draws from it. Off: one
-    /// walk does both, as before.
-    pipelined: bool,
-    walk_stream: WalkStream,
-    /// Stage B's GE state, block-transfer writes and statistics (draws,
-    /// textures, ...; the walk's counts stay in `current_frame`).
-    stage_ge: GeState,
-    stage_writes: GeWrites,
-    stage_stats: FrameStats,
-    /// Stage B in another thread (`set_stage_hooks`): the frame it records
-    /// into (null: none; set by stage A with each event, the same for a
-    /// whole frame), and set by stage B when it has reached the frame's end
-    /// (it then waits until stage A has finished the frame and clears it).
-    stage_frame: AtomicPtr<Frame>,
-    stage_frame_ended: AtomicBool,
-    /// Stage B's `PlainActions` (the recorder's, worked out once).
-    stage_actions: Option<PlainActions>,
-    /// Stage A's filter for register writes that change nothing.
-    write_filter: WriteFilter,
     /// GE states saved by lists with a context and sceGeSaveContext.
     contexts: ContextTable,
     /// Writes the draws the GPU takes raw on this thread (`frame_builder`).
@@ -155,15 +130,6 @@ impl Capture {
             vram_waits: false,
             vram_wait: None,
             walk_only: false,
-            pipelined: false,
-            walk_stream: WalkStream::new(),
-            stage_ge: GeState::new(),
-            stage_writes: GeWrites::new(),
-            stage_stats: FrameStats::new(),
-            stage_frame: AtomicPtr::new(core::ptr::null_mut()),
-            stage_frame_ended: AtomicBool::new(false),
-            stage_actions: None,
-            write_filter: WriteFilter::new(),
             contexts: ContextTable::new(),
             builder: FrameBuilder::new(),
         }
@@ -223,14 +189,9 @@ impl Capture {
         self.current_frame.ge_states += 1;
         self.current_frame.ge_state_register_differences += registers;
         self.current_frame.ge_state_matrix_differences += matrices;
-        if self.pipelined {
-            // As a context restore: stage B's registers don't get it (yet).
-            self.current_frame.contexts_pipelined += 1;
-        }
     }
 
     fn forget(&mut self, registers_too: bool) {
-        self.walk_stream.wait_until_read();
         self.queue_len = 0;
         if registers_too {
             self.ge = GeState::new();
@@ -238,21 +199,10 @@ impl Capture {
         self.palette.clear(); // in place: LoadedPalette holds 2 KiB of words
         self.draw_states.forget();
         self.stream.clear();
-        self.restart_builder(!self.pipelined);
+        self.restart_builder(true);
         self.ge_writes.clear();
         self.current_frame = FrameStats::new();
         self.frames_completed = 0;
-        self.walk_stream.clear();
-        // Stage B starts from the walk's registers (as in `set_pipelined`).
-        if registers_too {
-            self.stage_ge = GeState::new();
-        } else {
-            self.stage_ge.clone_from(&self.ge);
-        }
-        self.stage_writes.clear();
-        self.stage_stats = FrameStats::new();
-        self.write_filter.start(&self.stage_ge, crate::recorder::recorder_wants);
-        self.stage_actions = None;
         self.contexts.clear();
         self.waiting_for_ge_state = false;
         self.vram_wait = None;
@@ -265,11 +215,6 @@ impl Capture {
             return;
         }
         self.current_frame.contexts_restored += 1;
-        if self.pipelined {
-            // Stage B keeps its own copy of the registers, fed by the
-            // walk's commands; a restore doesn't reach it (yet).
-            self.current_frame.contexts_pipelined += 1;
-        }
     }
 
     /// Makes a `Capture` in zeroed memory at `place`, without building one
@@ -320,71 +265,7 @@ impl Capture {
             self.queue[index] = DisplayList::load(input, version, self.ge.offset)?;
         }
         self.queue_len = queue_len;
-        self.stage_ge.clone_from(&self.ge);
-        self.write_filter.start(&self.stage_ge, crate::recorder::recorder_wants);
         Some(())
-    }
-
-    /// Runs the capture in two stages (`walk_stream`) or in one. Only
-    /// between frames (stage B must have caught up).
-    pub fn set_pipelined(&mut self, on: bool) {
-        self.walk_stream.wait_until_read();
-        self.pipelined = on;
-        self.restart_builder(!on);
-        self.stage_ge.clone_from(&self.ge);
-        self.write_filter.start(&self.stage_ge, crate::recorder::recorder_wants);
-    }
-
-    /// Plain register writes stage A passed on / left out so far.
-    pub fn write_filter_counts(&self) -> (u32, u32) {
-        (self.write_filter.sent, self.write_filter.dropped)
-    }
-
-    pub fn pipelined(&self) -> bool {
-        self.pipelined
-    }
-
-    /// Stage B runs in another thread from now on, which calls
-    /// `run_stage_b_thread` when woken (`None`: stage A's thread runs it).
-    /// Only between frames.
-    pub fn set_stage_hooks(&mut self, hooks: Option<&'static WalkHooks>) {
-        self.walk_stream.wait_until_read();
-        self.walk_stream.set_hooks(hooks);
-    }
-
-    /// Stage B's thread: works out the draws the walk stream holds, up to
-    /// its end or the frame's end.
-    ///
-    /// # Safety
-    /// `capture` must point to a `Capture` whose stage A runs in another
-    /// thread with `set_stage_hooks` set, and only one thread may call this.
-    /// Stage B's fields (`stage_*`, `palette`, `draw_states`, `stream`) are
-    /// this thread's while the stream holds records; stage A touches them
-    /// only after `wait_until_read` or a frame's end.
-    pub unsafe fn run_stage_b_thread(capture: *mut Capture, memory: &mut impl PspMemory) -> StageBRun {
-        let stream = &*core::ptr::addr_of!((*capture).walk_stream);
-        let ended = &*core::ptr::addr_of!((*capture).stage_frame_ended);
-        if stream.is_empty() || ended.load(Ordering::Acquire) {
-            return StageBRun::Nothing;
-        }
-        let frame = (*capture).stage_frame.load(Ordering::Acquire);
-        let mut memory = Overlaid { writes: &mut *core::ptr::addr_of_mut!((*capture).stage_writes), inner: memory };
-        let recorder = Recorder {
-            stats: &mut *core::ptr::addr_of_mut!((*capture).stage_stats),
-            frame: frame.as_mut(),
-            palette: &mut *core::ptr::addr_of_mut!((*capture).palette),
-            draw_states: &mut *core::ptr::addr_of_mut!((*capture).draw_states),
-            stream: &mut *core::ptr::addr_of_mut!((*capture).stream),
-            builder: None,
-        };
-        let mut visitors = Both(recorder, NoTrace);
-        let actions = &*(*core::ptr::addr_of_mut!((*capture).stage_actions)).get_or_insert_with(|| PlainActions::for_visitor(&visitors));
-        let ge = &mut *core::ptr::addr_of_mut!((*capture).stage_ge);
-        if walk_stream::replay(stream, ge, &mut memory, &mut visitors, actions).is_some() {
-            ended.store(true, Ordering::Release);
-            return StageBRun::FrameEnded;
-        }
-        StageBRun::Worked
     }
 
     /// Whether textured 3D draws are left to the GPU's transform where the
@@ -392,7 +273,6 @@ impl Capture {
     /// `frame::GpuTransform`). Off by default; the display side must
     /// support it.
     pub fn set_gpu_transform(&mut self, on: bool) {
-        self.walk_stream.wait_until_read();
         self.draw_states.gpu_transform = on;
     }
 
@@ -404,11 +284,10 @@ impl Capture {
     /// frames, see `vertex_cache`); `None`: none. Only runs for the GPU
     /// transform use it.
     pub fn set_vertex_cache(&mut self, cache: Option<&'static mut crate::vertex_cache::VertexCache>) {
-        self.walk_stream.wait_until_read();
         // The builder gives the old cache's raw arena back first.
         self.restart_builder(false);
         self.stream.set_vertex_cache(cache);
-        self.restart_builder(!self.pipelined);
+        self.restart_builder(true);
     }
 
     /// Starts the capture thread's builder (`frame_builder`) anew, writing
@@ -421,10 +300,9 @@ impl Capture {
     /// Gives the capture thread's builder its lists (`frame_builder`;
     /// `None`: none, every draw goes through the job queue).
     pub fn set_direct_lists(&mut self, lists: Option<&'static mut crate::frame_builder::DirectLists>) {
-        self.walk_stream.wait_until_read();
         self.restart_builder(false);
         self.builder.set_lists(lists);
-        self.restart_builder(!self.pipelined);
+        self.restart_builder(true);
     }
 
 
@@ -432,21 +310,18 @@ impl Capture {
     /// (`DrawStream::set_hooks`); `None`: the capture records the vertices
     /// itself.
     pub fn set_stream_hooks(&mut self, hooks: Option<&'static crate::draw_stream::StreamHooks>) {
-        self.walk_stream.wait_until_read();
         self.stream.set_hooks(hooks);
     }
 
     /// See `DrawStream::set_reader`: the consumer thread copies the vertex
     /// memory itself.
     pub fn set_stream_reader(&mut self, reader: Option<crate::draw_stream::DeferredReader>) {
-        self.walk_stream.wait_until_read();
         self.stream.set_reader(reader);
     }
 
     /// See `DrawStream::set_copier`: a copier thread copies the vertex
     /// memory as the draws are queued (with a reader, `set_stream_reader`).
     pub fn set_stream_copier(&mut self, copier: Option<&'static crate::draw_stream::CopierHooks>) {
-        self.walk_stream.wait_until_read();
         self.stream.set_copier(copier);
     }
 
@@ -492,10 +367,6 @@ impl Capture {
         frame: Option<&mut Frame>,
         tracer: &mut impl CommandVisitor,
     ) -> Option<FrameStats> {
-        if self.pipelined && self.walk_stream.threaded() {
-            let frame_pointer = frame.as_deref().map_or(core::ptr::null_mut(), |frame| frame as *const Frame as *mut Frame);
-            self.stage_frame.store(frame_pointer, Ordering::Release);
-        }
         match event {
             Event::ListEnqueued { list, stall, id, context } => {
                 if id >= 0 {
@@ -534,9 +405,6 @@ impl Capture {
             }
             Event::FramebufferShown { address, stride, pixel_format } => {
                 let displayed = DisplayedFramebuffer { address, stride, pixel_format };
-                if self.pipelined {
-                    return Some(self.end_frame_pipelined(displayed, memory, frame, tracer));
-                }
                 return Some(self.end_frame(displayed, frame));
             }
         }
@@ -587,9 +455,6 @@ impl Capture {
             let mut commands = 0;
             let result = if self.walk_only {
                 walk(&mut self.queue[0], &mut self.ge, overlaid, &mut NoTrace, MAX_COMMANDS_PER_WALK, &mut commands)
-            } else if self.pipelined {
-                let mut writer = StreamWriter::new(&self.walk_stream, &mut self.write_filter);
-                walk(&mut self.queue[0], &mut self.ge, overlaid, &mut writer, MAX_COMMANDS_PER_WALK, &mut commands)
             } else {
                 let recorder = Recorder {
                     stats: &mut self.current_frame,
@@ -605,18 +470,7 @@ impl Capture {
             crate::phase::enter(crate::phase::OTHER);
             self.current_frame.commands += commands;
             match result {
-                WalkResult::Paused => {
-                    // The stream is full: stage B catches up, then the walk
-                    // goes on.
-                    self.run_stage_b(&mut *memory, frame.as_deref_mut(), tracer);
-                    continue;
-                }
-                WalkResult::Stalled => {
-                    if self.pipelined {
-                        self.walk_stream.wake();
-                    }
-                    return;
-                }
+                WalkResult::Stalled => return,
                 WalkResult::Finished => {
                     self.current_frame.lists_finished += 1;
                     if context != 0 {
@@ -625,7 +479,7 @@ impl Capture {
                 }
                 WalkResult::TooManyCommands => self.current_frame.endless_lists += 1,
                 WalkResult::BadAddress(address) => {
-                    if self.vram_waits && !self.pipelined && !self.walk_only && is_vram(address) {
+                    if self.vram_waits && !self.walk_only && is_vram(address) {
                         // Maybe a block not copied yet: the list stays at
                         // its pc (the command not read), see `vram_wait`.
                         self.vram_wait = Some(address);
@@ -666,87 +520,6 @@ impl Capture {
         self.current_frame.last_bad_address = address;
         self.remove(0);
         self.run_queue(memory, frame, &mut NoTrace);
-    }
-
-    /// Stage B (single thread): works out the draws the stream holds,
-    /// up to its end or the end of a frame (returned).
-    fn run_stage_b(
-        &mut self,
-        memory: &mut impl PspMemory,
-        frame: Option<&mut Frame>,
-        tracer: &mut impl CommandVisitor,
-    ) -> Option<DisplayedFramebuffer> {
-        let mut memory = Overlaid { writes: &mut self.stage_writes, inner: memory };
-        let recorder = Recorder {
-            stats: &mut self.stage_stats,
-            frame,
-            palette: &mut self.palette,
-            draw_states: &mut self.draw_states,
-            stream: &mut self.stream,
-            builder: None,
-        };
-        let mut visitors = Both(recorder, tracer);
-        let actions = PlainActions::for_visitor(&visitors);
-        let shown = walk_stream::replay(&self.walk_stream, &mut self.stage_ge, &mut memory, &mut visitors, &actions);
-        crate::phase::enter(crate::phase::OTHER);
-        shown
-    }
-
-    /// `end_frame` with two stages: stage B finishes the frame, then the
-    /// walk's counts join its statistics.
-    fn end_frame_pipelined(
-        &mut self,
-        displayed: DisplayedFramebuffer,
-        memory: &mut impl PspMemory,
-        mut frame: Option<&mut Frame>,
-        tracer: &mut impl CommandVisitor,
-    ) -> FrameStats {
-        self.walk_stream.push_end_frame(displayed);
-        if self.walk_stream.threaded() {
-            // Stage B (another thread) finishes the frame; then it waits.
-            while !self.stage_frame_ended.load(Ordering::Acquire) {
-                self.walk_stream.wake_and_wait();
-            }
-        } else {
-            let shown = self.run_stage_b(memory, frame.as_deref_mut(), tracer);
-            debug_assert_eq!(shown, Some(displayed));
-        }
-        let mut finished = self.stage_stats;
-        self.stage_stats = FrameStats::new();
-        self.finish_recording(&mut finished, displayed, frame);
-        self.stage_writes.clear();
-
-        let walk = &self.current_frame;
-        finished.lists_enqueued = walk.lists_enqueued;
-        finished.stall_updates = walk.stall_updates;
-        finished.lists_finished = walk.lists_finished;
-        finished.commands = walk.commands;
-        finished.bad_addresses = walk.bad_addresses;
-        finished.last_bad_address = walk.last_bad_address;
-        finished.endless_lists = walk.endless_lists;
-        finished.lists_abandoned = walk.lists_abandoned;
-        finished.queue_overflows = walk.queue_overflows;
-        finished.dropped_events = walk.dropped_events;
-        finished.contexts_saved = walk.contexts_saved;
-        finished.contexts_restored = walk.contexts_restored;
-        finished.contexts_missing = walk.contexts_missing;
-        finished.contexts_pipelined = walk.contexts_pipelined;
-        finished.ge_states = walk.ge_states;
-        finished.ge_state_register_differences = walk.ge_state_register_differences;
-        finished.ge_state_matrix_differences = walk.ge_state_matrix_differences;
-        finished.ge_state_psp_us = walk.ge_state_psp_us;
-        finished.vram_waits = walk.vram_waits;
-        finished.vram_wait_us = walk.vram_wait_us;
-        self.note_screen_offset_x(&mut finished);
-        finished.transfers_skipped = self.ge_writes.transfers_skipped;
-        self.ge_writes.clear();
-        finished.displayed = Some(displayed);
-        finished.lists_pending = self.queue_len as u32;
-        self.current_frame = FrameStats::new();
-        self.frames_completed += 1;
-        // Stage B may go on with the next frame's records.
-        self.stage_frame_ended.store(false, Ordering::Release);
-        finished
     }
 
     fn end_frame(&mut self, displayed: DisplayedFramebuffer, frame: Option<&mut Frame>) -> FrameStats {
@@ -823,24 +596,11 @@ impl Capture {
             }
         }
         // The next frame starts empty; nothing in it to reuse. The builder
-        // writes the raw draws of the next frame unless the capture runs in
-        // two stages (`walk_stream`).
-        self.restart_builder(!self.pipelined);
+        // writes the raw draws of the next frame.
+        self.restart_builder(true);
         self.draw_states.forget();
         self.palette.next_frame();
     }
-}
-
-/// What `Capture::run_stage_b_thread` did.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StageBRun {
-    /// Nothing to do (the stream was empty, or stage B waits at a frame end).
-    Nothing,
-    /// Worked out what the stream held.
-    Worked,
-    /// Reached a frame's end: it waits now until stage A has finished the
-    /// frame (memory read from here on belongs to the next frame).
-    FrameEnded,
 }
 
 /// A tracer that ignores everything (plain `Capture::handle`).
@@ -892,20 +652,6 @@ impl<A: CommandVisitor, B: CommandVisitor> CommandVisitor for Both<A, B> {
         }
     }
 
-    fn plain_run(&mut self, words: &[u32]) {
-        self.0.plain_run(words);
-        self.1.plain_run(words);
-    }
-
-    #[inline]
-    fn should_pause(&self) -> bool {
-        self.0.should_pause() || self.1.should_pause()
-    }
-
-    #[inline]
-    fn plain_runs_by_line(&self) -> bool {
-        self.0.plain_runs_by_line() || self.1.plain_runs_by_line()
-    }
 }
 
 impl<T: CommandVisitor> CommandVisitor for &mut T {
@@ -927,19 +673,6 @@ impl<T: CommandVisitor> CommandVisitor for &mut T {
         (**self).visit_prims(prims, ge, memory);
     }
 
-    fn plain_run(&mut self, words: &[u32]) {
-        (**self).plain_run(words);
-    }
-
-    #[inline]
-    fn should_pause(&self) -> bool {
-        (**self).should_pause()
-    }
-
-    #[inline]
-    fn plain_runs_by_line(&self) -> bool {
-        (**self).plain_runs_by_line()
-    }
 }
 
 impl Default for Capture {
@@ -1107,7 +840,6 @@ mod tests {
         capture.start_session();
         assert_eq!(capture.queue_len, 0, "the lists are forgotten");
         assert_eq!(capture.ge.register(op::SCISSOR_2), scissor_end, "the registers are kept");
-        assert_eq!(capture.stage_ge.register(op::SCISSOR_2), capture.ge.register(op::SCISSOR_2));
 
         capture.reset();
         assert_eq!(capture.ge.register(op::SCISSOR_2), 0, "reset still forgets everything");
@@ -1315,70 +1047,6 @@ mod tests {
     }
 
     #[test]
-    fn two_stages_give_what_one_gives() {
-        // A transfer writes commands, a CALL runs them (setting BASE and the
-        // vertex address), a stall splits the list: what stage B must get
-        // from the stream.
-        let mut memory = TestMemory::default();
-        let list = 0x0890_0000;
-        let source = 0x08A0_0000;
-        let destination = 0x0415_4480;
-        let vertices = 0x0891_0000;
-        let through_s16_color = (1 << 23) | (7 << 2) | (2 << 7);
-        memory.write(
-            source,
-            &[
-                cmd(op::BASE, 0x08_0000),
-                cmd(op::VERTEX_TYPE, through_s16_color),
-                cmd(op::VERTEX_ADDRESS, 0x91_0000),
-                cmd(op::PRIM, (6 << 16) | 2),
-                cmd(op::RET, 0),
-                0,
-                0,
-                0,
-            ],
-        );
-        for i in 0..4u32 {
-            memory.write(vertices + 12 * i, &[0xFFFF_FFFF, i, 0]);
-        }
-        let stride = 16;
-        memory.write(
-            list,
-            &[
-                cmd(op::FRAMEBUFFER_POINTER, 0x08_8000),
-                cmd(op::TRANSFER_SOURCE, source & 0xFF_FFF0),
-                cmd(op::TRANSFER_SOURCE_WIDTH, ((source >> 8) & 0xFF_0000) | stride),
-                cmd(op::TRANSFER_DESTINATION, destination & 0xFF_FFF0),
-                cmd(op::TRANSFER_DESTINATION_WIDTH, ((destination >> 8) & 0xFF_0000) | stride),
-                cmd(op::TRANSFER_SOURCE_POSITION, 0),
-                cmd(op::TRANSFER_DESTINATION_POSITION, 0),
-                cmd(op::TRANSFER_SIZE, 7), // 8 x 1 pixels of 32 bits: 8 words
-                cmd(op::TRANSFER_START, 1),
-                cmd(op::BASE, 0x04_0000),
-                cmd(op::CALL, destination & 0xFF_FFFF),
-                cmd(op::PRIM, (6 << 16) | 2),
-                cmd(op::FINISH, 0),
-                cmd(op::END, 0),
-            ],
-        );
-
-        let mut results = Vec::new();
-        for pipelined in [false, true] {
-            let mut frame = crate::frame::new_boxed_frame();
-            let mut capture = Capture::new();
-            capture.set_pipelined(pipelined);
-            capture.handle(Event::ListEnqueued { list, stall: list + 24, id: 0, context: 0 }, &mut memory, Some(&mut frame));
-            capture.handle(Event::StallUpdated { id: 0, stall: 0 }, &mut memory, Some(&mut frame));
-            let stats = capture.handle(shown(), &mut memory, Some(&mut frame)).unwrap();
-            let xs: Vec<f32> = frame.vertices().iter().map(|vertex| vertex.x).collect();
-            results.push((stats.draws, stats.commands, stats.block_transfers, stats.stall_updates, xs));
-        }
-        assert_eq!(results[0].0, 2);
-        assert_eq!(results[0].4.len(), 12);
-        assert_eq!(results[0], results[1]);
-    }
-
-    #[test]
     fn a_capture_made_in_zeroed_memory_records_what_a_new_one_records() {
         use crate::frame::new_boxed_frame;
         let mut memory = TestMemory::default();
@@ -1438,7 +1106,7 @@ mod tests {
             Box::from_raw(place)
         };
         assert!(capture.builder.raw_arena().is_none(), "no arena before the vertex cache brings one");
-        crate::raw_arena::ENABLED.store(true, Ordering::Relaxed);
+        crate::raw_arena::ENABLED.store(true, core::sync::atomic::Ordering::Relaxed);
         let arena = Box::leak(vec![crate::frame::FrameVertex::default(); 16].into_boxed_slice());
         let cache = Box::leak(Box::new(crate::vertex_cache::VertexCache::new(arena)));
         cache.set_raw_arena(Box::leak(vec![0u8; crate::raw_arena::WINDOW_BYTES as usize].into_boxed_slice()));

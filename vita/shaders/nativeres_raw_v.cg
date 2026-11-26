@@ -22,9 +22,6 @@
 //   2..4): 0 none, 4 5650, 5 5551, 6 4444, 7 8888.
 // aNormal: the raw normal (s8, s16 or float, as numbers; (byte 0..2) for
 //   formats without one, unused then): only for lighting 3.
-// aGeDepth (GE_DEPTH only): the GE's depth of the vertex from the CPU, a
-//   second vertex stream (core ge_depth_stream.rs; see GE_DEPTH below); read
-//   only where uGeDepth.z is 1 (debug `gedepthcpu`).
 // aWeights0, aWeights1: the raw skinning weights 1-4 and 5-8 (u8, u16 or
 //   float; read from byte 0 for formats with fewer, unused then: their bones
 //   are zero). uSkin: x > 0.5 = skinned (frame.rs Draw::bones), y = what the
@@ -239,8 +236,7 @@ float3 Ge8(float3 c)
 // uGeZ / uGeW: the combined world-view-projection matrix's clip z and w
 // columns as the GE combines it (ge_math::combined; rows x, y, z,
 // translation), uGeDepth: x the viewport's depth scale, y its centre
-// (float24s), z who works the depth out (0: this program; 1: the CPU, read
-// from aGeDepth); what the program takes from them alone (halves, units) it
+// (float24s); what the program takes from them alone (halves, units) it
 // works out once per draw. uRecip: the GE's reciprocal segments (start, slope;
 // ge_math RECIP), a uniform buffer of its own bound once (draw.rs).
 uniform float2 uRecip[128] : BUFFER[0];
@@ -397,9 +393,6 @@ void main(
 #ifndef RAW_NO_LIGHTS
 	float3 aNormal,
 #endif
-#ifdef GE_DEPTH
-	float aGeDepth,
-#endif
 	uniform float4x4 wvp,
 	uniform float4 uWorld[3],
 	uniform float4 uView[3],
@@ -503,29 +496,22 @@ void main(
 	float farSide = uDepth.y >= 0.0f ? 1.0f : -1.0f;
 	float pspDepth = floor(saturate(uDepth.x + uDepth.y * clip.z / max(clip.w, 1.0e-6f)) * 65535.0f);
 #ifdef GE_DEPTH
-	// The GE's own depth of the model position (GE_DEPTH above), worked out
-	// here (uGeDepth.z 0, the default) or by the CPU once per
-	// vertex (uGeDepth.z 1, debug `gedepthcpu 1|2`; core ge_depth_stream.rs:
-	// aGeDepth 0..65535; -1: the GE gives none, the float depth stands in).
+	// The GE's own depth of the model position (GE_DEPTH above); where the
+	// GE gives none, the float depth stands in.
 	//
-	// No per-vertex jumps: the jump on uGeDepth.z is free (a per-draw value;
-	// draws with the CPU's depth skip GdScreenZ). But once a vertex program
-	// has run a jump whose condition comes from the vertex (an attribute, or
-	// anything worked out from one), the GPU runs everything after it about
-	// 1.46 times slower, whichever way the jump went (measured 2026-11-26,
-	// DESIGN "seventy-fifth session": 80 rounds of a multiply-add and a frac
-	// for a million vertices 50.4 ms, 69.4 ms behind such a jump, 51.9 ms
-	// with a select instead). So per-vertex choices here are selects of
-	// values worked out either way. (Free as well, same lab: a jump on a
-	// uniform read from memory, a loop with a counter, a predicated
-	// instruction, bit masks, and GdScreenZ's table read at a per-vertex
-	// place, which costs its own ~4 ns and no more.)
-	if (uGeDepth.z > 0.5f) {
-		pspDepth = aGeDepth >= 0.0f ? aGeDepth : pspDepth;
-	} else {
-		float2 geDepth = GdScreenZ(position, uGeZ, uGeW, uGeDepth);
-		pspDepth = geDepth.y > 0.5f ? geDepth.x : pspDepth;
-	}
+	// No per-vertex jumps: once a vertex program has run a jump whose
+	// condition comes from the vertex (an attribute, or anything worked out
+	// from one), the GPU runs everything after it about 1.46 times slower,
+	// whichever way the jump went (measured 2026-11-26, DESIGN
+	// "seventy-fifth session": 80 rounds of a multiply-add and a frac for a
+	// million vertices 50.4 ms, 69.4 ms behind such a jump, 51.9 ms with a
+	// select instead). So per-vertex choices here are selects of values
+	// worked out either way. (Free, same lab: a jump on a uniform read from
+	// memory, a loop with a counter, a predicated instruction, bit masks, and
+	// GdScreenZ's table read at a per-vertex place, which costs its own ~4 ns
+	// and no more.)
+	float2 geDepth = GdScreenZ(position, uGeZ, uGeW, uGeDepth);
+	pspDepth = geDepth.y > 0.5f ? geDepth.x : pspDepth;
 #endif
 	vDepth = float2(farSide > 0.0f ? 65535.0f - pspDepth : pspDepth, farSide) * clip.w;
 #endif

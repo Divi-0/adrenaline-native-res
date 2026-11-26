@@ -657,6 +657,101 @@ pub fn opaque_rows(data: &[u8], texture: &TextureDescriptor) -> u16 {
     ALL_ROWS_OPAQUE
 }
 
+/// Where a texture's texels may show: per cell of texels, which raw values
+/// lie in it. A draw that keeps its target where the source alpha is 0
+/// (core `zero_alpha`) can leave out a triangle whose fragments filter
+/// from cells of transparent texels only (`zero_alpha::TexelTest`): God of
+/// War's light streaks are 256x32 index textures transparent but for a few
+/// columns, drawn over the whole screen (DESIGN "seventy-ninth session").
+///
+/// The texture's power-of-two size is cut into at most 32 columns and
+/// `MASK_CELLS` cells of at least 8x8 texels (smaller textures: one cell
+/// column or row). Made from the bytes a texture is decoded from
+/// (`texel_mask`), so it is what the GPU samples.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TexelMask {
+    /// log2 of a cell's width and height in texels.
+    pub cell_shift: [u8; 2],
+    /// log2 of the cells across and down.
+    pub grid_shift: [u8; 2],
+    /// Per cell, row by row: bit k set if a texel of raw value k lies in it
+    /// (4-bit indices: the index; 4444 / 5551 / 8888: bit 0 for a texel
+    /// whose alpha is not 0).
+    pub used: [u16; MASK_CELLS],
+}
+
+/// The most cells a `TexelMask` has.
+pub const MASK_CELLS: usize = 256;
+/// The largest texture a mask is made of (texels): making one walks every
+/// texel once, at decode (~10 ns each).
+pub const MASK_MOST_TEXELS: u32 = 32 * 1024;
+
+impl TexelMask {
+    pub const EMPTY: TexelMask = TexelMask { cell_shift: [0; 2], grid_shift: [0; 2], used: [0; MASK_CELLS] };
+
+    /// The raw values that are transparent in every texture of this kind
+    /// whose texels are not palette indices (bit 0 means "alpha not 0").
+    pub const DIRECT_TRANSPARENT: u16 = !1;
+
+    /// The cells of the grid (`used` past them is 0 and means nothing).
+    pub fn cells(&self) -> &[u16] {
+        &self.used[..1 << (self.grid_shift[0] + self.grid_shift[1])]
+    }
+
+    /// True if every cell in columns `columns` and rows `rows` (inclusive,
+    /// in cells, either may run past the grid's ends: they wrap) holds only
+    /// raw values in `transparent`.
+    pub fn transparent_cells(&self, columns: (i64, i64), rows: (i64, i64), transparent: u16) -> bool {
+        let (column_mask, row_mask) = ((1i64 << self.grid_shift[0]) - 1, (1i64 << self.grid_shift[1]) - 1);
+        let visible = !transparent;
+        (rows.0..=rows.1).all(|row| {
+            let first = ((row & row_mask) << self.grid_shift[0]) as usize;
+            (columns.0..=columns.1).all(|column| self.used[first + (column & column_mask) as usize] & visible == 0)
+        })
+    }
+}
+
+/// The `TexelMask` of `texture` decoded from `data` (as `decode_texture`
+/// reads it: swizzle, buffer width): 4-bit index textures and 4444 / 5551 /
+/// 8888 ones whose alpha is used, power-of-two sizes of at most
+/// `MASK_MOST_TEXELS` texels. None for other textures.
+pub fn texel_mask(data: &[u8], texture: &TextureDescriptor) -> Option<TexelMask> {
+    let (width, height) = (texture.width as u32, texture.height as u32);
+    if texture.flags & texture_flags::IGNORE_ALPHA != 0
+        || !width.is_power_of_two()
+        || !height.is_power_of_two()
+        || width * height > MASK_MOST_TEXELS
+        || !matches!(texture.format, format::CLUT4 | format::ABGR4444 | format::ABGR5551 | format::ABGR8888)
+    {
+        return None;
+    }
+    let (bits, row) = check_decode(data, texture, width as usize * height as usize, width as usize).ok()?;
+    let (width_log, height_log) = (width.trailing_zeros(), height.trailing_zeros());
+    let cell_x = width_log.min(3).max(width_log.saturating_sub(5));
+    let across = width_log - cell_x;
+    let cell_y = height_log.min(3).max(height_log.saturating_sub(MASK_CELLS.trailing_zeros() - across));
+    let mut mask = TexelMask { cell_shift: [cell_x as u8, cell_y as u8], grid_shift: [across as u8, (height_log - cell_y) as u8], used: [0; MASK_CELLS] };
+    let mut bytes = [0u8; MAX_ROW_BYTES];
+    let bytes = &mut bytes[..texel_bytes(width as usize, bits)];
+    for y in 0..height {
+        read_row(data, texture, row, y, bytes);
+        let cells = &mut mask.used[((y >> cell_y) << across) as usize..][..1 << across];
+        let texels_per_cell = 1usize << cell_x;
+        let cell_bytes = (texels_per_cell * bits as usize).div_ceil(8);
+        for (cell, chunk) in cells.iter_mut().zip(bytes.chunks(cell_bytes)) {
+            *cell |= match texture.format {
+                // Two texels a byte, the low nibble first; a 1-texel-wide texture uses only that one.
+                format::CLUT4 if texels_per_cell == 1 => 1 << (chunk[0] & 0xF),
+                format::CLUT4 => chunk.iter().fold(0u16, |used, &byte| used | 1 << (byte & 0xF) | 1 << (byte >> 4)),
+                format::ABGR4444 => chunk.chunks_exact(2).any(|texel| texel[1] & 0xF0 != 0) as u16,
+                format::ABGR5551 => chunk.chunks_exact(2).any(|texel| texel[1] & 0x80 != 0) as u16,
+                _ => chunk.chunks_exact(4).any(|texel| texel[3] != 0) as u16,
+            };
+        }
+    }
+    Some(mask)
+}
+
 /// A DXT block's four colours (`0xAABBGGRR`), PPSSPP's DecodeColors.
 fn dxt_colors(block: &[u8], dxt1: bool) -> [u32; 4] {
     let c1 = u16::from_le_bytes([block[4], block[5]]) as u32;

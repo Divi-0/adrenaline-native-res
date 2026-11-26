@@ -22,7 +22,7 @@ use crate::texture::{self, format, DecodeError};
 
 use super::gpu::{GpuFormat, GpuTexture, TextureShape};
 use super::staging::{stage, StagedLayout};
-use super::{Host, TextureCache, BACKGROUND_MIN_BYTES, HASH_VOLATILE_EVERY, VOLATILE_CHANGES};
+use super::{Host, TextureCache, BACKGROUND_MIN_BYTES, HASH_VOLATILE_EVERY, NO_MASK, VOLATILE_CHANGES};
 
 /// What the display thread hands the worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,6 +191,7 @@ impl TextureCache {
             entry.texture = Some(job.texture);
             entry.shape = job.shape();
             entry.opaque_rows = result.opaque_rows;
+            entry.mask = NO_MASK; // made from the old pixels
             entry.quick = 0; // copied at some point: its sample isn't known
             if job.hash {
                 // Same data as at the last hash: no longer volatile.

@@ -155,12 +155,10 @@ pub struct FrameStats {
     /// Ring events lost because the reader fell behind.
     pub dropped_events: u32,
     /// GE contexts (`ge_context`): states saved, restored, restores of a
-    /// context we never saw saved, and restores stage B didn't get
-    /// (pipelined capture).
+    /// context we never saw saved.
     pub contexts_saved: u32,
     pub contexts_restored: u32,
     pub contexts_missing: u32,
-    pub contexts_pipelined: u32,
     /// The GE's own state taken over (`EVENT_GE_STATE`, after a new
     /// session), and how many registers / matrix elements of ours differed
     /// from it (0 / 0 when our walk had the GE's state).
@@ -274,7 +272,6 @@ impl FrameStats {
             contexts_saved: 0,
             contexts_restored: 0,
             contexts_missing: 0,
-            contexts_pipelined: 0,
             ge_states: 0,
             ge_state_register_differences: 0,
             ge_state_matrix_differences: 0,

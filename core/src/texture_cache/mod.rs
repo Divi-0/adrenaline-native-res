@@ -348,6 +348,23 @@ struct Entry {
     /// (`texture::opaque_rows`; with mip levels `ALL_ROWS_OPAQUE` or 0):
     /// `TextureCache::opaque_rows`.
     opaque_rows: u16,
+    /// Its `texture::TexelMask` in `TextureCache::masks` (`NO_MASK`: none),
+    /// valid while that slot names this entry and its texture (`mask_of`).
+    mask: u8,
+}
+
+/// `Entry::mask` of an entry without one.
+const NO_MASK: u8 = 0xFF;
+/// Texel masks kept (`TexelMask`, 512 bytes each): textures of the draws a
+/// zero-alpha cull may thin out, a few a frame (God of War's light streaks).
+const MASK_SLOTS: usize = 16;
+
+/// A `TexelMask` and the entry (and its GPU texture) it was made for.
+#[derive(Clone, Copy)]
+struct MaskSlot {
+    owner: u16,
+    texture: Option<GpuTexture>,
+    mask: texture::TexelMask,
 }
 
 const NO_DESCRIPTOR: TextureDescriptor = TextureDescriptor {
@@ -380,6 +397,7 @@ const FREE_ENTRY: Entry = Entry {
     sample_hash: 0,
     quick: 0,
     opaque_rows: 0,
+    mask: NO_MASK,
 };
 
 const FREE_RETIRED: Retired = Retired { texture: None, shape: NO_SHAPE, ready_at: 0 };
@@ -443,6 +461,12 @@ pub struct TextureCache {
     /// The `opaque_rows` of the entry the last `look_up` returned
     /// `Lookup::Ready` from (`ready`).
     last_opaque_rows: u16,
+    /// Texel masks of entries (`Entry::mask`).
+    masks: [MaskSlot; MASK_SLOTS],
+    /// Per texture of the last `textures_for_frame`: its mask's slot (`NO_MASK`: none).
+    frame_masks: [u8; MAX_TEXTURES],
+    /// The mask slot of the entry the last `look_up` returned (`ready`).
+    last_mask: u8,
     failed_next: usize,
     refresh: Option<PendingRefresh>,
     stats: TextureStats,
@@ -483,6 +507,9 @@ impl TextureCache {
             moved_on: 0,
             frame_opaque_rows: [0; MAX_TEXTURES],
             last_opaque_rows: 0,
+            masks: [MaskSlot { owner: 0, texture: None, mask: texture::TexelMask::EMPTY }; MASK_SLOTS],
+            frame_masks: [NO_MASK; MAX_TEXTURES],
+            last_mask: NO_MASK,
             failed_next: 0,
             refresh: None,
             stats: TextureStats {
@@ -523,6 +550,7 @@ impl TextureCache {
             let index = (n + self.render_count as usize) % count;
             let texture = &textures[index];
             self.last_opaque_rows = 0;
+            self.last_mask = NO_MASK;
             out[index] = if is_render_target(&start, textures, texture) {
                 Lookup::RenderTarget
             } else {
@@ -536,7 +564,9 @@ impl TextureCache {
                 }
                 lookup
             };
-            self.frame_opaque_rows[index] = if matches!(out[index], Lookup::Ready(_)) { self.last_opaque_rows } else { 0 };
+            let ready = matches!(out[index], Lookup::Ready(_));
+            self.frame_opaque_rows[index] = if ready { self.last_opaque_rows } else { 0 };
+            self.frame_masks[index] = if ready { self.last_mask } else { NO_MASK };
         }
     }
 
@@ -548,9 +578,40 @@ impl TextureCache {
         self.frame_opaque_rows.get(index).copied().unwrap_or(0)
     }
 
+    /// The `texture::TexelMask` of the last `textures_for_frame`'s texture
+    /// `index` (ready, decoded on the CPU from 4-bit indices or 4444 / 5551 /
+    /// 8888 texels, without mip levels), made from the bytes its texture was
+    /// decoded from. None if it has none.
+    pub fn texel_mask(&self, index: usize) -> Option<&texture::TexelMask> {
+        let slot = *self.frame_masks.get(index)? as usize;
+        self.masks.get(slot).map(|slot| &slot.mask)
+    }
+
+    /// The slot of entry `slot`'s mask, if it is still its own.
+    fn mask_of(&self, slot: usize) -> u8 {
+        let entry = &self.entries[slot];
+        match self.masks.get(entry.mask as usize) {
+            Some(mask) if mask.owner as usize == slot && mask.texture == entry.texture && entry.texture.is_some() => entry.mask,
+            _ => NO_MASK,
+        }
+    }
+
+    /// Keeps `mask` for entry `slot` (decoded just now) in a free mask slot,
+    /// or the one whose entry was used longest ago; returns its slot.
+    fn keep_mask(&mut self, slot: usize, mask: texture::TexelMask) -> u8 {
+        let owned = |cache: &Self, at: usize| {
+            let owner = cache.masks[at].owner as usize;
+            (cache.mask_of(owner) as usize == at).then(|| cache.entries[owner].last_used)
+        };
+        let place = (0..MASK_SLOTS).find(|&at| owned(self, at).is_none()).unwrap_or_else(|| (0..MASK_SLOTS).min_by_key(|&at| owned(self, at)).unwrap_or(0));
+        self.masks[place] = MaskSlot { owner: slot as u16, texture: self.entries[slot].texture, mask };
+        place as u8
+    }
+
     /// `Lookup::Ready` with entry `slot`'s texture, noting whether it is
     /// opaque (`opaque`).
     fn ready(&mut self, slot: usize) -> Lookup {
+        self.last_mask = self.mask_of(slot);
         let entry = &self.entries[slot];
         self.last_opaque_rows = entry.opaque_rows;
         Lookup::Ready(entry.texture.unwrap())
@@ -1087,6 +1148,7 @@ impl TextureCache {
         let mut result = Ok(());
         // Unswizzled on the GPU: not looked at (16-bit with alpha: rarely opaque).
         let mut opaque_rows = 0;
+        let mut texel_mask = None;
         if !on_gpu || !self.unswizzle_on_gpu(host, wanted, texture, shape) {
             if staged_size == 0 {
                 // The hash came from an earlier copy this frame (or there was none).
@@ -1100,6 +1162,20 @@ impl TextureCache {
             // Palette textures: their colours come per frame (palette tables).
             result = host.decode(texture, format, &layout.as_texture, data, palette, self.smooth, 0);
             opaque_rows = texture::opaque_rows(data, &layout.as_texture);
+            // Where it shows, for the zero-alpha cull (one level only; only
+            // if some cell can be transparent at all).
+            if crate::frame::texture_level_count(wanted) == 1 && opaque_rows != texture::ALL_ROWS_OPAQUE {
+                texel_mask = texture::texel_mask(data, &layout.as_texture).filter(|mask| {
+                    let transparent = if wanted.format == texture::format::CLUT4 {
+                        let mut table = [0u32; 256];
+                        texture::palette_rgba(wanted, palette, &mut table);
+                        (0..16).filter(|&k| table[k] >> 24 == 0).fold(0u16, |bits, k| bits | 1 << k)
+                    } else {
+                        texture::TexelMask::DIRECT_TRANSPARENT
+                    };
+                    mask.cells().iter().any(|&used| used & !transparent == 0)
+                });
+            }
             if format == GpuFormat::Wide16 && texture::is_vita_palette_format(wanted.format) {
                 // Decoded with its palette (part of the key): opaque as its
                 // palette table would be (the display side's palette
@@ -1180,7 +1256,11 @@ impl TextureCache {
             sample_hash: new_sample_hash,
             quick,
             opaque_rows,
+            mask: NO_MASK,
         };
+        if let Some(mask) = texel_mask {
+            self.entries[slot].mask = self.keep_mask(slot, mask);
+        }
         self.ready(slot)
     }
 

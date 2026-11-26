@@ -20,6 +20,7 @@
 use nativeres_core::blend::{channel_mask, reads_destination_alpha, samples_target_alpha, StencilState, BLEND_ENABLED, BLEND_FIX_B_ALPHA, BLEND_FIX_B_SHIFT, BLEND_PREMULTIPLY_SHIFT};
 use nativeres_core::frame::{draw_flags, ge_blend_term, test_flags, texture_flags, wide_variant, Draw, Frame, FrameVertex, TextureDescriptor};
 use nativeres_core::black_texels;
+use nativeres_core::zero_alpha;
 use nativeres_core::hidden_draws::{self, HiddenDraws};
 use nativeres_core::offscreen;
 use nativeres_core::texture::{data_size, decode_texture, format, ALL_ROWS_OPAQUE};
@@ -50,6 +51,11 @@ thread_local! {
     // triangles of those draws kept and left out.
     static ZERO_ALPHA: bool = std::env::var("REPLAY_ZERO_ALPHA").is_ok_and(|value| value == "1");
     static ZERO_ALPHA_COUNTS: std::cell::Cell<(u32, u32)> = std::cell::Cell::new((0, 0));
+    // REPLAY_ZERO_TEXELS=1 (with REPLAY_ZERO_ALPHA=1): also the triangles that
+    // sample only texels of alpha 0 (core zero_alpha::TexelTest, the texture's
+    // TexelMask), as draw.rs `texel_test`; counted in `ZERO_TEXEL_COUNT`.
+    static ZERO_TEXELS: bool = std::env::var("REPLAY_ZERO_TEXELS").is_ok_and(|value| value == "1");
+    static ZERO_TEXEL_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// A decoded texture, RGBA (0xAABBGGRR) row by row.
@@ -57,6 +63,9 @@ struct Texture {
     width: usize,
     height: usize,
     pixels: Vec<u32>,
+    /// Where its texels show (core `texture::texel_mask`, as the Vita's
+    /// texture cache makes it at decode); None for targets.
+    mask: Option<nativeres_core::texture::TexelMask>,
 }
 
 /// RGBA as floats 0..1 (may go above 1 with colour doubling).
@@ -457,7 +466,7 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
     }
     if ZERO_ALPHA.with(|on| *on) {
         let (kept, culled) = ZERO_ALPHA_COUNTS.with(|counts| counts.replace((0, 0)));
-        println!("zero alpha: {kept} triangles kept, {culled} culled");
+        println!("zero alpha: {kept} triangles kept, {culled} culled ({} by their texels)", ZERO_TEXEL_COUNT.with(|count| count.replace(0)));
     }
     // Debugging: REPLAY_RUN_STATS=1: index runs per primitive type (raw draws):
     // runs, vertices, triangles.
@@ -596,7 +605,7 @@ fn target_texture(texture: &TextureDescriptor, picture: &[u32]) -> Texture {
             pixels[y * width + x] = if opaque { pixel | 0xFF00_0000 } else { pixel };
         }
     }
-    Texture { width, height, pixels }
+    Texture { width, height, pixels, mask: None }
 }
 
 /// Draws one of the frame's draws into `screen` (the shown framebuffer's
@@ -627,14 +636,22 @@ fn draw_one_black(
     };
     let index = (draw as *const Draw as usize - frame.draws().as_ptr() as usize) / core::mem::size_of::<Draw>();
     let zero_alpha = ZERO_ALPHA.with(|on| *on) && culls_zero_alpha(frame, draw);
+    let texels = if ZERO_ALPHA.with(|on| *on) && ZERO_TEXELS.with(|on| *on) { texel_test(frame, draw, texture) } else { None };
     let mut corners = frame.screen_corners(draw);
     while let (Some(a), Some(b), Some(c)) = (corners.next(), corners.next(), corners.next()) {
         if black.is_some_and(|black| !black.keeps_triangle([&a, &b, &c])) {
             culled += 1;
             continue;
         }
-        if zero_alpha {
-            let gone = [&a, &b, &c].iter().all(|corner| corner.color >> 24 == 0);
+        if zero_alpha || texels.is_some() {
+            let corner = |vertex: &FrameVertex| {
+                let zero = zero_alpha && vertex.color >> 24 == 0;
+                texels.as_ref().map_or(zero_alpha::Corner::alpha_only(zero), |texels| texels.corner(zero, Some([vertex.u, vertex.v])))
+            };
+            let (ca, cb, cc) = (corner(&a), corner(&b), corner(&c));
+            let by_texels = !(ca.zero && cb.zero && cc.zero) && texels.as_ref().is_some_and(|texels| texels.gone(&ca, &cb, &cc));
+            ZERO_TEXEL_COUNT.with(|count| count.set(count.get() + by_texels as u32));
+            let gone = ca.zero && cb.zero && cc.zero || by_texels;
             ZERO_ALPHA_COUNTS.with(|counts| {
                 let (kept, culled) = counts.get();
                 counts.set(if gone { (kept, culled + 1) } else { (kept + 1, culled) });
@@ -695,6 +712,46 @@ fn culls_zero_alpha(frame: &Frame, draw: &Draw) -> bool {
     }
 }
 
+/// The Vita's texel test for `draw` (draw.rs `texel_test`): a draw that keeps
+/// the target at alpha 0, textured without mip levels, its texture with a
+/// mask, vertices whose texture coordinates the CPU knows (raw ones with
+/// their own: `zero_alpha::RawUv`; the frame's screen-space ones), at most
+/// the Vita's 4,096 indices; 4-bit indices transparent by the frame's palette.
+fn texel_test<'a>(frame: &Frame, draw: &Draw, texture: Option<&'a Texture>) -> Option<zero_alpha::TexelTest<'a>> {
+    use nativeres_core::texture::{format, palette_rgba, TexelMask};
+    let mask = texture?.mask.as_ref()?;
+    if draw.flags & draw_flags::MIPS != 0 || !zero_alpha::keeps_target(frame, draw) || draw.index_count > 4096 {
+        return None;
+    }
+    if draw.flags & draw_flags::RAW_VERTICES != 0 {
+        let (_, camera) = frame.raw_transform_of(draw)?;
+        let colors = frame.raw_colors_of(draw)?;
+        if draw.flags & draw_flags::RAW_SPRITES != 0 || zero_alpha::RawUv::new(nativeres_core::vertex::VertexFormat(draw.vertex_format), camera).is_none() {
+            return None;
+        }
+    } else if draw.transform != 0 || draw.flags & draw_flags::CACHED_VERTICES != 0 {
+        return None;
+    }
+    let descriptor = frame.textures().get(draw.texture as usize)?;
+    let transparent = if descriptor.format == format::CLUT4 {
+        let words = &frame.palette_words[..(frame.palette_word_count as usize).min(frame.palette_words.len())];
+        let start = (descriptor.palette_offset as usize).min(words.len());
+        let end = (start + descriptor.palette_word_count as usize).min(words.len());
+        let mut table = [0u32; 256];
+        palette_rgba(descriptor, &words[start..end], &mut table);
+        (0..16).filter(|&k| table[k] >> 24 == 0).fold(0u16, |bits, k| bits | 1 << k)
+    } else {
+        TexelMask::DIRECT_TRANSPARENT
+    };
+    Some(zero_alpha::TexelTest::new(
+        mask,
+        transparent,
+        [descriptor.width.trailing_zeros() as u8, descriptor.height.trailing_zeros() as u8],
+        draw.flags & draw_flags::LINEAR_FILTER != 0,
+        [draw.flags & draw_flags::CLAMP_U != 0, draw.flags & draw_flags::CLAMP_V != 0],
+    ))
+}
+
 /// A texture that is the PSP framebuffer the frame doesn't draw into: a
 /// 32-bit VRAM texture at least the screen's size (MTX's motion blur samples
 /// the previous frame this way). The Vita samples its own render target
@@ -725,7 +782,7 @@ fn framebuffer_texture(texture: &TextureDescriptor, picture: &OriginalPicture) -
             pixels[y * width + x] = (picture.pixels[y * picture.width + x] & 0x00FF_FFFF) | forced_alpha;
         }
     }
-    Texture { width, height, pixels }
+    Texture { width, height, pixels, mask: None }
 }
 
 fn decode(texture: &TextureDescriptor, frame: &Frame, memory: &DumpMemory) -> Option<Texture> {
@@ -735,7 +792,8 @@ fn decode(texture: &TextureDescriptor, frame: &Frame, memory: &DumpMemory) -> Op
     let (width, height) = (texture.width as usize, texture.height as usize);
     let mut pixels = vec![0u32; width * height];
     decode_texture(&data, texture, palette, &mut pixels, width).ok()?;
-    Some(Texture { width, height, pixels })
+    let mask = nativeres_core::texture::texel_mask(&data, texture);
+    Some(Texture { width, height, pixels, mask })
 }
 
 /// Scissor rectangle in screen pixels: [left, right) x [top, bottom).
@@ -1311,7 +1369,7 @@ mod tests {
     /// A 2x1 texture, black then white, bilinear, clamped: half way
     /// between the texel centres the exact mix is 127.5.
     fn black_white() -> (Texture, Draw) {
-        let texture = Texture { width: 2, height: 1, pixels: vec![0xFF00_0000, 0xFFFF_FFFF] };
+        let texture = Texture { width: 2, height: 1, pixels: vec![0xFF00_0000, 0xFFFF_FFFF], mask: None };
         let flags = draw_flags::TEXTURED | draw_flags::LINEAR_FILTER | draw_flags::CLAMP_U | draw_flags::CLAMP_V;
         (texture, Draw { flags, ..Draw::default() })
     }
@@ -1381,7 +1439,7 @@ mod tests {
             corner(100.0, 0.0, 8.0, 0xFFFF_FFFF, 1.0),
             corner(0.0, 100.0, 8.0, 0xFFFF_FFFF, 1.0),
         ];
-        let white = Texture { width: 1, height: 1, pixels: vec![0xFFFF_FFFF] };
+        let white = Texture { width: 1, height: 1, pixels: vec![0xFFFF_FFFF], mask: None };
         let mut screen = vec![0u32; WIDTH * HEIGHT];
         let mut depth = vec![1.0f32; WIDTH * HEIGHT];
         // Unfogged: the screen-linear colour, 0.505 white (with perspective: 0.11).
@@ -1449,7 +1507,7 @@ mod tests {
         let draw = Draw { blend: packed, flags: draw_flags::TEXTURED, scissor_right: 479, scissor_bottom: 271, ..Draw::default() };
         assert!(wide_variant(draw.flags, draw.blend, true).is_some());
         // A white texel: the source is the vertex colour (modulate).
-        let texture = Texture { width: 1, height: 1, pixels: vec![0xFFFF_FFFF] };
+        let texture = Texture { width: 1, height: 1, pixels: vec![0xFFFF_FFFF], mask: None };
         GE_BLEND_FRAME.store(true, std::sync::atomic::Ordering::Relaxed);
         draw_triangle(&mut screen, &mut depth, &draw, Some(&texture), triangle, 0, None);
         GE_BLEND_FRAME.store(false, std::sync::atomic::Ordering::Relaxed);

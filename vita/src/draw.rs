@@ -41,18 +41,7 @@ use crate::capture::{RAW_ARENA, RAW_ARENA_BYTES, VERTEX_ARENA, VERTEX_ARENA_VERT
 use crate::frame_pool::alloc as frame_pool_alloc;
 use crate::gpu_textures::TextureObject;
 use crate::gxm::{self, ProgramParameter};
-use crate::programs::{AlphaOut, Kind, Programs, RawColor, RawUniforms, RawVariant, GE_DEPTH_STRIDE, SPRITE_CORNERS};
-use nativeres_core::ge_depth_stream::{RawDrawVertices, SkinRounding};
-
-/// Index runs of a draw that `Draws::ge_depth_stream` keeps apart (more:
-/// one range from the lowest to the highest vertex).
-const GE_DEPTH_RANGES: usize = 256;
-
-/// Cached scratch for `Draws::ge_depth_stream`'s copies out of PSP RAM.
-const GE_DEPTH_SCRATCH_BYTES: usize = 16 * 1024;
-#[repr(align(16))]
-struct GeDepthScratch([u8; GE_DEPTH_SCRATCH_BYTES]);
-static GE_DEPTH_SCRATCH: SingleThreaded<GeDepthScratch> = SingleThreaded::new(GeDepthScratch([0; GE_DEPTH_SCRATCH_BYTES]));
+use crate::programs::{AlphaOut, Kind, Programs, RawColor, RawUniforms, RawVariant, SPRITE_CORNERS};
 use crate::render_stats::stats;
 use crate::{basic_programs, render_log, sys, SingleThreaded};
 
@@ -227,56 +216,57 @@ pub static ZERO_ALPHA: AtomicI32 = AtomicI32::new(1);
 /// drawn whole.
 const ZERO_ALPHA_MOST_INDICES: usize = 4096;
 
-/// Raw vertices' alphas in PSP RAM (zero copy), read through a window of
-/// them copied in bursts. PSP RAM is not cached: a single load costs ~0.8 us
+/// Raw vertices in PSP RAM (zero copy), read through a window of them
+/// copied in bursts. PSP RAM is not cached: a single load costs ~0.8 us
 /// under load, a burst of 128 bytes about the same and 256 bytes ~1.75 us
 /// (docs/vita-performance.md "PSP RAM seen from the Vita"), so whole
 /// vertices 256 bytes at a time are several times cheaper than one alpha
 /// byte each (God of War's cloud layer, ~1,800 vertices of 24 bytes: 1.5 ms
 /// a frame byte by byte). Not more at a time: most of its strips are ~6
-/// vertices, and the next one is somewhere else.
-struct AlphaWindow<'a> {
+/// vertices, and the next one is somewhere else. (Alphas and texture
+/// coordinates come from the same copy.)
+struct VertexWindow<'a> {
     /// The vertices in PSP RAM, vertex 0 at the start.
     source: &'a [u8],
-    alphas: zero_alpha::RawAlphas<'a>,
+    stride: usize,
     /// The copy (words, so that the burst copy finds it aligned): `skip`
     /// bytes before vertex `first`, then `count` whole vertices.
-    room: [u32; ALPHA_WINDOW_BYTES / 4],
+    room: [u32; VERTEX_WINDOW_BYTES / 4],
     skip: usize,
     first: u32,
     count: u32,
 }
 
-const ALPHA_WINDOW_BYTES: usize = 256;
+const VERTEX_WINDOW_BYTES: usize = 256;
 
-impl<'a> AlphaWindow<'a> {
-    fn new(alphas: zero_alpha::RawAlphas<'a>, source: &'a [u8]) -> Self {
-        Self { source, alphas, room: [0; ALPHA_WINDOW_BYTES / 4], skip: 0, first: 0, count: 0 }
+impl<'a> VertexWindow<'a> {
+    fn new(stride: usize, source: &'a [u8]) -> Self {
+        Self { source, stride, room: [0; VERTEX_WINDOW_BYTES / 4], skip: 0, first: 0, count: 0 }
     }
 
-    /// True if vertex number `vertex` has alpha 0 (a vertex outside the
-    /// block: no). Vertices asked for in rising order (a strip's) are
-    /// copied once.
-    fn is_zero(&mut self, vertex: u16) -> bool {
+    /// The copied bytes from vertex number `vertex` on (as vertex 0); None
+    /// for a vertex outside the block. Vertices asked for in rising order
+    /// (a strip's) are copied once.
+    fn at(&mut self, vertex: u16) -> Option<&[u8]> {
         let vertex = vertex as u32;
         if vertex.wrapping_sub(self.first) >= self.count && !self.fill(vertex) {
-            return false;
+            return None;
         }
         // Safe: `room` is plain words; `skip` + `count` vertices lie inside it (`fill`).
-        let bytes = unsafe { core::slice::from_raw_parts(self.room.as_ptr() as *const u8, ALPHA_WINDOW_BYTES) };
-        self.alphas.over(&bytes[self.skip..]).is_zero((vertex - self.first) as u16)
+        let bytes = unsafe { core::slice::from_raw_parts(self.room.as_ptr() as *const u8, VERTEX_WINDOW_BYTES) };
+        Some(&bytes[self.skip + (vertex - self.first) as usize * self.stride..self.skip + self.count as usize * self.stride])
     }
 
     /// Copies the vertices from `vertex` on, as many as fit; false if there is none.
     fn fill(&mut self, vertex: u32) -> bool {
-        let stride = self.alphas.stride();
+        let stride = self.stride;
         let start = vertex as usize * stride;
         if stride == 0 || start >= self.source.len() {
             return false;
         }
         // From the word the vertex starts in (the burst copy wants both ends aligned).
         let skip = (self.source.as_ptr() as usize + start) & 3;
-        let count = ((ALPHA_WINDOW_BYTES - skip) / stride).min((self.source.len() - start) / stride);
+        let count = ((VERTEX_WINDOW_BYTES - skip) / stride).min((self.source.len() - start) / stride);
         if count == 0 {
             return false;
         }
@@ -290,11 +280,71 @@ impl<'a> AlphaWindow<'a> {
     }
 }
 
-/// `cull_zero_alpha`'s room: a draw's runs written out as a triangle list,
-/// and the new list; the display thread only. (Not on the stack yet: 16 KiB
-/// of the display thread's 64 KiB, and how deep the draw path already is
-/// there has not been measured.)
-static ZERO_ALPHA_ROOM: SingleThreaded<[[u16; ZERO_ALPHA_MOST_INDICES]; 2]> = SingleThreaded::new([[0; ZERO_ALPHA_MOST_INDICES]; 2]);
+/// Triangles that sample only texels of alpha 0 join the zero-alpha cull
+/// (core `zero_alpha::TexelTest`, the textures' `texture::TexelMask`s): God
+/// of War's light streaks. 1 = on (default), 0 = only the vertices' alphas.
+/// Debug `zerotexels`.
+pub static ZERO_TEXELS: AtomicI32 = AtomicI32::new(1);
+
+/// The texel test for textured `draw` (no mip levels, its texture from the
+/// cache with a `TexelMask`): the raw values that are transparent (4-bit
+/// indices: those whose entry in the frame's palette has alpha 0). None if
+/// no cell of the mask can go.
+fn texel_test(frame: &Frame, draw: &Draw) -> Option<zero_alpha::TexelTest<'static>> {
+    if ZERO_TEXELS.load(Ordering::Relaxed) == 0 || draw.flags & draw_flags::TEXTURED == 0 || draw.flags & draw_flags::MIPS != 0 {
+        return None;
+    }
+    let mask = crate::textures::texel_mask(draw.texture as usize)?;
+    let texture = frame.textures().get(draw.texture as usize)?;
+    let transparent = if texture.format == nativeres_core::texture::format::CLUT4 {
+        let words = &frame.palette_words[..(frame.palette_word_count as usize).min(frame.palette_words.len())];
+        let mut table = [0u32; 256];
+        crate::texture_palette(texture, words, &mut table);
+        (0..16).filter(|&k| table[k] >> 24 == 0).fold(0u16, |bits, k| bits | 1 << k)
+    } else {
+        nativeres_core::texture::TexelMask::DIRECT_TRANSPARENT
+    };
+    let test = zero_alpha::TexelTest::new(
+        mask,
+        transparent,
+        [texture.width.trailing_zeros() as u8, texture.height.trailing_zeros() as u8],
+        draw.flags & draw_flags::LINEAR_FILTER != 0,
+        [draw.flags & draw_flags::CLAMP_U != 0, draw.flags & draw_flags::CLAMP_V != 0],
+    );
+    test.any_transparent().then_some(test)
+}
+
+/// The cull of index runs `runs` written out as a triangle list of
+/// `length` indices into `room` (as `draw_indices` does without strips),
+/// into `out`; None where the list doesn't fit the room.
+fn runs_as_list<C>(
+    runs: &[u16],
+    room: &mut core::mem::MaybeUninit<[u16; ZERO_ALPHA_MOST_INDICES]>,
+    length: usize,
+    corner: impl FnMut(u16) -> C,
+    gone: impl FnMut(&C, &C, &C) -> bool,
+    out: &mut [u16],
+) -> Option<zero_alpha::Culled> {
+    if length > ZERO_ALPHA_MOST_INDICES {
+        return None;
+    }
+    let list = index_room(room, length);
+    write_runs(runs, list);
+    zero_alpha::cull_list_by(list, corner, gone, out)
+}
+
+/// The first `count` indices of `room` (at most its length), set to 0 and
+/// handed out as a slice: a list on the stack initialised only as far as
+/// the draw needs it (`zero_alpha_list`), not all 8 KiB on every call.
+fn index_room(room: &mut core::mem::MaybeUninit<[u16; ZERO_ALPHA_MOST_INDICES]>, count: usize) -> &mut [u16] {
+    let count = count.min(ZERO_ALPHA_MOST_INDICES);
+    let first = room.as_mut_ptr() as *mut u16;
+    // Safe: `count` u16s inside `room`, written before they are looked at.
+    unsafe {
+        core::ptr::write_bytes(first, 0, count);
+        core::slice::from_raw_parts_mut(first, count)
+    }
+}
 
 /// Flat draws whose vertices all have one colour and that need no PSP depth
 /// go through the constant-colour program (nativeres_textured_const_f.cg:
@@ -1737,8 +1787,7 @@ impl Draws {
             let buffer = reserve_vertex_uniforms();
             let format = VertexFormat(draw.vertex_format);
             let format_uniform = [format.position_scale(), ((draw.vertex_format >> 2) & 7) as f32, 0.0, 0.0];
-            // Texgen draws: their own (RawColors::texgen).
-            let raw_uv = nativeres_core::raw_blocks::raw_uv_of(camera, format, colors);
+            let raw_uv = nativeres_core::raw_blocks::raw_uv(camera, format);
             set_raw_uniforms(buffer, &uniforms, matrix, (transform, camera), uv_scale, &format_uniform, &raw_uv, colors);
             if let Some(skinning) = skinning {
                 set_uniform(buffer, skinning.scale, 4, floats(&colors.scale));
@@ -1766,130 +1815,6 @@ impl Draws {
     /// rest) and skin where uSkin.x is 1; the one-bone programs get bone 0
     /// and add uSkin.z to the weight, so formats without weights get weight 1
     /// and the identity.
-    /// The GE depth stream of a raw draw for the GE_DEPTH programs (their
-    /// aGeDepth, vertex stream 1; core ge_depth_stream.rs): one float per
-    /// vertex the draw uses, in the frame pool, worked out here once per
-    /// vertex instead of by the program once per index (`GE_DEPTH_CPU`).
-    /// `bytes`: the draw's vertices from vertex 0 (what stream 0 reads).
-    /// Returns the stream's address for vertex 0: it may lie before the
-    /// block, as only the used vertices from the lowest on are kept (the
-    /// GPU reads only those). Null if the frame pool is full.
-    #[allow(clippy::too_many_arguments)]
-    fn ge_depth_stream(
-        &mut self,
-        frame: &Frame,
-        draw: &Draw,
-        variant: RawVariant,
-        (transform, camera): (&RawTransform, &RawCamera),
-        bytes: &[u8],
-        uncached: bool,
-        indices: *const u16,
-        index_count: u32,
-    ) -> *const c_void {
-        let start = draw_clock();
-        // The vertices the draw uses: its runs' ranges, or its index list.
-        let mut ranges = [(0u32, 0u32); GE_DEPTH_RANGES];
-        let mut range_count = 0;
-        let (mut lowest, mut end) = (u32::MAX, 0u32);
-        let first_run = draw.first_index as usize;
-        let runs = (draw.flags & draw_flags::INDEX_RUNS != 0)
-            .then(|| frame.indices.get(first_run..first_run + draw.index_count as usize))
-            .flatten();
-        if let Some(runs) = runs {
-            for run in runs.chunks_exact(3) {
-                if run[1] != 0 && run[0] as u32 != nativeres_core::command::primitive::RECTANGLES {
-                    lowest = lowest.min(run[2] as u32);
-                    end = end.max(run[2] as u32 + run[1] as u32);
-                }
-            }
-            if runs.len() / 3 <= GE_DEPTH_RANGES {
-                range_count = nativeres_core::ge_depth_stream::run_ranges(runs, &mut ranges);
-            }
-        } else if index_count > 0 {
-            // Safe: the draw's index buffer (draw_indices), index_count long.
-            let list = unsafe { core::slice::from_raw_parts(indices, index_count as usize) };
-            for &index in list {
-                lowest = lowest.min(index as u32);
-                end = end.max(index as u32 + 1);
-            }
-        }
-        if lowest >= end {
-            return null();
-        }
-        if range_count == 0 {
-            ranges[0] = (lowest, end); // all of them (gaps worked out too)
-            range_count = 1;
-        }
-        let block = frame_pool_alloc((end - lowest) * GE_DEPTH_STRIDE, 4) as *mut f32;
-        if block.is_null() {
-            return null();
-        }
-        // Safe: the block just allocated, end - lowest floats.
-        let values = unsafe { core::slice::from_raw_parts_mut(block, (end - lowest) as usize) };
-        let mode = GE_DEPTH_CPU.load(Ordering::Relaxed);
-        if mode == 0 {
-            // Not read by the program then (its uGeDepth.z is 0); a defined value all the same.
-            values.fill(nativeres_core::ge_depth_stream::ON_GPU);
-        } else {
-            // The bones the program skins with (as set_raw_bones: none when
-            // it doesn't skin, which the one-bone identity equals).
-            let weight_type = (draw.vertex_format >> 9) & 3;
-            let bone_count = (((draw.vertex_format >> 14) & 7) + 1).min(variant.bones());
-            let first = draw.bones as usize;
-            let wanted = 12 * bone_count as usize;
-            let skinned = draw.bones != 0 && weight_type != 0 && first - 1 + wanted <= (frame.bone_float_count as usize).min(frame.bone_floats.len());
-            let bones: &[f32] = if skinned { &frame.bone_floats[first - 1..first - 1 + wanted] } else { &[] };
-            let vertices = RawDrawVertices::new(bytes, draw.vertex_format, bones);
-            let inputs = nativeres_core::ge_depth_stream::GeDepthInputs::new(transform, camera);
-            let rounding = if mode == 2 { SkinRounding::SingleRounding } else { SkinRounding::Sequential };
-            let stride = vertices.layout.size as usize;
-            let ranges = &ranges[..range_count];
-            for &(first, range_end) in ranges {
-                stats().ge_depth_vertices += range_end - first;
-            }
-            if !uncached {
-                for &(first, range_end) in ranges {
-                    vertices.fill(first, &mut values[(first - lowest) as usize..(range_end - lowest) as usize], &inputs, rounding);
-                }
-            } else {
-                // PSP RAM is uncached for the CPU and costs per load, not
-                // per byte (~5 MB/s a word at a time): the draw's whole
-                // vertex span comes over in VLDM bursts (platform psp_copy,
-                // ~160 MB/s) into cached scratch, a part at a time, gaps
-                // between runs included (one long copy beats many short
-                // ones: GoW's runs are ~6 vertices).
-                // Safe: display thread only; the reference ends in this block.
-                let scratch = unsafe { &mut GE_DEPTH_SCRATCH.get().0 };
-                let per_part = ((GE_DEPTH_SCRATCH_BYTES - 4) / stride.max(1)) as u32;
-                let mut at = lowest;
-                while at < end {
-                    let count = (end - at).min(per_part).max(1);
-                    let start = at as usize * stride;
-                    let lead = (bytes.as_ptr() as usize + start) & 3; // copied from a word boundary
-                    let size = (count as usize * stride + lead).min(bytes.len().saturating_sub(start) + lead).min(GE_DEPTH_SCRATCH_BYTES);
-                    // Safe: `size` bytes from a word boundary at or before
-                    // vertex `at`, inside `bytes` (clamped) but for the up to
-                    // 3 lead bytes before it, which lie in the same block.
-                    unsafe { crate::platform::psp_copy(scratch.as_mut_ptr(), bytes.as_ptr().add(start - lead), size as u32) };
-                    let part = RawDrawVertices::new(&scratch[lead..size], draw.vertex_format, bones);
-                    // The ranges' vertices in this part.
-                    let part_end = at + count;
-                    for &(first, range_end) in ranges {
-                        let (from, to) = (first.max(at), range_end.min(part_end));
-                        if from < to {
-                            part.fill(from - at, &mut values[(from - lowest) as usize..(to - lowest) as usize], &inputs, rounding);
-                        }
-                    }
-                    at = part_end;
-                }
-            }
-        }
-        stats().ge_depth_draws += 1;
-        stats().ge_depth_us += draw_clock().wrapping_sub(start);
-        // Vertex 0's place: `lowest` floats before the block.
-        block.cast::<u8>().wrapping_sub((lowest * GE_DEPTH_STRIDE) as usize) as *const c_void
-    }
-
     fn set_raw_bones(&mut self, frame: &Frame, draw: &Draw, buffer: *mut c_void, skinning: &RawSkinning) {
         const WEIGHT_SCALES: [f32; 4] = [1.0, 1.0 / 128.0, 1.0 / 32768.0, 1.0];
         const IDENTITY_ROWS: [f32; 12] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
@@ -1947,34 +1872,72 @@ impl Draws {
     }
 
     /// `cull_zero_alpha` for a draw that keeps the target where its alpha is 0.
+    /// Not inlined: its two index lists (16 KiB of stack) exist only while it runs.
+    #[inline(never)]
     fn zero_alpha_list(&mut self, frame: &Frame, draw: &Draw, indices: *const u16, index_count: u32) -> Option<(*const u16, u32)> {
         let first = draw.first_index as usize;
         let stored = frame.indices.get(first..first.checked_add(draw.index_count as usize)?)?;
         let runs = draw.flags & draw_flags::INDEX_RUNS != 0;
         let strip = self.index_primitive == gxm::PRIMITIVE_TRIANGLE_STRIP;
-        // Whose alphas: raw vertices' bytes or the frame's vertices.
+        let texels = texel_test(frame, draw);
+        // What is known of the corners: raw vertices' alpha bytes (where
+        // the colour rules keep 0 at 0) and texture coordinates (where the
+        // texel test applies), or the frame's vertices as they are.
         let raw = if draw.flags & draw_flags::RAW_VERTICES != 0 {
-            if draw.flags & draw_flags::RAW_SPRITES != 0 || !frame.raw_colors_of(draw).is_some_and(zero_alpha::raw_zero_stays_zero) {
+            if draw.flags & draw_flags::RAW_SPRITES != 0 {
                 return None;
             }
+            let colors = frame.raw_colors_of(draw)?;
+            let format = VertexFormat(draw.vertex_format);
             let (base, region_end) = raw_window(frame, draw)?;
             // Safe: the block the GPU reads the draw's vertices from, from its vertex 0 on.
             let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, region_end - base) };
-            Some((zero_alpha::RawAlphas::new(VertexFormat(draw.vertex_format), bytes)?, bytes))
+            let alphas = if zero_alpha::raw_zero_stays_zero(colors) { zero_alpha::RawAlphas::new(format, bytes) } else { None };
+            let uvs = if texels.is_some() { frame.raw_transform_of(draw).and_then(|(_, camera)| zero_alpha::RawUv::new(format, camera)) } else { None };
+            if alphas.is_none() && uvs.is_none() {
+                return None;
+            }
+            Some((alphas, uvs, bytes, format.layout().size as usize))
         } else if draw.transform != 0 || draw.flags & draw_flags::CACHED_VERTICES != 0 {
             return None; // model space: the GPU may light them
         } else {
             None
         };
+        let texels = texels.filter(|_| raw.is_none_or(|(_, uvs, _, _)| uvs.is_some()));
         let first_vertex = draw.first_vertex as usize;
         let own = if raw.is_none() { frame.vertices.get(first_vertex..first_vertex.checked_add(draw.vertex_count as usize)?)? } else { &[] };
         // (In PSP RAM: through a window copied in bursts.)
-        let mut window = raw.filter(|_| draw.flags & draw_flags::RAW_PSP_RAM != 0).map(|(alphas, bytes)| AlphaWindow::new(alphas, bytes));
-        let zero = |vertex: u16| match (&mut window, &raw) {
-            (Some(window), _) => window.is_zero(vertex),
-            (None, Some((alphas, _))) => alphas.is_zero(vertex),
-            (None, None) => own.get(vertex as usize).is_some_and(|vertex| vertex.color >> 24 == 0),
+        let mut window = raw.filter(|_| draw.flags & draw_flags::RAW_PSP_RAM != 0).map(|(_, _, bytes, stride)| VertexWindow::new(stride, bytes));
+        // A corner as the texel test reads it (coordinates in 1/16 texels);
+        // one without coordinates keeps its triangle.
+        let make = |zero: bool, uv: Option<[f32; 2]>| match &texels {
+            Some(texels) => texels.corner(zero, uv),
+            None => zero_alpha::Corner::alpha_only(zero),
         };
+        let corner = |vertex: u16| match (&mut window, &raw) {
+            (Some(window), Some((alphas, uvs, _, _))) => match window.at(vertex) {
+                Some(bytes) => make(alphas.is_some_and(|alphas| alphas.over(bytes).is_zero(0)), uvs.and_then(|uvs| uvs.uv(bytes, 0))),
+                None => zero_alpha::Corner::alpha_only(false),
+            },
+            (_, Some((alphas, uvs, bytes, _))) => make(alphas.is_some_and(|alphas| alphas.is_zero(vertex)), uvs.and_then(|uvs| uvs.uv(bytes, vertex))),
+            (_, None) => match own.get(vertex as usize) {
+                Some(vertex) => make(vertex.color >> 24 == 0, Some([vertex.u, vertex.v])),
+                None => zero_alpha::Corner::alpha_only(false),
+            },
+        };
+        // Three corners of alpha 0, or only transparent texels between them.
+        let (by_texels, any_gone) = (core::cell::Cell::new(0u32), core::cell::Cell::new(false));
+        let mut gone = |a: &zero_alpha::Corner, b: &zero_alpha::Corner, c: &zero_alpha::Corner| {
+            if a.zero && b.zero && c.zero {
+                any_gone.set(true);
+                return true;
+            }
+            let goes = texels.as_ref().is_some_and(|texels| texels.gone(a, b, c));
+            by_texels.set(by_texels.get() + goes as u32);
+            any_gone.set(any_gone.get() | goes);
+            goes
+        };
+        let mut corner = corner;
         // A raw draw that had too little to leave out waits some frames
         // (`zero_alpha::Memo`): known by its vertices' PSP address, or in the
         // arena (another place every frame) by its texture's.
@@ -1987,25 +1950,50 @@ impl Draws {
         if remembered && !self.zero_alpha_memo.due(key, draw.index_count) {
             return None;
         }
-        // The new list is put together in memory of our own and copied into
-        // the frame pool in one go: the pool (and the index ring) is slow to
+        // The new list is put together on the stack and copied into the
+        // frame pool in one go: the pool (and the index ring) is slow to
         // write and read index by index (as `cull_black_triangles` found).
+        // Two lists of 8 KiB: the display thread (64 KiB) used at most 18.3
+        // KiB of its stack in God of War's gameplay (debug "stackfree
+        // paint", 2026-11-26), this function is not inlined into the draw
+        // path, so they are there only while it runs.
         stats().alpha0_read += 1;
-        // Safe: the display thread's, used only here.
-        let [written, local] = unsafe { ZERO_ALPHA_ROOM.get() };
-        let local = &mut local[..index_count as usize];
+        // Strips written out as a list take 3 indices a triangle (the room for both).
+        let list_length = if runs { run_corners(stored) as usize } else { index_count as usize };
+        let room = (index_count as usize).max(list_length);
+        let mut new_list = core::mem::MaybeUninit::uninit();
+        let local = index_room(&mut new_list, room);
+        let mut written_out = core::mem::MaybeUninit::uninit();
         let culled = if strip {
-            // One strip of the draw's runs (`draw_indices`): made again from them.
-            zero_alpha::cull_strip_runs(stored, zero, local)
+            // One strip of the draw's runs (`draw_indices`): made again from
+            // them. Where the kept triangles lie scattered (God of War's light
+            // streaks), the joins make that longer than the strip was, or
+            // than a list of the kept ones: then that list, drawn as a list.
+            let strip_room = &mut local[..index_count as usize];
+            match zero_alpha::cull_strip_runs_by(stored, &mut corner, &mut gone, strip_room) {
+                Some(culled) if culled.indices <= 3 * culled.kept as usize => Some(culled),
+                // (None also where nothing went: then no list either.)
+                _ if any_gone.get() && list_length <= ZERO_ALPHA_MOST_INDICES => {
+                    by_texels.set(0); // counted again
+                    let culled = runs_as_list(stored, &mut written_out, list_length, &mut corner, &mut gone, local);
+                    if culled.is_some() {
+                        self.index_primitive = gxm::PRIMITIVE_TRIANGLES;
+                        stats().alpha0_as_list += 1;
+                    }
+                    culled
+                }
+                _ => None,
+            }
         } else if runs {
-            // Its runs written out as a triangle list, as `draw_indices` did.
-            let list = &mut written[..index_count as usize];
-            write_runs(stored, list);
-            zero_alpha::cull_list(list, zero, local)
+            runs_as_list(stored, &mut written_out, list_length, &mut corner, &mut gone, local)
         } else {
             // The frame's own triangle list.
-            zero_alpha::cull_list(stored, zero, local)
+            zero_alpha::cull_list_by(stored, &mut corner, &mut gone, local)
         };
+        if texels.is_some() {
+            stats().texel0_draws += 1;
+            stats().texel0_culled += by_texels.get();
+        }
         if remembered {
             // (No cull made: as if none of its triangles went.)
             let (gone, kept) = culled.map_or((0, 1), |culled| (culled.culled, culled.kept));
@@ -2470,8 +2458,6 @@ impl Draws {
         let mut check_tail = 0u32;
         let checks = DRAW_CHECKS.load(Ordering::Relaxed) != 0;
         let mut sprite_stride = 0u32;
-        // The GE_DEPTH programs' second stream (aGeDepth), null for the others.
-        let mut ge_depths: *const c_void = null();
         if !fragment.is_null() && draw.flags & draw_flags::RAW_VERTICES != 0 {
             // Raw PSP vertices in the raw arena or PSP RAM: drawn from there as they are.
             sprites = draw.flags & draw_flags::RAW_SPRITES != 0;
@@ -2563,23 +2549,6 @@ impl Draws {
                 out = unsafe { frame.raw_vertices.add(draw.first_vertex as usize) } as *const c_void;
                 check_region = RAW_ARENA.load(Ordering::Relaxed);
                 check_region_bytes = RAW_ARENA_BYTES.load(Ordering::Relaxed);
-            }
-            if let RawSetChoice::Raw(variant, color) = set {
-                if self.programs.raw_set(variant, color).reads_ge_depth() {
-                    // What stream 0 reads, from vertex 0 to the end of its block.
-                    let available = if in_psp_ram {
-                        let ram = arenas::PSP_RAM_FOR_GPU.load(Ordering::Acquire);
-                        arenas::PSP_RAM_FOR_GPU_BYTES.load(Ordering::Acquire) as usize - (out as usize - ram as usize)
-                    } else {
-                        (frame.raw_vertices_len - draw.first_vertex) as usize
-                    };
-                    // Safe: `out` and the bytes after it lie in the block checked above.
-                    let bytes = unsafe { core::slice::from_raw_parts(out as *const u8, available) };
-                    ge_depths = self.ge_depth_stream(frame, draw, variant, blocks, bytes, in_psp_ram, indices, index_count);
-                    if ge_depths.is_null() {
-                        return; // the frame pool is full
-                    }
-                }
             }
             // The format's stride only where needed (layout() is not free).
             let stride = if sprites || checks { VertexFormat(draw.vertex_format).layout().size } else { 0 };
@@ -2740,9 +2709,6 @@ impl Draws {
         // programs set above.
         unsafe {
             gxm::sceGxmSetVertexStream(context(), 0, out);
-            if !ge_depths.is_null() {
-                gxm::sceGxmSetVertexStream(context(), 1, ge_depths);
-            }
             if sprites {
                 // B one stride after A; the corner numbers (SpriteSet::program_for).
                 gxm::sceGxmSetVertexStream(context(), 1, (out as *const u8).add(sprite_stride as usize) as *const c_void);
@@ -3365,11 +3331,6 @@ fn set_raw_uniforms(
         if GE_DEPTH_ON.load(Ordering::Relaxed) == 0 {
             ge[1] = [0.0; 4]; // w 0: the programs' float depth (debug `gedepth 0`)
         }
-        // uGeDepth.z: 1 = the depth stream holds the CPU's depths (debug
-        // `gedepthcpu 1|2`), 0 = the program works the depth out. A per-draw
-        // value on purpose: a jump on the stream's own values (the way before)
-        // made the GPU run the rest of the vertex program ~1.46 times slower.
-        ge[2][2] = if GE_DEPTH_CPU.load(Ordering::Relaxed) != 0 { 1.0 } else { 0.0 };
         set_uniform(buffer, uniforms.ge_z, 4, ge[0].as_ptr());
         set_uniform(buffer, uniforms.ge_w, 4, ge[1].as_ptr());
         set_uniform(buffer, uniforms.ge_depth, 4, ge[2].as_ptr());
@@ -3382,15 +3343,6 @@ fn set_raw_uniforms(
 /// Debug `gedepth 0|1`: 0 gives the GE_DEPTH programs w 0, so they take
 /// their float depth (1, default: the GE's depth).
 pub static GE_DEPTH_ON: AtomicU8 = AtomicU8::new(1);
-
-/// Debug `gedepthcpu 0|1|2`: who works out the GE_DEPTH programs' GE depth
-/// (core ge_depth_stream.rs). 0: the program, per index (the old way);
-/// 1: the display thread once per vertex, skinning in sequential f32 steps;
-/// 2: the same, each bone row's dot product rounded once. Both 1 and 2 give
-/// the program's pictures (0 px in GoW gameplay) and -35 ms GPU, but cost the
-/// display thread ~77 ms a gameplay frame (generic per-vertex code, ~1,000
-/// instructions): 0 by default until that is cut (DESIGN "sixty-ninth session").
-pub static GE_DEPTH_CPU: AtomicU8 = AtomicU8::new(0);
 
 /// The last transform and camera `ge_depth_uniforms` combined, and the result.
 struct GeDepthCache {

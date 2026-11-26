@@ -31,11 +31,6 @@ pub const SKIP_TRANSFORM_LOOKUP: u32 = 4;
 pub const SKIP_QUEUE: u32 = 8;
 /// Indexed draws don't scan their indices (vertex range = count).
 pub const SKIP_HIGHEST_INDEX: u32 = 16;
-/// The capture's stage B doesn't apply plain register writes (`walk_stream`).
-pub const SKIP_STAGE_B_PLAIN: u32 = 32;
-/// The capture's stage A passes every plain register write on, also those
-/// that change nothing (`walk_stream::StreamWriter`); not frame-changing.
-pub const NO_WRITE_FILTER: u32 = 64;
 /// The capture thread's raw draws work their table entries out every time,
 /// also when they repeat the previous draw's (`frame_builder::LastEntries`).
 pub const NO_REPEATED_ENTRIES: u32 = 128;

@@ -10,10 +10,10 @@
 //! [`RECORDER`] the same way ([`recorder::enter`] / [`recorder::leave`]).
 //!
 //! Only in builds with the `instrument` feature, and there only while a
-//! profile runs ([`ENABLED`]): with the capture in two stages
-//! (`walk_stream`) both threads passed here, and two cores storing to one
-//! cache line all the time slowed both down. For the same reason the two
-//! words lie on cache lines of their own ([`PhaseWord`]).
+//! profile runs ([`ENABLED`]): two cores storing to one cache line all the
+//! time slow both down (the two-stage capture, removed 2026-11-26, did). For
+//! the same reason the two words lie on cache lines of their own
+//! ([`PhaseWord`]).
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 

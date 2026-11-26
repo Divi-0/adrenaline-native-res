@@ -152,32 +152,6 @@ pub fn raw_uv(camera: &RawCamera, format: VertexFormat) -> [f32; 4] {
     [scale * scale_u, scale * scale_v, offset_u, offset_v]
 }
 
-/// A raw draw's `VertexFormat` bit: its texture coordinates come from the
-/// raw position's x and y (texgen from the position, `RawColors::texgen`);
-/// the display patches the program to read them there. Above the GE's
-/// VERTEX_TYPE bits.
-pub const TEXCOORDS_FROM_POSITION: u32 = 1 << 30;
-
-/// The vertex format a raw draw with `colors` records: `format` and
-/// `TEXCOORDS_FROM_POSITION` for texgen from the position.
-pub fn raw_vertex_format(format: u32, colors: &RawColors) -> u32 {
-    if colors.texgen_source[0] == 2.0 {
-        format | TEXCOORDS_FROM_POSITION
-    } else {
-        format
-    }
-}
-
-/// A raw draw's texture coordinate scale and offset (uRawUv): its texgen's
-/// (`RawColors::texgen`) or the camera's (`raw_uv`).
-pub fn raw_uv_of(camera: &RawCamera, format: VertexFormat, colors: &RawColors) -> [f32; 4] {
-    if colors.texgen_source[0] != 0.0 {
-        colors.texgen
-    } else {
-        raw_uv(camera, format)
-    }
-}
-
 /// A model-space vertex in clip space with its view-space z: world, view,
 /// projection one after the other.
 #[inline]

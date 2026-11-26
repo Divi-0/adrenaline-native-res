@@ -128,13 +128,19 @@ pub struct Culled {
 /// The triangles of triangle list `list` without those whose three corners
 /// all are `zero`, written to `out` in their order. None if none goes (the
 /// list stays as it is) or `out` is shorter than the list.
-pub fn cull_list(list: &[u16], mut zero: impl FnMut(u16) -> bool, out: &mut [u16]) -> Option<Culled> {
+pub fn cull_list(list: &[u16], zero: impl FnMut(u16) -> bool, out: &mut [u16]) -> Option<Culled> {
+    cull_list_by(list, zero, |a, b, c| *a && *b && *c, out)
+}
+
+/// `cull_list` with what is read of each corner (`corner`, e.g. its alpha
+/// and texture coordinates: `Corner`) and which triangles go (`gone`).
+pub fn cull_list_by<C>(list: &[u16], mut corner: impl FnMut(u16) -> C, mut gone: impl FnMut(&C, &C, &C) -> bool, out: &mut [u16]) -> Option<Culled> {
     if out.len() < list.len() {
         return None;
     }
     let (mut indices, mut culled) = (0, 0);
     for triangle in list.chunks_exact(3) {
-        if zero(triangle[0]) && zero(triangle[1]) && zero(triangle[2]) {
+        if gone(&corner(triangle[0]), &corner(triangle[1]), &corner(triangle[2])) {
             culled += 1;
         } else {
             out[indices..indices + 3].copy_from_slice(triangle);
@@ -161,7 +167,14 @@ pub fn cull_list(list: &[u16], mut zero: impl FnMut(u16) -> bool, out: &mut [u16
 /// doesn't fit `out` (single kept triangles between left-out ones take up
 /// to six indices each: where that is longer than the strip was, the cull
 /// isn't worth its vertices).
-pub fn cull_strip_runs(runs: &[u16], mut zero: impl FnMut(u16) -> bool, out: &mut [u16]) -> Option<Culled> {
+pub fn cull_strip_runs(runs: &[u16], zero: impl FnMut(u16) -> bool, out: &mut [u16]) -> Option<Culled> {
+    cull_strip_runs_by(runs, zero, |a, b, c| *a && *b && *c, out)
+}
+
+/// `cull_strip_runs` with what is read of each corner (`corner`, once per
+/// vertex) and which triangles go (`gone`, given the corners in the run's
+/// order: k, k + 1, k + 2).
+pub fn cull_strip_runs_by<C>(runs: &[u16], mut corner: impl FnMut(u16) -> C, mut gone: impl FnMut(&C, &C, &C) -> bool, out: &mut [u16]) -> Option<Culled> {
     let (mut length, mut kept, mut culled) = (0usize, 0u32, 0u32);
     // Appends the stretch of triangles `first..=last` of the run starting at vertex `base`.
     let mut append = |length: &mut usize, base: u16, first: u16, last: u16| -> Option<()> {
@@ -190,14 +203,14 @@ pub fn cull_strip_runs(runs: &[u16], mut zero: impl FnMut(u16) -> bool, out: &mu
     for run in runs.chunks_exact(3).filter(|run| run[1] >= 3) {
         let (count, base) = (run[1], run[2]);
         // The corners of triangle k are vertices k, k + 1, k + 2 of the run.
-        let (mut zero_0, mut zero_1) = (zero(base), zero(base.wrapping_add(1)));
+        let (mut corner_0, mut corner_1) = (corner(base), corner(base.wrapping_add(1)));
         // The first triangle of the stretch of kept ones being gathered.
         let mut open = None;
         for k in 0..count - 2 {
-            let zero_2 = zero(base.wrapping_add(k + 2));
-            let gone = zero_0 && zero_1 && zero_2;
-            (zero_0, zero_1) = (zero_1, zero_2);
-            if gone {
+            let corner_2 = corner(base.wrapping_add(k + 2));
+            let goes = gone(&corner_0, &corner_1, &corner_2);
+            (corner_0, corner_1) = (corner_1, corner_2);
+            if goes {
                 culled += 1;
                 if let Some(first) = open.take() {
                     append(&mut length, base, first, k - 1)?;
@@ -212,6 +225,213 @@ pub fn cull_strip_runs(runs: &[u16], mut zero: impl FnMut(u16) -> bool, out: &mu
         }
     }
     (culled > 0).then_some(Culled { indices: length, kept, culled })
+}
+
+/// What a cull reads of a triangle corner: whether its alpha is 0 (false
+/// where the draw's alphas aren't known) and its texture coordinates in
+/// 1/16 texels of the draw's texture (`TexelTest::corner`; `UNKNOWN` where
+/// they aren't known). Integers: the box of three corners then takes no
+/// float compares, each of which stalls the Cortex-A9 on `vmrs` (God of
+/// War's light streaks: ~1.6 ms a frame of the display thread with floats).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Corner {
+    pub zero: bool,
+    pub u: i32,
+    pub v: i32,
+}
+
+impl Corner {
+    /// Texture coordinates not known (or not finite, or far outside the
+    /// texture): the triangle is kept.
+    pub const UNKNOWN: i32 = i32::MIN;
+
+    /// A corner whose alpha is (`zero`) or isn't 0, coordinates unknown.
+    pub const fn alpha_only(zero: bool) -> Corner {
+        Corner { zero, u: Self::UNKNOWN, v: Self::UNKNOWN }
+    }
+}
+
+/// Coordinates beyond this many 1/16 texels (64 times the largest texture
+/// across) count as unknown: the casts stay in range, and the GPU's floats
+/// there are not ours to predict.
+const FIXED_LIMIT: i32 = 64 * 512 * 16;
+
+/// `value` (0..1 across the texture) times `scale` (16 x its size) as an
+/// integer, cut toward zero (at most 1/16 texel off); `Corner::UNKNOWN` for
+/// NaN, infinities and values past `FIXED_LIMIT`. No float compare: the
+/// NaN test looks at the bits, and the cast saturates.
+#[inline]
+fn to_fixed(value: f32, scale: f32) -> i32 {
+    let product = value * scale;
+    let fixed = product as i32;
+    let not_finite = product.to_bits() & 0x7FFF_FFFF >= 0x7F80_0000;
+    if not_finite || fixed <= -FIXED_LIMIT || fixed >= FIXED_LIMIT {
+        Corner::UNKNOWN
+    } else {
+        fixed
+    }
+}
+
+/// Triangles that sample only transparent texels: a fragment's alpha is
+/// (p + 1) t >> 8 (`GeShade`) with the filtered texel's alpha t, and t is 0
+/// where every texel the filter reads has alpha 0 (the GE's filter, the
+/// GPU's bilinear and the gather all weigh texels: zeros give zero; the
+/// renderer draws every texture function as "modulate", the others folded
+/// into the vertex colour, and textures whose alpha is ignored are decoded
+/// opaque). Between three corners the texture coordinates stay inside
+/// their box (perspective weighs them by positive weights; clipping makes
+/// corners on the edges), so the texels such a triangle reads lie in the
+/// box widened by the filter: nearest texel floor(u w), or the two around
+/// u w - 0.5. One texel more on each side covers rounding (the corners cut
+/// to 1/16 texel, the GE filter program's own steps of 1/16, float
+/// interpolation).
+///
+/// Only for draws without mip levels (one texture level, `texture::TexelMask`).
+/// Made once per draw (`new`): its rows of visible cells make a triangle's
+/// test a few bit operations per row of cells (~1 KiB: not `Copy`).
+#[derive(Clone)]
+pub struct TexelTest<'a> {
+    mask: &'a crate::texture::TexelMask,
+    /// The texture's size in texels, log2.
+    size_shift: [u8; 2],
+    linear: bool,
+    clamp: [bool; 2],
+    /// Per row of cells: bit c set if cell c of it holds a raw value that is
+    /// not transparent (the mask has at most 32 columns).
+    visible: [u32; crate::texture::MASK_CELLS],
+}
+
+impl<'a> TexelTest<'a> {
+    /// The test for a draw whose texture has `mask`, `transparent` the raw
+    /// values that are transparent (`TexelMask::used` bits: for 4-bit index
+    /// textures the indices whose palette entry has alpha 0,
+    /// `TexelMask::DIRECT_TRANSPARENT` for the others), the texture's size
+    /// log2, its filter and clamping.
+    pub fn new(mask: &'a crate::texture::TexelMask, transparent: u16, size_shift: [u8; 2], linear: bool, clamp: [bool; 2]) -> Self {
+        let mut visible = [0u32; crate::texture::MASK_CELLS];
+        let columns = 1usize << mask.grid_shift[0];
+        for (row, cells) in visible.iter_mut().zip(mask.cells().chunks_exact(columns)) {
+            *row = cells.iter().enumerate().fold(0, |bits, (column, &used)| bits | ((used & !transparent != 0) as u32) << column);
+        }
+        Self { mask, size_shift, linear, clamp, visible }
+    }
+
+    /// True if some cell of the texture holds only transparent values (else
+    /// no triangle can go).
+    pub fn any_transparent(&self) -> bool {
+        let full = column_bits(0, (1 << self.mask.grid_shift[0]) - 1, self.mask.grid_shift[0]);
+        self.visible[..1 << self.mask.grid_shift[1]].iter().any(|&row| row != full)
+    }
+
+    /// A corner with alpha `zero` (or not) and texture coordinates `uv`
+    /// (0..1 across the texture; None: unknown) as `gone` reads it.
+    #[inline]
+    pub fn corner(&self, zero: bool, uv: Option<[f32; 2]>) -> Corner {
+        match uv {
+            Some([u, v]) => Corner {
+                zero,
+                u: to_fixed(u, (16u32 << self.size_shift[0]) as f32),
+                v: to_fixed(v, (16u32 << self.size_shift[1]) as f32),
+            },
+            None => Corner::alpha_only(zero),
+        }
+    }
+
+    /// True if a triangle with these corners (`corner`) reads only texels
+    /// of alpha 0.
+    pub fn gone(&self, a: &Corner, b: &Corner, c: &Corner) -> bool {
+        let Some((first_column, last_column)) = self.cells(0, [a.u, b.u, c.u]) else { return false };
+        let Some((first_row, last_row)) = self.cells(1, [a.v, b.v, c.v]) else { return false };
+        let columns = column_bits(first_column, last_column, self.mask.grid_shift[0]);
+        let rows = 1i64 << self.mask.grid_shift[1];
+        let (first_row, count) = if last_row - first_row + 1 >= rows { (0, rows) } else { (first_row, last_row - first_row + 1) };
+        (0..count).all(|k| self.visible[((first_row + k) & (rows - 1)) as usize] & columns == 0)
+    }
+
+    /// The cells (first, last; may run past the grid: they wrap) that the
+    /// texels read along axis `axis` (0: u) fall into, from the corners'
+    /// coordinates in 1/16 texels.
+    fn cells(&self, axis: usize, values: [i32; 3]) -> Option<(i64, i64)> {
+        if values.contains(&Corner::UNKNOWN) {
+            return None;
+        }
+        let (low, high) = (values[0].min(values[1]).min(values[2]) as i64, values[0].max(values[1]).max(values[2]) as i64);
+        let size = 1i64 << self.size_shift[axis];
+        // Texels: `>> 4` is the floor of a 1/16 value; linear reads the two
+        // around x - 0.5 (8/16), nearest the one at x; one texel of margin more.
+        let (first, last) = if self.linear { (((low - 8) >> 4) - 1, ((high - 8) >> 4) + 2) } else { ((low >> 4) - 1, (high >> 4) + 1) };
+        let (first, last) = if self.clamp[axis] {
+            (first.clamp(0, size - 1), last.clamp(0, size - 1))
+        } else if last - first + 1 >= size {
+            (0, size - 1)
+        } else {
+            (first, last)
+        };
+        let shift = self.mask.cell_shift[axis];
+        Some((first >> shift, last >> shift))
+    }
+}
+
+/// The columns `first..=last` of a row of `1 << shift` cells (they wrap) as bits.
+fn column_bits(first: i64, last: i64, shift: u8) -> u32 {
+    let count = 1i64 << shift;
+    let bits = |from: i64, to: i64| (((1u64 << (to + 1)) - (1u64 << from)) & 0xFFFF_FFFF) as u32;
+    if last - first + 1 >= count {
+        return bits(0, count - 1);
+    }
+    let (from, to) = (first & (count - 1), last & (count - 1));
+    if from <= to {
+        bits(from, to)
+    } else {
+        bits(from, count - 1) | bits(0, to)
+    }
+}
+
+/// The texture coordinates of raw vertices as the raw vertex programs work
+/// them out: the raw values (8 or 16 bits unsigned, or floats) times the
+/// scale and plus the offset of `raw_blocks::raw_uv` (the GE's texture
+/// scale and offset, 1/128 or 1/32768 for integers), 0..1 across the
+/// texture.
+#[derive(Clone, Copy)]
+pub struct RawUv {
+    stride: usize,
+    at: usize,
+    kind: u32,
+    uv: [f32; 4],
+}
+
+impl RawUv {
+    /// None where the coordinates aren't the vertex's own in this way: none
+    /// in the format, morphed vertices. (Texgen draws are never raw.)
+    pub fn new(format: VertexFormat, camera: &crate::frame::RawCamera) -> Option<Self> {
+        if format.morph_count() != 1 || format.0 & 3 == 0 {
+            return None;
+        }
+        let layout = format.layout();
+        let at = layout.texcoord_offset? as usize;
+        let stride = layout.size as usize;
+        let kind = format.0 & 3;
+        let bytes = [0, 2, 4, 8][kind as usize];
+        (stride >= at + bytes).then(|| Self { stride, at, kind, uv: crate::raw_blocks::raw_uv(camera, format) })
+    }
+
+    /// One vertex's size in bytes.
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
+    /// The texture coordinates of vertex number `vertex` of `bytes` (vertex 0
+    /// at its start); None outside the bytes.
+    #[inline]
+    pub fn uv(&self, bytes: &[u8], vertex: u16) -> Option<[f32; 2]> {
+        let at = vertex as usize * self.stride + self.at;
+        let raw = match self.kind {
+            1 => bytes.get(at..at + 2).map(|b| [b[0] as f32, b[1] as f32])?,
+            2 => bytes.get(at..at + 4).map(|b| [u16::from_le_bytes([b[0], b[1]]) as f32, u16::from_le_bytes([b[2], b[3]]) as f32])?,
+            _ => bytes.get(at..at + 8).map(|b| [f32::from_le_bytes([b[0], b[1], b[2], b[3]]), f32::from_le_bytes([b[4], b[5], b[6], b[7]])])?,
+        };
+        Some([raw[0] * self.uv[0] + self.uv[2], raw[1] * self.uv[1] + self.uv[3]])
+    }
 }
 
 /// Which raw draws are worth reading for their alphas.
@@ -568,5 +788,214 @@ mod tests {
         let whole: Vec<u16> = stitched_strip(&runs).collect();
         let wanted: Vec<[u16; 3]> = strip_triangles(&whole).into_iter().filter(|t| !t.iter().all(|&v| zero(v))).collect();
         assert_eq!(strip_triangles(&out[..culled.indices]), wanted);
+    }
+
+    /// A 4-bit index texture `width` x `height`, row by row: index 0
+    /// (transparent) but for index 5 in columns 0..=2 and index 9 at (100, 20).
+    fn streak_texture(width: u16, height: u16, swizzled: bool) -> (crate::frame::TextureDescriptor, Vec<u8>) {
+        let index = |x: usize, y: usize| if x <= 2 { 5u8 } else if (x, y) == (100, 20) { 9 } else { 0 };
+        let row = width as usize / 2;
+        let mut data = vec![0u8; row * height as usize];
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let at = if swizzled { (y / 8) * (row / 16) * 128 + (x / 2 / 16) * 128 + (y % 8) * 16 + (x / 2) % 16 } else { y * row + x / 2 };
+                data[at] |= index(x, y) << (4 * (x & 1));
+            }
+        }
+        let texture = crate::frame::TextureDescriptor {
+            address: 0x0900_0000,
+            buffer_width: width as u32,
+            width,
+            height,
+            format: crate::texture::format::CLUT4,
+            swizzled: swizzled as u8,
+            flags: 0,
+            clut_format: 0,
+            palette_offset: 0,
+            palette_word_count: 0,
+            palette_hash: 0,
+        };
+        (texture, data)
+    }
+
+    #[test]
+    fn a_texel_mask_holds_which_indices_each_cell_has() {
+        let (texture, data) = streak_texture(256, 32, false);
+        let mask = crate::texture::texel_mask(&data, &texture).unwrap();
+        // 8x8 cells, 32 across, 4 down.
+        assert_eq!((mask.cell_shift, mask.grid_shift), ([3, 3], [5, 2]));
+        assert!((0..4).all(|row| mask.used[row * 32] == 1 << 0 | 1 << 5));
+        assert_eq!(mask.used[2 * 32 + 12], 1 << 0 | 1 << 9); // (100, 20)
+        assert_eq!(mask.cells().len(), 128);
+        assert_eq!(mask.cells().iter().filter(|&&used| used == 1).count(), 128 - 4 - 1);
+        // Swizzled the same.
+        let (swizzled, data) = streak_texture(256, 32, true);
+        assert_eq!(crate::texture::texel_mask(&data, &swizzled), Some(mask));
+        // Too big, 8-bit indices, ignored alpha: none.
+        let (big, data) = streak_texture(512, 128, false);
+        assert_eq!(crate::texture::texel_mask(&data, &big), None);
+        let (mut eight, data) = streak_texture(256, 32, false);
+        eight.format = crate::texture::format::CLUT8;
+        assert_eq!(crate::texture::texel_mask(&data, &eight), None);
+        let (mut ignored, data) = streak_texture(256, 32, false);
+        ignored.flags = crate::frame::texture_flags::IGNORE_ALPHA;
+        assert_eq!(crate::texture::texel_mask(&data, &ignored), None);
+    }
+
+    #[test]
+    fn a_triangle_whose_texture_box_holds_only_transparent_texels_goes() {
+        let (texture, data) = streak_texture(256, 32, false);
+        let mask = crate::texture::texel_mask(&data, &texture).unwrap();
+        let test = |linear: bool, clamp: [bool; 2]| TexelTest::new(&mask, 1 << 0, [8, 5], linear, clamp);
+        let gone = |test: &TexelTest, a: (f32, f32), b: (f32, f32), c: (f32, f32)| {
+            let corner = |(x, y): (f32, f32)| test.corner(false, Some([x / 256.0, y / 32.0]));
+            test.gone(&corner(a), &corner(b), &corner(c))
+        };
+        let linear = test(true, [false, false]);
+        // Columns 20..60: only index 0.
+        assert!(gone(&linear, (20.0, 1.0), (60.0, 1.0), (40.0, 30.0)));
+        // Near the streak at columns 0..2 (cells of 8: its cell ends at 7): the box reaches it.
+        assert!(!gone(&linear, (9.0, 1.0), (60.0, 1.0), (40.0, 30.0)));
+        assert!(gone(&linear, (18.0, 1.0), (60.0, 1.0), (40.0, 30.0)));
+        // Repeat: u just below 1 filters from column 0 too.
+        assert!(!gone(&linear, (250.0, 1.0), (255.9, 1.0), (252.0, 30.0)));
+        assert!(gone(&test(true, [true, false]), (230.0, 1.0), (255.9, 1.0), (240.0, 30.0)));
+        // Nearest is narrower: 255.9 reads column 255 (and the margin 254..=0 wraps to the streak).
+        assert!(!gone(&test(false, [false, false]), (230.0, 1.0), (255.9, 1.0), (240.0, 30.0)));
+        assert!(gone(&test(false, [false, false]), (200.0, 1.0), (247.0, 1.0), (240.0, 7.0)));
+        // The texel at (100, 20).
+        assert!(!gone(&linear, (90.0, 10.0), (110.0, 10.0), (100.0, 25.0)));
+        // A box as wide as the texture, or coordinates far out: everything.
+        assert!(!gone(&linear, (20.0, 1.0), (300.0, 1.0), (40.0, 30.0)));
+        assert!(!gone(&linear, (20.0, 1.0), (1.0e9, 1.0), (40.0, 30.0)));
+        assert!(!gone(&linear, (f32::NAN, 1.0), (60.0, 1.0), (40.0, 30.0)));
+        // Index 5 transparent too: the streak goes with it.
+        let both = TexelTest::new(&mask, 1 << 0 | 1 << 5, [8, 5], true, [false, false]);
+        assert!(gone(&both, (0.0, 1.0), (60.0, 1.0), (40.0, 30.0)));
+    }
+
+    #[test]
+    fn a_corner_without_a_finite_texture_coordinate_keeps_the_triangle() {
+        // Regression (79th session): `f32::min` / `max` pass a NaN over, so a NaN
+        // corner dropped out of the box and a triangle over the streak counted as
+        // transparent. Every corner, both axes, NaN and infinities.
+        let (texture, data) = streak_texture(256, 32, false);
+        let mask = crate::texture::texel_mask(&data, &texture).unwrap();
+        let test = TexelTest::new(&mask, 1 << 0, [8, 5], true, [false, false]);
+        // Without the bad corner the box lies in transparent texels only.
+        let fine = [[20.0 / 256.0, 1.0 / 32.0], [60.0 / 256.0, 1.0 / 32.0], [40.0 / 256.0, 30.0 / 32.0]];
+        let corners = |uvs: [[f32; 2]; 3]| uvs.map(|uv| test.corner(false, Some(uv)));
+        let [a, b, c] = corners(fine);
+        assert!(test.gone(&a, &b, &c));
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1.0e9, -1.0e9] {
+            for at in 0..3 {
+                for axis in 0..2 {
+                    let mut uvs = fine;
+                    uvs[at][axis] = bad;
+                    let [a, b, c] = corners(uvs);
+                    assert!(!test.gone(&a, &b, &c), "{bad} at corner {at}, axis {axis}");
+                }
+            }
+        }
+        // Unknown coordinates (`alpha_only`) keep it too.
+        let [a, b, _] = corners(fine);
+        assert!(!test.gone(&a, &b, &Corner::alpha_only(false)));
+    }
+
+    #[test]
+    fn the_rows_of_visible_cells_answer_as_the_cells_themselves() {
+        // Random masks, transparent sets and boxes (wrapping, clamped, past the
+        // ends): `gone` by its bit rows against `TexelMask::transparent_cells`.
+        let mut seed = 0x1234_5678u32;
+        let mut next = |n: u32| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) % n
+        };
+        for (width, height) in [(256u16, 32u16), (64, 64), (8, 256), (128, 16)] {
+            let (texture, _) = streak_texture(width, height, false);
+            let mut data = vec![0u8; width as usize * height as usize / 2];
+            for byte in data.iter_mut() {
+                *byte = if next(8) == 0 { (next(16) | next(16) << 4) as u8 } else { 0 };
+            }
+            let mask = crate::texture::texel_mask(&data, &texture).unwrap();
+            for _ in 0..2000 {
+                let transparent = 1 | (next(0x10000) as u16 & next(0x10000) as u16);
+                let (linear, clamp) = (next(2) == 1, [next(3) == 0, next(3) == 0]);
+                let size_shift = [width.trailing_zeros() as u8, height.trailing_zeros() as u8];
+                let test = TexelTest::new(&mask, transparent, size_shift, linear, clamp);
+                let mut uv = |n: u32| (next(n) as f32 - n as f32 / 4.0) / (n as f32 / 2.0);
+                let corners = [0, 1, 2].map(|_| test.corner(false, Some([uv(400), uv(400)])));
+                let reference = match (test.cells(0, corners.map(|c| c.u)), test.cells(1, corners.map(|c| c.v))) {
+                    (Some(columns), Some(rows)) => mask.transparent_cells(columns, rows, transparent),
+                    _ => false,
+                };
+                assert_eq!(test.gone(&corners[0], &corners[1], &corners[2]), reference, "{width}x{height} {corners:?} {transparent:x}");
+            }
+        }
+    }
+
+    #[test]
+    fn raw_texture_coordinates_are_the_raw_programs_ones() {
+        use crate::frame::{RawCamera, RawTransform};
+        let camera = RawCamera { texture: [2.0, 0.5, 0.25, -0.125], ..Default::default() };
+        let colors = RawColors::default();
+        // u8 / u16 / float coordinates, 4444 colour, 8-bit normal, float position (God of War's 0x1b9 is the first).
+        for format in [0x1B9u32, 0x1BA, 0x1BB] {
+            let format = VertexFormat(format);
+            let layout = format.layout();
+            let raw = RawUv::new(format, &camera).unwrap();
+            let stride = layout.size as usize;
+            let mut bytes = vec![0u8; 3 * stride];
+            for (k, vertex) in bytes.chunks_exact_mut(stride).enumerate() {
+                let at = layout.texcoord_offset.unwrap() as usize;
+                match format.0 & 3 {
+                    1 => vertex[at..at + 2].copy_from_slice(&[17 + k as u8 * 50, 200 - k as u8]),
+                    2 => {
+                        vertex[at..at + 2].copy_from_slice(&(1234u16 + 9000 * k as u16).to_le_bytes());
+                        vertex[at + 2..at + 4].copy_from_slice(&(65000u16 - k as u16).to_le_bytes());
+                    }
+                    _ => {
+                        vertex[at..at + 4].copy_from_slice(&(0.3f32 + k as f32).to_le_bytes());
+                        vertex[at + 4..at + 8].copy_from_slice(&(-1.7f32).to_le_bytes());
+                    }
+                }
+            }
+            let uv = crate::raw_blocks::raw_uv(&camera, format);
+            for k in 0..3u16 {
+                let fields = crate::raw_vertex::decode_raw(&bytes, k as usize * stride, format, &layout).unwrap();
+                let clip = crate::raw_blocks::clip_vertex(&RawTransform::default(), &camera, &colors, &uv, [0.0; 3], fields.texcoord, fields.color);
+                assert_eq!(raw.uv(&bytes, k), Some([clip.u, clip.v]), "format {:x} vertex {k}", format.0);
+            }
+            assert_eq!(raw.uv(&bytes, 3), None);
+        }
+        // Formats without coordinates: none.
+        assert!(RawUv::new(VertexFormat(0x1B8), &camera).is_none());
+    }
+
+    #[test]
+    fn the_cull_reads_each_strip_vertex_once_and_tests_whole_triangles() {
+        // A strip of 6 vertices (4 triangles); triangle k goes if k is 1 or 2.
+        let runs = [TRIANGLE_STRIP as u16, 6, 10];
+        let mut reads = 0;
+        let mut out = [0u16; 32];
+        let culled = cull_strip_runs_by(
+            &runs,
+            |v| {
+                reads += 1;
+                v
+            },
+            |a, _, _| *a == 11 || *a == 12,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(reads, 6);
+        assert_eq!((culled.kept, culled.culled), (2, 2));
+        let whole: Vec<u16> = stitched_strip(&runs).collect();
+        let wanted: Vec<[u16; 3]> = strip_triangles(&whole).into_iter().enumerate().filter(|(k, _)| *k != 1 && *k != 2).map(|(_, t)| t).collect();
+        assert_eq!(strip_triangles(&out[..culled.indices]), wanted);
+        // A list by triangles.
+        let list = [0u16, 1, 2, 3, 4, 5, 6, 7, 8];
+        let culled = cull_list_by(&list, |v| v, |a, b, c| a + b + c == 12, &mut out).unwrap();
+        assert_eq!(&out[..culled.indices], &[0, 1, 2, 6, 7, 8]);
     }
 }

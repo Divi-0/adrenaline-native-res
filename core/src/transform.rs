@@ -1834,35 +1834,6 @@ impl Texgen {
         Some(Texgen { source, matrix: m, position_scale: format.position_scale(), texcoord_scale: format.texcoord_scale(), projective })
     }
 
-    /// The texgen as raw draws do texture coordinates (`RawColors::texgen`):
-    /// raw value x scale + offset per coordinate, from the raw texture
-    /// coordinates (source 1) or the raw position's x and y (source 0).
-    /// Only where that is what `uv` works out, bit for bit: not projective,
-    /// u from the first source coordinate alone and v from the second (the
-    /// other matrix entries 0: their products add exact zeros), and the
-    /// format's scale a power of two (so folding it into the matrix entry
-    /// is exact). NFS UR's menu: source 1 with u = 64 s - 32, source 0 with
-    /// diagonal matrices. `None` otherwise (the CPU works them out).
-    /// Returns ([scale u, scale v, offset u, offset v], source: 1 or 2).
-    pub fn raw_form(&self, format: VertexFormat) -> Option<([f32; 4], f32)> {
-        let m = &self.matrix;
-        if self.projective || m[3] != 0.0 || m[1] != 0.0 {
-            return None;
-        }
-        match self.source {
-            1 => {
-                // z is 0: m[6], m[7] multiply 0. No texture coordinates: 0.
-                let scale = if format.0 & 3 == 0 { 0.0 } else { self.texcoord_scale };
-                Some(([scale * m[0], scale * m[4], m[9], m[10]], 1.0))
-            }
-            0 if m[6] == 0.0 && m[7] == 0.0 => {
-                let scale = self.position_scale;
-                Some(([scale * m[0], scale * m[4], m[9], m[10]], 2.0))
-            }
-            _ => None,
-        }
-    }
-
     /// Whether the source is the normal (lit draws decode it; others don't).
     pub fn needs_normal(&self) -> bool {
         self.source >= 2
@@ -1923,36 +1894,6 @@ mod texgen_tests {
 
     /// 16-bit positions, no texture coordinates (NFS UR's title quads).
     const POSITION_16: VertexFormat = VertexFormat(2 << 7);
-
-    /// `raw_form` gives what `uv` works out, bit for bit: raw x scale +
-    /// offset (as the raw program and raw_vertex.rs do) over every 16-bit
-    /// raw value, for NFS UR's menu and title matrices.
-    #[test]
-    fn raw_form_matches_uv() {
-        let matrices: [(u32, [f32; 12]); 4] = [
-            (1, [64.0, 0.0, 0.0, 0.0, 64.0, 0.0, 0.0, 0.0, 1.0, -32.0, -32.0, 1.0]),
-            (0, [1.0999756, 0.0, 0.0, 0.0, 0.8937378, 0.0, 0.0, 0.0, 0.0, 0.4921875, 0.390625, 1.0]),
-            (0, [1.0656128, 0.0, 0.0, 0.0, 0.7218628, 0.0, 0.0, 0.0, 0.0, 0.4921875, 0.3125, 1.0]),
-            (0, [32.930664, 0.0, 0.0, 0.0, 0.67030334, 0.0, 0.0, 0.0, 0.0, -14.1875, 0.296875, 1.0]),
-        ];
-        // 16-bit positions and texture coordinates.
-        let format = VertexFormat(2 << 7 | 2);
-        for (source, matrix) in matrices {
-            let ge = ge_with(1 | source << 8, matrix);
-            let texgen = Texgen::of(&ge, format).unwrap();
-            let ([su, sv, ou, ov], _) = texgen.raw_form(format).expect("a raw form");
-            let mut differing = 0;
-            for value in (-32768..32768).step_by(7) {
-                let v = value as f32;
-                let (u, w) = texgen.uv(&raw([v, -v, 0.0], [v.abs(), v.abs()]), None);
-                let (x, y) = if source == 0 { (v, -v) } else { (v.abs(), v.abs()) };
-                if (x * su + ou).to_bits() != u.to_bits() || (y * sv + ov).to_bits() != w.to_bits() {
-                    differing += 1;
-                }
-            }
-            assert_eq!(differing, 0, "source {source} matrix {matrix:?}");
-        }
-    }
 
     #[test]
     fn only_mode_1_is_texgen() {

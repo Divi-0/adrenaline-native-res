@@ -1,6 +1,6 @@
-//! Texgen draws on the CPU route (`raw_arena::TEXGEN` off, the default:
-//! the Vita's GPU doesn't round its float maths like the ARM, so raw
-//! texgen draws can't give the CPU route's positions), four vertices at a
+//! Texgen draws on the CPU route (always: the Vita's GPU doesn't round its
+//! float maths like the ARM, so raw texgen draws couldn't give the CPU
+//! route's positions; the raw way was removed 2026-11-26), four vertices at a
 //! time: `TexgenKernel::transform4` does what `Transform::frame_vertex`
 //! and `Texgen::uv` do for one vertex, with the same operations in the same
 //! order, so the vertices come out the same to the bit

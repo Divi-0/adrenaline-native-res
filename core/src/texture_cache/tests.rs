@@ -1366,3 +1366,49 @@ fn two_textures_sharing_a_hint_bucket_do_not_scan_every_frame() {
     let stats = test.cache.take_stats();
     assert_eq!((stats.finds, stats.scans), (10, 0));
 }
+
+/// The texel mask (`TextureCache::texel_mask`) of the texture the last lookup returned.
+fn last_mask(test: &Test) -> Option<texture::TexelMask> {
+    test.cache.masks.get(test.cache.last_mask as usize).map(|slot| slot.mask)
+}
+
+#[test]
+fn a_texture_with_transparent_cells_gets_a_texel_mask_made_from_the_pixels_decoded() {
+    let mut test = Test::new();
+    // 64x64 8888, all alpha 0: every 8x8 cell transparent.
+    let wanted = small_texture(RAM_START);
+    test.use_texture(&wanted);
+    let mask = last_mask(&test).expect("a mask");
+    assert_eq!((mask.cell_shift, mask.grid_shift), ([3, 3], [3, 3]));
+    assert!(mask.used[..64].iter().all(|&used| used == 0));
+    // A texel of alpha 1 at (9, 0): cell 1 shows, after the re-check that decodes it again.
+    test.host.write(RAM_START + 9 * 4, 0x0100_0000);
+    test.frame_number += 3 * VERIFY_INTERVAL;
+    test.use_texture(&wanted);
+    let mask = last_mask(&test).expect("a mask");
+    assert_eq!(mask.used[1], 1);
+    assert_eq!(mask.used.iter().filter(|&&used| used != 0).count(), 1);
+    // All opaque: no cell can go, so no mask.
+    let opaque = small_texture(RAM_START + 0x10000);
+    for texel in 0..64 * 64 {
+        test.host.write(RAM_START + 0x10000 + 4 * texel, 0xFF00_0000);
+    }
+    test.use_texture(&opaque);
+    assert_eq!(last_mask(&test), None);
+}
+
+#[test]
+fn a_texture_used_every_frame_keeps_its_texel_mask_while_others_come_and_go() {
+    let mut test = Test::new();
+    let streak = small_texture(RAM_START);
+    test.use_texture(&streak);
+    let kept = last_mask(&test).expect("a mask");
+    for k in 1..=20 {
+        let other = small_texture(RAM_START + k * 0x4000);
+        test.frame(&[other, streak]);
+        assert_eq!(last_mask(&test), Some(kept), "after {k} others");
+    }
+    // The first others lost theirs (16 slots): used once, long ago.
+    test.use_texture(&small_texture(RAM_START + 0x4000));
+    assert_eq!(last_mask(&test), None);
+}

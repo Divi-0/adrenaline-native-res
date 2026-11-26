@@ -181,9 +181,6 @@ pub enum WalkResult {
     TooManyCommands,
     /// A command or jump target was outside readable memory.
     BadAddress(u32),
-    /// The visitor asked to stop for now (`CommandVisitor::should_pause`);
-    /// call `walk` again to go on from the same command.
-    Paused,
 }
 
 /// Receives the commands the GE would execute, after the GE state has been
@@ -218,28 +215,6 @@ pub trait CommandVisitor {
         }
     }
 
-    /// Plain commands (`PLAIN_COMMANDS`, not wanted by `wants`) that `walk`
-    /// just executed, in order: the GE state already has them. Only the
-    /// capture's stage A wants them (`walk_stream`), to pass them on.
-    #[inline]
-    fn plain_run(&mut self, _words: &[u32]) {}
-
-    /// True: `walk` hands plain runs over a cache line (`LINE_SIZE`) at a
-    /// time and returns to its main loop after each, as before 2026-11-17:
-    /// the capture's stage A (`walk_stream`) makes room in its stream for
-    /// one such step at a time.
-    #[inline]
-    fn plain_runs_by_line(&self) -> bool {
-        false
-    }
-
-    /// Checked before every command: true makes `walk` return
-    /// `WalkResult::Paused` (stage A when its stream is full and the same
-    /// thread has to empty it first, see `walk_stream`).
-    #[inline]
-    fn should_pause(&self) -> bool {
-        false
-    }
 }
 
 /// Most PRIM commands `walk` hands over at once.
@@ -378,9 +353,6 @@ fn walk_list(
     let mut windows: [ListWindow; KEPT_WINDOWS] = core::array::from_fn(|_| ListWindow::new());
     let actions = PlainActions::for_visitor(visitor);
     while executed < max_commands {
-        if visitor.should_pause() {
-            return WalkResult::Paused;
-        }
         let mut transferred = false;
         let plain_started = crate::cycles::start(crate::cycles::PLAIN);
         let (ran, stopped_at) =
@@ -488,9 +460,6 @@ fn walk_list(
         if visitor.wants(command.opcode()) {
             visitor.visit(command, ge, memory);
             crate::phase::enter(crate::phase::WALK);
-        } else if PLAIN_COMMANDS[command.opcode() as usize] {
-            // Normally the plain run takes these; this one it couldn't.
-            visitor.plain_run(&[word]);
         }
         if command.opcode() == op::PRIM {
             ge.advance_after_draw(command.data() & 0xFFFF);
@@ -560,7 +529,7 @@ fn run_plain_commands(
     commands: &mut u32,
 ) -> (u32, Option<u32>) {
     // As before 2026-11-17 (A/B): one piece, up to the line's end.
-    let one_line = crate::bench::experiment(crate::bench::NO_CALL_RUNS) || visitor.plain_runs_by_line();
+    let one_line = crate::bench::experiment(crate::bench::NO_CALL_RUNS);
     let mut ran = 0;
     crate::phase::enter(crate::phase::PLAIN);
     // A piece of the list from one window at a time: up to the window's
@@ -656,17 +625,13 @@ fn run_plain_commands(
             }
         }
         let read_all = done == words.len();
-        if done > 0 {
-            visitor.plain_run(&words[..done]);
-        }
         *commands += done as u32;
         ran += done as u32;
         list.pc = next_pc.unwrap_or(pc.wrapping_add(4 * done as u32));
         // On after a CALL / RET or at the window's end, unless the main loop
-        // must look first: a command the run doesn't take, the limit, a
-        // pausing visitor (stage A, whose stream may be full).
+        // must look first: a command the run doesn't take, the limit.
         let go_on = next_pc.is_some() || (read_all && !one_line);
-        if stopped_at.is_some() || !go_on || ran >= limit || visitor.should_pause() {
+        if stopped_at.is_some() || !go_on || ran >= limit {
             return (ran, stopped_at);
         }
     }
@@ -759,8 +724,7 @@ pub struct PlainActions(pub(crate) [PlainAction; 256]);
 
 impl PlainActions {
     pub(crate) fn for_visitor(visitor: &impl CommandVisitor) -> Self {
-        // Not for stage A, whose runs must hold plain commands only.
-        let visits = !visitor.plain_runs_by_line() && !crate::bench::experiment(crate::bench::NO_VISIT_RUNS);
+        let visits = !crate::bench::experiment(crate::bench::NO_VISIT_RUNS);
         PlainActions(core::array::from_fn(|opcode| {
             let opcode = opcode as u8;
             if opcode == op::PRIM && visits && visitor.batches_prims() && visitor.wants(op::PRIM) {

@@ -435,8 +435,7 @@ pub mod integer {
         float(ba) + float(bb)
     }
 
-    /// `screen_z` for many vertices of one transform (core
-    /// ge_depth_stream.rs, once per raw vertex): what the columns give to
+    /// `screen_z` for many vertices of one transform: what the columns give to
     /// each product worked out once, and each model coordinate's bits taken
     /// apart once for both rows. The same arithmetic as `screen_z` step by
     /// step (test `prepared_is_screen_z`).

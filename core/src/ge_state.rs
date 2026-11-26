@@ -633,7 +633,7 @@ impl GeState {
         self.registers[opcode as usize]
     }
 
-    /// All registers (for the capture's stage A, `walk_stream`).
+    /// All registers.
     pub fn registers(&self) -> &[u32; 256] {
         &self.registers
     }

@@ -31,7 +31,7 @@ use nativeres_core::texture;
 use nativeres_core::vram_requests::{Plan, VramRange, VramRequests, MAX_RANGES, VRAM_SIZE, VRAM_START};
 
 use crate::dump::DumpRecorder;
-use crate::{copy_thread, ext, frames, log, platform, recorder_thread, stage_thread, sys, SingleThreaded};
+use crate::{copy_thread, ext, frames, log, platform, recorder_thread, sys, SingleThreaded};
 
 /// How often the ring is checked while a game with the plugin runs.
 const POLL_INTERVAL_US: u32 = 1000;
@@ -1262,9 +1262,6 @@ fn log_frame(state: &mut CaptureState, timing: &mut FrameTiming, flip: &RawEvent
     // thread (room in the draw stream, end of the frame), and the recorder
     // thread recording. Which half holds the other up, live.
     let (stream_waited_us, stream_busy_us) = recorder_thread::take_times();
-    // The same for the walk stream: the capture thread (stage A) waiting
-    // for stage B's thread, and stage B working (`stage_thread`).
-    let (stage_waited_us, stage_busy_us, stage_cpu_us) = stage_thread::take_times();
     let mut line = [0u8; 1024];
     let mut text = TextBuffer::new(&mut line[..1023]);
     let frame_time = flip.psp_time_us.wrapping_sub(timing.last_flip_psp_time);
@@ -1294,7 +1291,7 @@ fn log_frame(state: &mut CaptureState, timing: &mut FrameTiming, flip: &RawEvent
     let method = copy_method::name(method);
     let _ = write!(
         text,
-        "frame={} rec={} dt={}.{}ms cpu={}us run={}us copy={}us/{}x/{}direct/{}k stream={}waited/{}busy stage={}waited/{}busy/{}cpu waits={}/{}/{}/{}/{} badread={}@{:08x}+{:x} vram={}x/{}k/{}us/{} sync={}/{}us enq={}/{}us changes={} thread={}/{:08x} vramlist={}k/{}missing@{:08x} free={}k ours={}k wakes={} copier={}us/{}/{}/{} helped={}/{}/{}/{}/{} gesync={}/{}ms/{} behind={}.{}ms ",
+        "frame={} rec={} dt={}.{}ms cpu={}us run={}us copy={}us/{}x/{}direct/{}k stream={}waited/{}busy waits={}/{}/{}/{}/{} badread={}@{:08x}+{:x} vram={}x/{}k/{}us/{} sync={}/{}us enq={}/{}us changes={} thread={}/{:08x} vramlist={}k/{}missing@{:08x} free={}k ours={}k wakes={} copier={}us/{}/{}/{} helped={}/{}/{}/{}/{} gesync={}/{}ms/{} behind={}.{}ms ",
         timing.frame_number,
         recorded as u8,
         frame_time / 1000,
@@ -1307,9 +1304,6 @@ fn log_frame(state: &mut CaptureState, timing: &mut FrameTiming, flip: &RawEvent
         state.copies.direct_bytes / 1024,
         stream_waited_us,
         stream_busy_us,
-        stage_waited_us,
-        stage_busy_us,
-        stage_cpu_us,
         // Producer waits since the session started, by cause: rings full
         // (jobs/calls/words/transforms), then waiting for an idle consumer.
         draw_stream::WAITS[0].load(Ordering::Relaxed),
@@ -1522,9 +1516,6 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
     let mut vertex_cache_tried = false;
     let mut ring_version_reported = false;
 
-    // Whether stage B of the capture runs on its own thread
-    // (stage_thread.rs; switched at frame ends).
-    let mut staged = false;
 
     loop {
         if recorder_thread::wanted() != threaded {
@@ -1704,10 +1695,6 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
                 continue;
             }
 
-            if staged {
-                // Stage B waits at the frame's end now.
-                state.vram.add_stage_reads(stage_thread::vram_reads());
-            }
             COMPLETED_FRAME_COUNT.store(state.capture.frames_completed(), Ordering::Relaxed);
             if state.capture.waiting_for_ge_state() {
                 ge_state_frames += 1;
@@ -1799,28 +1786,6 @@ unsafe extern "C" fn capture_thread(_args: u32, _argp: *mut c_void) -> i32 {
             recording = wanted && (ext::dump_requested() || !state.reader.newer_frame_waiting(&ring));
             timeouts_at_start = ring.header().sync_timeouts;
             skipping = wanted && !recording;
-            // Stage B on its own thread, switched between frames. Not while
-            // a dump runs: the dump records the blocks the capture thread
-            // reads.
-            let stage_wanted = stage_thread::wanted() && !ext::dump_requested() && !state.dump.is_active();
-            if stage_wanted != staged {
-                staged = stage_wanted && stage_thread::start();
-                let capture: *mut Capture = &mut *state.capture;
-                if staged {
-                    state.capture.set_pipelined(true);
-                    state.capture.set_stage_hooks(Some(&stage_thread::HOOKS));
-                    let requests = core::ptr::addr_of!(state.vram);
-                    stage_thread::serve(capture, stage_thread::Source::Live { requests });
-                } else {
-                    state.capture.set_stage_hooks(None);
-                    stage_thread::serve(core::ptr::null_mut(), stage_thread::Source::Live { requests: core::ptr::null() });
-                    state.capture.set_pipelined(false);
-                }
-                let message: &[u8] = if staged { b"stage B on its own thread
-" } else { b"stage B off
-" };
-                log::append(message);
-            }
             ext::dump_start(state, recording);
         }
         timing.vita_time_us += sys::now_us() - start_time;

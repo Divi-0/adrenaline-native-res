@@ -14,7 +14,6 @@
 //! |---|---|---|---|---|
 //! | `Render` | display thread, a frame drawn (`frame_loop`) | start us | end us | - |
 //! | `Copy` | copier, a job's memory copied (`copy_thread`) | start us | end us | - |
-//! | `StageB` | stage B worked (`stage_thread`) | start us | end us | - |
 //! | `PoolWait` | display thread waits for the GPU (`frame_pool`) | `BEGIN`/`END` | 0 / begin's value | begin: a token |
 //! | `Texture` | texture worker refreshes a texture (`textures`) | `BEGIN`/`END` | 0 / begin's value | begin: a token |
 //! | `PartStart` | a measuring part of `cycles` starts | part | - | the value `PartEnd` gets |
@@ -36,7 +35,6 @@
 pub enum Point {
     Render,
     Copy,
-    StageB,
     PoolWait,
     Texture,
     PartStart,
@@ -49,7 +47,7 @@ pub enum Point {
     VertexUniforms,
 }
 
-pub const POINTS: usize = 13;
+pub const POINTS: usize = 12;
 /// `a` of a `span` point at its begin and end.
 pub const BEGIN: u32 = 0;
 pub const END: u32 = 1;

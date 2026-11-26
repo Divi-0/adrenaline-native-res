@@ -129,8 +129,7 @@ pub struct VramRequests {
     /// Blocks the last plan requested for the capture (for the log).
     capture_blocks: u32,
     /// `frame` up to which a block back after a pause is not read
-    /// ([`STALE_FRAMES`]); 0 = trusted. Not `ready`: stage B reads those
-    /// flags meanwhile (`ready_for_stage`).
+    /// ([`STALE_FRAMES`]); 0 = trusted.
     distrusted_until: [u32; BLOCKS],
     /// Distrusted blocks to be copied again in full (ranges of their own in
     /// the plans, see DISTRUST_FRAMES) until a copy is confirmed.
@@ -150,43 +149,6 @@ pub struct VramRequests {
 }
 
 impl Default for VramRequests {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// The VRAM blocks the capture's stage B read (another thread; see
-/// `VramRequests::ready_for_stage`).
-pub struct StageVramReads {
-    used: [u32; BLOCKS / 32],
-    missing: u32,
-    /// The first unready address read (0: none), for the log.
-    first_missing: u32,
-}
-
-impl StageVramReads {
-    pub const fn new() -> Self {
-        StageVramReads { used: [0; BLOCKS / 32], missing: 0, first_missing: 0 }
-    }
-
-    /// Stage B read the block at physical `address` (in VRAM); `ready`:
-    /// it was in the plugin's copy.
-    pub fn note(&mut self, address: u32, ready: bool) {
-        if let Some(block) = address.checked_sub(VRAM_START).map(|offset| (offset / BLOCK_SIZE) as usize) {
-            if block < BLOCKS {
-                self.used[block / 32] |= 1 << (block % 32);
-                if !ready {
-                    if self.missing == 0 {
-                        self.first_missing = address;
-                    }
-                    self.missing += 1;
-                }
-            }
-        }
-    }
-}
-
-impl Default for StageVramReads {
     fn default() -> Self {
         Self::new()
     }
@@ -287,43 +249,6 @@ impl VramRequests {
         };
         let last = self.block_last_used[previous];
         last != 0 && (self.frame + 1).wrapping_sub(last) < RECENT_FRAMES
-    }
-
-    /// `block_ready` for the capture's stage B in another thread: only
-    /// reads whether the block is in the plugin's copy; stage B notes its
-    /// reads in its own [`StageVramReads`], added with `add_stage_reads`
-    /// at the frame's end.
-    ///
-    /// # Safety
-    /// `requests` must point to a `VramRequests` whose `ready` flags no
-    /// thread changes meanwhile (only `plan`, at a frame's end, does).
-    pub unsafe fn ready_for_stage(requests: *const VramRequests, address: u32) -> bool {
-        let Some(block) = address.checked_sub(VRAM_START).map(|offset| (offset / BLOCK_SIZE) as usize) else {
-            return false;
-        };
-        block < BLOCKS && core::ptr::read_volatile(core::ptr::addr_of!((*requests).ready[block]))
-    }
-
-    /// What stage B read this frame, as if it had called `block_ready`.
-    pub fn add_stage_reads(&mut self, reads: &mut StageVramReads) {
-        for (word_index, word) in reads.used.iter_mut().enumerate() {
-            let mut bits = core::mem::take(word);
-            while bits != 0 {
-                let block = word_index * 32 + bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                self.block_last_used[block] = self.frame + 1;
-                if !self.ready[block] {
-                    for next in block + 1..(block + LOOKAHEAD_BLOCKS).min(BLOCKS) {
-                        self.block_last_used[next] = self.frame + 1;
-                    }
-                }
-            }
-        }
-        if self.first_missing == 0 {
-            self.first_missing = reads.first_missing;
-        }
-        reads.first_missing = 0;
-        self.missing += core::mem::take(&mut reads.missing);
     }
 
     /// Reads of unready blocks since the last call (0 = the frame read

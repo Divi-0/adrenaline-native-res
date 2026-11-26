@@ -717,13 +717,6 @@ pub struct RawColors {
     /// draw water with FIX A over raw ground with an equal-depth GEQUAL, and
     /// the two paths' depths differed by a few ulps (32x32 tile squares).
     pub scale: [f32; 4],
-    /// Texgen (`transform::Texgen::raw_form`): the texture coordinates'
-    /// scale u, v and offset u, v (the program's uRawUv) in place of the
-    /// camera's (`raw_blocks::raw_uv_of`), where `texgen_source[0]` is not
-    /// 0: 1 from the raw texture coordinates, 2 from the raw position's x
-    /// and y (the draw's `raw_blocks::TEXCOORDS_FROM_POSITION`).
-    pub texgen: [f32; 4],
-    pub texgen_source: [f32; 4],
 }
 
 /// The lighting of GPU-lit draws (`lighting::Lights::gpu`), world space:
@@ -787,7 +780,7 @@ const GPU_TRANSFORM_WORDS: usize = core::mem::size_of::<GpuTransform>() / 4;
 const GPU_LIGHTS_WORDS: usize = core::mem::size_of::<GpuLights>() / 4;
 const _: () = assert!(core::mem::size_of::<GpuTransform>() == 48 * 4);
 const RAW_COLORS_WORDS: usize = core::mem::size_of::<RawColors>() / 4;
-const _: () = assert!(core::mem::size_of::<RawColors>() == 28 * 4);
+const _: () = assert!(core::mem::size_of::<RawColors>() == 20 * 4);
 const _: () = assert!(core::mem::size_of::<GpuLights>() == 104 * 4);
 
 impl GpuTransform {
@@ -1849,7 +1842,7 @@ impl Frame {
                 }
             }
             if let Some(colors) = self.raw_colors_of(draw) {
-                [colors.material, colors.ambient, colors.emissive, colors.rules, colors.scale, colors.texgen, colors.texgen_source]
+                [colors.material, colors.ambient, colors.emissive, colors.rules, colors.scale]
                     .iter()
                     .flatten()
                     .for_each(|value| add(0, value.to_bits()));

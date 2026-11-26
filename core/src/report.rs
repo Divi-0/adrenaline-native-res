@@ -162,7 +162,6 @@ pub fn write_frame(out: &mut impl Write, stats: &FrameStats) -> fmt::Result {
         ("ctx_save", stats.contexts_saved),
         ("ctx_restore", stats.contexts_restored),
         ("ctx_missing", stats.contexts_missing),
-        ("ctx_pipelined", stats.contexts_pipelined),
         ("gestate", stats.ge_states),
         ("gestate_regdiff", stats.ge_state_register_differences),
         ("gestate_mtxdiff", stats.ge_state_matrix_differences),

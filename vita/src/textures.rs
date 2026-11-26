@@ -171,6 +171,15 @@ pub fn opaque_rows(index: usize) -> u16 {
     unsafe { DISPLAY.get() }.cache.opaque_rows(index)
 }
 
+/// Display thread, after `for_frame`: where the frame's texture `index`
+/// (from the cache) has texels that show (`TextureCache::texel_mask`), for
+/// the zero-alpha cull. None if it has no mask. Valid until the next
+/// `for_frame`.
+pub fn texel_mask(index: usize) -> Option<&'static nativeres_core::texture::TexelMask> {
+    // Safe: only the display thread calls this, and only it changes the cache.
+    unsafe { DISPLAY.get() }.cache.texel_mask(index)
+}
+
 /// Display thread, after `for_frame`: whether the frame waits for textures
 /// (isn't drawn).
 pub fn frame_done(waited: bool) {

@@ -85,7 +85,6 @@ pub mod recorder_thread;
 pub mod render_log;
 pub mod render_stats;
 pub mod shaders;
-pub mod stage_thread;
 pub mod sys;
 pub mod taihen;
 pub mod targets;

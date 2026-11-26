@@ -32,7 +32,7 @@ pub const BLOCK_WORDS: usize = BLOCK_SIZE as usize / 4;
 pub const CAPTURE_BLOCKS: usize = 128;
 
 /// Blocks in a store that lives on a thread's stack or in the module's data
-/// (main memory, which is short): stage B on its own thread, off by default.
+/// (main memory, which is short).
 pub const SMALL_BLOCKS: usize = 16;
 
 /// Slots per set: a block can only be in one of the `WAYS` slots of its set
@@ -183,8 +183,7 @@ impl<'s, S: BlockSource, const BLOCKS: usize> BlockCache<'s, S, BLOCKS> {
     }
 
     /// Empties the cache (for reading memory that may have changed), as
-    /// `new` does: for a cache kept across many short uses (the capture's
-    /// stage B, `walk_stream`).
+    /// `new` does: for a cache kept across many short uses.
     pub fn forget(&mut self) {
         self.store.forget();
         self.last = 0;

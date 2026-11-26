@@ -45,7 +45,7 @@ mod trace;
 use std::process::ExitCode;
 
 use nativeres_core::bench::{self, Mode};
-use nativeres_core::block_cache::{BlockCache, BlockStore, CAPTURE_BLOCKS, SMALL_BLOCKS};
+use nativeres_core::block_cache::{BlockCache, BlockStore, CAPTURE_BLOCKS};
 use nativeres_core::capture::{Capture, Event};
 use nativeres_core::dump::DumpView;
 use nativeres_core::frame::{Frame, FrameVertex};
@@ -124,24 +124,10 @@ fn main() -> ExitCode {
     }
 }
 
-/// Stage B's thread (`--stage-thread`) polls; nothing to wake.
-static PC_STAGE_HOOKS: nativeres_core::walk_stream::WalkHooks =
-    nativeres_core::walk_stream::WalkHooks { wake_reader: || {}, wait: std::thread::yield_now };
-
-fn stage_thread() -> bool {
-    std::env::args().any(|arg| arg == "--stage-thread") || std::env::var("NATIVERES_STAGE_THREAD").is_ok()
-}
-
 /// Whether the draw stream's copier copies the vertex memory (as the Vita's
 /// copy thread, here in this thread): `--copier` or NATIVERES_COPIER set.
 fn copier() -> bool {
     std::env::args().any(|arg| arg == "--copier") || std::env::var("NATIVERES_COPIER").is_ok()
-}
-
-/// Whether the capture runs in two stages (`walk_stream`), both in this
-/// thread: `--pipeline` or NATIVERES_PIPELINE set.
-fn pipelined() -> bool {
-    std::env::args().any(|arg| arg == "--pipeline") || std::env::var("NATIVERES_PIPELINE").is_ok()
 }
 
 /// Whether 3D draws are left to the GPU transform (see the module comment).
@@ -167,10 +153,6 @@ fn new_vertex_cache() -> Option<&'static mut VertexCache> {
     // their indices were kept (`raw_arena::INDEXED_DRAWS`).
     let gather = std::env::args().any(|arg| arg == "--gather");
     nativeres_core::raw_arena::INDEXED_DRAWS.store(!gather, std::sync::atomic::Ordering::Relaxed);
-    // NATIVERES_RAW_TEXGEN=1: texgen draws raw where they can be
-    // (`raw_arena::TEXGEN`, off by default as on the Vita).
-    let raw_texgen = std::env::var("NATIVERES_RAW_TEXGEN").is_ok_and(|value| value == "1");
-    nativeres_core::raw_arena::TEXGEN.store(raw_texgen, std::sync::atomic::Ordering::Relaxed);
     // NATIVERES_POINT_LIGHTS=0: point-lit draws lit on the CPU, as before
     // 2026-11-22 (`lighting::POINT_LIGHTS_GPU`, on by default as on the Vita).
     let point_lights = std::env::var("NATIVERES_POINT_LIGHTS").map_or(true, |value| value != "0");
@@ -228,7 +210,6 @@ fn run(dump_path: &str, png_path: &str, trace: bool) -> Result<(), String> {
     capture.set_gpu_transform(gpu_transform());
     capture.set_vertex_cache(new_vertex_cache());
     capture.set_direct_lists(new_direct_lists());
-    capture.set_pipelined(pipelined());
     // `--copier`: the vertex memory goes through the draw stream's copier
     // (copied before the jobs are recorded, as the Vita's copy_thread.rs).
     if copier() {
@@ -244,32 +225,7 @@ fn run(dump_path: &str, png_path: &str, trace: bool) -> Result<(), String> {
     // Traces the round that is drawn (the last).
     let mut tracer = trace::DrawTracer::new(trace);
     let mut silent = trace::DrawTracer::new(false);
-    // Stage B on a thread of its own (`--stage-thread` or
-    // NATIVERES_STAGE_THREAD), as on the Vita.
-    let threaded = stage_thread();
-    if threaded {
-        capture.set_pipelined(true);
-        capture.set_stage_hooks(Some(&PC_STAGE_HOOKS));
-    }
-    let stop = std::sync::atomic::AtomicBool::new(false);
-    let capture_address = &mut capture as *mut Capture as usize;
-    let shared_memory = &dump.memory;
-    std::thread::scope(|scope| -> Result<(), String> {
-        if threaded {
-            scope.spawn(|| {
-                // Stage B's own store, small as on the Vita (stage_thread.rs).
-                let mut store = Box::new(BlockStore::<SMALL_BLOCKS>::new());
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    let mut memory = BlockCache::new(&mut *store, shared_memory);
-                    // Safe: the capture outlives the scope; this is its only
-                    // stage B thread (`Capture::run_stage_b_thread`).
-                    let run = unsafe { Capture::run_stage_b_thread(capture_address as *mut Capture, &mut memory) };
-                    if run == nativeres_core::capture::StageBRun::Nothing {
-                        std::thread::yield_now();
-                    }
-                }
-            });
-        }
+    {
         let result = (|| -> Result<(), String> {
             let mut store = Box::new(BlockStore::<CAPTURE_BLOCKS>::new());
             for round in 0..rounds {
@@ -301,14 +257,9 @@ fn run(dump_path: &str, png_path: &str, trace: bool) -> Result<(), String> {
             }
             Ok(())
         })();
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        result
-    })?;
-    let stats = stats.ok_or("the dump contains no complete frame")?;
-    if capture.pipelined() {
-        let (sent, dropped) = capture.write_filter_counts();
-        println!("walk stream: {sent} plain register writes passed on, {dropped} left out (no change)");
+        result?;
     }
+    let stats = stats.ok_or("the dump contains no complete frame")?;
     if stats.approximated_draws > 0 {
         let reasons: Vec<String> = nativeres_core::recorder::approx::NAMES
             .iter()

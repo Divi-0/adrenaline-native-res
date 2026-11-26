@@ -235,8 +235,6 @@ pub struct RawCorners<'a, I: Iterator<Item = u16>> {
     pending: [FrameVertex; 6],
     pending_count: usize,
     next: usize,
-    /// `raw_blocks::TEXCOORDS_FROM_POSITION`.
-    from_position: bool,
 }
 
 impl<'a, I: Iterator<Item = u16>> RawCorners<'a, I> {
@@ -251,8 +249,7 @@ impl<'a, I: Iterator<Item = u16>> RawCorners<'a, I> {
         indices: I,
         sprites: bool,
     ) -> Self {
-        let from_position = vertex_format & raw_blocks::TEXCOORDS_FROM_POSITION != 0;
-        let format = VertexFormat(vertex_format & !raw_blocks::TEXCOORDS_FROM_POSITION);
+        let format = VertexFormat(vertex_format);
         let layout = format.layout();
         let lights = (colors.rules[0] == lighting::LIGHTS)
             .then(|| frame.light_sets[..frame.light_set_count as usize].get((transform.light_set as usize).checked_sub(1)?).copied())
@@ -270,8 +267,7 @@ impl<'a, I: Iterator<Item = u16>> RawCorners<'a, I> {
             layout,
             transform,
             camera,
-            uv: raw_blocks::raw_uv_of(&camera, format, &colors),
-            from_position,
+            uv: raw_blocks::raw_uv(&camera, format),
             sprites,
             pending: [FrameVertex::default(); 6],
             pending_count: 0,
@@ -279,14 +275,9 @@ impl<'a, I: Iterator<Item = u16>> RawCorners<'a, I> {
         }
     }
 
-    /// The raw texture coordinates the program reads: the raw position's x
-    /// and y for texgen from the position (`raw_blocks::TEXCOORDS_FROM_POSITION`).
+    /// The raw texture coordinates the program reads.
     fn texcoord(&self, fields: &RawFields) -> [f32; 2] {
-        if self.from_position {
-            [fields.position[0], fields.position[1]]
-        } else {
-            fields.texcoord
-        }
+        fields.texcoord
     }
 
     fn clip_vertex(&self, index: u16) -> Option<ClipVertex> {
