@@ -56,6 +56,11 @@
 // (~13 of a textured program's ~27); the specular 4. Keep this function the
 // same in nativeres_textured_f.cg, nativeres_textured_test_f.cg and
 // nativeres_textured_read_f.cg.
+// OUT_BYTES, FOG_TO_BYTES: see nativeres_textured_f.cg.
+#ifndef BLEND_FIX
+#define OUT_BYTES 1
+#define FOG_TO_BYTES 1
+#endif
 #define FLOOR(x) ((x) - frac(x))
 float4 GeShade(float4 texel, float4 vertexColor, float3 specular, float fog, float4 fogAndScale)
 {
@@ -72,7 +77,11 @@ float4 GeShade(float4 texel, float4 vertexColor, float3 specular, float fog, flo
 	c.rgb = min(c.rgb + FLOOR(specular * 255.0f + 0.5f) * fogAndScale.aaa, 255.0f);
 #endif
 	float f = min(FLOOR(saturate(fog) * 256.0f + 0.01f), 255.0f);
-#ifdef FOG_UNFLOORED
+#ifdef FOG_TO_BYTES
+	// The caller converts to bytes: half a level down, the conversion's
+	// rounding is the floor (the numerator is whole: (2 X - 255) / 512).
+	c.rgb = (f * (c.rgb - fogAndScale.rgb) + (fogAndScale.rgb * 255.0f + 255.0f)) * (1.0f / 256.0f) - (127.5f / 256.0f);
+#elif defined(FOG_UNFLOORED)
 	// The caller floors it with its cut (floor(floor(x) / 8) = floor(x / 8)).
 	c.rgb = (f * (c.rgb - fogAndScale.rgb) + (fogAndScale.rgb * 255.0f + 255.0f)) * (1.0f / 256.0f);
 #else
@@ -106,14 +115,15 @@ float4 GeShade(float4 texel, float4 vertexColor, float3 specular, float fog, flo
 float4 GeTexel(sampler2D tex, float2 uv, float4 size)
 {
 	float2 step = 1.0f / size.xy;
-	float2 p = FLOOR(uv * size.xy * 16.0f) - size.z;
-	float2 m = p * (1.0f / 16.0f);
+	float2 m = FLOOR(uv * (size.xy * 16.0f)) * (1.0f / 16.0f) - size.z * (1.0f / 16.0f);
 	float2 fraction = frac(m); // f / 16, exact
-	float2 cell = m - fraction;
-	float x = (cell.x + 0.5f + fraction.x * size.w) * step.x; // f = 0 for the GE's nearest texel
-	float y = (cell.y + 0.5f) * step.y;
-	float4 top = FLOOR(tex2D<float4>(tex, float2(x, y)) * 255.0f + (1.0f / 32.0f));
-	float4 bottom = FLOOR(tex2D<float4>(tex, float2(x, y + step.y)) * 255.0f + (1.0f / 32.0f));
+	// (cell.x + f.x w, cell.y) with cell = m - fraction, then the texel centres (2026-11-26,
+	// DESIGN "seventy-second session"; 1 instruction less than cell + 0.5 per axis). Every
+	// value a multiple of 1/16 texel below 2^19 texels and the step a power of two: each step exact
+	// in any order the compiler picks, the same coordinates as before.
+	float2 at = (m + fraction * float2(size.w - 1.0f, -1.0f)) * step + 0.5f * step;
+	float4 top = FLOOR(tex2D<float4>(tex, at) * 255.0f + (1.0f / 32.0f));
+	float4 bottom = FLOOR(tex2D<float4>(tex, float2(at.x, at.y + step.y)) * 255.0f + (1.0f / 32.0f));
 	return FLOOR(top + (bottom - top) * (fraction.y * size.w));
 }
 #else
@@ -140,7 +150,11 @@ float4 GeTexel(sampler2D tex, float2 uv, float4 size)
 #define SAMPLE(tex, uv) tex2D<half4>(tex, uv)
 #endif
 
+#ifdef OUT_BYTES
+__regformat unsigned char4 main(
+#else
 float4 main(
+#endif
 	float2 vTexcoord : TEXCOORD0,
 	float4 vColor : TEXCOORD1,
 	float2 vFog : TEXCOORD2,
@@ -175,6 +189,9 @@ float4 main(
 	// The test on the GE's whole alpha (uAlphaTest above).
 	if ((c.a - uAlphaTest.x) * (uAlphaTest.y - c.a) * uAlphaTest.z < 0.0f)
 		discard;
+#ifdef OUT_BYTES
+	return (unsigned char4)c;
+#else
 	float4 color = c * (1.0f / 255.0f);
 #ifdef BLEND_FIX
 	float sourceAlpha = saturate(color.a);
@@ -182,4 +199,5 @@ float4 main(
 	color.a = uBlendFix.x;
 #endif
 	return color;
+#endif
 }

@@ -51,14 +51,15 @@
 float4 GeTexel(sampler2D tex, float2 uv, float4 size)
 {
 	float2 step = 1.0f / size.xy;
-	float2 p = FLOOR(uv * size.xy * 16.0f) - size.z;
-	float2 m = p * (1.0f / 16.0f);
+	float2 m = FLOOR(uv * (size.xy * 16.0f)) * (1.0f / 16.0f) - size.z * (1.0f / 16.0f);
 	float2 fraction = frac(m); // f / 16, exact
-	float2 cell = m - fraction;
-	float x = (cell.x + 0.5f + fraction.x * size.w) * step.x; // f = 0 for the GE's nearest texel
-	float y = (cell.y + 0.5f) * step.y;
-	float4 top = FLOOR(tex2D<float4>(tex, float2(x, y)) * 255.0f + (1.0f / 32.0f));
-	float4 bottom = FLOOR(tex2D<float4>(tex, float2(x, y + step.y)) * 255.0f + (1.0f / 32.0f));
+	// (cell.x + f.x w, cell.y) with cell = m - fraction, then the texel centres (2026-11-26,
+	// DESIGN "seventy-second session"; 1 instruction less than cell + 0.5 per axis). Every
+	// value a multiple of 1/16 texel below 2^19 texels and the step a power of two: each step exact
+	// in any order the compiler picks, the same coordinates as before.
+	float2 at = (m + fraction * float2(size.w - 1.0f, -1.0f)) * step + 0.5f * step;
+	float4 top = FLOOR(tex2D<float4>(tex, at) * 255.0f + (1.0f / 32.0f));
+	float4 bottom = FLOOR(tex2D<float4>(tex, float2(at.x, at.y + step.y)) * 255.0f + (1.0f / 32.0f));
 	return FLOOR(top + (bottom - top) * (fraction.y * size.w));
 }
 #else
@@ -85,7 +86,7 @@ float4 GeTexel(sampler2D tex, float2 uv, float4 size)
 #define SAMPLE(tex, uv) tex2D<half4>(tex, uv)
 #endif
 
-float4 main(
+__regformat unsigned char4 main(
 	float2 vTexcoord : TEXCOORD0,
 	float4 vColor : TEXCOORD1,
 	float2 vFog : TEXCOORD2,
@@ -115,7 +116,10 @@ float4 main(
 	float4 t = FLOOR(SAMPLE(tex, vTexcoord) * 255.0f + 0.5f); // rounded: GeShade's comment
 #endif
 	float4 p1 = FLOOR(vColor * overW * 255.0f + 1.01f); // p + 1
-	float4 c = FLOOR(p1 * t * (float4(uFogAndScale.aaa, 1.0f) * (1.0f / 256.0f)));
-	c.rgb = min(c.rgb, 255.0f);
-	return c * (1.0f / 255.0f);
+	// The 8-bit values written by the program itself (2026-11-26, DESIGN
+	// "seventy-third session"; nativeres_textured_f.cg OUT_BYTES): the product
+	// / 256 half a level down, at least 1/512 from a tie, goes through the
+	// conversion to bytes as its floor, saturated at 255 (the colour
+	// doubling's clamp): no floor, no min, no c / 255 for GXM to convert.
+	return (unsigned char4)(p1 * t * (float4(uFogAndScale.aaa, 1.0f) * (1.0f / 256.0f)) - (127.5f / 256.0f));
 }

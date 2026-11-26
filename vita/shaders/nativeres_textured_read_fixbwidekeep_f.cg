@@ -220,14 +220,15 @@ float4 GeShade(float4 texel, float4 vertexColor, float3 specular, float fog, flo
 float4 GeTexel(sampler2D tex, float2 uv, float4 size)
 {
 	float2 step = 1.0f / size.xy;
-	float2 p = FLOOR(uv * size.xy * 16.0f) - size.z;
-	float2 m = p * (1.0f / 16.0f);
+	float2 m = FLOOR(uv * (size.xy * 16.0f)) * (1.0f / 16.0f) - size.z * (1.0f / 16.0f);
 	float2 fraction = frac(m); // f / 16, exact
-	float2 cell = m - fraction;
-	float x = (cell.x + 0.5f + fraction.x * size.w) * step.x; // f = 0 for the GE's nearest texel
-	float y = (cell.y + 0.5f) * step.y;
-	float4 top = FLOOR(tex2D<float4>(tex, float2(x, y)) * 255.0f + (1.0f / 32.0f));
-	float4 bottom = FLOOR(tex2D<float4>(tex, float2(x, y + step.y)) * 255.0f + (1.0f / 32.0f));
+	// (cell.x + f.x w, cell.y) with cell = m - fraction, then the texel centres (2026-11-26,
+	// DESIGN "seventy-second session"; 1 instruction less than cell + 0.5 per axis). Every
+	// value a multiple of 1/16 texel below 2^19 texels and the step a power of two: each step exact
+	// in any order the compiler picks, the same coordinates as before.
+	float2 at = (m + fraction * float2(size.w - 1.0f, -1.0f)) * step + 0.5f * step;
+	float4 top = FLOOR(tex2D<float4>(tex, at) * 255.0f + (1.0f / 32.0f));
+	float4 bottom = FLOOR(tex2D<float4>(tex, float2(at.x, at.y + step.y)) * 255.0f + (1.0f / 32.0f));
 	return FLOOR(top + (bottom - top) * (fraction.y * size.w));
 }
 #else
@@ -398,13 +399,20 @@ __nativecolor __regformat unsigned char4 main(
 #if defined(READ_FIXB)
 	// As the generic program: the source premultiplied and rounded (s), its
 	// factor ONE (the term is s itself), FIX B's term truncated, added
-	// (color = c / 255 above).
+	// (color = c / 255 above). The term without its floor and the sum without
+	// its min (2026-11-26, DESIGN "seventy-third session"): t(d, fixB) =
+	// (2d + 1)(2 fixB + 1) / 1024 is never whole before its cut (see the normal
+	// blend below), so s + term - 1/2 goes through the conversion to bytes as
+	// s + floor(term), saturated at 255. kf = (K, K / 2 - 1/2) with
+	// K = (2 fixB + 1) / 512, per draw; every step a multiple of 1/1024 below
+	// 2^9: exact in any order. `value` is not whole (as the normal blend's).
 	color.rgb *= uBlendFix.x + uBlendFix.y * saturate(color.a);
 	float4 s = floor(saturate(color) * 255.0f + 0.5f);
 	float4 d = (float4)target;
 	float fixB = floor(uBlendFix.w * 255.0f + 0.5f);
-	float4 value = min(s + floor((d * 2.0f + 1.0f) * (fixB * 2.0f + 1.0f) * (1.0f / 1024.0f)), 255.0f);
-#elif defined(READ_NORMAL) && !defined(READ_565)
+	float2 kf = fixB * float2(1.0f / 256.0f, 1.0f / 512.0f) + float2(1.0f / 512.0f, 1.0f / 1024.0f - 0.5f);
+	float4 value = (d * kf.x + kf.y) + s;
+#elif defined(READ_NORMAL)
 	// One floor instead of two (2026-11-26, DESIGN "seventy-first session";
 	// 6 instructions less). A term t(v, f) = (2v + 1)(2f + 1) / 1024 has an odd
 	// numerator: before its cut it is never whole, at least 1/1024 from a whole
@@ -418,15 +426,12 @@ __nativecolor __regformat unsigned char4 main(
 	// however the GPU rounds. `value` is NOT whole: up to 1/2 - 1/1024 off the
 	// blend's value, for the conversion (or the dither's clamp, which keeps
 	// that) to round. Checked for all byte inputs on the PC and on the Vita's
-	// GPU (0 wrong of 16,777,216).
+	// GPU (0 wrong of 16,777,216). 565 targets (since the seventy-third
+	// session): their cut floors (value + 1/2) x step, the same rounding.
 	float4 k = c.a * float4(-1.0f / 256.0f, -1.0f / 256.0f, -1.0f / 512.0f, -1.0f / 512.0f)
 		+ float4(-1.0f / 512.0f, 511.0f / 512.0f, -1025.0f / 1024.0f, -1.0f / 1024.0f);
 	float4 d = (float4)target;
 	float4 value = (d * k.y + k.z) - floor(c * k.x + k.w);
-#elif defined(READ_NORMAL)
-	float4 d = (float4)target;
-	float4 value = FLOOR((c * 2.0f + 1.0f) * ((c.a * 2.0f + 1.0f) * (1.0f / 1024.0f)))
-		+ FLOOR((d * 2.0f + 1.0f) * ((511.0f - c.a * 2.0f) * (1.0f / 1024.0f)));
 #elif defined(READ_INVISIBLE)
 	// A normal blend of alpha 0 (untextured only: every vertex alpha 0,
 	// core frame.rs `ReadWay::Invisible`): t(c, 0) = 0, t(d, 255) = d,
@@ -451,15 +456,21 @@ __nativecolor __regformat unsigned char4 main(
 #ifdef READ_KEEP_ALPHA
 	value.a = 0.0f;
 #endif
-#elif defined(READ_ADD) && !defined(READ_565)
+#elif defined(READ_ADD) && defined(READ_DITHER)
 	// Dithered: the same term in floats (the dither's clamp and the
-	// conversion's rounding after it: `value` not whole, as the normal blend's).
+	// conversion's rounding, or the 565 cut's floor((value + 1/2) x step),
+	// after it: `value` not whole, as the normal blend's).
 	float2 k = c.a * float2(1.0f / 256.0f, 1.0f / 512.0f) + float2(1.0f / 512.0f, 1.0f / 1024.0f - 0.5f);
 	float4 d = (float4)target;
 	float4 value = min((c * k.x + k.y) + d, 255.0f);
 #elif defined(READ_ADD)
+	// 565 targets, undithered (2026-11-26, DESIGN "seventy-third session"):
+	// the same term in floats and no min: the cut floors (value + 1/2) x step,
+	// and a step past the last one (h above 31, green above 63) widens past
+	// 255, where the conversion to bytes saturates; the alpha likewise.
+	float2 k = c.a * float2(1.0f / 256.0f, 1.0f / 512.0f) + float2(1.0f / 512.0f, 1.0f / 1024.0f - 0.5f);
 	float4 d = (float4)target;
-	float4 value = min(FLOOR((c * 2.0f + 1.0f) * ((c.a * 2.0f + 1.0f) * (1.0f / 1024.0f))) + d, 255.0f);
+	float4 value = (c * k.x + k.y) + d;
 #else
 	float4 value = c;
 #endif
@@ -506,7 +517,8 @@ __nativecolor __regformat unsigned char4 main(
 	// theory, but the target's pixel arrives a hair below its whole value
 	// (12 read as 11.99..: the invisible and add ways then floored one step
 	// too low, NFS UR's title, 2026-11-21): floor((v + 0.5) x step), the
-	// same for whole values and safe for errors up to +-0.4. The bit
+	// same for whole values and safe for errors up to +-0.4; the normal and
+	// add blends rely on it (their value is up to 1/2 - 1/1024 off). The bit
 	// operations of the 5551 programs round in their cast first. The alpha
 	// (565 has none) written uncut, as the generic program writes it.
 	float4 h = FLOOR(value * float4(0.125f, 0.25f, 0.125f, 0.125f) + float4(0.0625f, 0.125f, 0.0625f, 0.0625f));
