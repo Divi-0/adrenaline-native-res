@@ -311,6 +311,12 @@ const STDLIB_PATH_PATCH: [u16; 3] = [0x4619, 0xF000, 0xB8B0];
 /// ONE_MINUS_SRC1 4, SRC2 5, ONE_MINUS_SRC2 6, SRC1_ALPHA 9,
 /// ONE_MINUS_SRC1_ALPHA 10, SRC2_ALPHA 11, ONE_MINUS_SRC2_ALPHA 12. Write
 /// mask bits R 1, G 2, B 4, A 8.
+///
+/// `tex2D_gather4` (the sample instruction's raw sample data: the four
+/// texels of the bilinear footprint, unfiltered; the last form also the
+/// filter's weights) and `tex2D_info` (the texture unit's own numbers for a
+/// coordinate: u fraction, v fraction, trilinear fraction, level of detail)
+/// are declared for lab programs; no program of the renderer uses them yet.
 static INTRINSICS: &[u8] = b"\
 #define __BLEND_OP_ADD 1
 #define __BLEND_OP_SUB 2
@@ -336,6 +342,22 @@ unsigned char4 __min(unsigned char4 a, unsigned char4 b) __attribute__((Intrinsi
 unsigned char4 __max(unsigned char4 a, unsigned char4 b) __attribute__((Intrinsic, OpcodeName(\"MAX\")));
 unsigned short __pixel_x() __attribute__((Intrinsic, OpcodeName(\"PIXEL_X\")));
 unsigned short __pixel_y() __attribute__((Intrinsic, OpcodeName(\"PIXEL_Y\")));
+unsigned int __getTexCtrlWord(sampler2D s, unsigned int cwIndex) __attribute__((Intrinsic, OpcodeName(\"GETTEXCTRLWORD\"), Internal));
+unsigned int __getTexCtrlWord(usampler2D s, unsigned int cwIndex) __attribute__((Intrinsic, OpcodeName(\"GETTEXCTRLWORD\"), Internal));
+unsigned char4 __tex2D_sinf(unsigned int cw0, unsigned int cw1, unsigned int cw2, unsigned int cw3, float2 uv) __attribute__((Intrinsic, OpcodeName(\"TEX2D_SINF\"), Internal));
+unsigned char4 tex2D_info(sampler2D smp, float2 uv) { return __tex2D_sinf(__getTexCtrlWord(smp, 0), __getTexCtrlWord(smp, 1), __getTexCtrlWord(smp, 2), __getTexCtrlWord(smp, 3), uv); }
+unsigned char4 tex2D_info(usampler2D smp, float2 uv) { return __tex2D_sinf(__getTexCtrlWord(smp, 0), __getTexCtrlWord(smp, 1), __getTexCtrlWord(smp, 2), __getTexCtrlWord(smp, 3), uv); }
+void tex2D_gather4(sampler2D, float2, out float[4]) __attribute__((Intrinsic, OpcodeName(\"TEX2D_RSD\")));
+void tex2D_gather4(sampler2D, float2, out float2[4]) __attribute__((Intrinsic, OpcodeName(\"TEX2D_RSD\")));
+void tex2D_gather4(sampler2D, float2, out float4[4]) __attribute__((Intrinsic, OpcodeName(\"TEX2D_RSD\")));
+void tex2D_gather4(sampler2D, float2, out half[4]) __attribute__((Intrinsic, OpcodeName(\"TEX2D_RSD\")));
+void tex2D_gather4(sampler2D, float2, out half2[4]) __attribute__((Intrinsic, OpcodeName(\"TEX2D_RSD\")));
+void tex2D_gather4(sampler2D, float2, out half4[4]) __attribute__((Intrinsic, OpcodeName(\"TEX2D_RSD\")));
+void tex2D_gather4(usampler2D, float2, out unsigned char[4]) __attribute__((Intrinsic, OpcodeName(\"TEX2D_RSD\")));
+void tex2D_gather4(usampler2D, float2, out unsigned char2[4]) __attribute__((Intrinsic, OpcodeName(\"TEX2D_RSD\")));
+void tex2D_gather4(usampler2D, float2, out unsigned char4[4]) __attribute__((Intrinsic, OpcodeName(\"TEX2D_RSD\")));
+void tex2D_gather4(usampler2D, float2, out unsigned short4[4]) __attribute__((Intrinsic, OpcodeName(\"TEX2D_RSD\")));
+void tex2D_gather4(sampler2D, float2, out float[4], out half4) __attribute__((Intrinsic, OpcodeName(\"TEX2D_IRSD\")));
 \0";
 
 type LoadInternalString = unsafe extern "C" fn(*mut c_void, *const u8) -> bool;

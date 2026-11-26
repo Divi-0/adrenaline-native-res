@@ -122,6 +122,11 @@ pub struct RenderStats {
     /// the GPU's LINEAR filter: its 16-bit lerps aren't the 8-bit texture's
     /// (should stay 0 in God of War, whose set filters every texture as the GE).
     pub ge_wide_inexact: u32,
+    /// GE-filtered draws through the GE_GATHER twin of their program
+    /// (draw.rs `GE_GATHER`; DESIGN "seventy-fourth session"), and ones whose
+    /// program has no usable twin (four point samples: the same pixels).
+    pub ge_gather_draws: u32,
+    pub ge_gather_missed: u32,
     /// Textures from off-screen targets drawn wide (wide_targets.rs, DESIGN
     /// "sixty-sixth session"): textures given a wide copy, copies made
     /// and the copy scenes that made them.
@@ -218,6 +223,8 @@ impl RenderStats {
         ge_wide_draws: 0,
         ge_wide_missed: 0,
         ge_wide_inexact: 0,
+        ge_gather_draws: 0,
+        ge_gather_missed: 0,
         wide_target_textures: 0,
         wide_copies: 0,
         wide_copy_scenes: 0,
@@ -317,7 +324,7 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
     );
     let _ = write!(
         text,
-        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} point_light_draws={} fixed_color_draws={} fix_b_draws={} cut_draws={} cut_fast_draws={} cut_off_draws={} wide_draws={} opaque_draws={} opaque_untested_draws={} opaque_rows_draws={} hidden_draws={} depth_only_draws={} hidden={}us flat_draws={} ge_filter_draws={} ge_wide_draws={} ge_wide_missed={} ge_wide_inexact={} wide_target_textures={} wide_copies={} wide_copy_scenes={} black_draws={} black_culled={} black_kept={} black_skipped={} strip_draws={} strip_indices={} strip_corners={} ge_depth_draws={} ge_depth_vertices={} ge_depth={}us opaque={}us ",
+        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} point_light_draws={} fixed_color_draws={} fix_b_draws={} cut_draws={} cut_fast_draws={} cut_off_draws={} wide_draws={} opaque_draws={} opaque_untested_draws={} opaque_rows_draws={} hidden_draws={} depth_only_draws={} hidden={}us flat_draws={} ge_filter_draws={} ge_wide_draws={} ge_wide_missed={} ge_wide_inexact={} ge_gather_draws={} ge_gather_missed={} wide_target_textures={} wide_copies={} wide_copy_scenes={} black_draws={} black_culled={} black_kept={} black_skipped={} strip_draws={} strip_indices={} strip_corners={} ge_depth_draws={} ge_depth_vertices={} ge_depth={}us opaque={}us ",
         per_frame(s.begin_us),
         per_frame(s.loop_us),
         per_frame(s.convert_us),
@@ -348,6 +355,8 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
         s.ge_wide_draws / frames,
         s.ge_wide_missed / frames,
         s.ge_wide_inexact,
+        s.ge_gather_draws / frames,
+        s.ge_gather_missed / frames,
         s.wide_target_textures / frames,
         s.wide_copies / frames,
         s.wide_copy_scenes / frames,

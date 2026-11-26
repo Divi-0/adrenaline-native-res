@@ -587,6 +587,14 @@ static MIP_TEST_DEFAULT_BIAS: AtomicU32 = AtomicU32::new(0);
 /// same pixels: for A/Bs).
 pub static WIDE_PROGRAMS: AtomicU32 = AtomicU32::new(1);
 
+/// Debug "gegather 0|1": GE-filtered draws of the PSP-depth set whose texture
+/// is not a wide copy take the GE_GATHER twin of their program: the four
+/// texels from one gather of the texture as it is (any format; power-of-two
+/// sizes without mip levels; never a view of one of our targets) instead of
+/// four point samples, the same pixels (DESIGN "seventy-fourth session").
+/// 1 is the default; 0: the four point samples.
+pub static GE_GATHER: AtomicU32 = AtomicU32::new(1);
+
 fn smooth_textures() -> bool {
     crate::frame_loop::SMOOTH_TEXTURES.load(Ordering::Relaxed) != 0
 }
@@ -2097,6 +2105,32 @@ impl Draws {
                 _ => stats().ge_wide_missed += 1,
             }
         }
+        // Any other texture of a power-of-two size without mip levels: the
+        // GE filter by the program's GE_GATHER sibling, one gather (the
+        // texture LINEAR-filtered below, so the texture unit takes the four
+        // texels) instead of four point samples, the same pixels (DESIGN
+        // "seventy-fourth session"). The twin's grouped size x 16 is the four
+        // point samples' product only for powers of two; with mip levels the
+        // unit would gather from the level it picks. Never a view of one of
+        // our targets (`from_target`: strided textures, the alpha-as-1
+        // format): gathered, God of War's target parts gave a wrong picture
+        // (most of the screen darker; cause not known).
+        let mut gather_filter = false;
+        if !wide_texture && !from_target && ge_size.is_some() && !ge_target_read && GE_GATHER.load(Ordering::Relaxed) != 0 {
+            // Safe: a texture description of ours.
+            let (width, height, levels) =
+                unsafe { (gxm::sceGxmTextureGetWidth(&texture.gxm), gxm::sceGxmTextureGetHeight(&texture.gxm), gxm::sceGxmTextureGetMipmapCount(&texture.gxm)) };
+            if width.is_power_of_two() && height.is_power_of_two() && levels <= 1 {
+                match self.programs.gather_program(fragment) {
+                    Some(program) => {
+                        fragment = program;
+                        gather_filter = true;
+                        stats().ge_gather_draws += 1;
+                    }
+                    None => stats().ge_gather_missed += 1,
+                }
+            }
+        }
         let read_stencil = if read { stencil_state } else { None };
         // Vertices in model space: the 3D program transforms them (raw
         // draws: their own blocks, `raw_transform_of` below).
@@ -2321,8 +2355,9 @@ impl Draws {
         if !skip(4) {
             let mut gxm_texture = texture.gxm;
             // GE_FILTER programs filter themselves from point samples; their
-            // GE_WIDE siblings from the texture unit's 16-bit lerps.
-            let linear = wide_filter || ((draw.flags & draw_flags::LINEAR_FILTER != 0 || smooth_textures()) && ge_size.is_none());
+            // GE_WIDE siblings from the texture unit's 16-bit lerps, their
+            // GE_GATHER siblings from the four texels of its footprint.
+            let linear = wide_filter || gather_filter || ((draw.flags & draw_flags::LINEAR_FILTER != 0 || smooth_textures()) && ge_size.is_none());
             if wide_texture && !wide_filter && linear {
                 stats().ge_wide_inexact += 1;
             }

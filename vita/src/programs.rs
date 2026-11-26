@@ -82,6 +82,10 @@ struct WideSibling {
     /// Null: not made (yet, or it couldn't be: `tried`).
     wide: *mut gxm::FragmentProgram,
     tried: bool,
+    /// The same from its GE_GATHER twin (nativeres_x_pspgather_f: one gather
+    /// of the texture as it is; DESIGN "seventy-fourth session").
+    gather: *mut gxm::FragmentProgram,
+    gather_tried: bool,
     fragment_gxp: *const gxm::Program,
     vertex_gxp: *const gxm::Program,
     info: Option<gxm::BlendInfo>,
@@ -91,6 +95,8 @@ const NO_WIDE_SIBLING: WideSibling = WideSibling {
     point: null_mut(),
     wide: null_mut(),
     tried: false,
+    gather: null_mut(),
+    gather_tried: false,
     fragment_gxp: null(),
     vertex_gxp: null(),
     info: None,
@@ -1026,6 +1032,8 @@ pub struct Programs {
     /// The last `wide_program` answer (point, wide): consecutive draws
     /// mostly share their program.
     wide_last: (*mut gxm::FragmentProgram, *mut gxm::FragmentProgram),
+    /// The same for `gather_program`.
+    gather_last: (*mut gxm::FragmentProgram, *mut gxm::FragmentProgram),
 }
 
 const NO_BLEND_PROGRAM: BlendProgram = BlendProgram { kind: Kind::Color, blend: 0, alpha: AlphaOut::AsColor, program: null_mut() };
@@ -1383,6 +1391,7 @@ impl Programs {
             wide: [NO_WIDE_SIBLING; MAX_WIDE_SIBLINGS],
             wide_count: 0,
             wide_last: (null_mut(), null_mut()),
+            gather_last: (null_mut(), null_mut()),
         }
     }
 
@@ -1429,6 +1438,7 @@ impl Programs {
         }
         addr_of_mut!((*place).wide_count).write(0);
         addr_of_mut!((*place).wide_last).write((null_mut(), null_mut()));
+        addr_of_mut!((*place).gather_last).write((null_mut(), null_mut()));
     }
 
     /// Notes `point`, made from `fragment_gxp` with `info` for `vertex_gxp`,
@@ -1478,6 +1488,36 @@ impl Programs {
         }
         self.wide_last = (point, sibling.wide);
         (!sibling.wide.is_null()).then_some(sibling.wide)
+    }
+
+    /// The gather sibling of fragment program `point` (for GE-filtered draws
+    /// of a texture the gather can read: draw.rs `GE_GATHER`), made on first
+    /// use; None as `wide_program`: the draw then keeps `point` and its four
+    /// point samples, the same pixels.
+    pub fn gather_program(&mut self, point: *mut gxm::FragmentProgram) -> Option<*mut gxm::FragmentProgram> {
+        if self.gather_last.0 == point && !point.is_null() {
+            return (!self.gather_last.1.is_null()).then_some(self.gather_last.1);
+        }
+        let index = (0..self.wide_count).find(|&i| self.wide[i].point == point)?;
+        let sibling = &mut self.wide[index];
+        if !sibling.gather_tried {
+            sibling.gather_tried = true;
+            let gather_gxp = shaders::gather_twin(sibling.fragment_gxp).unwrap_or(null());
+            let fits = !gather_gxp.is_null() && same_uniforms(sibling.fragment_gxp, gather_gxp);
+            if fits {
+                if let Some(id) = register(gather_gxp) {
+                    let info = sibling.info.as_ref().map_or(null(), |info| info as *const gxm::BlendInfo);
+                    sibling.gather = basic_programs::fragment_program(id, info, sibling.vertex_gxp);
+                }
+            }
+            render_log::line(format_args!(
+                "gather program {}: {}\n",
+                index,
+                if !fits { "other uniforms (not used)" } else if sibling.gather.is_null() { "failed" } else { "ready" }
+            ));
+        }
+        self.gather_last = (point, sibling.gather);
+        (!sibling.gather.is_null()).then_some(sibling.gather)
     }
 
     /// The frame-read program `variant` for a draw into a 16-bit PSP

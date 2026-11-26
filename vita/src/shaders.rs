@@ -106,6 +106,19 @@ fn depth_program(name: &[u8]) -> Option<*const u8> {
 /// for drawing wide textures (core `GpuFormat::Wide16`, DESIGN "sixty-fifth
 /// session"); None for any other program, or before the pack is loaded.
 pub fn wide_twin(program: *const crate::gxm::Program) -> Option<*const crate::gxm::Program> {
+    filter_twin(program, b"_pspwide_")
+}
+
+/// The GE_GATHER twin (nativeres_x_pspgather_f) of the pack's program
+/// `program`, as `wide_twin`: the GE's filter from one gather of the texture
+/// as it is (DESIGN "seventy-fourth session").
+pub fn gather_twin(program: *const crate::gxm::Program) -> Option<*const crate::gxm::Program> {
+    filter_twin(program, b"_pspgather_")
+}
+
+/// The pack's program named as `program` (a nativeres_x_pspdepth_f) with
+/// `twin` in place of "_pspdepth_".
+fn filter_twin(program: *const crate::gxm::Program, twin: &[u8]) -> Option<*const crate::gxm::Program> {
     // Safe: display thread only (programs are made there).
     let pack = unsafe { *DEPTH_PACK.get() }?;
     let name = (0..DEPTH_PACK_COUNT).find_map(|i| {
@@ -117,17 +130,16 @@ pub fn wide_twin(program: *const crate::gxm::Program) -> Option<*const crate::gx
         })
     })?;
     const DEPTH: &[u8] = b"_pspdepth_";
-    const WIDE: &[u8] = b"_pspwide_";
     let at = name.windows(DEPTH.len()).position(|part| part == DEPTH)?;
-    let mut wide = [0u8; DEPTH_PACK_NAME_BYTES];
-    let length = name.len() - DEPTH.len() + WIDE.len();
-    if length > wide.len() {
+    let mut twin_name = [0u8; DEPTH_PACK_NAME_BYTES];
+    let length = name.len() - DEPTH.len() + twin.len();
+    if length > twin_name.len() {
         return None;
     }
-    wide[..at].copy_from_slice(&name[..at]);
-    wide[at..at + WIDE.len()].copy_from_slice(WIDE);
-    wide[at + WIDE.len()..length].copy_from_slice(&name[at + DEPTH.len()..]);
-    depth_program(&wide[..length]).map(|start| start as *const crate::gxm::Program)
+    twin_name[..at].copy_from_slice(&name[..at]);
+    twin_name[at..at + twin.len()].copy_from_slice(twin);
+    twin_name[at + twin.len()..length].copy_from_slice(&name[at + DEPTH.len()..]);
+    depth_program(&twin_name[..length]).map(|start| start as *const crate::gxm::Program)
 }
 
 /// True once the loaded pack has the GE_WIDE twins (pspdepth.pak.z built

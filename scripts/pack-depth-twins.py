@@ -30,11 +30,13 @@ def twin_names():
             continue
         stem, *defines = line.split()
         # As scripts/shader-variants.sh: nativeres_x_f -> nativeres_x_pspdepth_f,
-        # the GE_FILTER ones also nativeres_x_pspwide_f (GE_WIDE).
+        # the GE_FILTER ones also nativeres_x_pspwide_f (GE_WIDE) and
+        # nativeres_x_pspgather_f (GE_GATHER).
         head, kind = stem.rsplit("_", 1)
         names.append(f"{head}_pspdepth_{kind}")
         if "GE_FILTER" in defines:
             names.append(f"{head}_pspwide_{kind}")
+            names.append(f"{head}_pspgather_{kind}")
     return names
 
 

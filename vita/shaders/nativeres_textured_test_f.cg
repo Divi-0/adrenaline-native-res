@@ -101,7 +101,35 @@ float4 GeShade(float4 texel, float4 vertexColor, float3 specular, float fog, flo
 // 2^13). Proof over all texel pairs and fractions, also one ulp off: DESIGN
 // "sixty-third session" (the old way rounded each texel first and went
 // through k / 255 again: 13 instructions more per pixel).
-#ifdef GE_WIDE
+#ifdef GE_GATHER
+// GE_GATHER (the "pspgather" twins, DESIGN "seventy-fourth session"; the four
+// point samples described above after the last #else): the four texels of the
+// bilinear footprint from one sample instruction (Sony's hidden
+// tex2D_gather4, declared by the shader compiler app; the texture
+// LINEAR-filtered, so the texture unit takes four; slots 0..3 = texels (0,0)
+// (1,0) (0,1) (1,1), measured), read at the corner the four share,
+// (cell + 1) / size: the middle of the footprint, half a texel from where it
+// would change, so the unit picks GeTexel's four texels whatever its own
+// rounding. The texels arrive as point samples do (k / 255 in fp32; palette
+// texels through the palette, 16-bit ones as the unit widens them), then the
+// same lerps. Any texture format and no copy of the texture; power-of-two
+// sizes (the grouped size x 16 is the four point samples' product only then).
+// 1 read instead of 4 and 12-14 instructions less. Same pixels as the four
+// point samples (device test gathertest: 0 differing pixels; 8888, palette,
+// 565, 5551, 4444).
+float4 GeTexel(sampler2D tex, float2 uv, float4 size)
+{
+	float2 step = 1.0f / size.xy;
+	float2 m = FLOOR(uv * (size.xy * 16.0f)) * (1.0f / 16.0f) - size.z * (1.0f / 16.0f);
+	float2 fraction = frac(m); // f / 16, exact
+	float2 f = fraction * size.w; // 0 for the GE's nearest texel
+	float4 t[4];
+	tex2D_gather4(tex, (m - fraction) * step + step, t);
+	float4 top = FLOOR((t[0] + (t[1] - t[0]) * f.x) * 255.0f + (1.0f / 32.0f));
+	float4 bottom = FLOOR((t[2] + (t[3] - t[2]) * f.x) * 255.0f + (1.0f / 32.0f));
+	return FLOOR(top + (bottom - top) * f.y);
+}
+#elif defined(GE_WIDE)
 // GE_WIDE (the "pspwide" twins, DESIGN "sixty-fifth session"; the four point
 // samples described above after #else): the texture is
 // the texture cache's U16x4 copy (GpuFormat::Wide16: k x 257, read as k / 255)
@@ -144,7 +172,7 @@ float4 GeTexel(sampler2D tex, float2 uv, float4 size)
 	float4 bottom = FLOOR((c + (d - c) * f.x) * 255.0f + (1.0f / 32.0f));
 	return FLOOR(top + (bottom - top) * f.y);
 }
-#endif // GE_WIDE
+#endif // GE_GATHER, GE_WIDE
 #define SAMPLE(tex, uv) GeTexel(tex, uv, uTexSize)
 #else
 #define SAMPLE(tex, uv) tex2D<half4>(tex, uv)
