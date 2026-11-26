@@ -406,6 +406,25 @@ __nativecolor __regformat unsigned char4 main(
 	float4 d = (float4)target;
 	float fixB = floor(uBlendFix.w * 255.0f + 0.5f);
 	float4 value = min(s + floor((d * 2.0f + 1.0f) * (fixB * 2.0f + 1.0f) * (1.0f / 1024.0f)), 255.0f);
+#elif defined(READ_NORMAL) && !defined(READ_565)
+	// One floor instead of two (2026-11-26, DESIGN "seventy-first session";
+	// 6 instructions less). A term t(v, f) = (2v + 1)(2f + 1) / 1024 has an odd
+	// numerator: before its cut it is never whole, at least 1/1024 from a whole
+	// number on either side. The conversion to bytes at the end rounds to the
+	// nearest (ties to even, saturating; measured on the Vita in steps of
+	// 1/1024), so floor(A) + B - 1/2 comes out as floor(A) + floor(B): only
+	// the source's term is floored here. With K = (2a + 1) / 512:
+	// k = (-K, 1 - K, -K / 2 - 1, -K / 2); c k.x + k.w = -A, and
+	// floor(-A) = -floor(A) - 1 (A is never whole), hence the - 1 in k.z;
+	// d k.y + k.z = B - 3/2. Every step a multiple of 1/1024 below 2^9: exact
+	// however the GPU rounds. `value` is NOT whole: up to 1/2 - 1/1024 off the
+	// blend's value, for the conversion (or the dither's clamp, which keeps
+	// that) to round. Checked for all byte inputs on the PC and on the Vita's
+	// GPU (0 wrong of 16,777,216).
+	float4 k = c.a * float4(-1.0f / 256.0f, -1.0f / 256.0f, -1.0f / 512.0f, -1.0f / 512.0f)
+		+ float4(-1.0f / 512.0f, 511.0f / 512.0f, -1025.0f / 1024.0f, -1.0f / 1024.0f);
+	float4 d = (float4)target;
+	float4 value = (d * k.y + k.z) - floor(c * k.x + k.w);
 #elif defined(READ_NORMAL)
 	float4 d = (float4)target;
 	float4 value = FLOOR((c * 2.0f + 1.0f) * ((c.a * 2.0f + 1.0f) * (1.0f / 1024.0f)))
@@ -421,6 +440,25 @@ __nativecolor __regformat unsigned char4 main(
 	// trail buffer fade. The target's read a hair below its whole value
 	// stays so; the 565 cut below rounds it.
 	float4 value = max((float4)target - c, 0.0f);
+#elif defined(READ_ADD) && !defined(READ_565) && !defined(READ_DITHER)
+	// The source's term half a level down, k = (K, K / 2 - 1 / 2) with K as
+	// above: the conversion to bytes rounds it to its floor (never below
+	// -1/2), and the GPU's saturating 8-bit add (`__add_sat`, one
+	// instruction) puts it onto the target: the target is not unpacked, no
+	// min (5 instructions less). An alpha of 0 added keeps the target's.
+	// Checked as the normal blend.
+#define READ_ADD_SAT 1
+	float2 k = c.a * float2(1.0f / 256.0f, 1.0f / 512.0f) + float2(1.0f / 512.0f, 1.0f / 1024.0f - 0.5f);
+	float4 value = c * k.x + k.y;
+#ifdef READ_KEEP_ALPHA
+	value.a = 0.0f;
+#endif
+#elif defined(READ_ADD) && !defined(READ_565)
+	// Dithered: the same term in floats (the dither's clamp and the
+	// conversion's rounding after it: `value` not whole, as the normal blend's).
+	float2 k = c.a * float2(1.0f / 256.0f, 1.0f / 512.0f) + float2(1.0f / 512.0f, 1.0f / 1024.0f - 0.5f);
+	float4 d = (float4)target;
+	float4 value = min((c * k.x + k.y) + d, 255.0f);
 #elif defined(READ_ADD)
 	float4 d = (float4)target;
 	float4 value = min(FLOOR((c * 2.0f + 1.0f) * ((c.a * 2.0f + 1.0f) * (1.0f / 1024.0f))) + d, 255.0f);
@@ -433,10 +471,15 @@ __nativecolor __regformat unsigned char4 main(
 	value.rgb = clamp(value.rgb + dither, 0.0f, 255.0f);
 #endif
 #ifdef READ_WIDE
-	// An 8-bit target: no cut; value is whole, the cast exact.
+	// An 8-bit target: no cut; the cast rounds to the nearest (the blends
+	// above leave it their last floor).
+#ifdef READ_ADD_SAT
+	unsigned char4 cut = __add_sat(target, (unsigned char4)value);
+#else
 	unsigned char4 cut = (unsigned char4)value;
 #ifdef READ_KEEP_ALPHA
 	cut.a = target.a;
+#endif
 #endif
 #elif defined(READ_OFF)
 	// The cut in floats (2 instructions less than the bit operations
@@ -472,7 +515,11 @@ __nativecolor __regformat unsigned char4 main(
 	unsigned char4 cut = (unsigned char4)(h * float4(8.25f, 4.0625f, 8.25f, 8.25f) - float4(0.375f, 0.46875f, 0.375f, 0.375f));
 	cut.a = (unsigned char)value.a;
 #else
+#ifdef READ_ADD_SAT
+	unsigned char4 v = __add_sat(target, (unsigned char4)value);
+#else
 	unsigned char4 v = (unsigned char4)value;
+#endif
 	unsigned char4 cut = (v & 0xF8) | (v >> 5);
 #endif
 #ifdef READ_KEEP_ALPHA
