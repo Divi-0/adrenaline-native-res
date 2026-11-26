@@ -111,15 +111,28 @@ done
 # of the pspdepth twin when the draw's texture is one, and as
 # nativeres_x_pspgather_f with GE_GATHER: the GE's filter from one gather of
 # the texture as it is (tex2D_gather4; DESIGN "seventy-fourth session").
+# A stem marked NO_DEPTH also as nativeres_x_nodepth_f, _nodepthwide_f and
+# _nodepthgather_f: those three without PSP_DEPTH, for draws without depth
+# test (DESIGN "seventy-sixth session").
 twins() {
   grep -v '^#' psp_depth_twins.txt | tr -d '\r' | while read -r stem defines; do
     [ -n "$stem" ] || continue
+    # NO_DEPTH is a mark, not a define: the GE_FILTER twins also without PSP_DEPTH (below).
+    nodepth=0
+    case " $defines " in
+      *" NO_DEPTH "*) nodepth=1; defines=$(echo " $defines " | sed 's/ NO_DEPTH / /; s/^ *//; s/ *$//') ;;
+    esac
     variant "$stem" "PSP_DEPTH $defines" "${stem%_?}_pspdepth_${stem##*_}"
     case " $defines " in
       *" GE_FILTER "*)
         variant "$stem" "PSP_DEPTH $defines GE_WIDE" "${stem%_?}_pspwide_${stem##*_}"
         variant "$stem" "PSP_DEPTH $defines GE_GATHER" "${stem%_?}_pspgather_${stem##*_}" ;;
     esac
+    if [ $nodepth = 1 ]; then
+      variant "$stem" "$defines" "${stem%_?}_nodepth_${stem##*_}"
+      variant "$stem" "$defines GE_WIDE" "${stem%_?}_nodepthwide_${stem##*_}"
+      variant "$stem" "$defines GE_GATHER" "${stem%_?}_nodepthgather_${stem##*_}"
+    fi
   done
 }
 # 8-bit targets (God of War): the GE's normal / additive blend without a cut

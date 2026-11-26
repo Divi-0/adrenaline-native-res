@@ -116,9 +116,28 @@ pub fn gather_twin(program: *const crate::gxm::Program) -> Option<*const crate::
     filter_twin(program, b"_pspgather_")
 }
 
+/// The twin WITHOUT the PSP depth of the pack's program `program` (a
+/// nativeres_x_pspdepth_f, _pspwide_f or _pspgather_f whose stem is marked
+/// NO_DEPTH in psp_depth_twins.txt): nativeres_x_nodepth_f, _nodepthwide_f,
+/// _nodepthgather_f, the same program without the depth output, for draws
+/// without depth test (DESIGN "seventy-sixth session"). None for any other
+/// program.
+pub fn nodepth_twin(program: *const crate::gxm::Program) -> Option<*const crate::gxm::Program> {
+    const FORMS: [(&[u8], &[u8]); 3] =
+        [(b"_pspdepth_", b"_nodepth_"), (b"_pspwide_", b"_nodepthwide_"), (b"_pspgather_", b"_nodepthgather_")];
+    FORMS.iter().find_map(|(from, to)| renamed_twin(program, from, to))
+}
+
 /// The pack's program named as `program` (a nativeres_x_pspdepth_f) with
 /// `twin` in place of "_pspdepth_".
 fn filter_twin(program: *const crate::gxm::Program, twin: &[u8]) -> Option<*const crate::gxm::Program> {
+    renamed_twin(program, b"_pspdepth_", twin)
+}
+
+/// The pack's program named as `program` with `twin` in place of `part`
+/// (None if `program` is not in the pack, its name has no `part`, or the
+/// pack has no program of the new name).
+fn renamed_twin(program: *const crate::gxm::Program, part: &[u8], twin: &[u8]) -> Option<*const crate::gxm::Program> {
     // Safe: display thread only (programs are made there).
     let pack = unsafe { *DEPTH_PACK.get() }?;
     let name = (0..DEPTH_PACK_COUNT).find_map(|i| {
@@ -129,16 +148,15 @@ fn filter_twin(program: *const crate::gxm::Program, twin: &[u8]) -> Option<*cons
             &stored[..stored.iter().position(|&byte| byte == 0).unwrap_or(DEPTH_PACK_NAME_BYTES)]
         })
     })?;
-    const DEPTH: &[u8] = b"_pspdepth_";
-    let at = name.windows(DEPTH.len()).position(|part| part == DEPTH)?;
+    let at = name.windows(part.len()).position(|window| window == part)?;
     let mut twin_name = [0u8; DEPTH_PACK_NAME_BYTES];
-    let length = name.len() - DEPTH.len() + twin.len();
+    let length = name.len() - part.len() + twin.len();
     if length > twin_name.len() {
         return None;
     }
     twin_name[..at].copy_from_slice(&name[..at]);
     twin_name[at..at + twin.len()].copy_from_slice(twin);
-    twin_name[at + twin.len()..length].copy_from_slice(&name[at + DEPTH.len()..]);
+    twin_name[at + twin.len()..length].copy_from_slice(&name[at + part.len()..]);
     depth_program(&twin_name[..length]).map(|start| start as *const crate::gxm::Program)
 }
 
@@ -266,6 +284,8 @@ embed_twin!(nativeres_textured_v, nativeres_textured_pspdepth_v);
 embed_twin!(nativeres_textured_f, nativeres_textured_pspdepth_f);
 // The same without fog and specular (most 2D draws): a third of the work.
 embed_twin!(nativeres_textured_flat_f, nativeres_textured_flat_pspdepth_f);
+// The flat one for draws of one vertex colour that need no PSP depth: half the work again.
+embed_twin!(nativeres_textured_const_f, nativeres_textured_const_pspdepth_f);
 // The same with the PSP's alpha test (discard).
 embed_twin!(nativeres_textured_test_f, nativeres_textured_test_pspdepth_f);
 // Grey FIX B blending through the alpha, without and with the alpha test.

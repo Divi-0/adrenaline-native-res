@@ -213,6 +213,41 @@ fn flat_shading(frame: &Frame, draw: &Draw) -> bool {
     draw.flags & draw_flags::FOG == 0 && FLAT_SHADING.load(Ordering::Relaxed) != 0 && !separate_specular(frame, draw)
 }
 
+/// Flat draws whose vertices all have one colour and that need no PSP depth
+/// go through the constant-colour program (nativeres_textured_const_f.cg:
+/// the colour as a uniform; God of War's bloom add over the whole screen 54
+/// -> 29 instructions per pixel, the same pixels). 1 = on (default), 0 = the
+/// flat program. Debug `constcolor`.
+pub static CONST_COLOR: AtomicI32 = AtomicI32::new(1);
+
+/// Draws without depth test of the PSP-depth set take their program's
+/// sibling without the PSP depth output where there is one
+/// (`Programs::nodepth_program`: the frame-read programs of God of War's
+/// depth-of-field pass, bright pass and HUD): the same pixels, one pass
+/// instead of two and 16 instructions less. 1 = on (default), 0 = the
+/// depth-writing program. Debug `nodepthtwins`.
+pub static NO_DEPTH_TWINS: AtomicI32 = AtomicI32::new(1);
+
+/// The one vertex colour of textured `draw` if it may take the
+/// constant-colour program in place of the flat one (`flat_shading` holds):
+/// vertices of ours (not raw or cached ones, whose colours the vertex
+/// program works out) that all share a colour (core `constant_color`), and
+/// no depth test, so the PSP depth the flat program writes is not used (the
+/// PSP writes depth only with the test on; `use_depth` sets ALWAYS
+/// without writes then).
+fn const_color(frame: &Frame, draw: &Draw) -> Option<u32> {
+    if CONST_COLOR.load(Ordering::Relaxed) == 0
+        || draw.tests & test_flags::DEPTH_TEST != 0
+        || draw.transform != 0
+        || draw.flags & (draw_flags::RAW_VERTICES | draw_flags::CACHED_VERTICES) != 0
+    {
+        return None;
+    }
+    let first = draw.first_vertex as usize;
+    let vertices = first.checked_add(draw.vertex_count as usize).and_then(|end| frame.vertices.get(first..end))?;
+    nativeres_core::opaque_source::constant_color(vertices)
+}
+
 /// True if textured `draw` samples only the first `rows` rows of its
 /// texture (the opaque ones, `texture::opaque_rows`): any draw when all
 /// are; else screen-space vertices with V clamped, by their largest v (core
@@ -1275,6 +1310,8 @@ impl Draws {
     /// scale, for the alpha-test program its range, for the BLEND_FIX ones
     /// FIX B. Set into a fresh default uniform buffer only when something
     /// changed. `flat`: the draw took the flat program (`Kind::TexturedFlat`).
+    /// `const_tint`: it took the constant-colour one (`Kind::TexturedConst`,
+    /// only with `ge_size`): its uTint, in place of fog and colour scale.
     ///
     /// `stencil_value`: the draw took a BLEND_FIX program for its stencil
     /// value (`StencilWay::FixProgram`): written as its alpha, the colour
@@ -1288,6 +1325,7 @@ impl Draws {
         &mut self,
         tested: bool,
         flat: bool,
+        const_tint: Option<[f32; 4]>,
         fog_and_scale: [f32; 4],
         alpha_range: [f32; 4],
         blend: u32,
@@ -1301,6 +1339,15 @@ impl Draws {
             Some(value) => [value as f32 / 255.0, 0.0, 0.0, 0.0],
             None => [((blend >> 12) & 0xFF) as f32 / 255.0, ((blend >> 20) & 3) as f32, 0.0, 0.0],
         };
+        if let (Some(size), Some(tint)) = (ge_size, const_tint) {
+            // The constant-colour program: its tint and the texture's size.
+            let buffer = reserve_fragment_uniforms();
+            set_uniform(buffer, textured.tint_const, 4, tint.as_ptr());
+            set_uniform(buffer, textured.tex_size_const, 4, size.as_ptr());
+            self.state.tint = None; // the cached default buffer is no longer the one in use
+            stats().const_draws += 1;
+            return;
+        }
         if let Some(size) = ge_size {
             // The texture's size too, per draw: no caching.
             let fixed = (fix_b || stencil_value.is_some()) && (ge_target_read || textured.have_fix);
@@ -1996,6 +2043,8 @@ impl Draws {
         let read = read_program.is_some();
         let read_alpha_range = if tested { alpha_range } else { ALPHA_ALL_PASS };
         let mut flat = false;
+        // The constant-colour program's uTint, if the draw took it.
+        let mut const_tint = None;
         // The stencil value through a BLEND_FIX program, or 0 by GXM's
         // alpha factors (`StencilWay`).
         let mut stencil_value = match stencil_way {
@@ -2018,11 +2067,30 @@ impl Draws {
                 Kind::TexturedTest
             } else if self.programs.textured.have_flat && flat_shading(frame, draw) {
                 flat = true;
-                Kind::TexturedFlat
+                // One vertex colour and no depth: the constant-colour program
+                // (only where it filters as the GE: the PSP-depth set; the
+                // plain one is not in use yet). Not with FIX B, which goes
+                // through the BLEND_FIX programs.
+                let fix_b = draw.blend & BLEND_ENABLED != 0 && draw.blend & BLEND_FIX_B_ALPHA != 0;
+                let textured = &self.programs.textured;
+                match const_color(frame, draw) {
+                    Some(color) if textured.have_const && !textured.tex_size_const.is_null() && !fix_b => {
+                        const_tint = Some(nativeres_core::opaque_source::const_tint(color, fog_and_scale(draw)[3]));
+                        Kind::TexturedConst
+                    }
+                    _ => Kind::TexturedFlat,
+                }
             } else {
                 Kind::Textured
             };
-            self.programs.blend_program_with(kind, draw.blend, keep, alpha_out)
+            let program = self.programs.blend_program_with(kind, draw.blend, keep, alpha_out);
+            if const_tint.is_some() && program.is_null() {
+                // No constant-colour program for this blend: the flat one.
+                const_tint = None;
+                self.programs.blend_program_with(Kind::TexturedFlat, draw.blend, keep, alpha_out)
+            } else {
+                program
+            }
         } else {
             null_mut()
         };
@@ -2033,6 +2101,7 @@ impl Draws {
         }
         if flat && fragment.is_null() {
             flat = false;
+            const_tint = None;
             fragment = self.programs.blend_program_with(Kind::Textured, draw.blend, keep, alpha_out);
         }
         if tested && fragment.is_null() {
@@ -2064,6 +2133,7 @@ impl Draws {
             if !program.is_null() {
                 fragment = program;
                 flat = false;
+                const_tint = None;
                 ge_size = Some(ge_texel_size(&texture.gxm, true));
                 ge_target_read = true;
                 stats().ge_filter_draws += 1;
@@ -2083,6 +2153,8 @@ impl Draws {
                 textured.tex_size_fix
             } else if tested {
                 textured.tex_size_test
+            } else if const_tint.is_some() {
+                textured.tex_size_const
             } else if flat {
                 textured.tex_size_flat
             } else {
@@ -2143,6 +2215,16 @@ impl Draws {
                     }
                     None => stats().ge_gather_missed += 1,
                 }
+            }
+        }
+        // No depth test: the PSP depth the program writes is not used (the
+        // PSP writes depth only with the test on; `use_depth` sets ALWAYS
+        // without depth writes), so its sibling without that output draws
+        // the same pixels (`NO_DEPTH_TWINS`).
+        if draw.tests & test_flags::DEPTH_TEST == 0 && NO_DEPTH_TWINS.load(Ordering::Relaxed) != 0 && crate::shaders::psp_depth() {
+            if let Some(program) = self.programs.nodepth_program(fragment) {
+                fragment = program;
+                stats().nodepth_draws += 1;
             }
         }
         let read_stencil = if read { stencil_state } else { None };
@@ -2297,7 +2379,7 @@ impl Draws {
                 if read {
                     self.read_fragment_uniforms(frame, draw, read_variant, tested, Some((fog_and_scale(draw), read_alpha_range)), read_stencil, ge_size);
                 } else {
-                    self.textured_fragment_uniforms(tested, flat, fog_and_scale(draw), alpha_range, draw.blend, stencil_value, ge_size, ge_target_read);
+                    self.textured_fragment_uniforms(tested, flat, const_tint, fog_and_scale(draw), alpha_range, draw.blend, stencil_value, ge_size, ge_target_read);
                 }
             }
         } else if !fragment.is_null() {
@@ -2354,7 +2436,7 @@ impl Draws {
                 if read {
                     self.read_fragment_uniforms(frame, draw, read_variant, tested, Some((fog_and_scale(draw), read_alpha_range)), read_stencil, ge_size);
                 } else {
-                    self.textured_fragment_uniforms(tested, flat, fog_and_scale(draw), alpha_range, draw.blend, stencil_value, ge_size, ge_target_read);
+                    self.textured_fragment_uniforms(tested, flat, const_tint, fog_and_scale(draw), alpha_range, draw.blend, stencil_value, ge_size, ge_target_read);
                 }
             }
         } else {
@@ -2814,8 +2896,8 @@ impl Draws {
         let ge = |tex_size: *const ProgramParameter| if tex_size.is_null() { None } else { nearest };
         let (eight_bit_ge, flat_ge) = (ge(if tested { textured.tex_size_test } else { textured.tex_size }), ge(textured.tex_size_flat));
         match program {
-            ShadeProgram::EightBit => self.textured_fragment_uniforms(tested, false, case.fog_and_scale, alpha_test, 0, None, eight_bit_ge, false),
-            ShadeProgram::Flat => self.textured_fragment_uniforms(false, true, case.fog_and_scale, alpha_test, 0, None, flat_ge, false),
+            ShadeProgram::EightBit => self.textured_fragment_uniforms(tested, false, None, case.fog_and_scale, alpha_test, 0, None, eight_bit_ge, false),
+            ShadeProgram::Flat => self.textured_fragment_uniforms(false, true, None, case.fog_and_scale, alpha_test, 0, None, flat_ge, false),
             ShadeProgram::Cut5551 | ShadeProgram::Wide => {
                 let read = self.programs.made_read_program(true, tested, off);
                 let (fog_and_scale, alpha) = (read.fog_and_scale, read.alpha_test);

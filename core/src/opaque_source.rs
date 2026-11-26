@@ -178,6 +178,31 @@ pub fn samples_only_rows(vertices: &[crate::frame::FrameVertex], flags: u32, hei
     last_sampled_row(v_max, height, flags & draw_flags::LINEAR_FILTER != 0) < rows as u32
 }
 
+/// The colour all of a draw's CPU `vertices` share (0xAABBGGRR), if they
+/// do: such a draw is shaded by the constant-colour program
+/// (nativeres_textured_const_f.cg, `const_tint`) instead of the flat one,
+/// the same pixels in half the instructions (God of War's full-screen bloom
+/// passes). None for no vertices.
+pub fn constant_color(vertices: &[crate::frame::FrameVertex]) -> Option<u32> {
+    let color = vertices.first()?.color;
+    vertices.iter().all(|vertex| vertex.color == color).then_some(color)
+}
+
+/// The constant-colour program's uTint for vertex colour `color`
+/// (0xAABBGGRR) and the draw's colour scale (1, or 2 with colour doubling:
+/// RGB only): (p + 1) x scale / 256 per channel, what the flat program
+/// multiplies the texel's whole value with ((p + 1) t >> 8 as the GE's
+/// modulate, nativeres_textured_flat_f.cg). Exact in f32: p + 1 <= 256 and
+/// the scale a power of two.
+pub fn const_tint(color: u32, scale: f32) -> [f32; 4] {
+    let mut tint = [0.0f32; 4];
+    for (channel, value) in tint.iter_mut().enumerate() {
+        let plus_one = (((color >> (8 * channel)) & 0xFF) + 1) as f32;
+        *value = plus_one * if channel < 3 { scale } else { 1.0 } * (1.0 / 256.0);
+    }
+    tint
+}
+
 /// The vertex numbers a raw draw (`draw_flags::RAW_VERTICES`) uses, as
 /// `first..end` counted from its window (`Draw::first_vertex`): from its
 /// index runs or its triangle list. None without any.
@@ -212,6 +237,47 @@ mod tests {
         for source in 0..=255 {
             for target in 0..=255 {
                 assert_eq!(ge_blend_term(source, 255) + ge_blend_term(target, 0), source, "source {source}, target {target}");
+            }
+        }
+    }
+
+    fn vertex(color: u32) -> crate::frame::FrameVertex {
+        crate::frame::FrameVertex { color, ..Default::default() }
+    }
+
+    #[test]
+    fn a_draw_has_a_constant_colour_only_if_every_vertex_has_it() {
+        assert_eq!(constant_color(&[]), None);
+        assert_eq!(constant_color(&[vertex(0xFF33_4C65)]), Some(0xFF33_4C65));
+        assert_eq!(constant_color(&[vertex(0xFFFF_FFFF); 6]), Some(0xFFFF_FFFF));
+        let mut vertices = [vertex(0xFFFF_FFFF); 6];
+        vertices[5].color = 0xFEFF_FFFF;
+        assert_eq!(constant_color(&vertices), None);
+    }
+
+    /// The constant-colour program's product t x uTint - 127.5 / 256, taken to
+    /// bytes as its floor saturated at 255 (the program's conversion), is the
+    /// GE's modulate (p + 1) t >> 8 (x 2 with colour doubling, clamped) that
+    /// the flat program works out from the vertex colour, for every texel
+    /// value, colour byte and scale; every step is exact in f32.
+    #[test]
+    fn the_constant_tint_gives_the_flat_programs_bytes() {
+        for scale in [1u32, 2] {
+            for p in 0..=255u32 {
+                let tint = const_tint(p | p << 8 | p << 16 | p << 24, scale as f32);
+                for t in 0..=255u32 {
+                    // RGB (scaled) and alpha (never scaled).
+                    for (channel, factor) in [(0, scale), (3, 1)] {
+                        let product = t as f32 * tint[channel];
+                        assert_eq!(product as f64, (t * (p + 1) * factor) as f64 / 256.0, "exact product: t {t} p {p}");
+                        let shifted = product - 127.5 / 256.0;
+                        // The conversion to bytes rounds to nearest: + 0.5, floor, saturate.
+                        let byte = ((shifted + 0.5) as u32).min(255);
+                        let ge = ((t * (p + 1)) >> 8) * factor;
+                        let ge = if factor == 2 { (t * (p + 1) * 2 >> 8).min(255) } else { ge };
+                        assert_eq!(byte, ge, "t {t} p {p} scale {factor}");
+                    }
+                }
             }
         }
     }

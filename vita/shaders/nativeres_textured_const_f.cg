@@ -1,0 +1,135 @@
+// shacc: precise
+// shacc: exact-math
+// (Compile options: as nativeres_textured_flat_f.cg.)
+// NativeRes: fragment program for textured draws of ONE vertex colour,
+// without fog, without a separate specular colour and without the PSP depth
+// (God of War's full-screen bloom passes, copies between targets):
+// nativeres_textured_flat_f.cg with the vertex colour as a uniform, the same
+// pixels in fewer instructions (a full-screen pass is shaded per pixel).
+//
+// Why exact. The flat program works out p + 1 = floor(c * overW * 255 + 1.01)
+// from the interpolated vertex colour c (the colour times w, divided by the
+// interpolated w again): with every vertex of the draw the same colour byte p
+// that is p + 1 at every pixel (interpolation and the division by w are off
+// by parts in 10^7, the floor's margin is 0.01), so the product
+// (p + 1) t scale / 256 is the same number when p + 1 comes as a uniform:
+// uTint = (p + 1) scale / 256 per channel (alpha: scale 1), worked out by
+// the renderer (draw.rs `const_tint`), exact in fp32 (p + 1 <= 256, the scale
+// 1 or 2), and t uTint exact too (t <= 255: at most 17 bits). The texel t
+// comes from the same GeTexel / rounding as there. The rest of the flat
+// program does not reach the colour: the PSP depth it writes is not used by
+// a draw without depth test (the PSP writes depth only with the test on:
+// draw.rs sets ALWAYS without depth writes), so the PSP-depth set takes this
+// program only for such draws (draw.rs `const_color`).
+//
+// uTint: (p + 1) x colour scale / 256 per channel.
+//
+// Compiled on the Vita with the shader compiler app (README.md "Shaders").
+#define FLOOR(x) ((x) - frac(x))
+
+// GE_FILTER: the GE's filter (nativeres_textured_f.cg's comment; keep GeTexel the same).
+#ifdef GE_FILTER
+// The GE's bilinear filter of a point-filtered texture, as the GE's whole
+// values 0..255 (GeShade and the flat program take them as they are). Point
+// samples of 8-bit texels are k / 255 in fp32 (tex2D<float4>; within an ulp:
+// within 0.0001 levels). The horizontal lerps on them unrounded: the GE's
+// value (A (16 - f) + B f) / 16 is a multiple of 1/16, so + 1/32 floors it to
+// the GE's truncation; the vertical lerp on whole values is exact (sums below
+// 2^13). Proof over all texel pairs and fractions, also one ulp off: DESIGN
+// "sixty-third session" (the old way rounded each texel first and went
+// through k / 255 again: 13 instructions more per pixel).
+#ifdef GE_GATHER
+// GE_GATHER (the "pspgather" twins, DESIGN "seventy-fourth session"; the four
+// point samples described above after the last #else): the four texels of the
+// bilinear footprint from one sample instruction (Sony's hidden
+// tex2D_gather4, declared by the shader compiler app; the texture
+// LINEAR-filtered, so the texture unit takes four; slots 0..3 = texels (0,0)
+// (1,0) (0,1) (1,1), measured), read at the corner the four share,
+// (cell + 1) / size: the middle of the footprint, half a texel from where it
+// would change, so the unit picks GeTexel's four texels whatever its own
+// rounding. The texels arrive as point samples do (k / 255 in fp32; palette
+// texels through the palette, 16-bit ones as the unit widens them), then the
+// same lerps. Any texture format and no copy of the texture; power-of-two
+// sizes (the grouped size x 16 is the four point samples' product only then).
+// 1 read instead of 4 and 12-14 instructions less. Same pixels as the four
+// point samples (device test gathertest: 0 differing pixels; 8888, palette,
+// 565, 5551, 4444).
+float4 GeTexel(sampler2D tex, float2 uv, float4 size)
+{
+	float2 step = 1.0f / size.xy;
+	float2 m = FLOOR(uv * (size.xy * 16.0f)) * (1.0f / 16.0f) - size.z * (1.0f / 16.0f);
+	float2 fraction = frac(m); // f / 16, exact
+	float2 f = fraction * size.w; // 0 for the GE's nearest texel
+	float4 t[4];
+	tex2D_gather4(tex, (m - fraction) * step + step, t);
+	float4 top = FLOOR((t[0] + (t[1] - t[0]) * f.x) * 255.0f + (1.0f / 32.0f));
+	float4 bottom = FLOOR((t[2] + (t[3] - t[2]) * f.x) * 255.0f + (1.0f / 32.0f));
+	return FLOOR(top + (bottom - top) * f.y);
+}
+#elif defined(GE_WIDE)
+// GE_WIDE (the "pspwide" twins, DESIGN "sixty-fifth session"; the four point
+// samples described above after #else): the texture is
+// the texture cache's U16x4 copy (GpuFormat::Wide16: k x 257, read as k / 255)
+// with the LINEAR filter, of power-of-two size. The texture unit does the
+// horizontal lerps (A (16 - f) + B f) / 16 at 16 bits (within 1/257 level;
+// at 8 bits it rounds to whole values, 1 off: tested), each row read at its
+// centre (vertical weight 0) and texel centre + f / 16 (exact coordinates:
+// the size is a power of two); + 1/32 floors to the GE's truncation as
+// below. 2 reads instead of 4 and 10 instructions less. Same pixels as the
+// four point samples (device test getexeltest, 0 of 262144 pixels differ).
+float4 GeTexel(sampler2D tex, float2 uv, float4 size)
+{
+	float2 step = 1.0f / size.xy;
+	float2 m = FLOOR(uv * (size.xy * 16.0f)) * (1.0f / 16.0f) - size.z * (1.0f / 16.0f);
+	float2 fraction = frac(m); // f / 16, exact
+	// (cell.x + f.x w, cell.y) with cell = m - fraction, then the texel centres (2026-11-26,
+	// DESIGN "seventy-second session"; 1 instruction less than cell + 0.5 per axis). Every
+	// value a multiple of 1/16 texel below 2^19 texels and the step a power of two: each step exact
+	// in any order the compiler picks, the same coordinates as before.
+	float2 at = (m + fraction * float2(size.w - 1.0f, -1.0f)) * step + 0.5f * step;
+	float4 top = FLOOR(tex2D<float4>(tex, at) * 255.0f + (1.0f / 32.0f));
+	float4 bottom = FLOOR(tex2D<float4>(tex, float2(at.x, at.y + step.y)) * 255.0f + (1.0f / 32.0f));
+	return FLOOR(top + (bottom - top) * (fraction.y * size.w));
+}
+#else
+float4 GeTexel(sampler2D tex, float2 uv, float4 size)
+{
+	float2 step = 1.0f / size.xy; // only lands the reads inside their texels
+	float2 p = FLOOR(uv * size.xy * 16.0f) - size.z;
+	float2 m = p * (1.0f / 16.0f);
+	float2 fraction = frac(m); // f / 16, exact
+	float2 at = (m - fraction + 0.5f) * step;
+	float2 next = at + step;
+	float2 f = fraction * size.w; // 0 for the GE's nearest texel
+	float4 a = tex2D<float4>(tex, at);
+	float4 b = tex2D<float4>(tex, float2(next.x, at.y));
+	float4 c = tex2D<float4>(tex, float2(at.x, next.y));
+	float4 d = tex2D<float4>(tex, next);
+	float4 top = FLOOR((a + (b - a) * f.x) * 255.0f + (1.0f / 32.0f));
+	float4 bottom = FLOOR((c + (d - c) * f.x) * 255.0f + (1.0f / 32.0f));
+	return FLOOR(top + (bottom - top) * f.y);
+}
+#endif // GE_GATHER, GE_WIDE
+#define SAMPLE(tex, uv) GeTexel(tex, uv, uTexSize)
+#else
+#define SAMPLE(tex, uv) tex2D<half4>(tex, uv)
+#endif
+
+__regformat unsigned char4 main(
+	float2 vTexcoord : TEXCOORD0,
+	uniform sampler2D tex,
+#ifdef GE_FILTER
+	uniform float4 uTexSize,
+#endif
+	uniform float4 uTint) : COLOR
+{
+#ifdef GE_FILTER
+	float4 t = SAMPLE(tex, vTexcoord); // GeTexel's whole values
+#else
+	float4 t = FLOOR(SAMPLE(tex, vTexcoord) * 255.0f + 0.5f); // rounded: GeShade's comment
+#endif
+	// The 8-bit values written by the program itself, as the flat program
+	// (nativeres_textured_f.cg OUT_BYTES): the product half a level down goes
+	// through the conversion to bytes as its floor, saturated at 255.
+	return (unsigned char4)(t * uTint - (127.5f / 256.0f));
+}

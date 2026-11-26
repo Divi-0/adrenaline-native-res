@@ -51,6 +51,10 @@ pub enum Kind {
     /// `Textured` for draws without fog and without a separate specular
     /// colour (nativeres_textured_flat_f.cg): the same pixels, less work.
     TexturedFlat,
+    /// `TexturedFlat` for draws whose vertices share one colour and that
+    /// need no PSP depth (nativeres_textured_const_f.cg): the colour as a
+    /// uniform, the same pixels, half the work again.
+    TexturedConst,
     TexturedTest,
     TexturedFix,
     TexturedTestFix,
@@ -86,6 +90,10 @@ struct WideSibling {
     /// of the texture as it is; DESIGN "seventy-fourth session").
     gather: *mut gxm::FragmentProgram,
     gather_tried: bool,
+    /// The point, wide and gather program again without the PSP depth
+    /// output (`Programs::nodepth_program`; null: not made).
+    nodepth: [*mut gxm::FragmentProgram; 3],
+    nodepth_tried: [bool; 3],
     fragment_gxp: *const gxm::Program,
     vertex_gxp: *const gxm::Program,
     info: Option<gxm::BlendInfo>,
@@ -97,6 +105,8 @@ const NO_WIDE_SIBLING: WideSibling = WideSibling {
     tried: false,
     gather: null_mut(),
     gather_tried: false,
+    nodepth: [null_mut(); 3],
+    nodepth_tried: [false; 3],
     fragment_gxp: null(),
     vertex_gxp: null(),
     info: None,
@@ -191,6 +201,11 @@ pub struct Textured {
     pub have_flat: bool,
     fragment_flat_id: PatcherId,
     pub fog_and_scale_flat: *const ProgramParameter,
+    /// nativeres_textured_const_f.cg: one vertex colour (uTint), no PSP depth.
+    pub have_const: bool,
+    fragment_const_id: PatcherId,
+    pub tint_const: *const ProgramParameter,
+    pub tex_size_const: *const ProgramParameter,
     /// nativeres_textured_test_f.cg: the fragment program with the alpha test.
     pub have_test: bool,
     fragment_test_id: PatcherId,
@@ -1034,6 +1049,8 @@ pub struct Programs {
     wide_last: (*mut gxm::FragmentProgram, *mut gxm::FragmentProgram),
     /// The same for `gather_program`.
     gather_last: (*mut gxm::FragmentProgram, *mut gxm::FragmentProgram),
+    /// The last `nodepth_program` answer (program, its sibling or null).
+    nodepth_last: (*mut gxm::FragmentProgram, *mut gxm::FragmentProgram),
 }
 
 const NO_BLEND_PROGRAM: BlendProgram = BlendProgram { kind: Kind::Color, blend: 0, alpha: AlphaOut::AsColor, program: null_mut() };
@@ -1329,6 +1346,10 @@ impl Textured {
             depth_far: null(),
             fog_and_scale: null(),
             have_flat: false,
+            have_const: false,
+            fragment_const_id: null_mut(),
+            tint_const: null(),
+            tex_size_const: null(),
             fragment_flat_id: null_mut(),
             fog_and_scale_flat: null(),
             tex_size: null(),
@@ -1392,6 +1413,7 @@ impl Programs {
             wide_count: 0,
             wide_last: (null_mut(), null_mut()),
             gather_last: (null_mut(), null_mut()),
+            nodepth_last: (null_mut(), null_mut()),
         }
     }
 
@@ -1439,6 +1461,7 @@ impl Programs {
         addr_of_mut!((*place).wide_count).write(0);
         addr_of_mut!((*place).wide_last).write((null_mut(), null_mut()));
         addr_of_mut!((*place).gather_last).write((null_mut(), null_mut()));
+        addr_of_mut!((*place).nodepth_last).write((null_mut(), null_mut()));
     }
 
     /// Notes `point`, made from `fragment_gxp` with `info` for `vertex_gxp`,
@@ -1518,6 +1541,58 @@ impl Programs {
         }
         self.gather_last = (point, sibling.gather);
         (!sibling.gather.is_null()).then_some(sibling.gather)
+    }
+
+    /// The sibling of fragment program `program` WITHOUT the PSP depth
+    /// output, for a draw without depth test: such a draw does not use the
+    /// depth its program writes (draw.rs `use_depth`: ALWAYS, no depth
+    /// writes), and a program without it runs in one pass with 16
+    /// instructions less (DESIGN "seventy-sixth session"). `program`: a
+    /// GE-filtered program of the PSP-depth set (`note_wide_candidate`) or
+    /// its wide or gather sibling. Made on first use from the twin
+    /// `shaders::nodepth_twin` names, with the same blending and vertex
+    /// program; None if there is none (only a few programs have one:
+    /// psp_depth_twins.txt NO_DEPTH), it has other uniforms or it couldn't be
+    /// made: the draw then keeps `program`, the same pixels.
+    pub fn nodepth_program(&mut self, program: *mut gxm::FragmentProgram) -> Option<*mut gxm::FragmentProgram> {
+        if program.is_null() {
+            return None;
+        }
+        if self.nodepth_last.0 == program {
+            return (!self.nodepth_last.1.is_null()).then_some(self.nodepth_last.1);
+        }
+        self.nodepth_last = (program, null_mut());
+        // Which sibling entry `program` belongs to, and as which form.
+        let (index, form) = (0..self.wide_count).find_map(|i| {
+            let sibling = &self.wide[i];
+            [sibling.point, sibling.wide, sibling.gather].iter().position(|&known| known == program).map(|form| (i, form))
+        })?;
+        let sibling = &mut self.wide[index];
+        if !sibling.nodepth_tried[form] {
+            sibling.nodepth_tried[form] = true;
+            let form_gxp = match form {
+                0 => Some(sibling.fragment_gxp),
+                1 => shaders::wide_twin(sibling.fragment_gxp),
+                _ => shaders::gather_twin(sibling.fragment_gxp),
+            };
+            if let Some(twin_gxp) = form_gxp.and_then(shaders::nodepth_twin) {
+                let fits = same_uniforms(form_gxp.unwrap_or(null()), twin_gxp);
+                if fits {
+                    if let Some(id) = register(twin_gxp) {
+                        let info = sibling.info.as_ref().map_or(null(), |info| info as *const gxm::BlendInfo);
+                        sibling.nodepth[form] = basic_programs::fragment_program(id, info, sibling.vertex_gxp);
+                    }
+                }
+                render_log::line(format_args!(
+                    "no-depth program {} (form {}): {}\n",
+                    index,
+                    form,
+                    if !fits { "other uniforms (not used)" } else if sibling.nodepth[form].is_null() { "failed" } else { "ready" }
+                ));
+            }
+        }
+        self.nodepth_last = (program, sibling.nodepth[form]);
+        (!sibling.nodepth[form].is_null()).then_some(sibling.nodepth[form])
     }
 
     /// The frame-read program `variant` for a draw into a 16-bit PSP
@@ -1608,6 +1683,7 @@ impl Programs {
         }
         render_log::line(format_args!("our programs ready\n"));
         self.make_flat_program();
+        self.make_const_program();
         self.make_alpha_test_program();
         self.make_blend_fix_programs();
         self.make_ge_filter_programs();
@@ -1631,6 +1707,24 @@ impl Programs {
             return;
         }
         textured.have_flat = true;
+    }
+
+    /// The variant for one vertex colour (nativeres_textured_const_f.cg).
+    fn make_const_program(&mut self) {
+        let textured = &mut self.textured;
+        let program = gxp(&shaders::nativeres_textured_const_f);
+        let Some(id) = register(program) else {
+            render_log::line(format_args!("constant-colour program: invalid GXP\n"));
+            return;
+        };
+        textured.fragment_const_id = id;
+        textured.tint_const = parameter(program, b"uTint\0");
+        textured.tex_size_const = parameter(program, b"uTexSize\0");
+        if textured.tint_const.is_null() {
+            render_log::line(format_args!("constant-colour program: parameters missing\n"));
+            return;
+        }
+        textured.have_const = true;
     }
 
     /// The alpha-test variant (nativeres_textured_test_f.cg). Once it is
@@ -1795,6 +1889,7 @@ impl Programs {
             Kind::TexturedTestFix if textured.have_test && textured.have_fix => textured.fragment_test_fix_id,
             Kind::Textured => textured.fragment_id,
             Kind::TexturedFlat if textured.have_flat => textured.fragment_flat_id,
+            Kind::TexturedConst if textured.have_const => textured.fragment_const_id,
             Kind::TexturedGe if textured.have_ge => textured.fragment_ge_id,
             Kind::TexturedFixGe if textured.have_ge => textured.fragment_fix_ge_id,
             _ => return null_mut(),
@@ -1908,6 +2003,7 @@ fn textured_gxp(kind: Kind) -> Option<*const gxm::Program> {
     Some(match kind {
         Kind::Textured => gxp(&shaders::nativeres_textured_f),
         Kind::TexturedFlat => gxp(&shaders::nativeres_textured_flat_f),
+        Kind::TexturedConst => gxp(&shaders::nativeres_textured_const_f),
         Kind::TexturedTest => gxp(&shaders::nativeres_textured_test_f),
         Kind::TexturedFix => gxp(&shaders::nativeres_textured_fix_f),
         Kind::TexturedTestFix => gxp(&shaders::nativeres_textured_test_fix_f),

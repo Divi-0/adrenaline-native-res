@@ -37,6 +37,11 @@ def twin_names():
         if "GE_FILTER" in defines:
             names.append(f"{head}_pspwide_{kind}")
             names.append(f"{head}_pspgather_{kind}")
+        # The same three without the PSP depth, for draws without depth test.
+        if "NO_DEPTH" in defines:
+            names.append(f"{head}_nodepth_{kind}")
+            names.append(f"{head}_nodepthwide_{kind}")
+            names.append(f"{head}_nodepthgather_{kind}")
     return names
 
 
