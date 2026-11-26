@@ -619,6 +619,36 @@ fn wide_mode_widens_palette_and_8888_textures() {
 
 /// Wide textures only while the arena keeps WIDE_ARENA_RESERVE free; then
 /// the next ones stay palette textures, and without an arena none is wide.
+/// The GPU crash of 2026-11-26 ("GPU Driver detects GPU Crash", twice at the
+/// same scene of the lab test debug/lab/gather74, combination 12): the gather
+/// twin of the opaque textured program (nativeres_textured_pspgather_f)
+/// drawing a 64 x 64 strided view, no mip levels, of a 128 x 64 block. The
+/// texture unit does not apply a strided texture's stride to a gather: it
+/// reads other memory. Such a texture must never be gathered, whatever else
+/// is true of it.
+#[test]
+fn gpu_crash_gather_of_a_strided_view() {
+    // The crashing input: the view as the lab made it (not marked as a target's).
+    assert!(!gpu::gather_texture(64, 64, 0, true, false));
+    // As the renderer makes them: views of parts of its targets.
+    assert!(!gpu::gather_texture(64, 64, 0, true, true));
+    assert!(!gpu::gather_texture(256, 256, 0, true, true));
+    // A view of a target is kept off the gather even if it were not strided.
+    assert!(!gpu::gather_texture(64, 64, 0, false, true));
+}
+
+#[test]
+fn gather_textures_are_whole_power_of_two_textures_without_levels() {
+    assert!(gpu::gather_texture(64, 64, 0, false, false));
+    assert!(gpu::gather_texture(128, 32, 1, false, false));
+    assert!(gpu::gather_texture(512, 512, 0, false, false));
+    // Sizes that are no powers of two, mip levels.
+    assert!(!gpu::gather_texture(48, 64, 0, false, false));
+    assert!(!gpu::gather_texture(64, 480, 0, false, false));
+    assert!(!gpu::gather_texture(64, 64, 2, false, false));
+    assert!(!gpu::gather_texture(64, 64, 7, false, false));
+}
+
 #[test]
 fn wide_textures_leave_room_in_the_arena() {
     let mut test = Test::new();

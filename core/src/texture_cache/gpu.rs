@@ -119,6 +119,27 @@ pub fn wide_texture(texture: &TextureDescriptor) -> bool {
         && texture_level_count(texture) == 1
 }
 
+/// True if a GE-filtered draw may take the four texels of its texture from
+/// one gather (the GE_GATHER programs' `tex2D_gather4`, DESIGN
+/// "seventy-fourth session") instead of four point samples:
+///
+/// - never a strided texture (the views of parts of our targets,
+///   `sceGxmTextureInitLinearStrided`): the texture unit does not apply the
+///   stride to a gather. It returns texels from other places (measured: the
+///   columns scattered over the whole picture), and the gather twin of the
+///   opaque textured program drawing a 64 x 64 strided view of a 128 x 64
+///   block crashed the GPU ("GPU Driver detects GPU Crash", 2026-11-26,
+///   twice at the same scene): the reads leave the mapped memory;
+/// - never a view of one of our targets at all (`from_target`): those are
+///   the strided ones today, and their parts have wide copies;
+/// - sizes that are powers of two (the twin's grouped size x 16 is the four
+///   point samples' product only then; PSP textures always are);
+/// - no mip levels (the unit would gather from the level it picks; `levels`
+///   as GXM counts them: 0 or 1 without any).
+pub fn gather_texture(width: u32, height: u32, levels: u32, strided: bool, from_target: bool) -> bool {
+    !strided && !from_target && width.is_power_of_two() && height.is_power_of_two() && levels <= 1
+}
+
 /// What a GPU texture is made as. Retired textures are only reused for a
 /// texture of exactly the same shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

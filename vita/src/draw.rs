@@ -2111,16 +2111,23 @@ impl Draws {
         // texels) instead of four point samples, the same pixels (DESIGN
         // "seventy-fourth session"). The twin's grouped size x 16 is the four
         // point samples' product only for powers of two; with mip levels the
-        // unit would gather from the level it picks. Never a view of one of
-        // our targets (`from_target`: strided textures, the alpha-as-1
-        // format): gathered, God of War's target parts gave a wrong picture
-        // (most of the screen darker; cause not known).
+        // unit would gather from the level it picks. Never a strided texture
+        // or a view of one of our targets (core `gather_texture`): the
+        // texture unit does not apply the stride to a gather, God of War's
+        // target parts gave a wrong picture that way (most of the screen
+        // darker) and a lab scene of that kind crashed the GPU.
         let mut gather_filter = false;
-        if !wide_texture && !from_target && ge_size.is_some() && !ge_target_read && GE_GATHER.load(Ordering::Relaxed) != 0 {
+        if !wide_texture && ge_size.is_some() && !ge_target_read && GE_GATHER.load(Ordering::Relaxed) != 0 {
             // Safe: a texture description of ours.
-            let (width, height, levels) =
-                unsafe { (gxm::sceGxmTextureGetWidth(&texture.gxm), gxm::sceGxmTextureGetHeight(&texture.gxm), gxm::sceGxmTextureGetMipmapCount(&texture.gxm)) };
-            if width.is_power_of_two() && height.is_power_of_two() && levels <= 1 {
+            let (width, height, levels, strided) = unsafe {
+                (
+                    gxm::sceGxmTextureGetWidth(&texture.gxm),
+                    gxm::sceGxmTextureGetHeight(&texture.gxm),
+                    gxm::sceGxmTextureGetMipmapCount(&texture.gxm),
+                    gxm::sceGxmTextureGetType(&texture.gxm) == gxm::TEXTURE_TYPE_LINEAR_STRIDED,
+                )
+            };
+            if nativeres_core::texture_cache::gpu::gather_texture(width, height, levels, strided, from_target) {
                 match self.programs.gather_program(fragment) {
                     Some(program) => {
                         fragment = program;

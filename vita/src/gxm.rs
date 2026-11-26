@@ -22,6 +22,8 @@ pub const TEXTURE_FORMAT_U8U8U8U8_ABGR: u32 = 0x0C00_0000;
 /// The same texels, alpha read as 1.
 pub const TEXTURE_FORMAT_X8U8U8U8_1BGR: u32 = 0x0C00_4000;
 pub const TEXTURE_FORMAT_P8_ABGR: u32 = 0x9500_0000;
+/// SCE_GXM_TEXTURE_LINEAR_STRIDED (`sceGxmTextureGetType`).
+pub const TEXTURE_TYPE_LINEAR_STRIDED: u32 = 0xC000_0000;
 pub const TEXTURE_FORMAT_U5U6U5_BGR: u32 = 0x0500_0000;
 pub const TEXTURE_FORMAT_U1U5U5U5_ABGR: u32 = 0x0400_0000;
 pub const TEXTURE_FORMAT_U4U4U4U4_ABGR: u32 = 0x0200_0000;
@@ -390,6 +392,8 @@ extern "C" {
     pub fn sceGxmTextureSetLodBias(texture: *mut Texture, bias: u32) -> i32;
     pub fn sceGxmTextureGetLodBias(texture: *const Texture) -> u32;
     pub fn sceGxmTextureGetMipmapCount(texture: *const Texture) -> u32;
+    /// SceGxmTextureType: `TEXTURE_TYPE_LINEAR_STRIDED` for a strided texture.
+    pub fn sceGxmTextureGetType(texture: *const Texture) -> u32;
     pub fn sceGxmTextureGetWidth(texture: *const Texture) -> u32;
     pub fn sceGxmTextureGetHeight(texture: *const Texture) -> u32;
 }
