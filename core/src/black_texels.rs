@@ -15,7 +15,11 @@
 //!   target during a frame: the part a black fill covered (`black_fill`),
 //!   and the parts later draws may have changed (`paint_area`, their boxes
 //!   cut by the scissor). `lit_box` then gives, for the part of the target a
-//!   texture reads, the texels that may not be black.
+//!   texture reads, the texels that may not be black. A draw that copies
+//!   another off-screen target paints only where that one's non-black
+//!   texels land (`Source`): the game blurs the whole strip through a
+//!   half-size target and back, which else left every tile painted all
+//!   over (2026-11-26, seventy-seventh session).
 //! - `zero_source_keeps_target`: a draw for which a fragment of texel colour
 //!   0 changes nothing (source colour 0 with an additive blend whose
 //!   destination factor is one or one minus the source colour; no depth,
@@ -23,6 +27,10 @@
 //! - `keeps_triangle` / `cull_triangles`: triangles whose texture
 //!   coordinates stay a margin away from the non-black texels on one side,
 //!   with clamped coordinates, can only sample black: dropped.
+//! - `lit_screen_box`: the box of pixels outside of which a draw's
+//!   triangles sample only black: where a copy of a target can paint
+//!   (`Source`). (As a scissor for the shadow passes themselves it gave
+//!   the GPU 1.1 ms and cost the display thread 2.7: not used so.)
 //!
 //! Everything is in PSP pixels of the off-screen target (our off-screen
 //! targets are 1:1) and in texels of the texture, which reads a part of the
@@ -145,15 +153,23 @@ impl TargetContents {
     }
 
     /// `draw` was drawn into this target, placed at x `origin_x` (a tile
-    /// of a wider framebuffer, core `offscreen::placement`).
-    pub fn note_draw(&mut self, frame: &Frame, draw: &Draw, origin_x: i32) {
+    /// of a wider framebuffer, core `offscreen::placement`). `source`: what
+    /// its texture reads, if that is another off-screen target.
+    pub fn note_draw(&mut self, frame: &Frame, draw: &Draw, origin_x: i32, source: Option<Source>) {
         if let Some(fill) = black_fill(frame, draw) {
             self.note_fill(fill.offset(origin_x, 0));
         } else if !self.black.is_empty() {
             // (Without a black part, what a draw paints doesn't matter: a
             // later fill covers it or leaves it outside. That spares the
             // pass over the vertices of God of War's big bloom draws.)
-            self.note_paint(paint_area(frame, draw).offset(origin_x, 0));
+            let area = paint_area(frame, draw);
+            let mut lit = [Rect::EMPTY; LIT_AREAS];
+            match source.and_then(|source| source.lit_areas(frame, draw, area, &mut lit)) {
+                // Black texels of the source leave black pixels black:
+                // only where its other texels land can something change.
+                Some(count) => lit[..count].iter().for_each(|part| self.note_paint(part.offset(origin_x, 0))),
+                None => self.note_paint(area.offset(origin_x, 0)),
+            }
         }
     }
 
@@ -186,6 +202,19 @@ impl TargetContents {
             return; // nothing of the black part changed
         }
         let count = self.painted_count as usize;
+        if self.painted[..count].iter().any(|part| part.contains(area)) {
+            return; // known already
+        }
+        // The parts inside it are part of it now (a blurred blob over the blob).
+        let mut count = 0;
+        for k in 0..self.painted_count as usize {
+            let part = self.painted[k];
+            if !area.contains(part) {
+                self.painted[count] = part;
+                count += 1;
+            }
+        }
+        self.painted_count = count as u8;
         if count < PAINTED_PARTS {
             self.painted[count] = area;
             self.painted_count += 1;
@@ -211,6 +240,105 @@ impl TargetContents {
             .fold(Rect::EMPTY, |lit, painted| lit.union(painted.intersect(part)));
         Some(lit.offset(-part.left, -part.top))
     }
+}
+
+/// The most parts `Source::lit_areas` gives: one per painted part of the
+/// source and one per side of its black part.
+pub const LIT_AREAS: usize = PAINTED_PARTS + 4;
+
+/// What the texture of a draw into an off-screen target reads, when that
+/// is another off-screen target (`TargetContents::note_draw`): God of War
+/// blurs its strip of shadow tiles by drawing it into a half-size target
+/// and back.
+#[derive(Clone, Copy, Debug)]
+pub struct Source<'a> {
+    /// What that target holds when the draw is drawn.
+    pub contents: &'a TargetContents,
+    /// The target's x of the texture's first texel (a tile's place in its
+    /// strip; else 0). From there texels and the target's PSP pixels are
+    /// the same, whatever size the texture claims: the Vita reads the
+    /// target itself, up to its right and bottom ends.
+    pub x: i32,
+    /// The target's size in PSP pixels.
+    pub width: i32,
+    pub height: i32,
+}
+
+impl Source<'_> {
+    /// The parts of `area` (what `draw` may paint, `paint_area`) where
+    /// `draw` can turn a black pixel into another colour, written to `out`:
+    /// their count. A fragment whose texels are all black is black itself
+    /// (`black_texel_gives_black`), and black onto black stays black with
+    /// every blend, so only the fragments that can sample a texel not known
+    /// black count: for each such part of the source the box
+    /// `BlackOutside::lit_screen_box` gives. None if that can't be told (the
+    /// caller then takes all of `area`).
+    fn lit_areas(&self, frame: &Frame, draw: &Draw, area: Rect, out: &mut [Rect; LIT_AREAS]) -> Option<usize> {
+        if !black_texel_gives_black(draw) {
+            return None;
+        }
+        let vertices = own_screen_vertices(frame, draw)?;
+        let first = draw.first_index as usize;
+        let indices = frame.indices.get(first..first.checked_add(draw.index_count as usize)?).filter(|_| draw.flags & draw_flags::INDEX_RUNS == 0)?;
+        let texture = frame.textures().get(draw.texture as usize)?;
+        // What the texture can reach of the target, and its black part.
+        let visible = Rect::new(self.x, 0, self.width, self.height);
+        let black = self.contents.black.intersect(visible);
+        if black.is_empty() {
+            return None;
+        }
+        // Not known black: the painted parts, and what lies around the
+        // black part (left, right, above, below).
+        let around = [
+            Rect::new(visible.left, visible.top, black.left, visible.bottom),
+            Rect::new(black.right, visible.top, visible.right, visible.bottom),
+            Rect::new(black.left, visible.top, black.right, black.top),
+            Rect::new(black.left, black.bottom, black.right, visible.bottom),
+        ];
+        let painted = &self.contents.painted[..self.contents.painted_count as usize];
+        let mut count = 0;
+        for part in painted.iter().chain(&around) {
+            let part = part.intersect(visible);
+            if part.is_empty() {
+                continue;
+            }
+            // In texels. A part that ends where the target ends has no
+            // black texels beyond it for a clamped coordinate to land on:
+            // it counts up to the texture's own end, which `BlackOutside`
+            // does not cut at.
+            let mut lit = part.offset(-self.x, 0);
+            if part.right >= visible.right {
+                lit.right = lit.right.max(texture.width as i32);
+            }
+            if part.bottom >= visible.bottom {
+                lit.bottom = lit.bottom.max(texture.height as i32);
+            }
+            let black = BlackOutside {
+                lit,
+                width: texture.width as u32,
+                height: texture.height as u32,
+                clamp_u: draw.flags & draw_flags::CLAMP_U != 0,
+                clamp_v: draw.flags & draw_flags::CLAMP_V != 0,
+            };
+            let shown = black.lit_screen_box(vertices, indices)?.intersect(area);
+            if !shown.is_empty() {
+                out[count] = shown;
+                count += 1;
+            }
+        }
+        Some(count)
+    }
+}
+
+/// True if a fragment of textured `draw` whose texels are all black (RGB
+/// 0) is black itself: the texel times the vertex colour, nothing added
+/// (no fog; no dither, which adds to the colour before a 16-bit target's
+/// cut; vertices of the frame's own, which carry no second colour).
+fn black_texel_gives_black(draw: &Draw) -> bool {
+    draw.flags & draw_flags::TEXTURED != 0
+        && draw.flags & (draw_flags::FOG | draw_flags::DITHER | draw_flags::RAW_VERTICES | draw_flags::CACHED_VERTICES) == 0
+        && draw.transform == 0
+        && draw.tests & test_flags::LOGIC_OP == 0
 }
 
 /// True if the float with these bits is finite.
@@ -314,8 +442,12 @@ pub fn black_fill(frame: &Frame, draw: &Draw) -> Option<Rect> {
     if draw.tests & test_flags::DEPTH_TEST != 0 && (draw.tests >> test_flags::DEPTH_FUNCTION_SHIFT) & 7 != 1 {
         return None;
     }
-    // A stencil test only as an exact state without a test.
-    if draw.tests & test_flags::STENCIL_TEST != 0 && !frame.stencil_state_of(draw).is_some_and(|state| state.test().is_none()) {
+    // A stencil test only as an exact state without a test. A 565 target
+    // has no stencil: nothing is tested there (core `blend::stencil` gives
+    // such a draw no state; God of War clears its half-size blur target
+    // with the test's flag still set).
+    let no_stencil = (draw.flags & draw_flags::TARGET_FORMAT_MASK) >> draw_flags::TARGET_FORMAT_SHIFT == draw_flags::TARGET_565;
+    if draw.tests & test_flags::STENCIL_TEST != 0 && !no_stencil && !frame.stencil_state_of(draw).is_some_and(|state| state.test().is_none()) {
         return None;
     }
     if frame.stencil_state_of(draw).is_some_and(|state| state.test().is_some()) {
@@ -514,6 +646,159 @@ impl BlackOutside {
         }
         written
     }
+
+    /// The four limits of `sides` as texture coordinates (0..1), in the
+    /// order left, right, top, bottom; None for a side nothing is out on.
+    fn limits(&self) -> [Option<f32>; 4] {
+        let (lit, width, height) = (self.lit, self.width as i32, self.height as i32);
+        let at = |texels: f32, size: u32| texels / size as f32;
+        [
+            (self.clamp_u && lit.left >= 1).then(|| at(lit.left as f32 - MARGIN, self.width)),
+            (self.clamp_u && lit.right < width).then(|| at(lit.right as f32 + MARGIN, self.width)),
+            (self.clamp_v && lit.top >= 1).then(|| at(lit.top as f32 - MARGIN, self.height)),
+            (self.clamp_v && lit.bottom < height).then(|| at(lit.bottom as f32 + MARGIN, self.height)),
+        ]
+    }
+
+    /// The pixels of the target (PSP pixels, as the vertices' x and y)
+    /// outside of which the triangles of `indices` (three corners each,
+    /// counted from the start of `vertices`) sample black texels only.
+    /// `EMPTY` if no fragment can sample anything else; None if it can't
+    /// be told (a corner outside `vertices`, not finite, w not positive, or
+    /// farther out than `SCREEN_LIMIT`).
+    ///
+    /// Why the box holds every fragment that matters: at a point of a
+    /// triangle with screen weights b0, b1, b2 (>= 0) the GPU's texture
+    /// coordinate is u = (sum bi ui / wi) / (sum bi / wi), so "left of the
+    /// limit L", u < L, is sum bi (ui - L) / wi < 0: a function that is
+    /// linear on the screen. Each side's out-region is therefore a half
+    /// plane, and what is out on no side is the triangle cut by up to four
+    /// of them, a convex polygon. The GPU takes a fragment's texture
+    /// coordinate at its pixel's centre: half a pixel in on our 1:1
+    /// targets, a quarter or three quarters of a PSP pixel on the 2x ones,
+    /// so a PSP pixel p matters only if p + 1/4 .. p + 3/4 reaches the
+    /// polygon's box (`CENTRE_SLACK` more on both sides: the float rounding
+    /// of the cuts, far below it). A fragment outside the box is out on
+    /// some side by more than `MARGIN`, like every fragment of a culled
+    /// triangle; of `MARGIN`'s 1.5 texels one is spare for the GPU's own
+    /// rounding (half a pixel and more here: the texels are magnified or
+    /// at most halved).
+    pub fn lit_screen_box(&self, vertices: &[FrameVertex], indices: &[u16]) -> Option<Rect> {
+        if self.lit.is_empty() {
+            return Some(Rect::EMPTY);
+        }
+        let limits = self.limits();
+        // The box as order keys (integer compares): left, top, right, bottom.
+        let mut bounds = [i32::MAX, i32::MAX, i32::MIN, i32::MIN];
+        let mut grow = |x: f32, y: f32| {
+            let (x, y) = (order_key(x.to_bits()), order_key(y.to_bits()));
+            bounds = [bounds[0].min(x), bounds[1].min(y), bounds[2].max(x), bounds[3].max(y)];
+        };
+        for triangle in indices.chunks_exact(3) {
+            let mut polygon = [ClipCorner::default(); CLIPPED_CORNERS];
+            let mut inside_all = true;
+            for (slot, index) in triangle.iter().enumerate() {
+                let vertex = vertices.get(*index as usize)?;
+                let corner = ClipCorner::of(vertex, &limits)?;
+                inside_all &= corner.out.iter().all(|distance| distance.to_bits() as i32 >= 0);
+                polygon[slot] = corner;
+            }
+            if inside_all {
+                // (Most kept triangles near a blob: no cut needed.)
+                polygon[..3].iter().for_each(|corner| grow(corner.x, corner.y));
+                continue;
+            }
+            let mut count = 3;
+            for side in 0..4 {
+                if limits[side].is_some() {
+                    count = clip_side(&mut polygon, count, side);
+                }
+            }
+            polygon[..count].iter().for_each(|corner| grow(corner.x, corner.y));
+        }
+        if bounds[0] > bounds[2] || bounds[1] > bounds[3] {
+            return Some(Rect::EMPTY);
+        }
+        let [left, top, right, bottom] = bounds.map(from_order_key);
+        // The pixels with a centre (1/4 .. 3/4) in the box.
+        let first = |low: f32| ceil(low - (0.75 + CENTRE_SLACK)) as i32;
+        let end = |high: f32| floor(high - (0.25 - CENTRE_SLACK)) as i32 + 1;
+        Some(Rect::new(first(left), first(top), end(right), end(bottom)))
+    }
+}
+
+/// How far (PSP pixels) outside a pixel's 1/4 .. 3/4 `lit_screen_box`
+/// still counts a point as its centre.
+const CENTRE_SLACK: f32 = 1.0 / 16.0;
+
+/// The corners a triangle can have after `lit_screen_box`'s cuts: one more
+/// per side.
+const CLIPPED_CORNERS: usize = 7;
+
+/// The largest |x| or |y| (PSP pixels) of a corner `lit_screen_box` works
+/// with: up to here an f32 cut point is right to a small fraction of a
+/// pixel (the GE's own coordinates end at 4096).
+const SCREEN_LIMIT: f32 = 16384.0;
+
+/// A corner of a triangle being cut in `lit_screen_box`: where it is on
+/// the screen and, per side (left, right, top, bottom), how far inside
+/// that side's limit its texture coordinate is, divided by w (negative:
+/// out; linear on the screen; 0 for a side without limit).
+#[derive(Clone, Copy, Default)]
+struct ClipCorner {
+    x: f32,
+    y: f32,
+    out: [f32; 4],
+}
+
+impl ClipCorner {
+    /// None for a vertex `lit_screen_box` can't work with.
+    fn of(vertex: &FrameVertex, limits: &[Option<f32>; 4]) -> Option<ClipCorner> {
+        let (x, y, u, v, w) = (vertex.x.to_bits(), vertex.y.to_bits(), vertex.u.to_bits(), vertex.v.to_bits(), vertex.w.to_bits());
+        let on_screen = |bits: u32| bits & 0x7FFF_FFFF <= SCREEN_LIMIT.to_bits();
+        if !(on_screen(x) && on_screen(y) && finite_bits(u) && finite_bits(v)) || !(w as i32 > 0 && w < 0x7F80_0000) {
+            return None;
+        }
+        let over_w = 1.0 / vertex.w;
+        let inside = |limit: Option<f32>, distance: &dyn Fn(f32) -> f32| limit.map_or(0.0, |limit| distance(limit) * over_w);
+        let out = [
+            inside(limits[0], &|limit| vertex.u - limit),
+            inside(limits[1], &|limit| limit - vertex.u),
+            inside(limits[2], &|limit| vertex.v - limit),
+            inside(limits[3], &|limit| limit - vertex.v),
+        ];
+        // (A tiny w can make them infinite: nothing to cut with.)
+        out.iter().all(|distance| finite_bits(distance.to_bits())).then_some(ClipCorner { x: vertex.x, y: vertex.y, out })
+    }
+}
+
+/// Cuts the convex polygon `polygon[..count]` down to its part not out on
+/// `side` (`ClipCorner::out[side]` >= 0), in place; returns its new corner
+/// count (0: nothing left; at most one corner more than before).
+fn clip_side(polygon: &mut [ClipCorner; CLIPPED_CORNERS], count: usize, side: usize) -> usize {
+    let source = *polygon;
+    let is_in = |corner: &ClipCorner| corner.out[side].to_bits() as i32 >= 0;
+    let mut written = 0;
+    for k in 0..count {
+        let (from, to) = (&source[k], &source[(k + 1) % count]);
+        if is_in(from) && written < CLIPPED_CORNERS {
+            polygon[written] = *from;
+            written += 1;
+        }
+        if is_in(from) != is_in(to) && written < CLIPPED_CORNERS {
+            // Where the edge crosses the limit: the distances have opposite
+            // signs, so the difference is the sum of their sizes.
+            let t = from.out[side] / (from.out[side] - to.out[side]);
+            let mix = |a: f32, b: f32| a + (b - a) * t;
+            let mut cut = ClipCorner { x: mix(from.x, to.x), y: mix(from.y, to.y), out: [0.0; 4] };
+            for other in 0..4 {
+                cut.out[other] = if other == side { 0.0 } else { mix(from.out[other], to.out[other]) };
+            }
+            polygon[written] = cut;
+            written += 1;
+        }
+    }
+    written
 }
 
 #[cfg(test)]
@@ -589,6 +874,16 @@ mod tests {
             let frame = frame_with(&vertices, &[0, 1, 2, 3, 4, 5], draw);
             assert_eq!(black_fill(&frame, &frame.draws[0]), None);
         }
+        // A stencil test without an exact state: not known to pass. On a
+        // 565 target there is no stencil to test (God of War's clear of
+        // its half-size blur target, flags 2000042, tests 4).
+        let (vertices, mut draw) = clear(0xFF00_0000);
+        draw.tests |= test_flags::STENCIL_TEST;
+        let frame = frame_with(&vertices, &[0, 1, 2, 3, 4, 5], draw);
+        assert_eq!(black_fill(&frame, &frame.draws[0]), None);
+        draw.flags |= draw_flags::TARGET_565 << draw_flags::TARGET_FORMAT_SHIFT;
+        let frame = frame_with(&vertices, &[0, 1, 2, 3, 4, 5], draw);
+        assert_eq!(black_fill(&frame, &frame.draws[0]), Some(Rect::new(0, 0, 448, 64)));
     }
 
     #[test]
@@ -733,5 +1028,228 @@ mod tests {
         let mut out = [0u16; 9];
         let written = black.cull_triangles(&vertices, &indices, &mut out);
         assert_eq!(&out[..written], &[3, 4, 5, 0, 1, 9]);
+    }
+
+    /// A frame with one rectangle drawn (two triangles): target pixels
+    /// `to`, reading texels `from` of a `size` texture, clamped, unblended.
+    fn copy_frame(to: Rect, from: Rect, size: (u16, u16), scissor: Rect) -> Box<Frame> {
+        let corner = |right: bool, bottom: bool| FrameVertex {
+            x: if right { to.right } else { to.left } as f32,
+            y: if bottom { to.bottom } else { to.top } as f32,
+            z: 0.0,
+            w: 1.0,
+            u: if right { from.right } else { from.left } as f32 / size.0 as f32,
+            v: if bottom { from.bottom } else { from.top } as f32 / size.1 as f32,
+            color: !0,
+            fog: 1.0,
+        };
+        let vertices = [corner(false, false), corner(true, false), corner(false, true), corner(true, false), corner(true, true), corner(false, true)];
+        let draw = Draw {
+            flags: draw_flags::TEXTURED | draw_flags::LINEAR_FILTER | draw_flags::CLAMP_U | draw_flags::CLAMP_V | draw_flags::RECTANGLES,
+            tests: test_flags::DEPTH_WRITE_DISABLED,
+            scissor_left: scissor.left as u16,
+            scissor_top: scissor.top as u16,
+            scissor_right: scissor.right as u16 - 1,
+            scissor_bottom: scissor.bottom as u16 - 1,
+            ..Default::default()
+        };
+        let mut frame = frame_with(&vertices, &[0, 1, 2, 3, 4, 5], draw);
+        frame.textures[0] = crate::frame::TextureDescriptor { width: size.0, height: size.1, buffer_width: size.0 as u32, ..Default::default() };
+        frame.texture_count = 1;
+        frame
+    }
+
+    /// God of War's shadow strip (2026-11-26): seven 64x64 tiles cleared
+    /// to black, a blob drawn into some, then the whole strip drawn into a
+    /// 224x32 target (cleared before) and that one back over the strip.
+    #[test]
+    fn a_copy_of_a_target_paints_only_where_its_lit_texels_land() {
+        let mut strip = TargetContents::UNKNOWN;
+        strip.note_fill(Rect::new(0, 0, 448, 64));
+        strip.note_paint(Rect::new(23, 32, 41, 53)); // tile 0
+        strip.note_paint(Rect::new(64 + 11, 22, 64 + 47, 52)); // tile 1
+        strip.note_paint(Rect::new(384 + 20, 34, 384 + 43, 58)); // tile 6
+        let mut half = TargetContents::UNKNOWN;
+        half.note_fill(Rect::new(0, 0, 224, 32));
+
+        // Down: 448x64 texels of a 512x64 texture onto 224x32 pixels.
+        let down = copy_frame(Rect::new(0, 0, 224, 32), Rect::new(0, 0, 448, 64), (512, 64), Rect::new(1, 1, 223, 31));
+        let source = Source { contents: &strip, x: 0, width: 448, height: 64 };
+        half.note_draw(&down, &down.draws[0], 0, Some(source));
+        // Each blob at half its place, 1.5 texels wider: texels 21.5 ..
+        // 42.5 are pixels 10.75 .. 21.25, the centres of pixels 10 .. 21.
+        assert_eq!(half.painted_count, 3);
+        assert_eq!(half.painted[0], Rect::new(10, 15, 22, 28));
+        assert_eq!(half.lit_box(Rect::new(0, 0, 224, 32)), Some(Rect::new(10, 10, 215, 30)));
+
+        // Up again: 224x32 texels of a 256x32 texture onto the strip.
+        let up = copy_frame(Rect::new(0, 0, 448, 64), Rect::new(0, 0, 224, 32), (256, 32), Rect::new(1, 1, 447, 63));
+        let source = Source { contents: &half, x: 0, width: 224, height: 32 };
+        strip.note_draw(&up, &up.draws[0], 0, Some(source));
+        // The blurred blobs took the blobs' places in the list.
+        assert_eq!(strip.painted_count, 3);
+        let tile = |k: i32| Rect::new(64 * k, 0, 64 * k + 64, 64);
+        assert_eq!(strip.lit_box(tile(0)), Some(Rect::new(17, 27, 47, 59)));
+        assert_eq!(strip.lit_box(tile(2)), Some(Rect::EMPTY));
+        assert!(strip.lit_box(tile(1)).is_some_and(|lit| lit.contains(Rect::new(11, 22, 47, 52)) && lit.area() < 64 * 64 * 2 / 3));
+        assert!(strip.lit_box(tile(6)).is_some_and(|lit| lit.contains(Rect::new(20, 34, 43, 58)) && lit.left > 8));
+
+        // Without the source (or with one that says nothing): all of it.
+        let mut plain = TargetContents::UNKNOWN;
+        plain.note_fill(Rect::new(0, 0, 448, 64));
+        plain.note_draw(&up, &up.draws[0], 0, None);
+        assert_eq!(plain.lit_box(tile(2)), Some(Rect::new(0, 1, 64, 63)));
+        let mut plain = TargetContents::UNKNOWN;
+        plain.note_fill(Rect::new(0, 0, 448, 64));
+        plain.note_draw(&up, &up.draws[0], 0, Some(Source { contents: &TargetContents::UNKNOWN, x: 0, width: 224, height: 32 }));
+        assert_eq!(plain.lit_box(tile(2)), Some(Rect::new(0, 1, 64, 63)));
+        // Fog adds its colour to a black texel: all of it.
+        let mut foggy = copy_frame(Rect::new(0, 0, 448, 64), Rect::new(0, 0, 224, 32), (256, 32), Rect::new(1, 1, 447, 63));
+        foggy.draws[0].flags |= draw_flags::FOG;
+        let mut plain = TargetContents::UNKNOWN;
+        plain.note_fill(Rect::new(0, 0, 448, 64));
+        plain.note_draw(&foggy, &foggy.draws[0], 0, Some(Source { contents: &half, x: 0, width: 224, height: 32 }));
+        assert_eq!(plain.lit_box(tile(2)), Some(Rect::new(0, 1, 64, 63)));
+    }
+
+    /// What the source's black fill does not cover may hold anything.
+    #[test]
+    fn a_copy_paints_where_the_source_is_not_known_black() {
+        // The source: 224 wide, black only up to x 200.
+        let mut source = TargetContents::UNKNOWN;
+        source.note_fill(Rect::new(0, 0, 200, 32));
+        let mut target = TargetContents::UNKNOWN;
+        target.note_fill(Rect::new(0, 0, 448, 64));
+        let up = copy_frame(Rect::new(0, 0, 448, 64), Rect::new(0, 0, 224, 32), (256, 32), Rect::new(0, 0, 448, 64));
+        target.note_draw(&up, &up.draws[0], 0, Some(Source { contents: &source, x: 0, width: 224, height: 32 }));
+        // Texels from 200 - 1.5 on: pixels from 397.
+        assert_eq!(target.lit_box(Rect::new(0, 0, 448, 64)), Some(Rect::new(397, 0, 448, 64)));
+        // A tile of the source read from x 64 on: the same texels, 64 lower.
+        let mut target = TargetContents::UNKNOWN;
+        target.note_fill(Rect::new(0, 0, 448, 64));
+        let up = copy_frame(Rect::new(0, 0, 320, 64), Rect::new(0, 0, 160, 32), (256, 32), Rect::new(0, 0, 448, 64));
+        target.note_draw(&up, &up.draws[0], 0, Some(Source { contents: &source, x: 64, width: 224, height: 32 }));
+        assert_eq!(target.lit_box(Rect::new(0, 0, 448, 64)), Some(Rect::new(269, 0, 320, 64)));
+    }
+
+    #[test]
+    fn paints_inside_one_another_are_one_part() {
+        let mut contents = TargetContents::UNKNOWN;
+        contents.note_fill(Rect::new(0, 0, 448, 64));
+        contents.note_paint(Rect::new(20, 20, 30, 30));
+        contents.note_paint(Rect::new(100, 20, 110, 30));
+        contents.note_paint(Rect::new(22, 22, 28, 28)); // inside the first
+        assert_eq!(contents.painted_count, 2);
+        contents.note_paint(Rect::new(15, 15, 40, 40)); // around the first
+        assert_eq!(contents.painted_count, 2);
+        assert_eq!(contents.lit_box(Rect::new(0, 0, 64, 64)), Some(Rect::new(15, 15, 40, 40)));
+        assert_eq!(contents.lit_box(Rect::new(64, 0, 128, 64)), Some(Rect::new(36, 20, 46, 30)));
+    }
+
+    /// A corner at screen (x, y) with texture coordinates in texels and w.
+    fn corner(x: f32, y: f32, u: f32, v: f32, w: f32) -> FrameVertex {
+        FrameVertex { x, y, z: 0.0, w, u: u / 64.0, v: v / 64.0, color: !0, fog: 1.0 }
+    }
+
+    #[test]
+    fn the_lit_screen_box_is_where_the_lit_texels_show() {
+        // Texels 20..40 lit; one texel per 10 pixels along x and y, so with
+        // the margin of 1.5 texels the lit ones show in 185..415: the pixels
+        // with their centres there.
+        let black = texture(Rect::new(20, 20, 40, 40));
+        let big = [corner(-1000.0, -1000.0, -100.0, -100.0, 1.0), corner(3000.0, -1000.0, 300.0, -100.0, 1.0), corner(-1000.0, 3000.0, -100.0, 300.0, 1.0)];
+        assert_eq!(black.lit_screen_box(&big, &[0, 1, 2]), Some(Rect::new(185, 185, 415, 415)));
+        // A triangle inside the lit texels: its own box.
+        let small = [corner(250.0, 250.0, 25.0, 25.0, 1.0), corner(300.5, 250.0, 30.05, 25.0, 1.0), corner(250.0, 290.0, 25.0, 29.0, 1.0)];
+        assert_eq!(black.lit_screen_box(&small, &[0, 1, 2]), Some(Rect::new(250, 250, 301, 290)));
+        // Both: the union. One that only sees black adds nothing.
+        let mut all = big.to_vec();
+        all.extend(small);
+        all.extend([corner(0.0, 0.0, 0.0, 0.0, 1.0), corner(100.0, 0.0, 10.0, 0.0, 1.0), corner(0.0, 100.0, 0.0, 10.0, 1.0)]);
+        assert_eq!(black.lit_screen_box(&all, &[0, 1, 2, 3, 4, 5, 6, 7, 8]), Some(Rect::new(185, 185, 415, 415)));
+        assert_eq!(black.lit_screen_box(&all, &[6, 7, 8]), Some(Rect::EMPTY));
+        // Around the corner of the lit texels without touching them (no
+        // side has all three corners out): nothing either.
+        let around = [corner(0.0, 300.0, 0.0, 30.0, 1.0), corner(300.0, 0.0, 30.0, 0.0, 1.0), corner(0.0, 0.0, 0.0, 0.0, 1.0)];
+        assert!(black.keeps_triangle([&around[0], &around[1], &around[2]]));
+        assert_eq!(black.lit_screen_box(&around, &[0, 1, 2]), Some(Rect::EMPTY));
+        // Nothing lit: empty. Lit up to an edge: that side is not cut.
+        assert_eq!(texture(Rect::EMPTY).lit_screen_box(&big, &[0, 1, 2]), Some(Rect::EMPTY));
+        assert_eq!(texture(Rect::new(0, 20, 40, 40)).lit_screen_box(&big, &[0, 1, 2]), Some(Rect::new(-1000, 185, 415, 415)));
+    }
+
+    #[test]
+    fn the_lit_screen_box_gives_up_on_corners_it_cannot_place() {
+        let black = texture(Rect::new(20, 20, 40, 40));
+        let good = [corner(0.0, 0.0, 0.0, 0.0, 1.0), corner(640.0, 0.0, 64.0, 0.0, 1.0), corner(0.0, 640.0, 0.0, 64.0, 1.0)];
+        assert!(black.lit_screen_box(&good, &[0, 1, 2]).is_some());
+        assert_eq!(black.lit_screen_box(&good, &[0, 1, 3]), None); // a corner that isn't there
+        for bad in [
+            corner(f32::NAN, 0.0, 0.0, 0.0, 1.0),
+            corner(0.0, f32::INFINITY, 0.0, 0.0, 1.0),
+            corner(0.0, 20000.0, 0.0, 0.0, 1.0),
+            corner(0.0, 0.0, f32::NAN, 0.0, 1.0),
+            corner(0.0, 0.0, 0.0, 0.0, 0.0),
+            corner(0.0, 0.0, 0.0, 0.0, -1.0),
+            corner(0.0, 0.0, 30.0, 30.0, 1e-42),
+        ] {
+            let vertices = [good[0], good[1], bad];
+            assert_eq!(black.lit_screen_box(&vertices, &[0, 1, 2]), None, "{bad:?}");
+        }
+    }
+
+    /// Random triangles with perspective, shaded as the GPU does at the
+    /// centres of the 2x pixels: every pixel whose texture coordinate is
+    /// out on no side lies in the box.
+    #[test]
+    fn the_lit_screen_box_holds_every_fragment_not_out_on_a_side() {
+        let mut seed = 0x1234_5678u32;
+        let mut random = |low: f32, high: f32| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            low + (high - low) * ((seed >> 8) as f32 / 16777216.0)
+        };
+        let (mut checked, mut empty) = (0u32, 0u32);
+        for round in 0..400 {
+            let left = random(0.0, 50.0) as i32;
+            let top = random(0.0, 50.0) as i32;
+            let lit = Rect::new(left, top, left + 1 + random(0.0, 12.0) as i32, top + 1 + random(0.0, 12.0) as i32);
+            let black = BlackOutside { lit, width: 64, height: 64, clamp_u: round % 5 != 0, clamp_v: round % 7 != 0 };
+            let vertices: [FrameVertex; 3] =
+                core::array::from_fn(|_| corner(random(-80.0, 200.0), random(-80.0, 200.0), random(-150.0, 220.0), random(-150.0, 220.0), random(0.2, 6.0)));
+            let Some(found) = black.lit_screen_box(&vertices, &[0, 1, 2]) else { panic!("no box for {vertices:?}") };
+            empty += found.is_empty() as u32;
+            let limits = black.limits();
+            let [a, b, c] = vertices.map(|v| (v.x as f64, v.y as f64, v.u as f64, v.v as f64, v.w as f64));
+            let area = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
+            if area == 0.0 {
+                continue;
+            }
+            // The 2x pixels of 0..120 x 0..120 PSP pixels.
+            for py in 0..240 {
+                for px in 0..240 {
+                    let (x, y) = ((px as f64 + 0.5) / 2.0, (py as f64 + 0.5) / 2.0);
+                    let weight = |p: (f64, f64, f64, f64, f64), q: (f64, f64, f64, f64, f64)| ((q.0 - p.0) * (y - p.1) - (q.1 - p.1) * (x - p.0)) / area;
+                    let weights = [weight(b, c), weight(c, a), weight(a, b)];
+                    if weights.iter().any(|w| *w < 0.0) {
+                        continue;
+                    }
+                    let over_w: f64 = weights[0] / a.4 + weights[1] / b.4 + weights[2] / c.4;
+                    let u = (weights[0] * a.2 / a.4 + weights[1] * b.2 / b.4 + weights[2] * c.2 / c.4) / over_w;
+                    let v = (weights[0] * a.3 / a.4 + weights[1] * b.3 / b.4 + weights[2] * c.3 / c.4) / over_w;
+                    let out = limits[0].is_some_and(|l| u < l as f64)
+                        || limits[1].is_some_and(|l| u > l as f64)
+                        || limits[2].is_some_and(|l| v < l as f64)
+                        || limits[3].is_some_and(|l| v > l as f64);
+                    if out {
+                        continue;
+                    }
+                    checked += 1;
+                    let (x, y) = (px / 2, py / 2);
+                    assert!(x >= found.left && x < found.right && y >= found.top && y < found.bottom, "round {round}: pixel {x},{y} not in {found:?}");
+                }
+            }
+        }
+        // (Enough of both kinds: boxes with fragments, and empty ones.)
+        assert!(checked > 20_000 && empty > 20, "{checked} {empty}");
     }
 }

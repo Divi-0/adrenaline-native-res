@@ -3,8 +3,11 @@
 //! texels change nothing, and the Vita leaves them out (core black_texels,
 //! DESIGN "sixty-seventh session"). The replay does the same with
 //! `REPLAY_BLACK_TEXELS=1`: the gameplay dump must give the very same
-//! picture with and without, and some triangles must go. Skipped without
-//! the private test directory's dump (see regression.rs).
+//! picture with and without, and some triangles must go: also those inside
+//! a tile's reach that the tile's blob does not reach, known since the
+//! black texels are followed through the game's blur of the strip (core
+//! `black_texels::Source`, DESIGN "seventy-seventh session"). Skipped
+//! without the private test directory's dump (see regression.rs).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -46,7 +49,8 @@ fn black_texel_triangles_change_nothing_in_god_of_wars_shadows() {
         .lines()
         .find_map(|line| line.strip_prefix("black texels: ")?.split_once(" triangles kept, ")?.1.strip_suffix(" culled")?.parse().ok())
         .expect("no black texels summary");
-    // 2026-11-24: 256 of 836 triangles in the dump's three shadow passes and the bloom add.
-    assert!(left_out > 0, "no triangle left out");
+    // 2026-11-24: 256 of 836 triangles in the dump's three shadow passes and the bloom add;
+    // 2026-11-26, with the blur followed: 417.
+    assert!(left_out > 300, "only {left_out} triangles left out: the blur's copies paint whole tiles again?");
     assert!(std::fs::read(&all).unwrap() == std::fs::read(&culled).unwrap(), "the pictures differ");
 }

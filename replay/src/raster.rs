@@ -241,7 +241,9 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
     // REPLAY_BLACK_TEXELS=1: triangles reading only black texels of an
     // off-screen picture with a blend that keeps the target there are left
     // out (core black_texels, as the Vita's draw loop does); the picture must
-    // not change. Each off-screen picture starts black.
+    // not change. Each off-screen picture starts black, and a draw from
+    // one off-screen picture into another paints only where the source's
+    // non-black texels land (core `black_texels::Source`).
     let black_texels = std::env::var("REPLAY_BLACK_TEXELS").is_ok_and(|value| value == "1");
     let mut contents: Vec<(u32, black_texels::TargetContents)> = offscreen
         .iter()
@@ -426,8 +428,16 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
             }
         } else if let Some((_, picture, picture_depth)) = offscreen.iter_mut().find(|(framebuffer, _, _)| *framebuffer == draw.framebuffer) {
             draw_one(picture, picture_depth, frame, draw_textures, draw);
+            // Its texture, if that reads another off-screen picture (480x272
+            // here, each from its own address), as the Vita's frame loop.
+            let read = (draw.flags & draw_flags::TEXTURED != 0)
+                .then(|| frame.textures().get(draw.texture as usize))
+                .flatten()
+                .and_then(|texture| contents.iter().find(|(framebuffer, _)| *framebuffer != draw.framebuffer && offscreen::reads_framebuffer(texture, *framebuffer)))
+                .map(|(_, known)| *known);
+            let source = read.as_ref().map(|contents| black_texels::Source { contents, x: 0, width: (WIDTH / 2) as i32, height: (HEIGHT / 2) as i32 });
             if let Some((_, known)) = contents.iter_mut().find(|(framebuffer, _)| *framebuffer == draw.framebuffer) {
-                known.note_draw(frame, draw, 0);
+                known.note_draw(frame, draw, 0, source);
             }
         }
         if let (Some(at), Some(before)) = (watched, before) {

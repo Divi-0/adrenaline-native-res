@@ -54,6 +54,14 @@ pub static WIDE_TEXTURES: AtomicU8 = AtomicU8::new(1);
 /// session"), or draw them all (0). The same picture either way.
 pub static BLACK_TEXELS: AtomicU8 = AtomicU8::new(1);
 
+/// Debug "blacksources 0|1": a draw into an off-screen target that reads
+/// another one counts as painting only where that one's non-black texels
+/// land (1, the default; core `black_texels::Source`: God of War's shadow
+/// tiles stay known black around their blobs through the game's blur, so
+/// `BLACK_TEXELS` leaves more out), or all of its box (0, as before the
+/// seventy-seventh session). The same picture either way.
+pub static BLACK_SOURCES: AtomicU8 = AtomicU8::new(1);
+
 /// Only these draws of a frame are drawn (count 0 = off), to find which draw makes a part of the picture (pause
 /// the game: the frame is redrawn).
 pub static DRAW_ONLY_FIRST: AtomicU32 = AtomicU32::new(0);
@@ -252,6 +260,30 @@ pub struct FrameLoop {
     /// black, as the target held it when this scene of the shown
     /// framebuffer began (None: not known; `TargetContents::lit_box`).
     screen_lit: [Option<black_texels::Rect>; MAX_TEXTURES],
+    /// The off-screen target each texture reads, if it reads one
+    /// (`use_targets_as_textures`): for `contents`, which follow black
+    /// texels through draws from one off-screen target into another.
+    read_parts: [ReadPart; MAX_TEXTURES],
+}
+
+/// The part of an off-screen target a texture reads: the target's index
+/// (`NONE`: not an off-screen target), the x of the texture's first texel
+/// in it and its size, all in PSP pixels (core `black_texels::Source`).
+#[derive(Clone, Copy)]
+struct ReadPart {
+    target: u8,
+    x: u16,
+    width: u16,
+    height: u16,
+}
+
+impl ReadPart {
+    const NONE: ReadPart = ReadPart { target: u8::MAX, x: 0, width: 0, height: 0 };
+
+    fn of(index: usize, x: u32, target: &targets::Target) -> ReadPart {
+        let (width, height) = target.psp_size();
+        ReadPart { target: index as u8, x: x as u16, width: width as u16, height: height as u16 }
+    }
 }
 
 static FRAME_LOOP: SingleThreaded<FrameLoop> = SingleThreaded::new(FrameLoop {
@@ -286,6 +318,7 @@ static FRAME_LOOP: SingleThreaded<FrameLoop> = SingleThreaded::new(FrameLoop {
     contents: [TargetContents::UNKNOWN; targets::OFFSCREEN_COUNT],
     scene_offscreen: None,
     screen_lit: [None; MAX_TEXTURES],
+    read_parts: [ReadPart::NONE; MAX_TEXTURES],
 });
 
 /// True if the GE can have drawn framebuffer `psp_address` (physical, see
@@ -691,10 +724,12 @@ impl FrameLoop {
             self.screen_views[i] = null();
             self.screen_keys[i] = None;
             self.screen_read[i] = false;
+            self.read_parts[i] = ReadPart::NONE;
             let drawn_into = wanted.address == frame.shown_framebuffer && !self.screen_from_target;
             if !self.textures[i].is_null() || wanted.format >= 4 || drawn_into {
                 continue;
             }
+            let whole_offscreen = targets.find_offscreen(wanted.address);
             let Some(target) = targets.sampled(wanted.address) else {
                 // A tile of a wider off-screen framebuffer (core
                 // `offscreen::placement`): its part of that one's target.
@@ -707,6 +742,7 @@ impl FrameLoop {
                 let Some(view) = target.tile_view(x, opaque) else {
                     continue;
                 };
+                self.read_parts[i] = ReadPart::of(index, x, target);
                 if wide != 0 {
                     let key = wide_targets::Key { address: base, x, opaque };
                     self.screen_view(frame, i, target, key, wide, &mut cuts, render_count);
@@ -724,6 +760,9 @@ impl FrameLoop {
                 let opaque = !blend::samples_target_alpha(wanted.flags) || wanted.format == texture_format::BGR5650;
                 let key = wide_targets::Key { address: wanted.address, x: 0, opaque };
                 self.screen_view(frame, i, target, key, wide, &mut cuts, render_count);
+            }
+            if let Some(index) = whole_offscreen.filter(|_| target.is_offscreen()) {
+                self.read_parts[i] = ReadPart::of(index, 0, target);
             }
             // A 16-bit 565 framebuffer has no alpha: read opaque.
             if blend::samples_target_alpha(wanted.flags) && wanted.format != texture_format::BGR5650 {
@@ -791,9 +830,21 @@ impl FrameLoop {
         };
         if depth_only {
             self.contents[k].note_paint(black_texels::paint_area(frame, draw).offset(origin_x, 0));
-        } else {
-            self.contents[k].note_draw(frame, draw, origin_x);
+            return;
         }
+        // Its texture, if that reads another off-screen target: what that
+        // one holds now (a copy: `contents[k]` is changed).
+        let read = if draw.flags & draw_flags::TEXTURED != 0 { self.read_parts.get(draw.texture as usize).copied() } else { None };
+        let read = read.filter(|part| (part.target as usize) < self.contents.len() && part.target as usize != k);
+        let read = read.filter(|_| BLACK_SOURCES.load(Ordering::Relaxed) != 0);
+        let held = read.map(|part| self.contents[part.target as usize]);
+        let source = read.zip(held.as_ref()).map(|(part, contents)| black_texels::Source {
+            contents,
+            x: part.x as i32,
+            width: part.width as i32,
+            height: part.height as i32,
+        });
+        self.contents[k].note_draw(frame, draw, origin_x, source);
     }
 
     /// For a scene of the shown framebuffer about to begin: the texels of
