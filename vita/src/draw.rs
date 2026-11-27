@@ -208,7 +208,10 @@ fn flat_shading(frame: &Frame, draw: &Draw) -> bool {
 /// the default; core zero_alpha: God of War's cloud layer, most of which
 /// is faded out), or draw them all (0). The same picture either way. 2: as
 /// 1 with every zero-copy draw read every frame (no `zero_alpha::Memo`),
-/// to measure what the memo saves.
+/// to measure what the memo saves. 3: as 1 with the reading as it was
+/// before (the memo asked after the draw's texel test, colour rules and
+/// window are made; every copy out of PSP RAM a whole window), to measure
+/// what asking first and `VertexWindow::wanted` save.
 pub static ZERO_ALPHA: AtomicI32 = AtomicI32::new(1);
 
 /// The longest index list `cull_zero_alpha` looks at (its room; God of
@@ -222,16 +225,27 @@ const ZERO_ALPHA_MOST_INDICES: usize = 4096;
 /// (docs/vita-performance.md "PSP RAM seen from the Vita"), so whole
 /// vertices 256 bytes at a time are several times cheaper than one alpha
 /// byte each (God of War's cloud layer, ~1,800 vertices of 24 bytes: 1.5 ms
-/// a frame byte by byte). Not more at a time: most of its strips are ~6
-/// vertices, and the next one is somewhere else. (Alphas and texture
-/// coordinates come from the same copy.)
+/// a frame byte by byte). Not more at a time, and no more than the cull
+/// will ask for next (`wanted`): most of its strips are ~6 vertices, and
+/// the bytes behind one cost the same whether or not the next strip is
+/// there. (Alphas and texture coordinates come from the same copy.)
 struct VertexWindow<'a> {
     /// The vertices in PSP RAM, vertex 0 at the start.
     source: &'a [u8],
     stride: usize,
+    /// The whole vertices the room holds: from a word's start, and behind
+    /// the 1 to 3 bytes before a vertex that starts inside a word. Worked
+    /// out once a draw: the Cortex-A9 has no divide instruction, and the
+    /// two divisions of every copy were calls into the runtime.
+    fit: [u32; 2],
+    /// The draw's index runs (`[type, count, first vertex]` each; empty for
+    /// a draw with an index list), and the run the last copy began in.
+    runs: &'a [u16],
+    run: usize,
     /// The copy (words, so that the burst copy finds it aligned): `skip`
-    /// bytes before vertex `first`, then `count` whole vertices.
-    room: [u32; VERTEX_WINDOW_BYTES / 4],
+    /// bytes before vertex `first`, then `count` whole vertices. Not set to
+    /// 0 for each draw: only what `fill` wrote is handed out.
+    room: core::mem::MaybeUninit<[u32; VERTEX_WINDOW_BYTES / 4]>,
     skip: usize,
     first: u32,
     count: u32,
@@ -240,8 +254,9 @@ struct VertexWindow<'a> {
 const VERTEX_WINDOW_BYTES: usize = 256;
 
 impl<'a> VertexWindow<'a> {
-    fn new(stride: usize, source: &'a [u8]) -> Self {
-        Self { source, stride, room: [0; VERTEX_WINDOW_BYTES / 4], skip: 0, first: 0, count: 0 }
+    fn new(stride: usize, source: &'a [u8], runs: &'a [u16]) -> Self {
+        let fit = if stride == 0 { [0, 0] } else { [(VERTEX_WINDOW_BYTES / stride) as u32, ((VERTEX_WINDOW_BYTES - 3) / stride) as u32] };
+        Self { source, stride, fit, runs, run: 0, room: core::mem::MaybeUninit::uninit(), skip: 0, first: 0, count: 0 }
     }
 
     /// The copied bytes from vertex number `vertex` on (as vertex 0); None
@@ -252,12 +267,48 @@ impl<'a> VertexWindow<'a> {
         if vertex.wrapping_sub(self.first) >= self.count && !self.fill(vertex) {
             return None;
         }
-        // Safe: `room` is plain words; `skip` + `count` vertices lie inside it (`fill`).
-        let bytes = unsafe { core::slice::from_raw_parts(self.room.as_ptr() as *const u8, VERTEX_WINDOW_BYTES) };
-        Some(&bytes[self.skip + (vertex - self.first) as usize * self.stride..self.skip + self.count as usize * self.stride])
+        let from = self.skip + (vertex - self.first) as usize * self.stride;
+        let to = self.skip + self.count as usize * self.stride;
+        // Safe: `fill` wrote the room's first `to` bytes (`skip` and `count` vertices,
+        // inside the room), and `vertex` is one of them: from < to.
+        Some(unsafe { core::slice::from_raw_parts((self.room.as_ptr() as *const u8).add(from), to - from) })
     }
 
-    /// Copies the vertices from `vertex` on, as many as fit; false if there is none.
+    /// How many vertices from `vertex` on the cull asks for next: the rest
+    /// of the index run `vertex` lies in, and the runs after it for as long
+    /// as each begins where the one before ended (back to back in PSP RAM:
+    /// one copy for them). Everything (`u32::MAX`) for a draw without runs
+    /// or a vertex in none of the next few runs. Only a hint that bounds
+    /// what `fill` copies: a vertex outside a copy is copied when asked for.
+    fn wanted(&mut self, vertex: u32) -> u32 {
+        let runs = self.runs;
+        let total = runs.len() / 3;
+        // The run holding `vertex`: the last one found or one of the next
+        // three (the cull goes through the runs in their order; after the
+        // last comes the first, for a second pass).
+        let mut k = self.run;
+        let mut found = None;
+        for _ in 0..total.min(4) {
+            let (count, base) = (runs[3 * k + 1] as u32, runs[3 * k + 2] as u32);
+            if vertex.wrapping_sub(base) < count {
+                found = Some(base + count);
+                break;
+            }
+            k = if k + 1 < total { k + 1 } else { 0 };
+        }
+        let Some(mut end) = found else { return u32::MAX };
+        self.run = k;
+        let most = vertex + self.fit[0];
+        let mut next = k + 1;
+        while end < most && next < total && runs[3 * next + 2] as u32 == end {
+            end += runs[3 * next + 1] as u32;
+            next += 1;
+        }
+        end - vertex
+    }
+
+    /// Copies the vertices from `vertex` on, as many as fit and are asked
+    /// for next (`wanted`); false if there is none.
     fn fill(&mut self, vertex: u32) -> bool {
         let stride = self.stride;
         let start = vertex as usize * stride;
@@ -266,15 +317,25 @@ impl<'a> VertexWindow<'a> {
         }
         // From the word the vertex starts in (the burst copy wants both ends aligned).
         let skip = (self.source.as_ptr() as usize + start) & 3;
-        let count = ((VERTEX_WINDOW_BYTES - skip) / stride).min((self.source.len() - start) / stride);
+        // (Debug "zeroalpha 3": a whole window every time, as before.)
+        let wanted = if ZERO_ALPHA.load(Ordering::Relaxed) == 3 { u32::MAX } else { self.wanted(vertex) };
+        let mut count = self.fit[(skip != 0) as usize].min(wanted) as usize;
+        if start + count * stride > self.source.len() {
+            count = (self.source.len() - start) / stride; // the block's end: the one division left
+        }
         if count == 0 {
             return false;
         }
+        let bytes = skip + count * stride;
         // Safe: `count` whole vertices from `start` lie in `source`; the up to 3 bytes
-        // before them are still PSP RAM (its mapping starts at a page); the room holds them.
+        // before them are still PSP RAM (its mapping starts at a page); the room holds
+        // them (`fit`: `count` vertices behind `skip` bytes are at most its size).
         unsafe {
-            crate::platform::psp_copy(self.room.as_mut_ptr() as *mut u8, self.source.as_ptr().add(start).sub(skip), (skip + count * stride) as u32);
+            crate::platform::psp_copy(self.room.as_mut_ptr() as *mut u8, self.source.as_ptr().add(start).sub(skip), bytes as u32);
         }
+        let stats = stats();
+        stats.alpha0_fills += 1;
+        stats.alpha0_fill_bytes += bytes as u32;
         (self.skip, self.first, self.count) = (skip, vertex, count as u32);
         true
     }
@@ -1916,6 +1977,26 @@ impl Draws {
         let stored = frame.indices.get(first..first.checked_add(draw.index_count as usize)?)?;
         let runs = draw.flags & draw_flags::INDEX_RUNS != 0;
         let strip = self.index_primitive == gxm::PRIMITIVE_TRIANGLE_STRIP;
+        // A raw draw that had too little to leave out waits some frames
+        // (`zero_alpha::Memo`): known by its vertices' PSP address, or in the
+        // arena (another place every frame) by its texture's. Asked before
+        // anything is made for the draw: a waiting one (half of God of
+        // War's) then costs a look into the memo, not the texel test's
+        // palette and rows, the colour rules, the vertex layouts and the
+        // window's place. (The answer needs none of them; a draw that is
+        // none for the cull never got an entry, so it is due and leaves
+        // below as before.)
+        let mode = ZERO_ALPHA.load(Ordering::Relaxed);
+        let remembered = draw.flags & draw_flags::RAW_VERTICES != 0 && mode != 2;
+        let key = if draw.flags & draw_flags::RAW_PSP_RAM != 0 {
+            draw.first_vertex
+        } else {
+            !frame.textures().get(draw.texture as usize).map_or(0, |texture| texture.address)
+        };
+        // (Debug "zeroalpha 3": asked after all that, as before.)
+        if mode != 3 && remembered && !self.zero_alpha_memo.due(key, draw.index_count) {
+            return None;
+        }
         let texels = texel_test(frame, draw);
         // What is known of the corners: raw vertices' alpha bytes (where
         // the colour rules keep 0 at 0) and texture coordinates (where the
@@ -1944,7 +2025,7 @@ impl Draws {
         let first_vertex = draw.first_vertex as usize;
         let own = if raw.is_none() { frame.vertices.get(first_vertex..first_vertex.checked_add(draw.vertex_count as usize)?)? } else { &[] };
         // (In PSP RAM: through a window copied in bursts.)
-        let mut window = raw.filter(|_| draw.flags & draw_flags::RAW_PSP_RAM != 0).map(|(_, _, bytes, stride)| VertexWindow::new(stride, bytes));
+        let mut window = raw.filter(|_| draw.flags & draw_flags::RAW_PSP_RAM != 0).map(|(_, _, bytes, stride)| VertexWindow::new(stride, bytes, if runs { stored } else { &[] }));
         // A corner as the texel test reads it (coordinates in 1/16 texels);
         // one without coordinates keeps its triangle.
         let make = |zero: bool, uv: Option<[f32; 2]>| match &texels {
@@ -1975,16 +2056,7 @@ impl Draws {
             goes
         };
         let mut corner = corner;
-        // A raw draw that had too little to leave out waits some frames
-        // (`zero_alpha::Memo`): known by its vertices' PSP address, or in the
-        // arena (another place every frame) by its texture's.
-        let remembered = raw.is_some() && ZERO_ALPHA.load(Ordering::Relaxed) != 2;
-        let key = if draw.flags & draw_flags::RAW_PSP_RAM != 0 {
-            draw.first_vertex
-        } else {
-            !frame.textures().get(draw.texture as usize).map_or(0, |texture| texture.address)
-        };
-        if remembered && !self.zero_alpha_memo.due(key, draw.index_count) {
+        if mode == 3 && remembered && !self.zero_alpha_memo.due(key, draw.index_count) {
             return None;
         }
         // The new list is put together on the stack and copied into the

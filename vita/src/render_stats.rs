@@ -164,6 +164,10 @@ pub struct RenderStats {
     /// thread's time in it (with `drawtiming 1` only, else 0).
     pub alpha0_read: u32,
     pub alpha0_us: u64,
+    /// The copies out of PSP RAM made for it (`draw::VertexWindow::fill`)
+    /// and their bytes.
+    pub alpha0_fills: u32,
+    pub alpha0_fill_bytes: u32,
     /// Draws read with a texel test (`draw::texel_test`), and the triangles
     /// it left out (counted in `alpha0_culled` too).
     pub texel0_draws: u32,
@@ -266,6 +270,8 @@ impl RenderStats {
         alpha0_skipped: 0,
         alpha0_read: 0,
         alpha0_us: 0,
+        alpha0_fills: 0,
+        alpha0_fill_bytes: 0,
         texel0_draws: 0,
         texel0_culled: 0,
         alpha0_as_list: 0,
@@ -358,7 +364,7 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
     );
     let _ = write!(
         text,
-        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} point_light_draws={} fixed_color_draws={} fix_b_draws={} cut_draws={} cut_fast_draws={} cut_off_draws={} wide_draws={} opaque_draws={} opaque_untested_draws={} opaque_rows_draws={} hidden_draws={} depth_only_draws={} hidden={}us flat_draws={} const_draws={} nodepth_draws={} ge_filter_draws={} ge_wide_draws={} ge_wide_missed={} ge_wide_inexact={} ge_gather_draws={} ge_gather_missed={} wide_target_textures={} wide_copies={} wide_copy_scenes={} black_draws={} black_culled={} black_kept={} black_skipped={} alpha0_draws={} alpha0_culled={} alpha0_kept={} alpha0_skipped={} alpha0_read={} alpha0={}us texel0_draws={} texel0_culled={} alpha0_as_list={} strip_draws={} strip_indices={} strip_corners={} opaque={}us ",
+        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} point_light_draws={} fixed_color_draws={} fix_b_draws={} cut_draws={} cut_fast_draws={} cut_off_draws={} wide_draws={} opaque_draws={} opaque_untested_draws={} opaque_rows_draws={} hidden_draws={} depth_only_draws={} hidden={}us flat_draws={} const_draws={} nodepth_draws={} ge_filter_draws={} ge_wide_draws={} ge_wide_missed={} ge_wide_inexact={} ge_gather_draws={} ge_gather_missed={} wide_target_textures={} wide_copies={} wide_copy_scenes={} black_draws={} black_culled={} black_kept={} black_skipped={} alpha0_draws={} alpha0_culled={} alpha0_kept={} alpha0_skipped={} alpha0_read={} alpha0={}us alpha0_fills={} alpha0_fill_bytes={} texel0_draws={} texel0_culled={} alpha0_as_list={} strip_draws={} strip_indices={} strip_corners={} opaque={}us ",
         per_frame(s.begin_us),
         per_frame(s.loop_us),
         per_frame(s.convert_us),
@@ -406,6 +412,8 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
         s.alpha0_skipped / frames,
         s.alpha0_read / frames,
         per_frame(s.alpha0_us),
+        s.alpha0_fills / frames,
+        s.alpha0_fill_bytes / frames,
         s.texel0_draws / frames,
         s.texel0_culled / frames,
         s.alpha0_as_list / frames,
