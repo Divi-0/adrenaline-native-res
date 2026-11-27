@@ -97,7 +97,7 @@ const MODES: [Mode; 2] = [
 ///   VRAM screen holds pieces of the next frame's HUD.
 fn scene_flags(name: &str) -> &'static [&'static str] {
     match name {
-        "gow_UCES00842/title" => &["--ge-filter", "--ge-light", "--ge-depth", "--reference-vram"],
+        "gow_UCES00842/title" | "gow_UCES00842/upgrade-menu" => &["--ge-filter", "--ge-light", "--ge-depth", "--reference-vram"],
         _ if name.starts_with("gow_UCES00842/") => &["--ge-filter", "--ge-light", "--ge-depth"],
         _ => &[],
     }
