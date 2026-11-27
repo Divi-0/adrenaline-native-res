@@ -60,6 +60,7 @@ nativeres_textured_const_f GE_FILTER
 nativeres_textured_f GE_FILTER
 nativeres_textured_fix_f GE_FILTER
 nativeres_textured_flat_f GE_FILTER
+nativeres_textured_nospec_f GE_FILTER
 nativeres_textured_read_add565_f GE_FILTER
 nativeres_textured_read_add565dither_f
 nativeres_textured_read_add565nofog_f GE_FILTER

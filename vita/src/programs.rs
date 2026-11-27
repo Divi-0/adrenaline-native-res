@@ -54,6 +54,10 @@ pub enum Kind {
     /// need no PSP depth (nativeres_textured_const_f.cg): the colour as a
     /// uniform, the same pixels, half the work again.
     TexturedConst,
+    /// `Textured` for draws whose specular part is 0 (nativeres_textured_nospec_f.cg,
+    /// NO_SPECULAR; only in the PSP-depth set, and only with `Textured`'s
+    /// uniform layout: draws set the same uniforms).
+    TexturedNoSpec,
     TexturedTest,
     /// `TexturedTest` with the GE's alpha-test mask (nativeres_textured_testmask_f.cg,
     /// ALPHA_MASK; only in the PSP-depth set): masked tests of draws GXM blends.
@@ -203,6 +207,10 @@ pub struct Textured {
     /// nativeres_textured_flat_f.cg: without fog and specular.
     pub have_flat: bool,
     fragment_flat_id: PatcherId,
+    /// nativeres_textured_nospec_f.cg: without the specular part; its
+    /// uniforms are `fog_and_scale` and `tex_size` (the same layout).
+    pub have_nospec: bool,
+    fragment_nospec_id: PatcherId,
     pub fog_and_scale_flat: *const ProgramParameter,
     /// nativeres_textured_const_f.cg: one vertex colour (uTint), no PSP depth.
     pub have_const: bool,
@@ -1331,6 +1339,8 @@ impl Textured {
             depth_far: null(),
             fog_and_scale: null(),
             have_flat: false,
+            have_nospec: false,
+            fragment_nospec_id: null_mut(),
             have_const: false,
             fragment_const_id: null_mut(),
             tint_const: null(),
@@ -1673,6 +1683,7 @@ impl Programs {
         }
         render_log::line(format_args!("our programs ready\n"));
         self.make_flat_program();
+        self.make_nospec_program();
         self.make_const_program();
         self.make_alpha_test_program();
         self.make_alpha_mask_program();
@@ -1698,6 +1709,29 @@ impl Programs {
             return;
         }
         textured.have_flat = true;
+    }
+
+    /// The variant without the specular part (nativeres_textured_nospec_f.cg),
+    /// only where its program filters as the GE (the PSP-depth set: its twins
+    /// are in the depth pack) and only if its uniforms lie where the
+    /// textured program's do, so a draw sets them as for `Kind::Textured`.
+    fn make_nospec_program(&mut self) {
+        if !crate::shaders::psp_depth() {
+            return;
+        }
+        let program = gxp(&shaders::nativeres_textured_nospec_f);
+        if !same_uniforms(program, gxp(&shaders::nativeres_textured_f)) {
+            render_log::line(format_args!("no-specular program: uniforms differ from the textured program's
+"));
+            return;
+        }
+        let Some(id) = register(program) else {
+            render_log::line(format_args!("no-specular program: invalid GXP
+"));
+            return;
+        };
+        self.textured.fragment_nospec_id = id;
+        self.textured.have_nospec = true;
     }
 
     /// The variant for one vertex colour (nativeres_textured_const_f.cg).
@@ -1908,6 +1942,7 @@ impl Programs {
             Kind::TexturedTestFix if textured.have_test && textured.have_fix => textured.fragment_test_fix_id,
             Kind::Textured => textured.fragment_id,
             Kind::TexturedFlat if textured.have_flat => textured.fragment_flat_id,
+            Kind::TexturedNoSpec if textured.have_nospec => textured.fragment_nospec_id,
             Kind::TexturedConst if textured.have_const => textured.fragment_const_id,
             Kind::TexturedGe if textured.have_ge => textured.fragment_ge_id,
             Kind::TexturedFixGe if textured.have_ge => textured.fragment_fix_ge_id,
@@ -1936,7 +1971,7 @@ impl Programs {
         // uniform (draw.rs textured_fragment_uniforms), not part of the program.
         if blend & BLEND_ENABLED != 0 && blend & BLEND_FIX_B_ALPHA != 0 {
             kind = match kind {
-                Kind::Textured | Kind::TexturedFlat => Kind::TexturedFix,
+                Kind::Textured | Kind::TexturedFlat | Kind::TexturedNoSpec => Kind::TexturedFix,
                 Kind::TexturedTest => Kind::TexturedTestFix,
                 Kind::TexturedGe => Kind::TexturedFixGe,
                 other => other,
@@ -2022,6 +2057,7 @@ fn textured_gxp(kind: Kind) -> Option<*const gxm::Program> {
     Some(match kind {
         Kind::Textured => gxp(&shaders::nativeres_textured_f),
         Kind::TexturedFlat => gxp(&shaders::nativeres_textured_flat_f),
+        Kind::TexturedNoSpec => gxp(&shaders::nativeres_textured_nospec_f),
         Kind::TexturedConst => gxp(&shaders::nativeres_textured_const_f),
         Kind::TexturedTest => gxp(&shaders::nativeres_textured_test_f),
         Kind::TexturedTestMask => gxp(&shaders::nativeres_textured_testmask_f),

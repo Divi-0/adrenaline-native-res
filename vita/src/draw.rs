@@ -197,10 +197,10 @@ pub static FLAT_SHADING: AtomicI32 = AtomicI32::new(1);
 /// 2 = measuring: also the draws onto the screen (GoW +18..71 ms GPU).
 pub static GE_FILTER: AtomicI32 = AtomicI32::new(1);
 
-/// Whether textured `draw` may take the flat program: no fog, no separate
-/// specular colour (the two parts it leaves out).
+/// Whether textured `draw` may take the flat program: no fog, no specular
+/// part (the two parts it leaves out).
 fn flat_shading(frame: &Frame, draw: &Draw) -> bool {
-    draw.flags & draw_flags::FOG == 0 && FLAT_SHADING.load(Ordering::Relaxed) != 0 && !separate_specular(frame, draw)
+    draw.flags & draw_flags::FOG == 0 && FLAT_SHADING.load(Ordering::Relaxed) != 0 && !specular_part(frame, draw)
 }
 
 /// Debug "zeroalpha 0|1|2": blended draws leave out the triangles whose
@@ -372,6 +372,16 @@ pub static NO_DEPTH_TWINS: AtomicI32 = AtomicI32::new(1);
 /// itself). 219 -> 78 instructions a fragment. 1 = on (default), 0 = the
 /// generic program. Debug `maskedtest`.
 pub static MASKED_TEST: AtomicI32 = AtomicI32::new(1);
+
+/// Textured draws whose specular part is 0 (`specular_part` false: no
+/// light computes specular) take the textured program without it
+/// (`Kind::TexturedNoSpec`, nativeres_textured_nospec_f.cg, NO_SPECULAR; the
+/// PSP-depth set), and unfogged ones may take the flat program. Exact: the
+/// vertex programs hand such a draw vSpecular = 0, and the GE's term
+/// floor(0 x 255 + 0.5) = 0 adds nothing (God of War: every lit draw has
+/// LIGHTMODE 1 but no light with specular). 1 = on (default), 0 = by the
+/// LIGHTMODE flag alone (`separate_specular`), as before. Debug `nospecular`.
+pub static NO_SPECULAR: AtomicI32 = AtomicI32::new(1);
 
 /// The one vertex colour of textured `draw` if it may take the
 /// constant-colour program in place of the flat one (`flat_shading` holds):
@@ -683,6 +693,26 @@ fn separate_specular(frame: &Frame, draw: &Draw) -> bool {
         None
     };
     lights.is_some_and(|lights| lights.material_specular[3] > 0.5)
+}
+
+/// Whether `draw`'s fragments can get a specular part (vSpecular other than
+/// 0): `separate_specular`, and a light that computes specular
+/// (`GpuLights::specular` w, DIFFUSE_AND_SPECULAR). Every lit vertex program
+/// adds a light's specular only under that flag (nativeres_raw_v.cg,
+/// nativeres_3d_v.cg), starting from 0, so without one the part is exactly
+/// 0. With `NO_SPECULAR` off: `separate_specular` alone.
+fn specular_part(frame: &Frame, draw: &Draw) -> bool {
+    if NO_SPECULAR.load(Ordering::Relaxed) == 0 {
+        return separate_specular(frame, draw);
+    }
+    let lights = if draw.flags & draw_flags::RAW_VERTICES != 0 {
+        frame.raw_transform_of(draw).and_then(|(transform, _)| raw_light_set(frame, transform))
+    } else if draw.transform != 0 && draw.transform <= frame.transform_count {
+        frame.transforms.get(draw.transform as usize - 1).and_then(|transform| light_set(frame, transform))
+    } else {
+        None
+    };
+    lights.is_some_and(|lights| lights.material_specular[3] > 0.5 && lights.specular.iter().any(|light| light[3] > 0.5))
 }
 
 /// Measuring only (0 = off): our scene draws only
@@ -2313,6 +2343,9 @@ impl Draws {
                     }
                     _ => Kind::TexturedFlat,
                 }
+            } else if self.programs.textured.have_nospec && !specular_part(frame, draw) {
+                // Its specular part is 0: the program without it (`NO_SPECULAR`).
+                Kind::TexturedNoSpec
             } else {
                 Kind::Textured
             };
@@ -2321,7 +2354,12 @@ impl Draws {
                 // No constant-colour program for this blend: the flat one.
                 const_tint = None;
                 self.programs.blend_program_with(Kind::TexturedFlat, draw.blend, keep, alpha_out)
+            } else if kind == Kind::TexturedNoSpec && program.is_null() {
+                self.programs.blend_program_with(Kind::Textured, draw.blend, keep, alpha_out)
             } else {
+                if kind == Kind::TexturedNoSpec {
+                    stats().nospec_draws += 1;
+                }
                 program
             }
         } else {

@@ -286,6 +286,8 @@ embed_twin!(nativeres_textured_f, nativeres_textured_pspdepth_f);
 embed_twin!(nativeres_textured_flat_f, nativeres_textured_flat_pspdepth_f);
 // The flat one for draws of one vertex colour that need no PSP depth: half the work again.
 embed_twin!(nativeres_textured_const_f, nativeres_textured_const_pspdepth_f);
+// Without the specular part (used in the PSP-depth set only).
+embed_twin!(nativeres_textured_nospec_f, nativeres_textured_nospec_pspdepth_f);
 // The same with the PSP's alpha test (discard).
 embed_twin!(nativeres_textured_test_f, nativeres_textured_test_pspdepth_f);
 // With the GE's alpha-test mask (used in the PSP-depth set only).

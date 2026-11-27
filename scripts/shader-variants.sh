@@ -12,6 +12,7 @@
 #   nativeres_raw_<variant>_<colour>_v.cg  each of these six + RAW_COLOR_<colour> (none, 5650,
 #                                   5551, 4444, 8888: the vertex colour format fixed)
 #   nativeres_textured_fix_f.cg     nativeres_textured_f.cg + BLEND_FIX (grey FIX B blending)
+#   nativeres_textured_nospec_f.cg  nativeres_textured_f.cg + NO_SPECULAR (draws whose specular part is 0)
 #   nativeres_textured_test_fix_f.cg nativeres_textured_test_f.cg + BLEND_FIX
 #   nativeres_textured_testmask_f.cg nativeres_textured_test_f.cg + ALPHA_MASK (the GE's alpha-test mask)
 #   nativeres_textured_ge_f.cg      nativeres_textured_f.cg + GE_FILTER (the GE's bilinear filter,
@@ -65,6 +66,7 @@ for v in PLAIN:plain PLAIN4:plain4 LIT1:lit1 LIT4:lit4 LIT1_FLAT:lit1flat LIT4_F
   done
 done
 variant nativeres_textured_f BLEND_FIX nativeres_textured_fix_f
+variant nativeres_textured_f NO_SPECULAR nativeres_textured_nospec_f
 variant nativeres_textured_f GE_FILTER nativeres_textured_ge_f
 variant nativeres_textured_f "BLEND_FIX GE_FILTER" nativeres_textured_fix_ge_f
 variant nativeres_textured_test_f BLEND_FIX nativeres_textured_test_fix_f
