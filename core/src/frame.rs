@@ -188,6 +188,42 @@ pub mod draw_flags {
     /// With a 16-bit target: dithering on, `Frame::dither_matrix` added to
     /// the colour before it is cut.
     pub const DITHER: u32 = 1 << 27;
+    /// With `MIPS`: the draw is in the GE's "slope" level mode and setting
+    /// `slopemip` is on (`texture::SLOPE_MIP`): the level comes per pixel
+    /// from its 1/w (`texture::slope_level`), not from the GPU. Its
+    /// `texture::slope_base` (11 bits, signed, clamped: |GELog16(1/w)| stays
+    /// far below 1024 for any depth, so the clamp changes no level) is in the
+    /// `MIP_BIAS` bits (low 8) and bits 28..30 (high 3); no bias then.
+    pub const MIP_SLOPE: u32 = 1 << 31;
+    pub const MIP_SLOPE_HIGH_SHIFT: u32 = 28;
+
+    /// `MIP_SLOPE` with `base` in its bits.
+    pub fn pack_slope_base(base: i32) -> u32 {
+        let bits = base.clamp(-1024, 1023) as u32 & 0x7FF;
+        MIP_SLOPE | ((bits & 0xFF) << MIP_BIAS_SHIFT) | ((bits >> 8) << MIP_SLOPE_HIGH_SHIFT)
+    }
+
+    /// The slope base of a `MIP_SLOPE` draw's flags.
+    pub fn slope_base(flags: u32) -> i32 {
+        let bits = ((flags & MIP_BIAS_MASK) >> MIP_BIAS_SHIFT) | (((flags >> MIP_SLOPE_HIGH_SHIFT) & 7) << 8);
+        ((bits << 21) as i32) >> 21
+    }
+}
+
+#[cfg(test)]
+mod slope_flag_tests {
+    use super::draw_flags::*;
+
+    #[test]
+    fn the_slope_base_survives_the_flags() {
+        for base in [-1024, -79, -1, 0, 1, 255, 256, 1023] {
+            let flags = pack_slope_base(base) | MIPS | MIP_LINEAR | DITHER | TEXTURED;
+            assert_eq!(slope_base(flags), base);
+            assert_ne!(flags & MIP_SLOPE, 0);
+        }
+        assert_eq!(slope_base(pack_slope_base(5000)), 1023);
+        assert_eq!(pack_slope_base(-1) & (MIP_LINEAR | TARGET_FORMAT_MASK | DITHER), 0, "other bits untouched");
+    }
 }
 
 /// What the GE writes into a 16-bit target for an 8-bit colour channel

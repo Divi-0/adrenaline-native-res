@@ -200,6 +200,39 @@ float4 GeTexel(sampler2D tex, float2 uv, float4 size)
 #else
 #define SAMPLE(tex, uv) tex2D<half4>(tex, uv)
 #endif
+#ifdef SLOPE_LOD
+// SLOPE_LOD (nativeres_textured[_fix|_test|_test_fix|_flat]_slope_f.cg, setting
+// `slopemip`, core texture.rs slope_level): the draw's texture in the GE's
+// "slope" level mode, the level from the pixel's 1/w (overW: linear on the
+// screen, the GE's q) as the PSP picks it (ppsspp-ref GPU/Software/
+// Rasterizer.cpp CalculateSamplingParams): detail = base - GELog16(q) in
+// 1/16 levels; none above 0 is level 0; capped at the highest level; without
+// blending between levels rounded at half a level. uTexSize: x = the draw's
+// base (16 + GELog16(slope) + TEXLEVEL offset), y = the highest level x 16,
+// z = 8 for the nearest level (the GE's "mip nearest"), 0 to blend (GXM's
+// mip filter then mixes the two levels by the fraction).
+// GeLog16: the GE's float-bits log2 in 1/16 (exponent and the top 4
+// mantissa bits) in float steps: the exponent from log2, put right where
+// log2 rounds across a power of two; the mantissa (v / 2^e, exact) cut to
+// 1/16.
+float GeLog16(float v)
+{
+	float e = floor(log2(v));
+	float p = exp2(e);
+	e += v >= p + p ? 1.0f : 0.0f;
+	e -= v < p ? 1.0f : 0.0f;
+	float m = v * exp2(-e);
+	return e * 16.0f + floor((m - 1.0f) * 16.0f);
+}
+float SlopeLod(float q, float4 slope)
+{
+	float detail = slope.x - GeLog16(q);
+	float level16 = detail > 0.0f ? min(detail, slope.y) + slope.z : 0.0f;
+	return slope.z > 0.0f ? floor(level16 * (1.0f / 16.0f)) : level16 * (1.0f / 16.0f);
+}
+#undef SAMPLE
+#define SAMPLE(tex, uv) tex2Dlod<half4>(tex, float4(uv, 0.0f, SlopeLod(overW, uTexSize)))
+#endif
 
 #ifdef OUT_BYTES
 __regformat unsigned char4 main(
@@ -222,7 +255,13 @@ float4 main(
 #ifdef GE_FILTER
 	uniform float4 uTexSize,
 #endif
-	uniform float4 uFogAndScale) : COLOR
+	uniform float4 uFogAndScale
+#ifdef SLOPE_LOD
+	// Last: the other uniforms stay where the program without SLOPE_LOD has
+	// them (draw.rs sets them through its parameters).
+	, uniform float4 uTexSize
+#endif
+	) : COLOR
 {
 	// Colour, specular and fog came times w (screen-linear, nativeres_3d_v.cg).
 	float overW = 1.0f / vFog.y;

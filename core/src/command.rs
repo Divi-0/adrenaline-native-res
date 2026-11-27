@@ -175,6 +175,9 @@ pub mod op {
     /// Mip level mode (bits 0..2: auto, const, slope) and offset (bits
     /// 16..24, signed, 1/16 levels).
     pub const TEXTURE_LEVEL: u8 = 0xC8;
+    /// The "slope" level mode's slope (TEXLODSLOPE, float24): the level
+    /// comes from the pixel's 1/w and this (`texture::slope_level`).
+    pub const TEXTURE_LOD_SLOPE: u8 = 0xD0;
     /// Bit 0: clamp U, bit 8: clamp V (otherwise repeat).
     pub const TEXTURE_WRAP: u8 = 0xC7;
     /// How texture and vertex colour combine (bits 0..3) and whether

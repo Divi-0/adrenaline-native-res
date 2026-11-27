@@ -121,6 +121,12 @@ pub fn is_palette_format(format: u8) -> bool {
 /// 2 "Mipmapped" (the game's levels as the GPU picks them at our size).
 pub static MIP_MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
+/// Setting `slopemip=1` (options.rs; off by default): draws in the GE's
+/// "slope" level mode (TEXLEVEL mode 2) sample their mip levels as the PSP
+/// does, the level from each pixel's 1/w (`slope_level`), whatever
+/// `MIP_MODE` says. Off: as before (the level the GPU picks, or level 0).
+pub static SLOPE_MIP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// How a draw samples its texture's mip levels (`describe_levels`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MipLevels {
@@ -131,6 +137,45 @@ pub struct MipLevels {
     pub linear: bool,
     /// Bias in 1/8 levels (`draw_flags::MIP_BIAS_SHIFT`).
     pub bias_eighths: i8,
+    /// With `SLOPE_MIP`, a draw in slope mode: its `slope_base` (the level
+    /// comes per pixel from `slope_level`; no bias then).
+    pub slope_base: Option<i32>,
+}
+
+/// The float-bits log2 the GE's level selection uses, in 1/16 levels: the
+/// exponent and the top 4 mantissa bits, a piecewise linear log2 floored to
+/// 1/16 (ppsspp-ref GPU/Software/GEMath.h GELog16, from GPU probes).
+pub fn ge_log16(value: f32) -> i32 {
+    ((value.to_bits() >> 19) & 0x0FFF) as i32 - 127 * 16
+}
+
+/// The per-draw part of the slope mode's level, in 1/16 levels:
+/// 16 + GELog16(slope) + the TEXLEVEL offset (ppsspp-ref GPU/Software/
+/// Rasterizer.cpp CalculateSamplingParams). `slope_register`: TEXLODSLOPE's
+/// 24 bits (a float24), `level_register`: TEXLEVEL's.
+pub fn slope_base(slope_register: u32, level_register: u32) -> i32 {
+    let slope = f32::from_bits((slope_register & 0x00FF_FFFF) << 8);
+    let offset = ((level_register >> 16) & 0xFF) as u8 as i8 as i32;
+    16 + ge_log16(slope) + offset
+}
+
+/// The GE's level in slope mode for a pixel whose 1/w is `q` (as the GE
+/// interpolates it: linear on the screen): (level, fraction in 1/16 towards
+/// the next level). detail = base - GELog16(q); none above 0 is level 0;
+/// capped at the highest level; without blending between levels ("mip
+/// nearest") rounded at half a level (ppsspp-ref Rasterizer.cpp
+/// CalculateSamplingParams). The two levels then mix as
+/// (next f + this (16 - f)) >> 4 per channel (Sampler.cpp).
+pub fn slope_level(base: i32, q: f32, highest: u32, linear: bool) -> (u32, u32) {
+    let detail = base - ge_log16(q);
+    if detail <= 0 || highest == 0 {
+        return (0, 0);
+    }
+    let mut level16 = detail.min(highest as i32 * 16);
+    if !linear {
+        level16 += 8;
+    }
+    ((level16 >> 4) as u32, if linear { (level16 & 15) as u32 } else { 0 })
 }
 
 /// The current texture's mip levels, if the draw uses them and the menu
@@ -143,19 +188,28 @@ pub struct MipLevels {
 /// of the one before (GPU mip chains); levels after one that isn't are left
 /// out.
 pub fn describe_levels(ge: &GeState, base: &TextureDescriptor) -> Option<MipLevels> {
-    describe_levels_in_mode(ge, base, MIP_MODE.load(core::sync::atomic::Ordering::Relaxed))
+    use core::sync::atomic::Ordering::Relaxed;
+    describe_levels_with(ge, base, MIP_MODE.load(Relaxed), SLOPE_MIP.load(Relaxed))
 }
 
 /// `describe_levels` for menu option value `mode` (tests don't share the
-/// global).
+/// globals).
+#[cfg(test)]
 fn describe_levels_in_mode(ge: &GeState, base: &TextureDescriptor, mode: u8) -> Option<MipLevels> {
+    describe_levels_with(ge, base, mode, false)
+}
+
+/// `describe_levels` for menu option value `mode` and setting `slope`
+/// (`SLOPE_MIP`): with it, slope-mode draws get their levels in any mode.
+fn describe_levels_with(ge: &GeState, base: &TextureDescriptor, mode: u8, slope: bool) -> Option<MipLevels> {
     let min_filter = ge.register(op::TEXTURE_FILTER) & 7;
     let max_level = (ge.register(op::TEXTURE_MODE) >> 16) & 7;
-    if mode == 0 || min_filter & 4 == 0 || max_level == 0 {
-        return None;
-    }
     let level_register = ge.register(op::TEXTURE_LEVEL);
     let level_mode = level_register & 3;
+    let slope = slope && level_mode == 2;
+    if (mode == 0 && !slope) || min_filter & 4 == 0 || max_level == 0 {
+        return None;
+    }
     let offset = ((level_register >> 16) & 0xFF) as u8 as i8 as i32; // 1/16 levels
     if level_mode == 1 && offset <= 0 {
         return None;
@@ -187,9 +241,14 @@ fn describe_levels_in_mode(ge: &GeState, base: &TextureDescriptor, mode: u8) -> 
     // Auto: the TEXLEVEL offset (1/16 -> 1/8 levels); const: the offset too
     // (as a bias, an approximation of a fixed level); slope: none (PPSSPP:
     // "not well understood"). Like the PSP: one level more at our 2x size.
+    let linear = min_filter & 2 != 0;
+    if slope {
+        let base = slope_base(ge.register(op::TEXTURE_LOD_SLOPE), level_register);
+        return Some(MipLevels { levels, count, linear, bias_eighths: 0, slope_base: Some(base) });
+    }
     let game_bias = if level_mode == 2 { 0 } else { offset / 2 };
     let psp_like = if mode == 1 { 8 } else { 0 };
-    Some(MipLevels { levels, count, linear: min_filter & 2 != 0, bias_eighths: (game_bias + psp_like).clamp(-31, 32) as i8 })
+    Some(MipLevels { levels, count, linear, bias_eighths: (game_bias + psp_like).clamp(-31, 32) as i8, slope_base: None })
 }
 
 /// Level `level` of a texture with mip levels as a texture of its own: its
@@ -1356,6 +1415,40 @@ mod tests {
         let (mut ge, base) = ge_with_levels(7, 0);
         ge.set_register(crate::command::Command(((op::TEXTURE_SIZE_0 as u32 + 2) << 24) | 5 | (5 << 8))); // level 2 not half
         assert_eq!(describe_levels_in_mode(&ge, &base, 1).unwrap().count, 2);
+    }
+
+    /// The GE's float-bits log2 and the slope mode's level, with Kenka
+    /// Bancho's train numbers (TEXLODSLOPE 0x3e4ccc = 0.2, TEXLEVEL 0xc80002:
+    /// slope, offset -56/16), worked out by hand from ppsspp-ref's rule.
+    #[test]
+    fn slope_mode_levels_as_the_ge_picks_them() {
+        assert_eq!([ge_log16(1.0), ge_log16(2.0), ge_log16(0.5), ge_log16(1.5)], [0, 16, -16, 8]);
+        // 0.2 = 1.6 x 2^-3: -48 + floor(0.6 x 16); 0.01 = 1.28 x 2^-7; 0.001 = 1.024 x 2^-10.
+        assert_eq!([ge_log16(f32::from_bits(0x3e4ccc00)), ge_log16(0.01), ge_log16(0.001)], [-39, -108, -160]);
+        let base = slope_base(0x3e4ccc, 0xc80002);
+        assert_eq!(base, 16 - 39 - 56);
+        // w 10: detail -24, level 0; w 100: 29 = level 1 and 13/16; w 1000: 81, capped at level 2.
+        assert_eq!(slope_level(base, 0.1, 2, true), (0, 0));
+        assert_eq!(slope_level(base, 0.01, 2, true), (1, 13));
+        assert_eq!(slope_level(base, 0.001, 2, true), (2, 0));
+        // Without blending between levels: rounded at half a level (29 + 8 = 37 -> 2).
+        assert_eq!(slope_level(base, 0.01, 2, false), (2, 0));
+        assert_eq!(slope_level(base, 0.001, 0, true), (0, 0), "no levels");
+    }
+
+    /// With `SLOPE_MIP`, slope-mode draws get their levels whatever the
+    /// menu option, with their base and no bias; other modes as before.
+    #[test]
+    fn slope_mode_draws_take_their_levels_with_the_setting() {
+        let (mut ge, base) = ge_with_levels(7, 0xc80002);
+        ge.set_register(crate::command::Command(((op::TEXTURE_LOD_SLOPE as u32) << 24) | 0x3e4ccc));
+        assert_eq!(describe_levels_with(&ge, &base, 0, false), None, "setting off, Sharp: none");
+        let slope = describe_levels_with(&ge, &base, 0, true).unwrap();
+        assert_eq!((slope.count, slope.linear, slope.bias_eighths, slope.slope_base), (4, true, 0, Some(-79)));
+        assert_eq!(describe_levels_with(&ge, &base, 1, true).unwrap().slope_base, Some(-79), "any menu mode");
+        let (ge, base) = ge_with_levels(7, 0); // auto: the setting changes nothing
+        assert_eq!(describe_levels_with(&ge, &base, 0, true), None);
+        assert_eq!(describe_levels_with(&ge, &base, 1, true).unwrap().slope_base, None);
     }
 
     /// GXM's layout as measured on the Vita: levels back to back, rows

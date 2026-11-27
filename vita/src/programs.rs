@@ -118,6 +118,77 @@ const NO_WIDE_SIBLING: WideSibling = WideSibling {
     info: None,
 };
 
+/// Textured blend programs that may get a SLOPE_LOD sibling
+/// (`Programs::slope_program`).
+const MAX_SLOPE_SIBLINGS: usize = 64;
+
+/// A textured blend program of the normal set and, made on first use, the
+/// same program from its SLOPE_LOD twin (setting `slopemip`: the GE's slope
+/// level mode per pixel), with the same blending and vertex program. The
+/// twin has the program's uniforms where it has them, plus uTexSize last
+/// (`extends_uniforms`), so draws set the others through the program's own
+/// parameters and the level constants through `tex_size`.
+#[derive(Clone, Copy)]
+struct SlopeSibling {
+    point: *mut gxm::FragmentProgram,
+    slope: *mut gxm::FragmentProgram,
+    tex_size: *const ProgramParameter,
+    tried: bool,
+    fragment_gxp: *const gxm::Program,
+    slope_gxp: *const gxm::Program,
+    vertex_gxp: *const gxm::Program,
+    info: Option<gxm::BlendInfo>,
+}
+
+const NO_SLOPE_SIBLING: SlopeSibling = SlopeSibling {
+    point: null_mut(),
+    slope: null_mut(),
+    tex_size: null(),
+    tried: false,
+    fragment_gxp: null(),
+    slope_gxp: null(),
+    vertex_gxp: null(),
+    info: None,
+};
+
+/// The SLOPE_LOD twin of textured `kind`'s program (normal set only).
+fn slope_gxp(kind: Kind) -> Option<*const gxm::Program> {
+    Some(match kind {
+        Kind::Textured => gxp(&shaders::nativeres_textured_slope_f),
+        Kind::TexturedFlat => gxp(&shaders::nativeres_textured_flat_slope_f),
+        Kind::TexturedTest => gxp(&shaders::nativeres_textured_test_slope_f),
+        Kind::TexturedFix => gxp(&shaders::nativeres_textured_fix_slope_f),
+        Kind::TexturedTestFix => gxp(&shaders::nativeres_textured_test_fix_slope_f),
+        _ => return None,
+    })
+}
+
+/// True if program `b` has every parameter of program `a` as `a` has it
+/// (`same_uniforms`' test, by name) and one more, named `extra` (with its
+/// 0): uniforms set through the parameters of `a` land where `b` reads them.
+fn extends_uniforms(a: *const gxm::Program, b: *const gxm::Program, extra: &[u8]) -> bool {
+    // Safe: checked programs; parameters and names come from them.
+    unsafe {
+        let count = gxm::sceGxmProgramGetParameterCount(a);
+        if gxm::sceGxmProgramGetParameterCount(b) != count + 1 || gxm::sceGxmProgramFindParameterByName(b, extra.as_ptr()).is_null() {
+            return false;
+        }
+        (0..count).all(|index| {
+            let p = gxm::sceGxmProgramGetParameter(a, index);
+            if p.is_null() {
+                return false;
+            }
+            let q = gxm::sceGxmProgramFindParameterByName(b, gxm::sceGxmProgramParameterGetName(p));
+            !q.is_null()
+                && gxm::sceGxmProgramParameterGetCategory(p) == gxm::sceGxmProgramParameterGetCategory(q)
+                && gxm::sceGxmProgramParameterGetResourceIndex(p) == gxm::sceGxmProgramParameterGetResourceIndex(q)
+                && gxm::sceGxmProgramParameterGetContainerIndex(p) == gxm::sceGxmProgramParameterGetContainerIndex(q)
+                && gxm::sceGxmProgramParameterGetComponentCount(p) == gxm::sceGxmProgramParameterGetComponentCount(q)
+                && gxm::sceGxmProgramParameterGetArraySize(p) == gxm::sceGxmProgramParameterGetArraySize(q)
+        })
+    }
+}
+
 /// True if programs `a` and `b` have the same parameters (names, kinds,
 /// places, sizes) and default uniform buffer: uniforms set through the
 /// parameters of `a` land where `b` reads them.
@@ -1061,6 +1132,9 @@ pub struct Programs {
     gather_last: (*mut gxm::FragmentProgram, *mut gxm::FragmentProgram),
     /// The last `nodepth_program` answer (program, its sibling or null).
     nodepth_last: (*mut gxm::FragmentProgram, *mut gxm::FragmentProgram),
+    /// Textured programs and their SLOPE_LOD siblings (`slope_program`).
+    slope: [SlopeSibling; MAX_SLOPE_SIBLINGS],
+    slope_count: usize,
 }
 
 const NO_BLEND_PROGRAM: BlendProgram = BlendProgram { kind: Kind::Color, blend: 0, alpha: AlphaOut::AsColor, program: null_mut() };
@@ -1414,6 +1488,8 @@ impl Programs {
             wide_last: (null_mut(), null_mut()),
             gather_last: (null_mut(), null_mut()),
             nodepth_last: (null_mut(), null_mut()),
+            slope: [NO_SLOPE_SIBLING; MAX_SLOPE_SIBLINGS],
+            slope_count: 0,
         }
     }
 
@@ -1462,6 +1538,11 @@ impl Programs {
         addr_of_mut!((*place).wide_last).write((null_mut(), null_mut()));
         addr_of_mut!((*place).gather_last).write((null_mut(), null_mut()));
         addr_of_mut!((*place).nodepth_last).write((null_mut(), null_mut()));
+        let slope = addr_of_mut!((*place).slope) as *mut SlopeSibling;
+        for i in 0..MAX_SLOPE_SIBLINGS {
+            slope.add(i).write(NO_SLOPE_SIBLING);
+        }
+        addr_of_mut!((*place).slope_count).write(0);
     }
 
     /// Notes `point`, made from `fragment_gxp` with `info` for `vertex_gxp`,
@@ -1593,6 +1674,34 @@ impl Programs {
         }
         self.nodepth_last = (program, sibling.nodepth[form]);
         (!sibling.nodepth[form].is_null()).then_some(sibling.nodepth[form])
+    }
+
+    /// The SLOPE_LOD sibling of textured blend program `point` and its
+    /// uTexSize (setting `slopemip`: draws in the GE's slope level mode),
+    /// made on first use; None if `point` has none (not a textured program
+    /// of the normal set, or the twin couldn't be made or doesn't extend its
+    /// uniforms): the draw then samples level 0 (draw.rs).
+    pub fn slope_program(&mut self, point: *mut gxm::FragmentProgram) -> Option<(*mut gxm::FragmentProgram, *const ProgramParameter)> {
+        let index = (0..self.slope_count).find(|&i| self.slope[i].point == point)?;
+        let sibling = &mut self.slope[index];
+        if !sibling.tried {
+            sibling.tried = true;
+            let fits = extends_uniforms(sibling.fragment_gxp, sibling.slope_gxp, b"uTexSize\0");
+            if fits {
+                if let Some(id) = register(sibling.slope_gxp) {
+                    let info = sibling.info.as_ref().map_or(null(), |info| info as *const gxm::BlendInfo);
+                    sibling.slope = basic_programs::fragment_program(id, info, sibling.vertex_gxp);
+                    // Safe: a checked program.
+                    sibling.tex_size = unsafe { gxm::sceGxmProgramFindParameterByName(sibling.slope_gxp, b"uTexSize\0".as_ptr()) };
+                }
+            }
+            render_log::line(format_args!(
+                "slope program {}: {}\n",
+                index,
+                if !fits { "other uniforms (not used)" } else if sibling.slope.is_null() { "failed" } else { "ready" }
+            ));
+        }
+        (!sibling.slope.is_null() && !sibling.tex_size.is_null()).then_some((sibling.slope, sibling.tex_size))
     }
 
     /// The frame-read program `variant` for a draw into a 16-bit PSP
@@ -2045,6 +2154,18 @@ impl Programs {
             self.blend_count += 1;
             if let Some(fragment_gxp) = textured_gxp(kind) {
                 self.note_wide_candidate(program, fragment_gxp, info, gxp(&shaders::nativeres_textured_v));
+                // A SLOPE_LOD sibling for the normal set's textured programs.
+                if let Some(slope_gxp) = slope_gxp(kind).filter(|_| !shaders::psp_depth() && self.slope_count < MAX_SLOPE_SIBLINGS) {
+                    self.slope[self.slope_count] = SlopeSibling {
+                        point: program,
+                        fragment_gxp,
+                        slope_gxp,
+                        vertex_gxp: gxp(&shaders::nativeres_textured_v),
+                        info,
+                        ..NO_SLOPE_SIBLING
+                    };
+                    self.slope_count += 1;
+                }
             }
         }
         program

@@ -80,6 +80,8 @@ struct Texture {
     /// Where its texels show (core `texture::texel_mask`, as the Vita's
     /// texture cache makes it at decode); None for targets.
     mask: Option<nativeres_core::texture::TexelMask>,
+    /// Its mip levels 1.. (draws with `draw_flags::MIPS`), each as a texture.
+    levels: Vec<Texture>,
 }
 
 /// RGBA as floats 0..1 (may go above 1 with colour doubling).
@@ -143,9 +145,13 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
     let textures: Vec<Option<Texture>> = frame
         .textures()
         .iter()
-        .map(|texture| match previous {
+        .enumerate()
+        .map(|(index, texture)| match previous {
             Some(picture) if other_framebuffer(texture, frame) => Some(framebuffer_texture(texture, picture)),
-            _ => decode(texture, frame, memory),
+            _ => decode(texture, frame, memory).map(|mut decoded| {
+                decoded.levels = decode_levels(texture, index, frame, memory);
+                decoded
+            }),
         })
         .collect();
     for (index, texture) in textures.iter().enumerate() {
@@ -629,7 +635,7 @@ fn target_texture(texture: &TextureDescriptor, picture: &[u32]) -> Texture {
             pixels[y * width + x] = if opaque { pixel | 0xFF00_0000 } else { pixel };
         }
     }
-    Texture { width, height, pixels, mask: None }
+    Texture { width, height, pixels, mask: None, levels: Vec::new() }
 }
 
 /// Draws one of the frame's draws into `screen` (the shown framebuffer's
@@ -806,7 +812,7 @@ fn framebuffer_texture(texture: &TextureDescriptor, picture: &OriginalPicture) -
             pixels[y * width + x] = (picture.pixels[y * picture.width + x] & 0x00FF_FFFF) | forced_alpha;
         }
     }
-    Texture { width, height, pixels, mask: None }
+    Texture { width, height, pixels, mask: None, levels: Vec::new() }
 }
 
 fn decode(texture: &TextureDescriptor, frame: &Frame, memory: &DumpMemory) -> Option<Texture> {
@@ -817,7 +823,39 @@ fn decode(texture: &TextureDescriptor, frame: &Frame, memory: &DumpMemory) -> Op
     let mut pixels = vec![0u32; width * height];
     decode_texture(&data, texture, palette, &mut pixels, width).ok()?;
     let mask = nativeres_core::texture::texel_mask(&data, texture);
-    Some(Texture { width, height, pixels, mask })
+    Some(Texture { width, height, pixels, mask, levels: Vec::new() })
+}
+
+/// The mip levels 1.. of frame texture `index` (`Frame::texture_levels`),
+/// as far as they decode; none for a texture without levels.
+fn decode_levels(texture: &TextureDescriptor, index: usize, frame: &Frame, memory: &DumpMemory) -> Vec<Texture> {
+    let count = nativeres_core::frame::texture_level_count(texture) as usize;
+    let levels = frame.texture_levels(index);
+    (1..count).map_while(|level| decode(&nativeres_core::texture::level_descriptor(texture, levels, level), frame, memory)).collect()
+}
+
+/// Setting `slopemip` (`--slope-mip`): a draw in the GE's slope level mode
+/// samples the level the GE picks for the pixel's 1/w `q` (core
+/// `texture::slope_level`), the next one mixed in by the fraction as the GE
+/// does on 8-bit values: (next f + this (16 - f)) >> 4 (ppsspp-ref
+/// GPU/Software/Sampler.cpp). None for other draws.
+fn slope_sample(texture: &Texture, draw: &Draw, u: f32, v: f32, q: f32, filter: Filter) -> Option<Color> {
+    if draw.flags & draw_flags::MIP_SLOPE == 0 || draw.flags & draw_flags::MIPS == 0 || texture.levels.is_empty() {
+        return None;
+    }
+    let linear = draw.flags & draw_flags::MIP_LINEAR != 0;
+    let (level, fraction) =
+        nativeres_core::texture::slope_level(draw_flags::slope_base(draw.flags), q, texture.levels.len() as u32, linear);
+    let at = |level: u32| if level == 0 { texture } else { &texture.levels[level as usize - 1] };
+    let this = sample(at(level), draw, u, v, filter);
+    if fraction == 0 {
+        return Some(this);
+    }
+    let (a, b) = (this.to_rgba(), sample(at(level + 1), draw, u, v, filter).to_rgba());
+    let mixed = (0..4).fold(0u32, |out, c| {
+        out | (((((a >> (8 * c)) & 0xFF) * (16 - fraction) + ((b >> (8 * c)) & 0xFF) * fraction) >> 4) << (8 * c))
+    });
+    Some(Color::from_rgba(mixed))
 }
 
 /// Scissor rectangle in screen pixels: [left, right) x [top, bottom).
@@ -999,8 +1037,11 @@ fn draw_triangle(
                     let b = over_w.map(|weight| weight / total);
                     let u = b[0] * corners[0].u + b[1] * corners[1].u + b[2] * corners[2].u;
                     let v = b[0] * corners[0].v + b[1] * corners[1].v + b[2] * corners[2].v;
+                    // `total` is the pixel's 1/w, linear on the screen (the GE's q).
+                    let texel = slope_sample(texture, draw, u, v, total, draw_filter())
+                        .unwrap_or_else(|| sample(texture, draw, u, v, draw_filter()));
                     // Colour and fog: linear on the screen, as the PSP shades.
-                    ge_shade(sample(texture, draw, u, v, draw_filter()), Color::weighted(colors, linear), fog_at(linear, &corners), draw, color_scale)
+                    ge_shade(texel, Color::weighted(colors, linear), fog_at(linear, &corners), draw, color_scale)
                 }
                 None => Color::weighted(colors, linear),
             };
@@ -1425,7 +1466,7 @@ mod tests {
     /// A 2x1 texture, black then white, bilinear, clamped: half way
     /// between the texel centres the exact mix is 127.5.
     fn black_white() -> (Texture, Draw) {
-        let texture = Texture { width: 2, height: 1, pixels: vec![0xFF00_0000, 0xFFFF_FFFF], mask: None };
+        let texture = Texture { width: 2, height: 1, pixels: vec![0xFF00_0000, 0xFFFF_FFFF], mask: None, levels: Vec::new() };
         let flags = draw_flags::TEXTURED | draw_flags::LINEAR_FILTER | draw_flags::CLAMP_U | draw_flags::CLAMP_V;
         (texture, Draw { flags, ..Draw::default() })
     }
@@ -1495,7 +1536,7 @@ mod tests {
             corner(100.0, 0.0, 8.0, 0xFFFF_FFFF, 1.0),
             corner(0.0, 100.0, 8.0, 0xFFFF_FFFF, 1.0),
         ];
-        let white = Texture { width: 1, height: 1, pixels: vec![0xFFFF_FFFF], mask: None };
+        let white = Texture { width: 1, height: 1, pixels: vec![0xFFFF_FFFF], mask: None, levels: Vec::new() };
         let mut screen = vec![0u32; WIDTH * HEIGHT];
         let mut depth = vec![1.0f32; WIDTH * HEIGHT];
         // Unfogged: the screen-linear colour, 0.505 white (with perspective: 0.11).
@@ -1563,7 +1604,7 @@ mod tests {
         let draw = Draw { blend: packed, flags: draw_flags::TEXTURED, scissor_right: 479, scissor_bottom: 271, ..Draw::default() };
         assert!(wide_variant(draw.flags, draw.blend, true).is_some());
         // A white texel: the source is the vertex colour (modulate).
-        let texture = Texture { width: 1, height: 1, pixels: vec![0xFFFF_FFFF], mask: None };
+        let texture = Texture { width: 1, height: 1, pixels: vec![0xFFFF_FFFF], mask: None, levels: Vec::new() };
         GE_BLEND_FRAME.store(true, std::sync::atomic::Ordering::Relaxed);
         draw_triangle(&mut screen, &mut depth, &draw, Some(&texture), triangle, 0, None);
         GE_BLEND_FRAME.store(false, std::sync::atomic::Ordering::Relaxed);

@@ -387,7 +387,7 @@ pub fn float24(data: u32) -> f32 {
 /// listed. The loaded palette is checked apart (`DrawStateCache::fits`).
 /// The test `registers_left_out_of_the_draw_state_do_not_change_it` (in
 /// recorder.rs) checks that the list is complete.
-pub const DRAW_STATE_REGISTERS: [u8; 60] = [
+pub const DRAW_STATE_REGISTERS: [u8; 61] = [
     // Render target.
     op::FRAMEBUFFER_POINTER,
     op::FRAMEBUFFER_WIDTH,
@@ -452,6 +452,7 @@ pub const DRAW_STATE_REGISTERS: [u8; 60] = [
     op::TEXTURE_SIZE_0 + 6,
     op::TEXTURE_SIZE_0 + 7,
     op::TEXTURE_LEVEL,
+    op::TEXTURE_LOD_SLOPE,
     // Blending.
     op::ALPHA_BLEND_ENABLE,
     op::BLEND_MODE,

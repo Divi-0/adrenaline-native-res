@@ -120,6 +120,10 @@ pub struct RenderStats {
     /// Draws without depth test through their program's sibling without the
     /// PSP depth output (draw.rs `NO_DEPTH_TWINS`).
     pub nodepth_draws: u32,
+    /// Draws in the GE's slope level mode through a SLOPE_LOD sibling (setting
+    /// `slopemip`), and those without one (level 0).
+    pub slope_draws: u32,
+    pub slope_missed: u32,
     /// Textured draws reading one of our targets through the GE_FILTER
     /// programs (the GE's bilinear filter; core `ge_filter_read`).
     pub ge_filter_draws: u32,
@@ -251,6 +255,8 @@ impl RenderStats {
         flat_draws: 0,
         const_draws: 0,
         nodepth_draws: 0,
+        slope_draws: 0,
+        slope_missed: 0,
         ge_filter_draws: 0,
         ge_wide_draws: 0,
         ge_wide_missed: 0,
@@ -364,7 +370,7 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
     );
     let _ = write!(
         text,
-        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} point_light_draws={} fixed_color_draws={} fix_b_draws={} cut_draws={} cut_fast_draws={} cut_off_draws={} wide_draws={} opaque_draws={} opaque_untested_draws={} opaque_rows_draws={} hidden_draws={} depth_only_draws={} hidden={}us flat_draws={} const_draws={} nodepth_draws={} ge_filter_draws={} ge_wide_draws={} ge_wide_missed={} ge_wide_inexact={} ge_gather_draws={} ge_gather_missed={} wide_target_textures={} wide_copies={} wide_copy_scenes={} black_draws={} black_culled={} black_kept={} black_skipped={} alpha0_draws={} alpha0_culled={} alpha0_kept={} alpha0_skipped={} alpha0_read={} alpha0={}us alpha0_fills={} alpha0_fill_bytes={} texel0_draws={} texel0_culled={} alpha0_as_list={} strip_draws={} strip_indices={} strip_corners={} opaque={}us ",
+        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} point_light_draws={} fixed_color_draws={} fix_b_draws={} cut_draws={} cut_fast_draws={} cut_off_draws={} wide_draws={} opaque_draws={} opaque_untested_draws={} opaque_rows_draws={} hidden_draws={} depth_only_draws={} hidden={}us flat_draws={} const_draws={} nodepth_draws={} slope_draws={} slope_missed={} ge_filter_draws={} ge_wide_draws={} ge_wide_missed={} ge_wide_inexact={} ge_gather_draws={} ge_gather_missed={} wide_target_textures={} wide_copies={} wide_copy_scenes={} black_draws={} black_culled={} black_kept={} black_skipped={} alpha0_draws={} alpha0_culled={} alpha0_kept={} alpha0_skipped={} alpha0_read={} alpha0={}us alpha0_fills={} alpha0_fill_bytes={} texel0_draws={} texel0_culled={} alpha0_as_list={} strip_draws={} strip_indices={} strip_corners={} opaque={}us ",
         per_frame(s.begin_us),
         per_frame(s.loop_us),
         per_frame(s.convert_us),
@@ -393,6 +399,8 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
         s.flat_draws / frames,
         s.const_draws / frames,
         s.nodepth_draws / frames,
+        s.slope_draws / frames,
+        s.slope_missed / frames,
         s.ge_filter_draws / frames,
         s.ge_wide_draws / frames,
         s.ge_wide_missed / frames,

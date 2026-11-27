@@ -298,6 +298,13 @@ embed_twin!(nativeres_textured_test_fix_f, nativeres_textured_test_fix_pspdepth_
 // Both with the GE's bilinear filter, for draws reading our targets.
 embed_gxp!(nativeres_textured_ge_f);
 embed_gxp!(nativeres_textured_fix_ge_f);
+// SLOPE_LOD siblings of the textured, BLEND_FIX, alpha-test and flat
+// programs (setting `slopemip`): the GE's slope level mode per pixel.
+embed_gxp!(nativeres_textured_slope_f);
+embed_gxp!(nativeres_textured_fix_slope_f);
+embed_gxp!(nativeres_textured_test_slope_f);
+embed_gxp!(nativeres_textured_test_fix_slope_f);
+embed_gxp!(nativeres_textured_flat_slope_f);
 // Draws into the PSP's 16-bit framebuffers: frame-read programs that blend
 // themselves and cut the colour as the GE does (textured and untextured).
 embed_twin!(nativeres_textured_read_f, nativeres_textured_read_pspdepth_f);

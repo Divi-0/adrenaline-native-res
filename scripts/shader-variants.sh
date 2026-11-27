@@ -15,6 +15,9 @@
 #   nativeres_textured_nospec_f.cg  nativeres_textured_f.cg + NO_SPECULAR (draws whose specular part is 0)
 #   nativeres_textured_test_fix_f.cg nativeres_textured_test_f.cg + BLEND_FIX
 #   nativeres_textured_testmask_f.cg nativeres_textured_test_f.cg + ALPHA_MASK (the GE's alpha-test mask)
+#   nativeres_textured[_fix|_test|_test_fix|_flat]_slope_f.cg
+#                                   the textured, BLEND_FIX, alpha-test and flat programs + SLOPE_LOD
+#                                   (the GE's slope level mode, setting `slopemip`)
 #   nativeres_textured_ge_f.cg      nativeres_textured_f.cg + GE_FILTER (the GE's bilinear filter,
 #                                   draws reading our targets; no PSP-depth twin: that set's
 #                                   textured programs all filter as the GE)
@@ -71,6 +74,11 @@ variant nativeres_textured_f GE_FILTER nativeres_textured_ge_f
 variant nativeres_textured_f "BLEND_FIX GE_FILTER" nativeres_textured_fix_ge_f
 variant nativeres_textured_test_f BLEND_FIX nativeres_textured_test_fix_f
 variant nativeres_textured_test_f ALPHA_MASK nativeres_textured_testmask_f
+variant nativeres_textured_f SLOPE_LOD nativeres_textured_slope_f
+variant nativeres_textured_f "BLEND_FIX SLOPE_LOD" nativeres_textured_fix_slope_f
+variant nativeres_textured_test_f SLOPE_LOD nativeres_textured_test_slope_f
+variant nativeres_textured_test_f "BLEND_FIX SLOPE_LOD" nativeres_textured_test_fix_slope_f
+variant nativeres_textured_flat_f SLOPE_LOD nativeres_textured_flat_slope_f
 variant nativeres_textured_read_f UNTEXTURED nativeres_color_read_f
 for dither in "" dither; do
   DITHER=$([ -n "$dither" ] && echo READ_DITHER)

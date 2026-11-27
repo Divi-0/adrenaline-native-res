@@ -5,6 +5,7 @@
 //!
 //! ```text
 //! mip=0        # distant textures: 0 sharp (default), 1 like the PSP, 2 mipmapped
+//! slopemip=0   # 1: draws in the GE's "slope" level mode blur with distance as on the PSP (default 0: off)
 //! smooth=0     # texture filter: 0 the game's own (default), 1 always smooth
 //! gamefps=0    # 0 (default): none; 1: diagnostics top right (game fps, drawn/held frames, timings)
 //! armclock=444 # ARM clock in MHz (333 = Sony's default, 444 = ours)
@@ -39,6 +40,9 @@ pub mod start_skip {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Options {
     pub mip: u8,
+    /// `slopemip=1`: the GE's slope level mode as the PSP has it
+    /// (`texture::SLOPE_MIP`); off by default.
+    pub slope_mip: bool,
     pub smooth: bool,
     /// 0 none (default), 1 the diagnostics.
     pub game_fps: u8,
@@ -49,7 +53,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mip: 0, smooth: false, game_fps: 0, arm_clock: 444, start_skip: 0 }
+        Options { mip: 0, slope_mip: false, smooth: false, game_fps: 0, arm_clock: 444, start_skip: 0 }
     }
 }
 
@@ -71,6 +75,7 @@ impl Options {
             let Some(value) = number(trim(&line[equals + 1..])) else { continue };
             match name {
                 b"mip" if value <= 2 => options.mip = value as u8,
+                b"slopemip" if value <= 1 => options.slope_mip = value == 1,
                 b"smooth" if value <= 1 => options.smooth = value == 1,
                 b"gamefps" if value <= 1 => options.game_fps = value as u8,
                 b"armclock" if ARM_CLOCKS.contains(&(value as i32)) => options.arm_clock = value as i32,
@@ -108,12 +113,13 @@ mod tests {
         let defaults = Options::default();
         assert!(defaults.game_fps == 0 && !defaults.smooth);
         assert_eq!((defaults.mip, defaults.arm_clock), (0, 444));
+        assert!(!defaults.slope_mip, "slope mode as the PSP: off unless set");
     }
 
     #[test]
     fn reads_every_setting() {
-        let options = Options::parse(b"mip=2\nsmooth=1\ngamefps=1\narmclock=333\nstartskip=33\n");
-        assert_eq!(options, Options { mip: 2, smooth: true, game_fps: 1, arm_clock: 333, start_skip: 33 });
+        let options = Options::parse(b"mip=2\nslopemip=1\nsmooth=1\ngamefps=1\narmclock=333\nstartskip=33\n");
+        assert_eq!(options, Options { mip: 2, slope_mip: true, smooth: true, game_fps: 1, arm_clock: 333, start_skip: 33 });
         assert_eq!(options.start_skip, start_skip::IO_HOOKS | start_skip::DISPLAY_HOOKS);
     }
 
@@ -126,7 +132,7 @@ mod tests {
 
     #[test]
     fn bad_values_and_unknown_names_keep_the_default() {
-        let options = Options::parse(b"mip=3\nsmooth=yes\nsmooth=-1\narmclock=500\ngamefps=\nfoo=1\nmip\n=1\ngamefps=00000\nrenderer=0\nstartskip=256\n");
+        let options = Options::parse(b"mip=3\nsmooth=yes\nsmooth=-1\narmclock=500\ngamefps=\nfoo=1\nmip\n=1\ngamefps=00000\nrenderer=0\nstartskip=256\nslopemip=2\n");
         assert_eq!(options, Options::default());
     }
 

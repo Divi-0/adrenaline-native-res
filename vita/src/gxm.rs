@@ -392,6 +392,7 @@ extern "C" {
     pub fn sceGxmTextureSetLodBias(texture: *mut Texture, bias: u32) -> i32;
     pub fn sceGxmTextureGetLodBias(texture: *const Texture) -> u32;
     pub fn sceGxmTextureGetMipmapCount(texture: *const Texture) -> u32;
+    pub fn sceGxmTextureSetMipmapCount(texture: *mut Texture, count: u32) -> i32;
     /// SceGxmTextureType: `TEXTURE_TYPE_LINEAR_STRIDED` for a strided texture.
     pub fn sceGxmTextureGetType(texture: *const Texture) -> u32;
     pub fn sceGxmTextureGetWidth(texture: *const Texture) -> u32;

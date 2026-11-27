@@ -422,6 +422,11 @@ pub static CONST_COLOR: AtomicI32 = AtomicI32::new(1);
 /// depth-writing program. Debug `nodepthtwins`.
 pub static NO_DEPTH_TWINS: AtomicI32 = AtomicI32::new(1);
 
+/// Debug `slopeprograms`: slope-mode draws (setting `slopemip`) through
+/// their SLOPE_LOD siblings (1, default) or at level 0 (0: the picture
+/// without the setting), switchable on a paused frame for A/Bs.
+pub static SLOPE_PROGRAMS: AtomicI32 = AtomicI32::new(1);
+
 /// A masked alpha test (`masked_alpha_test_uniform`) of a draw that GXM
 /// blends (no frame-read program chosen for it, no FIX B, no stencil state)
 /// takes the alpha-test program with the mask (`Kind::TexturedTestMask`,
@@ -967,6 +972,10 @@ pub struct Draws {
     pub keep_target_alpha: bool,
     /// The alpha-test program's range uniform as last set (bits).
     alpha_test_cache: [u32; 4],
+    /// The draw's SLOPE_LOD sibling (setting `slopemip`): its uTexSize and
+    /// the level constants, set for every textured draw where its program
+    /// is chosen, taken by `textured_fragment_uniforms`.
+    slope_uniform: Option<(*const ProgramParameter, [f32; 4])>,
     /// The alpha log (`ALPHA_LOG`): (tests, blend, count).
     alpha_log: [(u32, u32, u32); ALPHA_LOG_KINDS],
     alpha_log_kinds: usize,
@@ -1004,6 +1013,7 @@ static DRAWS: SingleThreaded<Draws> = SingleThreaded::new(Draws {
     state: FORGOTTEN,
     keep_target_alpha: false,
     alpha_test_cache: [0; 4],
+    slope_uniform: None,
     alpha_log: [(0, 0, 0); ALPHA_LOG_KINDS],
     alpha_log_kinds: 0,
     native_matrix: None,
@@ -1580,6 +1590,30 @@ impl Draws {
             Some(value) => [value as f32 / 255.0, 0.0, 0.0, 0.0],
             None => [((blend >> 12) & 0xFF) as f32 / 255.0, ((blend >> 20) & 3) as f32, 0.0, 0.0],
         };
+        if let Some((slope_parameter, slope)) = self.slope_uniform.take() {
+            // A SLOPE_LOD sibling (`Programs::slope_program`): the program's
+            // own uniforms through its parameters (the sibling has them in
+            // the same places), the level constants last; per draw, no caching.
+            let fixed = (fix_b || stencil_value.is_some()) && textured.have_fix;
+            let (fog, alpha_test, blend_fix) = if fixed && tested {
+                (textured.fog_and_scale_test_fix, textured.alpha_test_fix, textured.blend_fix_test)
+            } else if fixed {
+                (textured.fog_and_scale_fix, null(), textured.blend_fix)
+            } else if tested {
+                (textured.fog_and_scale_test, textured.alpha_test, null())
+            } else if flat {
+                (textured.fog_and_scale_flat, null(), null())
+            } else {
+                (textured.fog_and_scale, null(), null())
+            };
+            let buffer = reserve_fragment_uniforms();
+            set_uniform(buffer, fog, 4, fog_and_scale.as_ptr());
+            set_uniform(buffer, alpha_test, 4, alpha_range.as_ptr());
+            set_uniform(buffer, blend_fix, 4, fix.as_ptr());
+            set_uniform(buffer, slope_parameter, 4, slope.as_ptr());
+            self.state.tint = None; // the cached default buffer is no longer the one in use
+            return;
+        }
         if let (Some(size), Some(tint)) = (ge_size, const_tint) {
             // The constant-colour program: its tint and the texture's size.
             let buffer = reserve_fragment_uniforms();
@@ -2561,6 +2595,32 @@ impl Draws {
                 stats().nodepth_draws += 1;
             }
         }
+        // Setting `slopemip`: a draw in the GE's slope level mode (core
+        // `draw_flags::MIP_SLOPE`) takes its program's SLOPE_LOD sibling,
+        // which picks the level per pixel as the PSP does (uTexSize: the
+        // draw's base, the highest level x 16, 8 for the nearest level).
+        // Without a sibling it samples level 0 (below), the picture as
+        // without the setting. The constant-colour program has no 1/w: such
+        // draws are in the PSP-depth set only, which has no siblings.
+        self.slope_uniform = None;
+        let mut slope_levels = false;
+        if draw.flags & draw_flags::MIP_SLOPE != 0 && !read && ge_size.is_none() && const_tint.is_none() && !fragment.is_null() && SLOPE_PROGRAMS.load(Ordering::Relaxed) != 0 {
+            // Safe: a texture description of ours.
+            let levels = unsafe { gxm::sceGxmTextureGetMipmapCount(&texture.gxm) };
+            if levels > 1 {
+                match self.programs.slope_program(fragment) {
+                    Some((program, parameter)) => {
+                        fragment = program;
+                        slope_levels = true;
+                        let nearest = if draw.flags & draw_flags::MIP_LINEAR == 0 { 8.0 } else { 0.0 };
+                        let base = draw_flags::slope_base(draw.flags) as f32;
+                        self.slope_uniform = Some((parameter, [base, ((levels - 1) * 16) as f32, nearest, 0.0]));
+                        stats().slope_draws += 1;
+                    }
+                    None => stats().slope_missed += 1,
+                }
+            }
+        }
         let read_stencil = if read { stencil_state } else { None };
         // Vertices in model space: the 3D program transforms them (raw
         // draws: their own blocks, `raw_transform_of` below).
@@ -2792,8 +2852,18 @@ impl Draws {
                         gxm::TEXTURE_MIP_FILTER_DISABLED
                     };
                     gxm::sceGxmTextureSetMipFilter(&mut gxm_texture, mip_filter);
-                    let bias = 31 + ((draw.flags & draw_flags::MIP_BIAS_MASK) >> draw_flags::MIP_BIAS_SHIFT) as u8 as i8 as i32;
-                    gxm::sceGxmTextureSetLodBias(&mut gxm_texture, bias.clamp(0, 63) as u32);
+                    if draw.flags & draw_flags::MIP_SLOPE != 0 {
+                        // Slope mode: the SLOPE_LOD program names the level
+                        // (no bias: its bits hold the slope base); without
+                        // one, level 0 only.
+                        gxm::sceGxmTextureSetLodBias(&mut gxm_texture, 31);
+                        if !slope_levels {
+                            gxm::sceGxmTextureSetMipmapCount(&mut gxm_texture, 1);
+                        }
+                    } else {
+                        let bias = 31 + ((draw.flags & draw_flags::MIP_BIAS_MASK) >> draw_flags::MIP_BIAS_SHIFT) as u8 as i8 as i32;
+                        gxm::sceGxmTextureSetLodBias(&mut gxm_texture, bias.clamp(0, 63) as u32);
+                    }
                 }
                 if !palette.is_null() {
                     gxm::sceGxmTextureSetPalette(&mut gxm_texture, palette);

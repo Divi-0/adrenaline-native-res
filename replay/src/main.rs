@@ -59,6 +59,11 @@ use dump_file::DumpFile;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let trace = args.iter().any(|arg| arg == "--trace");
+    // `--slope-mip`: setting `slopemip=1` (core `texture::SLOPE_MIP`): draws
+    // in the GE's slope level mode sample the level the PSP picks per pixel.
+    if args.iter().any(|arg| arg == "--slope-mip") {
+        nativeres_core::texture::SLOPE_MIP.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     // NATIVERES_LIGHTS=0: lit draws with their vertex colours as they are
     // (`lighting::LIGHTS_ON` off), for comparing costs.
     if std::env::var("NATIVERES_LIGHTS").is_ok_and(|value| value == "0") {

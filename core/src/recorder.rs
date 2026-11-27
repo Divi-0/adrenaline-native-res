@@ -3985,7 +3985,11 @@ fn work_out_draw_state(catalog: &mut Catalog, stats: &mut FrameStats, palette: &
             catalog.set_texture_levels(index, &mips.levels);
             draw.flags |= draw_flags::MIPS
                 | if mips.linear { draw_flags::MIP_LINEAR } else { 0 }
-                | ((mips.bias_eighths as u8 as u32) << draw_flags::MIP_BIAS_SHIFT);
+                | match mips.slope_base {
+                    // Slope mode (setting `slopemip`): the level per pixel.
+                    Some(base) => draw_flags::pack_slope_base(base),
+                    None => (mips.bias_eighths as u8 as u32) << draw_flags::MIP_BIAS_SHIFT,
+                };
         }
 
         let filter = ge.register(op::TEXTURE_FILTER);

@@ -69,6 +69,8 @@ make new savestates; loading an old one runs the old PSP side.
 
 ```
 mip=0        # distant textures: 0 sharp (default), 1 blurry like the PSP, 2 mipmapped
+slopemip=0   # 1: games using the PSP's depth-based mip levels ("slope" mode) blur with distance
+             #    exactly as on the PSP (costs GPU time); 0 (default): off
 smooth=0     # texture filter: 0 the game's own (default), 1 always smooth
 gamefps=0    # 0 (default): off, 1: diagnostics (game fps, drawn/held frames, timings) top right
 ```

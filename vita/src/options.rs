@@ -102,16 +102,20 @@ fn load() {
     let text = read_file(&mut buffer);
     let options = Options::parse(text);
     render_log::line(format_args!(
-        "options: {} ({} bytes): mip={} smooth={} gamefps={} armclock={} startskip={}\n",
+        "options: {} ({} bytes): mip={} slopemip={} smooth={} gamefps={} armclock={} startskip={}\n",
         if text.is_empty() { "defaults, no ux0:data/nativeres/config.txt" } else { "config.txt" },
         text.len(),
         options.mip,
+        options.slope_mip as i32,
         options.smooth as i32,
         options.game_fps as i32,
         options.arm_clock,
         options.start_skip
     ));
     set_mip_mode(options.mip);
+    // `slopemip=1`: the GE's slope level mode as the PSP has it (off by
+    // default); the capture reads it (core texture::SLOPE_MIP).
+    nativeres_core::texture::SLOPE_MIP.store(options.slope_mip, Relaxed);
     frame_loop::SMOOTH_TEXTURES.store(options.smooth as u8, Relaxed);
     crate::display_hooks::timings::set_game_fps_label(options.game_fps);
     keep_arm_clock(options.arm_clock);
