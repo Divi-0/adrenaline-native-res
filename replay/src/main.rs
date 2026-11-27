@@ -37,6 +37,7 @@
 
 mod compare;
 mod dump_file;
+mod frag_stats;
 mod png;
 mod raster;
 mod sublists;

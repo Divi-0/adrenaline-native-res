@@ -26,6 +26,7 @@ use nativeres_core::offscreen;
 use nativeres_core::texture::{data_size, decode_texture, format, ALL_ROWS_OPAQUE};
 
 use crate::dump_file::{DumpMemory, OriginalPicture};
+use crate::frag_stats;
 
 pub const WIDTH: usize = 960;
 pub const HEIGHT: usize = 544;
@@ -54,10 +55,6 @@ thread_local! {
     static TIE_COUNTS: std::cell::RefCell<std::collections::BTreeMap<usize, u32>> = std::cell::RefCell::new(std::collections::BTreeMap::new());
     static CURRENT_DRAW: std::cell::Cell<usize> = std::cell::Cell::new(0);
     static TESTED: std::cell::Cell<u64> = std::cell::Cell::new(0);
-    // Debugging: REPLAY_FRAG_STATS=1 counts per draw [fragments, depth-tested
-    // against the untouched start depth 1.0, failing depth, failing stencil].
-    static FRAG_STATS: bool = std::env::var_os("REPLAY_FRAG_STATS").is_some();
-    static FRAG_COUNTS: std::cell::RefCell<std::collections::BTreeMap<usize, [u32; 4]>> = std::cell::RefCell::new(std::collections::BTreeMap::new());
     static FLOAT_DEPTH: std::cell::RefCell<std::collections::HashMap<usize, Vec<f32>>> = std::cell::RefCell::new(std::collections::HashMap::new());
     // REPLAY_ZERO_ALPHA=1: triangles whose three corners have alpha 0, in draws
     // that keep the target there, are left out (core zero_alpha, as the Vita's
@@ -433,6 +430,10 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
             None => &textures,
         };
         let colourless = hiding && draw.framebuffer == frame.shown_framebuffer && hidden_draws::colourless_depth_only(draw);
+        if frag_stats::on() && (draw.framebuffer == frame.shown_framebuffer || offscreen.iter().any(|(framebuffer, _, _)| *framebuffer == draw.framebuffer)) {
+            let native = NATIVE_DRAW.load(std::sync::atomic::Ordering::Relaxed);
+            frag_stats::begin_draw(index, frame, draw, native, hidden.is_depth_only(index) || colourless);
+        }
         if hidden.is_depth_only(index) || colourless {
             // Its depths alone, like the Vita's draw without a fragment
             // program (core hidden_draws: it keeps every fragment).
@@ -550,17 +551,10 @@ pub fn render_frame(frame: &Frame, memory: &mut DumpMemory, previous: Option<&Or
         }
         println!("run stats: strip-only raw draws {draws} stitched indices {stitched} corners {corners} unique vertices {unique} vertex slots {slots}");
     }
-    if FRAG_STATS.with(|on| *on) {
-        FRAG_COUNTS.with(|counts| {
-            for (index, [fragments, at_start, depth_fails, stencil_fails]) in counts.borrow().iter() {
-                let draw = &frame.draws()[*index];
-                let address = frame.textures().get(draw.texture as usize).map_or(0, |texture| texture.address);
-                println!(
-                    "frag stats: draw {index} fragments {fragments} at_start_depth {at_start} depth_fail {depth_fails} stencil_fail {stencil_fails} fb {:08x} tex {address:08x} blend {:08x} tests {:x} flags {:x} verts {} idx {}",
-                    draw.framebuffer, draw.blend, draw.tests, draw.flags, draw.vertex_count, draw.index_count
-                );
-            }
-        });
+    // Debugging: REPLAY_FRAG_STATS=1, the fragments of every draw by what
+    // becomes of them (frag_stats.rs).
+    if frag_stats::on() {
+        frag_stats::print(frame);
     }
     if LAYER_DEPTH.with(|on| *on) > 0 {
         let [n, d] = LAYER_COUNTS.with(|c| c.get());
@@ -1010,17 +1004,11 @@ fn draw_triangle(
                     }
                 });
             }
-            if FRAG_STATS.with(|on| *on) {
+            let counting = frag_stats::on();
+            if counting {
                 let depth_fails = depth_test && !passes(depth_function, z, depth[index]);
                 let stencil_fails = !depth_fails && stencil.is_some_and(|state| !state.passes((screen[index] >> 24) as u8));
-                FRAG_COUNTS.with(|counts| {
-                    let mut counts = counts.borrow_mut();
-                    let entry = counts.entry(CURRENT_DRAW.with(|d| d.get())).or_insert([0; 4]);
-                    entry[0] += 1;
-                    entry[1] += (depth_test && depth[index] == 1.0) as u32;
-                    entry[2] += depth_fails as u32;
-                    entry[3] += stencil_fails as u32;
-                });
+                frag_stats::covered(x as usize, y as usize, depth_test && depth[index] == 1.0, depth_fails, stencil_fails);
             }
             if depth_test && !passes(depth_function, z, depth[index]) {
                 continue;
@@ -1049,8 +1037,14 @@ fn draw_triangle(
             if alpha_test {
                 let alpha = (source.a.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
                 if !passes(alpha_function, alpha & alpha_mask, alpha_reference & alpha_mask) {
+                    if counting {
+                        frag_stats::alpha_killed();
+                    }
                     continue;
                 }
+            }
+            if counting {
+                frag_stats::written(x as usize, y as usize);
             }
             if depth_write {
                 depth[index] = z;
