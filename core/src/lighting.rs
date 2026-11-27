@@ -116,11 +116,19 @@ fn bytes(word: u32) -> [f32; 4] {
 }
 
 /// RGBA in 0..255 units, clamped and rounded, packed as 0xAABBGGRR.
+///
+/// Clamped after the conversion, in integers: `(v + 0.5) as i32` saturates
+/// and turns NaN into 0, and `clamp(0, 255)` is one `usat`. The same bits as
+/// clamping the float first (`(v.clamp(0.0, 255.0) + 0.5) as u32`, the form
+/// before) for every input: in 0..=255 it is the same add; below 0 the sum is
+/// under 0.5, so 0 either way; above 255 it is over 255.5, so 255 either way;
+/// NaN is 0 both ways. The float clamp cost two compares (`vcmp` + `vmrs`)
+/// per channel.
 #[inline(always)]
 fn pack(value: [f32; 4]) -> u32 {
     let mut color = 0u32;
     for (channel, value) in value.into_iter().enumerate() {
-        color |= ((value.clamp(0.0, 255.0) + 0.5) as u32) << (8 * channel);
+        color |= (((value + 0.5) as i32).clamp(0, 255) as u32) << (8 * channel);
     }
     color
 }
@@ -1001,6 +1009,48 @@ mod tests {
 
     fn float(value: f32) -> u32 {
         value.to_bits() >> 8
+    }
+
+    /// `pack` as it was before the integer clamp: the reference.
+    fn pack_float_clamp(value: [f32; 4]) -> u32 {
+        let mut color = 0u32;
+        for (channel, value) in value.into_iter().enumerate() {
+            color |= ((value.clamp(0.0, 255.0) + 0.5) as u32) << (8 * channel);
+        }
+        color
+    }
+
+    #[test]
+    fn pack_gives_the_float_clamps_bits_at_every_edge() {
+        let below = |x: f32| f32::from_bits(x.to_bits() - 1); // next float towards 0 (x > 0)
+        let edges = [
+            f32::NAN, -f32::NAN, f32::from_bits(0x7F80_0001), f32::from_bits(0xFFC0_1234),
+            f32::INFINITY, f32::NEG_INFINITY, f32::MAX, f32::MIN, 1e10, -1e10,
+            0.0, -0.0, f32::MIN_POSITIVE, f32::from_bits(1), -f32::from_bits(1),
+            0.5, below(0.5), -0.5, -below(0.5), 1.0, 1.5, below(1.5), 127.5, 128.0,
+            254.5, below(254.5), 255.0, below(255.0), 255.5, below(255.5), 256.0, 256.5, 1000.0,
+        ];
+        for &x in &edges {
+            for channel in 0..4 {
+                let mut value = [37.25, 0.0, 255.0, 128.5];
+                value[channel] = x;
+                assert_eq!(pack(value), pack_float_clamp(value), "{x:?} ({:08X}) in channel {channel}", x.to_bits());
+            }
+        }
+        assert_eq!(pack([0.0, 255.0, 254.5, f32::NAN]), 0x00FF_FF00);
+        // 0.49999997 + 0.5 rounds to 1.0 in f32: 1, as before (the old form has the same add).
+        assert_eq!(pack([-1.0, 300.0, below(0.5), 127.5]), 0x8001_FF00);
+    }
+
+    /// Every one of the 2^32 floats in every channel at once (~10 s in a
+    /// release build): `cargo test --release -p nativeres-core pack_ -- --ignored`.
+    #[test]
+    #[ignore]
+    fn pack_gives_the_float_clamps_bits_for_every_float() {
+        for bits in 0..=u32::MAX {
+            let value = [f32::from_bits(bits); 4];
+            assert_eq!(pack(value), pack_float_clamp(value), "{bits:08X}");
+        }
     }
 
     /// One white directional light along +z, identity world and view,
