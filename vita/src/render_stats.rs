@@ -84,7 +84,7 @@ pub struct RenderStats {
     /// the mask (draw.rs `MASKED_TEST`) instead of the generic one.
     pub mask_test_draws: u32,
     /// Textured draws that took the program without the specular part
-    /// (draw.rs `NO_SPECULAR`, `Kind::TexturedNoSpec`).
+    /// (draw.rs `specular_part`, `Kind::TexturedNoSpec`).
     pub nospec_draws: u32,
     /// Draws into 16-bit PSP targets with the frame-read programs
     /// (draw.rs `TARGET_CUT`).

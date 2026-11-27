@@ -373,16 +373,6 @@ pub static NO_DEPTH_TWINS: AtomicI32 = AtomicI32::new(1);
 /// generic program. Debug `maskedtest`.
 pub static MASKED_TEST: AtomicI32 = AtomicI32::new(1);
 
-/// Textured draws whose specular part is 0 (`specular_part` false: no
-/// light computes specular) take the textured program without it
-/// (`Kind::TexturedNoSpec`, nativeres_textured_nospec_f.cg, NO_SPECULAR; the
-/// PSP-depth set), and unfogged ones may take the flat program. Exact: the
-/// vertex programs hand such a draw vSpecular = 0, and the GE's term
-/// floor(0 x 255 + 0.5) = 0 adds nothing (God of War: every lit draw has
-/// LIGHTMODE 1 but no light with specular). 1 = on (default), 0 = by the
-/// LIGHTMODE flag alone (`separate_specular`), as before. Debug `nospecular`.
-pub static NO_SPECULAR: AtomicI32 = AtomicI32::new(1);
-
 /// The one vertex colour of textured `draw` if it may take the
 /// constant-colour program in place of the flat one (`flat_shading` holds):
 /// vertices of ours (not raw or cached ones, whose colours the vertex
@@ -700,11 +690,12 @@ fn separate_specular(frame: &Frame, draw: &Draw) -> bool {
 /// (`GpuLights::specular` w, DIFFUSE_AND_SPECULAR). Every lit vertex program
 /// adds a light's specular only under that flag (nativeres_raw_v.cg,
 /// nativeres_3d_v.cg), starting from 0, so without one the part is exactly
-/// 0. With `NO_SPECULAR` off: `separate_specular` alone.
+/// 0 and the GE's term floor(0 x 255 + 0.5) = 0 adds nothing. Draws without
+/// it take the textured program without the specular part
+/// (`Kind::TexturedNoSpec`, the PSP-depth set) or, unfogged, the flat one
+/// (God of War: every lit draw has LIGHTMODE 1 but no light with specular;
+/// DESIGN "eighty-first session").
 fn specular_part(frame: &Frame, draw: &Draw) -> bool {
-    if NO_SPECULAR.load(Ordering::Relaxed) == 0 {
-        return separate_specular(frame, draw);
-    }
     let lights = if draw.flags & draw_flags::RAW_VERTICES != 0 {
         frame.raw_transform_of(draw).and_then(|(transform, _)| raw_light_set(frame, transform))
     } else if draw.transform != 0 && draw.transform <= frame.transform_count {
@@ -2344,7 +2335,7 @@ impl Draws {
                     _ => Kind::TexturedFlat,
                 }
             } else if self.programs.textured.have_nospec && !specular_part(frame, draw) {
-                // Its specular part is 0: the program without it (`NO_SPECULAR`).
+                // Its specular part is 0: the program without it (NO_SPECULAR).
                 Kind::TexturedNoSpec
             } else {
                 Kind::Textured
