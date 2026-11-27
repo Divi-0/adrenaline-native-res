@@ -30,7 +30,7 @@ use nativeres_core::frame::{
 };
 use nativeres_core::texture;
 use nativeres_core::opaque_source::{
-    alpha_test_is_one_sided, alpha_test_lets_255_pass, for_opaque_source, lowest_vertex_alpha, raw_vertex_span, samples_only_rows,
+    alpha_test_is_one_sided, alpha_test_lets_255_pass, for_opaque_source, lowest_vertex_alpha, raw_vertex_span, samples_only_rows, used_alphas_reach,
 };
 use nativeres_core::texture::ALL_ROWS_OPAQUE;
 use nativeres_core::vertex::VertexFormat;
@@ -537,16 +537,52 @@ fn vertices_opaque(frame: &Frame, draw: &Draw) -> bool {
         return false;
     };
     let format = VertexFormat(draw.vertex_format);
-    let stride = format.layout().size as usize;
+    let layout = format.layout();
+    let stride = layout.size as usize;
     let start = base + first as usize * stride;
     let stop = base + end as usize * stride;
     if stride == 0 || stop > region_end || start > stop {
         return false;
     }
-    // Safe: inside the block the GPU reads the draw from (checked above).
-    let bytes = unsafe { core::slice::from_raw_parts(start as *const u8, stop - start) };
-    colors.alpha_always_255(lowest_vertex_alpha(format, bytes))
+    if OPAQUE_USED_ONLY.load(Ordering::Relaxed) == 0 {
+        // Safe: inside the block the GPU reads the draw from (checked above).
+        let bytes = unsafe { core::slice::from_raw_parts(start as *const u8, stop - start) };
+        return colors.alpha_always_255(lowest_vertex_alpha(format, bytes));
+    }
+    // Only the vertices the draw uses, each read once, and only as far as
+    // the first one whose alpha the rules don't make 255 (core
+    // `used_alphas_reach`): the same answer for what the draw draws.
+    if layout.color_offset.is_none() {
+        return colors.alpha_always_255(None);
+    }
+    let Some(least) = colors.least_opaque_alpha() else {
+        return false;
+    };
+    let Some(stored) = frame.indices.get(draw.first_index as usize..draw.first_index as usize + draw.index_count as usize) else {
+        return false;
+    };
+    // One bit per vertex of the span, on the stack: indices are 16 bits, so
+    // at most 65,536 vertices (8 KiB); only the span's words are zeroed.
+    let mut seen = [core::mem::MaybeUninit::<u32>::uninit(); 2048];
+    let words = ((end - first) as usize).div_ceil(32).min(seen.len());
+    for word in &mut seen[..words] {
+        word.write(0);
+    }
+    // Safe: the first `words` words were just written.
+    let seen = unsafe { core::slice::from_raw_parts_mut(seen.as_mut_ptr() as *mut u32, words) };
+    // Safe: vertex 0 of the window up to the span's end, inside the block
+    // the GPU reads the draw from (checked above).
+    let window = unsafe { core::slice::from_raw_parts(base as *const u8, stop - base) };
+    stats().opaque_checked_draws += 1;
+    used_alphas_reach(format, window, stored, draw.flags & draw_flags::INDEX_RUNS != 0, (first, end), least, seen)
 }
+
+/// The opaque-source check of a raw draw reads only the vertices it uses
+/// (core `used_alphas_reach`), not its whole span: Kenka Bancho's train
+/// draws ~100 vertices of a ~1,800-vertex model buffer per draw, and the
+/// span of every draw read from uncached PSP RAM cost the display thread
+/// 88 ms a frame. 1 = on (default); 0 = the whole span, as before (A/B).
+pub static OPAQUE_USED_ONLY: AtomicI32 = AtomicI32::new(1);
 
 /// Untextured normal alpha blends into 5551 whose vertex alphas are all 0
 /// get the "invisible" frame-read program (core frame.rs
@@ -2368,7 +2404,16 @@ impl Draws {
         let untest = tested && !masked && alpha_test_lets_255_pass(alpha_range) && OPAQUE_UNTESTED.load(Ordering::Relaxed) != 0;
         if opaque_rows != 0 && (unblend || untest) {
             let start = draw_clock();
-            if vertices_opaque(frame, draw) && samples_opaque_rows(frame, draw, opaque_rows) {
+            // Raw draws: the texture first (a flag for them) so that a draw
+            // whose texture isn't opaque reads no vertices from PSP RAM;
+            // the others as before (their vertices are ours, in cached
+            // memory, and the rows test counts what it finds).
+            let opaque = if draw.flags & draw_flags::RAW_VERTICES != 0 && OPAQUE_USED_ONLY.load(Ordering::Relaxed) != 0 {
+                samples_opaque_rows(frame, draw, opaque_rows) && vertices_opaque(frame, draw)
+            } else {
+                vertices_opaque(frame, draw) && samples_opaque_rows(frame, draw, opaque_rows)
+            };
+            if opaque {
                 if unblend {
                     choice = choice.and_then(|variant| if is_wide(variant) { None } else { Some(for_opaque_source(variant)) });
                     stats().opaque_draws += 1;

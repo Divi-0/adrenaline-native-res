@@ -172,6 +172,13 @@ fn new_vertex_cache() -> Option<&'static mut VertexCache> {
     // NATIVERES_BLEND_ALPHA_TEST=1: blending stands in as before (A/B).
     let shader_alpha_test = std::env::var("NATIVERES_BLEND_ALPHA_TEST").is_err();
     nativeres_core::blend::ALPHA_TEST_IN_SHADER.store(shader_alpha_test, std::sync::atomic::Ordering::Relaxed);
+    // REPLAY_ZERO_COPY=1 (with --copier, which lets runs be read later):
+    // big raw runs in main RAM stay there as on the Vita (`raw_arena::
+    // ZERO_COPY`), for counting only (REPLAY_OPAQUE_SPANS): this
+    // rasterizer doesn't draw such draws.
+    if std::env::var_os("REPLAY_ZERO_COPY").is_some() {
+        nativeres_core::raw_arena::ZERO_COPY.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     if raw {
         cache.set_raw_arena(Box::leak(vec![0u8; RAW_ARENA_BYTES].into_boxed_slice()));
     }
@@ -293,6 +300,9 @@ fn run(dump_path: &str, png_path: &str, trace: bool) -> Result<(), String> {
     }
     if std::env::args().any(|arg| arg == "--runs") {
         print_index_runs(&frame);
+    }
+    if std::env::var_os("REPLAY_OPAQUE_SPANS").is_some() {
+        print_opaque_spans(&frame);
     }
     if std::env::args().any(|arg| arg == "--palettes") {
         // The palette tables the Vita fills for this frame (one per distinct
@@ -460,6 +470,85 @@ fn print_sublists(dump_path: &str) -> Result<(), String> {
 /// drawn straight from fixed index tables: list and sprite runs that follow
 /// on from the run before (same type, next vertex) join it; strips and fans
 /// are one call each.
+/// Debugging (REPLAY_OPAQUE_SPANS=1): what the Vita's opaque-source check
+/// (vita draw.rs `vertices_opaque`) reads per raw draw: the vertex span
+/// (`opaque_source::raw_vertex_span`) against the vertices its runs or
+/// indices really use, whether its colour rules decide the answer without
+/// the vertices, and over the frame the bytes read against the distinct
+/// bytes (the union of the spans, in the raw arena).
+fn print_opaque_spans(frame: &nativeres_core::frame::Frame) {
+    use nativeres_core::frame::{draw_flags, test_flags};
+    use nativeres_core::opaque_source::raw_vertex_span;
+    use nativeres_core::vertex::VertexFormat;
+    let indices = frame.indices();
+    let (mut draws, mut span_bytes, mut used_bytes, mut decided, mut decided_bytes, mut tested) = (0u32, 0u64, 0u64, 0u32, 0u64, 0u32);
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    for (index, draw) in frame.draws().iter().enumerate().filter(|(_, draw)| draw.flags & draw_flags::RAW_VERTICES != 0) {
+        let Some((first, end)) = raw_vertex_span(frame, draw) else { continue };
+        let format = VertexFormat(draw.vertex_format);
+        let layout = format.layout();
+        let stride = layout.size as u64;
+        let stored = &indices[draw.first_index as usize..][..draw.index_count as usize];
+        let used: u64 = if draw.flags & draw_flags::INDEX_RUNS != 0 {
+            let mut seen = std::collections::BTreeSet::new();
+            for run in stored.chunks_exact(3) {
+                let count = if run[0] as u32 == nativeres_core::command::primitive::RECTANGLES { 2 * run[1] as u32 } else { run[1] as u32 };
+                seen.extend(run[2] as u32..run[2] as u32 + count);
+            }
+            seen.len() as u64
+        } else {
+            stored.iter().collect::<std::collections::BTreeSet<_>>().len() as u64
+        };
+        let colors = match draw.raw_colors {
+            0 => None,
+            n if n <= frame.raw_colors_count => frame.raw_colors.get(n as usize - 1),
+            _ => None,
+        };
+        let rules_decide = layout.color_offset.is_none()
+            || format.color_format_bits() == 4
+            || colors.is_some_and(|colors| colors.alpha_always_255(Some(0)) == colors.alpha_always_255(Some(0xFF)));
+        let span = (end - first) as u64 * stride;
+        draws += 1;
+        span_bytes += span;
+        used_bytes += used * stride;
+        if rules_decide {
+            decided += 1;
+            decided_bytes += span;
+        }
+        if draw.tests & test_flags::ALPHA_TEST != 0 {
+            tested += 1;
+        }
+        let start = draw.first_vertex as u64 + first as u64 * stride;
+        ranges.push((start, start + span));
+        println!(
+            "opaque span: draw {index:4} psp_ram {} span {:6} vertices ({:7} B) used {:6} stride {:2} colour bits {} rules decide {} rule {:?} alpha test {} blend {:08x}",
+            (draw.flags & draw_flags::RAW_PSP_RAM != 0) as u32,
+            end - first,
+            span,
+            used,
+            stride,
+            format.color_format_bits(),
+            rules_decide as u32,
+            colors.map(|colors| colors.rules),
+            (draw.tests & test_flags::ALPHA_TEST != 0) as u32,
+            draw.blend
+        );
+    }
+    ranges.sort_unstable();
+    let mut union = 0u64;
+    let mut covered_to = 0u64;
+    for (start, end) in ranges {
+        let start = start.max(covered_to);
+        if end > start {
+            union += end - start;
+            covered_to = end;
+        }
+    }
+    println!(
+        "opaque spans: {draws} raw draws ({tested} alpha-tested), span bytes {span_bytes}, used vertices' bytes {used_bytes}, distinct bytes {union}; rules decide {decided} draws ({decided_bytes} span bytes)"
+    );
+}
+
 fn print_index_runs(frame: &nativeres_core::frame::Frame) {
     use nativeres_core::command::primitive;
     use nativeres_core::frame::{draw_flags, run_triangles};

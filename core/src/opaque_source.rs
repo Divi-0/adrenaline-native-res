@@ -98,6 +98,105 @@ impl RawColors {
         let vertex = lowest.map(|alpha| (alpha as u32) << 24 | 0x00FF_FFFF);
         self.color(vertex) >> 24 == 0xFF
     }
+
+    /// The lowest vertex alpha (8 bits) that these rules turn into 255
+    /// (`alpha_always_255`), or None if not even 255 does: a draw's vertices
+    /// all end up opaque exactly when each has at least this alpha. Every
+    /// rule keeps a higher alpha at least as high (ambient lighting's
+    /// product and emission, doubling, the opaque and replace rules set it),
+    /// so the answer is a threshold, found by halving 0..255.
+    pub fn least_opaque_alpha(&self) -> Option<u8> {
+        if !self.alpha_always_255(Some(0xFF)) {
+            return None;
+        }
+        if self.alpha_always_255(Some(0)) {
+            return Some(0);
+        }
+        // 0 fails, 255 passes: the threshold lies in (low, high].
+        let (mut low, mut high) = (0u8, 0xFFu8);
+        while high - low > 1 {
+            let middle = low + (high - low) / 2;
+            if self.alpha_always_255(Some(middle)) {
+                high = middle;
+            } else {
+                low = middle;
+            }
+        }
+        Some(high)
+    }
+}
+
+/// True if every vertex a raw draw uses has an alpha (widened to 8 bits as
+/// `lowest_vertex_alpha`) of at least `least`: the vertices of its index
+/// runs (`runs`: `stored` as [primitive type, count, first vertex] triples)
+/// or the ones its indices name, not the whole span `first..end` between
+/// them (`raw_vertex_span`). The other vertices of the span give no
+/// fragment: Kenka Bancho's train draws ~100 vertices each out of a model
+/// buffer of ~1,800 that every draw spans, and on the Vita each vertex read
+/// is an uncached load from PSP RAM (~0.2 us): 12.6 MB of spans a frame cost
+/// the display thread 88 ms, the used vertices are 0.8 MB.
+///
+/// `window`: the draw's vertices from its vertex 0, back to back in
+/// `format` (which has a colour), at least up to `end`. Each used vertex is
+/// read once (`seen`: one bit per vertex of `first..end`, zero, at least
+/// (end - first) / 32 words rounded up), and the scan stops at the first
+/// one below `least`. False if a vertex lies outside `window`, `first..end`
+/// or `seen`.
+pub fn used_alphas_reach(
+    format: VertexFormat,
+    window: &[u8],
+    stored: &[u16],
+    runs: bool,
+    (first, end): (u32, u32),
+    least: u8,
+    seen: &mut [u32],
+) -> bool {
+    let layout = format.layout();
+    let Some(at) = layout.color_offset else {
+        return false; // no colour: the caller asks the rules alone
+    };
+    let bits = format.color_format_bits();
+    if least == 0 || bits == 4 {
+        return true; // every alpha reaches 0; 565 has none: 255
+    }
+    let stride = layout.size as usize;
+    // The byte that holds the alpha: the high byte of a 16-bit colour, the
+    // top byte of 8888. One load per vertex (uncached on the Vita).
+    let byte = at as usize + if bits == 7 { 3 } else { 1 };
+    let alpha = |high: u8| -> u8 {
+        match bits {
+            5 => if high & 0x80 != 0 { 0xFF } else { 0 },
+            6 => (high >> 4) * 17,
+            _ => high,
+        }
+    };
+    let mut check = |vertex: u32| -> bool {
+        let Some(slot) = vertex.checked_sub(first).filter(|_| vertex < end) else {
+            return false;
+        };
+        let (word, bit) = ((slot / 32) as usize, 1u32 << (slot % 32));
+        let Some(seen_word) = seen.get_mut(word) else {
+            return false;
+        };
+        if *seen_word & bit != 0 {
+            return true;
+        }
+        *seen_word |= bit;
+        window.get(vertex as usize * stride + byte).is_some_and(|&high| alpha(high) >= least)
+    };
+    if runs {
+        for run in stored.chunks_exact(3) {
+            // Sprites: two vertices per count (as `raw_vertex_span`).
+            let count = if run[0] as u32 == crate::command::primitive::RECTANGLES { 2 * run[1] as u32 } else { run[1] as u32 };
+            let start = run[2] as u32;
+            if !(start..start + count).all(&mut check) {
+                return false;
+            }
+        }
+        true
+    } else {
+        stored.iter().all(|&index| check(index as u32))
+    }
 }
 
 /// The variant for a draw whose every fragment has alpha 255: a normal
@@ -436,6 +535,146 @@ mod tests {
         // The strip: 20..30; the sprites: 4..8.
         assert_eq!(raw_vertex_span(&frame, &run_draw), Some((4, 30)));
         assert_eq!(raw_vertex_span(&frame, &Draw { index_count: 0, ..draw }), None);
+    }
+
+    /// Colour rules of every kind `alpha_always_255` knows.
+    fn rule_sets() -> Vec<RawColors> {
+        let plain = RawColors { material: [255.0, 255.0, 255.0, 255.0], ..RawColors::default() };
+        let mut sets = Vec::new();
+        for lit in [lighting::NONE, lighting::VERTEX_MATERIAL, lighting::MATERIAL, lighting::LIGHTS] {
+            for opaque in [0.0, 1.0] {
+                for replacing in [replace::NONE, replace::RGB, replace::ALL] {
+                    for doubled in [0.0, 1.0] {
+                        for (ambient, emissive) in [(255.0, 0.0), (254.0, 0.0), (128.0, 0.0), (100.0, 60.0), (0.0, 255.0), (0.0, 0.0)] {
+                            for material in [255.0, 254.0, 200.0] {
+                                sets.push(RawColors {
+                                    material: [255.0, 255.0, 255.0, material],
+                                    ambient: [255.0, 255.0, 255.0, ambient],
+                                    emissive: [0.0, 0.0, 0.0, emissive],
+                                    rules: [lit, opaque, replacing, doubled],
+                                    ..plain
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        sets
+    }
+
+    #[test]
+    fn the_least_opaque_alpha_is_the_threshold_of_the_rules() {
+        for colors in rule_sets() {
+            let least = colors.least_opaque_alpha();
+            for alpha in 0..=255u8 {
+                assert_eq!(
+                    colors.alpha_always_255(Some(alpha)),
+                    least.is_some_and(|least| alpha >= least),
+                    "rules {:?} ambient {:?} emissive {:?} material {:?}, alpha {alpha}, least {least:?}",
+                    colors.rules,
+                    colors.ambient,
+                    colors.emissive,
+                    colors.material
+                );
+            }
+        }
+        let plain = RawColors { material: [255.0, 255.0, 255.0, 255.0], ..RawColors::default() };
+        assert_eq!(plain.least_opaque_alpha(), Some(255));
+        assert_eq!(RawColors { rules: [0.0, 0.0, 0.0, 1.0], ..plain }.least_opaque_alpha(), Some(128));
+        assert_eq!(RawColors { rules: [0.0, 1.0, 0.0, 0.0], ..plain }.least_opaque_alpha(), Some(0));
+        assert_eq!(RawColors { rules: [lighting::LIGHTS, 0.0, 0.0, 0.0], ..plain }.least_opaque_alpha(), None);
+    }
+
+    /// The reference for `used_alphas_reach`: the used vertices (runs or
+    /// indices) gathered, and the old whole-slice `lowest_vertex_alpha`.
+    fn reach_by_gathering(format: VertexFormat, window: &[u8], stored: &[u16], runs: bool, least: u8) -> bool {
+        let stride = format.layout().size as usize;
+        let mut used: Vec<u32> = if runs {
+            stored
+                .chunks_exact(3)
+                .flat_map(|run| {
+                    let count = if run[0] as u32 == crate::command::primitive::RECTANGLES { 2 * run[1] as u32 } else { run[1] as u32 };
+                    run[2] as u32..run[2] as u32 + count
+                })
+                .collect()
+        } else {
+            stored.iter().map(|&index| index as u32).collect()
+        };
+        used.sort_unstable();
+        used.dedup();
+        let mut gathered = Vec::new();
+        for vertex in used {
+            gathered.extend_from_slice(&window[vertex as usize * stride..][..stride]);
+        }
+        lowest_vertex_alpha(format, &gathered).map_or(true, |lowest| lowest >= least)
+    }
+
+    #[test]
+    fn only_the_used_vertices_decide() {
+        use crate::command::primitive::{RECTANGLES, TRIANGLE_STRIP};
+        // A model buffer of 200 vertices: a draw that names a few of them
+        // is opaque even where vertices between them are not.
+        let mut state = 0x1234_5678u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state >> 8
+        };
+        for bits in [5, 6, 7] {
+            let format = format(bits);
+            for round in 0..200 {
+                // Mostly opaque vertices, some not (more of them in later rounds).
+                let colors: Vec<u32> = (0..200)
+                    .map(|_| {
+                        let random = next();
+                        let opaque = random % 100 >= round / 4;
+                        match bits {
+                            5 => (if opaque { 0x8000 } else { 0 }) | (random & 0x7FFF),
+                            6 => (if opaque { 0xF000 } else { (random >> 4) % 15 << 12 }) | (random & 0x0FFF),
+                            _ => (if opaque { 0xFF00_0000 } else { (random % 255) << 24 }) | (random & 0xFF_FFFF),
+                        }
+                    })
+                    .collect();
+                let window = vertices(format, &colors);
+                let least = [0xFF, 0x80, 0x11, 0][round as usize % 4];
+                let listed: Vec<u16> = (0..1 + next() % 40).map(|_| (next() % 200) as u16).collect();
+                let runs = [TRIANGLE_STRIP as u16, (1 + next() % 20) as u16, (next() % 150) as u16, RECTANGLES as u16, (1 + next() % 5) as u16, (next() % 150) as u16];
+                for (stored, are_runs) in [(&listed[..], false), (&runs[..], true)] {
+                    let expected = reach_by_gathering(format, &window, stored, are_runs, least);
+                    let mut seen = [0u32; 7];
+                    assert_eq!(
+                        used_alphas_reach(format, &window, stored, are_runs, (0, 200), least, &mut seen),
+                        expected,
+                        "bits {bits} round {round} least {least} runs {are_runs}"
+                    );
+                    // A span that starts later (the bits count from it).
+                    let first = stored.iter().copied().min().unwrap_or(0) as u32;
+                    if !are_runs {
+                        let mut seen = [0u32; 7];
+                        assert_eq!(used_alphas_reach(format, &window, stored, false, (first, 200), least, &mut seen), expected);
+                    }
+                }
+            }
+        }
+        // Where every vertex of the span is used: the old whole-span answer.
+        let f4444 = format(6);
+        let window = vertices(f4444, &[0xF000, 0xF000, 0xE000, 0xF000]);
+        let all = [0u16, 1, 2, 3];
+        assert_eq!(lowest_vertex_alpha(f4444, &window), Some(0xEE));
+        assert!(!used_alphas_reach(f4444, &window, &all, false, (0, 4), 0xFF, &mut [0]));
+        assert!(used_alphas_reach(f4444, &window, &all, false, (0, 4), 0xEE, &mut [0]));
+        // Vertex 2 left out: opaque.
+        assert!(used_alphas_reach(f4444, &window, &[0, 1, 3, 3, 1], false, (0, 4), 0xFF, &mut [0]));
+        // 565: no alpha (255); least 0: anything.
+        assert!(used_alphas_reach(format(4), &[], &all, false, (0, 4), 0xFF, &mut [0]));
+        assert!(used_alphas_reach(f4444, &[], &all, false, (0, 4), 0, &mut [0]));
+        // Outside the window, the span or the bits: false.
+        assert!(!used_alphas_reach(f4444, &window[..window.len() - f4444.layout().size as usize], &all, false, (0, 4), 0xEE, &mut [0]));
+        assert!(!used_alphas_reach(f4444, &window, &all, false, (1, 4), 0xEE, &mut [0]));
+        assert!(!used_alphas_reach(f4444, &window, &all, false, (0, 3), 0xEE, &mut [0]));
+        assert!(!used_alphas_reach(f4444, &window, &all, false, (0, 40), 0xEE, &mut []));
+        // No colour field: the caller asks the rules.
+        assert!(!used_alphas_reach(VertexFormat(2 | 2 << 7), &[0u8; 64], &all, false, (0, 4), 0xFF, &mut [0]));
     }
 
     #[test]
