@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en" data-type="software" data-radius="soft" data-buttons="pill" data-motion>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>NativeRes: PSP games at 960×544 on the PS Vita</title>
+<meta name="description" content="A plugin for Adrenaline that draws PSP games with the PS Vita's own GPU at the screen's native 960×544, with the list of tested games and each release's changes.">
+<meta property="og:type" content="website">
+<meta property="og:title" content="NativeRes: PSP games at 960×544 on the PS Vita">
+<meta property="og:description" content="PSP games drawn by the Vita's own GPU at its native resolution. Tested games, frame rates and what each release changed.">
+<meta property="og:image" content="share.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<meta name="theme-color" content="#0a0d14">
+<!-- <link rel="canonical" href="https://divi-0.github.io/adrenaline-native-res/"> -->
+<meta name="site-kind" content="software">
+<meta name="page-type" content="software">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Funnel+Display:wght@400..700&family=Funnel+Sans:wght@400..600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/system.css">
+<link rel="stylesheet" href="assets/ui/cards.css">
+<link rel="stylesheet" href="assets/motion/motion.css">
+<link rel="stylesheet" href="assets/backgrounds/backgrounds.css">
+<link rel="stylesheet" href="assets/layout/layout.css">
+<link rel="stylesheet" href="assets/icons/icon.css">
+<style>
+:root {
+  --p-bg: #0a0d14; --p-surface: #131824; --p-ink: #e9edf3; --p-muted: #8891a1;
+  --p-accent: #5ab9fc; --p-accent-ink: #0a0d14; --p-action: #5ab9fc; --p-action-ink: #0a0d14;
+  --p-inv-bg: #e9edf3; --p-inv-surface: #d7dbe1; --p-inv-ink: #0a0d14; --p-inv-muted: #54575f;
+  --p-inv-accent: #0a0d14; --p-inv-accent-ink: #e9edf3; --p-inv-action: #0a0d14; --p-inv-action-ink: #e9edf3;
+  --font-display: "Funnel Display", system-ui, sans-serif;
+  --font-text: "Funnel Sans", system-ui, sans-serif;
+  --font-mono: "DM Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  --display-weight: 400;
+  --display-tracking: -0.03em;
+  --display-tracking-xl: -0.04em;
+  --ly-scale: 0.98;
+}
+</style>
+<script>document.documentElement.classList.add('m-enter');setTimeout(()=>document.documentElement.classList.add('m-enter-done'),700)</script>
+<script src="assets/backgrounds/backgrounds.js"></script>
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<!-- The front page: the before/after picture, what the renderer does, and the installation steps.
+     games.html (the tested games) and releases.html (every release) are lists that grow; both are
+     drawn by pages.js from data.js. Layout, type and colors come from the files in assets/;
+     site.css holds what is this site's own. -->
+
+<header class="nav nav--centre">
+  <div class="wrap nav__bar">
+    <a class="skip-link" href="#top">Skip to content</a>
+    <a class="nav__logo" href="#top"><span class="mark mark--initial" aria-hidden="true">N</span>NativeRes</a>
+    <nav class="nav__links" aria-label="Main">
+      <div class="nav__item"><a class="nav__link" href="games.html">Games</a></div>
+      <div class="nav__item"><a class="nav__link" href="releases.html">Releases</a></div>
+    </nav>
+    <div class="nav__actions">
+      <a class="btn btn--primary" href="#install">Installation</a>
+    </div>
+    <button class="nav__toggle" type="button" aria-expanded="false" aria-label="Menu">
+      <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><path d="M2 5h14M2 13h14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+    </button>
+  </div>
+</header>
+
+<main id="top">
+  <!-- HERO (split): the words left; right one game frame twice, whole and never enlarged past its
+       960 pixels, with the line that is dragged between the two -->
+  <section class="hero hero--split" data-enter aria-labelledby="hero-h">
+    <div class="wrap"><div class="hero-text grid hero__grid">
+      <div class="hero__text span-5">
+        <h1 id="hero-h">PSP games at the Vita's native resolution</h1>
+        <p class="hero__lead">NativeRes is a plugin for Adrenaline. The Vita's own GPU draws each PSP game at 960×544, where the emulator shows a 480×272 picture scaled up.</p>
+        <label class="hero-label" for="cmp">Drag the line in the picture to compare the two.</label>
+        <div class="btn-row"><a class="btn btn--primary" href="#install">Installation</a><a class="btn btn--secondary" href="games.html">See the tested games</a></div>
+      </div>
+      <div class="hero-side span-7 start-6">
+        <div class="hero__media" id="compare" style="--pos: 50%">
+          <img src="img/kb-native.jpg" alt="Kenka Bancho: Badass Rumble drawn by NativeRes at 960×544: two fighters in a temple yard, sharp edges and text" fetchpriority="high" data-source="client" data-subject="a game frame drawn by the plugin">
+          <div class="cmp-clip"><img src="img/kb-sony.jpg" alt="The same frame as the PSP emulator shows it, 480×272 scaled up: blocky edges and text" data-source="client" data-subject="the same game frame from the PSP emulator"></div>
+          <input class="cmp-range" id="cmp" type="range" min="0" max="100" value="50">
+          <span class="cmp-line" aria-hidden="true"></span>
+          <span class="cmp-knob" aria-hidden="true"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 5l-4 5 4 5M13 5l4 5-4 5"/></svg></span>
+        </div>
+        <dl class="hero-facts">
+          <div><dt>Left of the line</dt><dd>480×272, Stock Adrenaline</dd></div>
+          <div><dt>Right of the line</dt><dd>960×544, NativeRes</dd></div>
+          <div><dt>Tested so far</dt><dd>6 games</dd></div>
+        </dl>
+      </div>
+    </div></div>
+  </section>
+
+  <!-- RENDERER: the statement and its moment (liquid-type), then how it differs -->
+  <section class="section" id="renderer" aria-labelledby="renderer-h">
+    <div class="wrap">
+      <div>
+        <h2 class="mo-lt__type" id="renderer-h">Four times the pixels</h2>
+      </div>
+      <div class="grid grid--top" style="margin-top: var(--s-7)">
+        <p class="t-lead span-5">The PSP emulator inside the Vita renders 480×272 and scales it up. NativeRes leaves that emulation untouched and draws every frame a second time, natively, at 960×544 in 32-bit color.</p>
+        <ul class="rows rows--spec span-7 start-6">
+          <li><span class="rows__name">Who draws the picture</span><span class="rows__value">The Vita's GPU</span></li>
+          <li><span class="rows__name">The game's own data</span><span class="rows__value">Read, never changed</span></li>
+          <li><span class="rows__name">Speed</span><span class="rows__value">Same as before, not faster</span></li>
+          <li><span class="rows__name">Heavy 3D scenes</span><span class="rows__value">Can drop frames</span></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- INSTALL -->
+  <section class="section" id="install" style="--h: 1; --hm: 2" aria-labelledby="install-h">
+    <div class="wrap">
+      <div class="section-head">
+        <h2 id="install-h">Install NativeRes in 4 steps. <span class="muted">For a Vita with HENkaku and Adrenaline 8.</span></h2>
+      </div>
+      <div class="grid">
+        <article class="card m-nolift span-6 step">
+          <div><span class="step-num">1</span>
+            <h3>Download the plugin</h3>
+            <p>One file, from the newest release on GitHub. Back up your saves first.</p></div>
+          <p class="step-get"><a class="btn btn--primary" href="https://github.com/Divi-0/adrenaline-native-res/releases/latest">Download the plugin</a></p>
+        </article>
+        <article class="card m-nolift span-6 step">
+          <div><span class="step-num">2</span>
+            <h3>Copy it to the Vita</h3>
+            <p>Put the file in the taiHEN folder, with VitaShell for example.</p></div>
+          <pre class="codebox" role="img" aria-label="The file's place on the Vita: ur0:tai/adrenaline-native-res.suprx">ur0:tai/
+<b>adrenaline-native-res.suprx</b></pre>
+        </article>
+        <article class="card m-nolift span-6 step">
+          <div><span class="step-num">3</span>
+            <h3>Add it to taiHEN's config</h3>
+            <p>Two lines in <code>ur0:tai/config.txt</code>. It loads only inside Adrenaline.</p></div>
+          <pre class="codebox" role="img" aria-label="Two lines for ur0:tai/config.txt: *PSPEMUCFW, then ur0:tai/adrenaline-native-res.suprx"><b>*PSPEMUCFW</b>
+<b>ur0:tai/adrenaline-native-res.suprx</b></pre>
+        </article>
+        <article class="card m-nolift span-6 step">
+          <div><span class="step-num">4</span>
+            <h3>Reboot and start a game</h3>
+            <p>The renderer is on from the first start. Switch it in Adrenaline's settings.</p></div>
+          <pre class="codebox" role="img" aria-label="Adrenaline's settings menu: NativeRes Renderer set to On">Settings
+<b>NativeRes Renderer   On</b></pre>
+        </article>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="footer closing plain" id="contact" aria-label="Site links">
+  <div class="wrap">
+    <div class="closing__links">
+      <div class="grid">
+        <div class="span-4 stack-4">
+          <a class="nav__logo" href="#top"><span class="mark mark--initial" aria-hidden="true">N</span>NativeRes</a>
+          <p class="footer__lede">A native-resolution renderer for Adrenaline.</p>
+        </div>
+        <div class="span-2 footer__col"><h3>Games</h3><ul><li><a href="games.html">Tested games</a></li><li><a href="https://github.com/Divi-0/adrenaline-native-res/issues">Report a game</a></li></ul></div>
+        <div class="span-2 footer__col"><h3>Releases</h3><ul><li><a href="releases.html">Newest release</a></li><li><a href="https://github.com/Divi-0/adrenaline-native-res/releases">Every release</a></li></ul></div>
+        <div class="span-2 footer__col"><h3>Renderer</h3><ul><li><a href="#renderer">How it draws</a></li><li><a href="https://github.com/Divi-0/adrenaline-native-res">Source code</a></li></ul></div>
+        <div class="span-2 footer__col"><h3>Install</h3><ul><li><a href="#install">Four steps</a></li><li><a href="https://github.com/Divi-0/adrenaline-native-res#troubleshooting">Troubleshooting</a></li></ul></div>
+      </div>
+      <div class="footer__legal">
+        <span>&copy; 2026 NativeRes, GPL-3.0-or-later</span>
+        <div class="socials"></div>
+        <span class="credits">Game names and pictures belong to their publishers</span>
+      </div>
+    </div>
+  </div>
+</footer>
+
+<script type="module" src="assets/system.js"></script>
+<script type="module" src="assets/motion/motion.js"></script>
+<script type="module" src="assets/layout/layout.js"></script>
+<script>
+  // the hero's line follows the range under it: one style write a frame, on the picture's own box
+  document.querySelectorAll('.cmp-range').forEach(r => {
+    const box = r.parentElement; let next = null;
+    r.addEventListener('input', () => {
+      if (next === null) requestAnimationFrame(() => { box.style.setProperty('--pos', next + '%'); next = null; });
+      next = r.value;
+    });
+  });
+</script>
+</body>
+</html>
