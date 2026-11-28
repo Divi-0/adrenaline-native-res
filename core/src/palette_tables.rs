@@ -267,4 +267,19 @@ mod tests {
         assert_eq!(tables.find(third, 6), PaletteLookup::Found(c));
         assert!(matches!(tables.find(second, 6), PaletteLookup::Fill(_)));
     }
+
+    /// Kenka Bancho's cloud wipe: a new palette every frame that differs from
+    /// the earlier ones only in its alpha ramp. Each must get a table of its
+    /// own: with an earlier palette's table the frame drew an earlier wipe (the
+    /// hole went back, 2-3 times per wipe, the same frames in every run).
+    #[test]
+    fn the_cloud_wipes_palettes_never_find_an_older_frames_table() {
+        let mut tables = tables();
+        for (frame, start) in (-15..=32).rev().enumerate() {
+            let words = crate::texture::kenka_bancho_wipe_palette(start);
+            let wipe = PaletteKey { hash: crate::texture::hash_words(&words), ..key(0) };
+            let found = tables.find(wipe, frame as u32 + 1);
+            assert!(matches!(found, PaletteLookup::Fill(_)), "frame {frame} (ramp at {start}): {found:?}, an older palette's table");
+        }
+    }
 }

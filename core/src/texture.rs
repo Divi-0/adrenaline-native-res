@@ -506,9 +506,36 @@ fn texel_bytes(width: usize, bits: u32) -> usize {
     (width * bits as usize).div_ceil(8)
 }
 
-/// FNV-1a over palette words.
+/// Whether `hash_words` mixes every bit of a word into the whole hash (on by
+/// default; off: FNV-1a over whole words, as before 2026-11-28).
+pub static MIXED_PALETTE_HASH: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// The hash of a palette's words: what tells palettes apart (the display's
+/// colour tables, `palette_tables`, are found by it alone; wide palette
+/// textures are cached under it).
+///
+/// MurmurHash3's word step and finalizer: rotations carry every bit of a
+/// word into the low bits too. FNV-1a over whole words (`(hash ^ word) *
+/// prime`) only carried bits upwards, so palettes that differed only in
+/// their alpha bytes shared the low 24 bits of their hash and had at most
+/// 256 hashes between them: Kenka Bancho's cloud wipe, a white alpha ramp
+/// sliding one entry a frame, found an older frame's table 2-3 times per
+/// wipe, and its hole went back.
 pub fn hash_words(words: &[u32]) -> u32 {
-    words.iter().fold(0x811C_9DC5u32, |hash, word| (hash ^ word).wrapping_mul(0x0100_0193))
+    if !MIXED_PALETTE_HASH.load(core::sync::atomic::Ordering::Relaxed) {
+        return words.iter().fold(0x811C_9DC5u32, |hash, word| (hash ^ word).wrapping_mul(0x0100_0193));
+    }
+    let mut hash = 0x811C_9DC5u32;
+    for &word in words {
+        let mixed = word.wrapping_mul(0xCC9E_2D51).rotate_left(15).wrapping_mul(0x1B87_3593);
+        hash = (hash ^ mixed).rotate_left(13).wrapping_mul(5).wrapping_add(0xE654_6B64);
+    }
+    hash ^= (words.len() as u32).wrapping_mul(4);
+    hash ^= hash >> 16;
+    hash = hash.wrapping_mul(0x85EB_CA6B);
+    hash ^= hash >> 13;
+    hash = hash.wrapping_mul(0xC2B2_AE35);
+    hash ^ hash >> 16
 }
 
 /// Decodes `texture` into RGBA8888 pixels (`0xAABBGGRR`), row by row with
@@ -1036,11 +1063,61 @@ impl PaletteColors {
     }
 }
 
+/// Kenka Bancho's cloud wipe after the train (one 512x512 CLUT8 mask drawn
+/// over the screen): its palette is 32 white entries whose alpha ramp (0x0F,
+/// 0x1F .. 0xFF) starts at entry `start` and slides down one entry a frame
+/// (from ~18 to below 0, cut off there; from -15 on all 32 are 0xFF), then
+/// 224 zero words. Recorded wipe frames held starts 7, 18, 9 and -7 word for
+/// word.
+#[cfg(test)]
+pub(crate) fn kenka_bancho_wipe_palette(start: i32) -> [u32; 256] {
+    let mut words = [0u32; 256];
+    for (entry, word) in words.iter_mut().take(32).enumerate() {
+        let step = entry as i32 - start;
+        let alpha = if step < 0 { 0 } else { (0x0F + 16 * step).min(0xFF) as u32 };
+        *word = alpha << 24 | 0x00FF_FFFF;
+    }
+    words
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const ADDRESS: u32 = 0x0890_0000;
+
+    /// Palettes that differ only in their alpha (a fade or wipe done by the
+    /// palette) must still hash apart: the display finds a palette's colour
+    /// table by this hash alone (palette_tables). FNV-1a over whole words
+    /// never carried a word's top byte into the low 24 bits of the hash, so
+    /// such palettes had at most 256 hashes; Kenka Bancho's cloud wipe drew
+    /// an older frame's palette whenever two of its palettes collided (the
+    /// hole went back at the same frames in every run, late in the wipe
+    /// only 16 hashes were left).
+    #[test]
+    fn palettes_that_differ_only_in_alpha_hash_apart() {
+        let starts = -15..=32; // from -15 on, all 32 entries are 0xFF
+        let mut hashes: Vec<(u32, i32)> = starts.map(|start| (hash_words(&kenka_bancho_wipe_palette(start)), start)).collect();
+        hashes.sort();
+        for pair in hashes.windows(2) {
+            assert_ne!(pair[0].0, pair[1].0, "wipe palettes starting at {} and {} hash alike", pair[0].1, pair[1].1);
+        }
+    }
+
+    /// Every bit of every word reaches the hash's low half too.
+    #[test]
+    fn one_alpha_bit_changes_the_low_bits_of_the_hash() {
+        let base = kenka_bancho_wipe_palette(5);
+        let hash = hash_words(&base);
+        for word in 0..base.len() {
+            for bit in 24..32 {
+                let mut changed = base;
+                changed[word] ^= 1 << bit;
+                let other = hash_words(&changed);
+                assert_ne!(other & 0xFFFF, hash & 0xFFFF, "word {word} bit {bit}: only the high bits of the hash moved");
+            }
+        }
+    }
 
     /// Little-endian bytes of `words`, i.e. texture memory.
     fn bytes(words: &[u32]) -> Vec<u8> {
