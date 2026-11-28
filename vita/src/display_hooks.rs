@@ -192,6 +192,12 @@ pub mod timings {
         SONY_COPY_EARLY.store(on, Relaxed);
     }
 
+    /// This pass copied Sony's picture right after its LCD sync (read by
+    /// `NativeResRenderFrame`, which comes after the sync).
+    pub fn copied_sony_early() -> bool {
+        COPIED_EARLY.load(Relaxed)
+    }
+
     /// Process time of the loop's last LCD sync.
     pub fn last_lcd_sync_us() -> u64 {
         LAST_LCD_SYNC_US.load(Relaxed)

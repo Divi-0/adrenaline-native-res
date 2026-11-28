@@ -144,6 +144,13 @@ pub static STALE_COPY: AtomicI32 = AtomicI32::new(1);
 /// `shows_cpu_written_picture` on (1, default) or off.
 pub static CPU_PICTURE_CHECK: AtomicU8 = AtomicU8::new(1);
 
+/// 1 (default) or 0. A frame waiting for textures whose held picture is
+/// too old (`MAX_HELD_FRAMES`) falls back to Sony's picture only in a pass
+/// that copied it right after the sync, else ours is held once more
+/// (`display_loop::holds_last_picture`; Kenka Bancho's train start tore).
+/// 0: at once, whenever it is copied.
+pub static HOLD_FOR_EARLY_COPY: AtomicBool = AtomicBool::new(true);
+
 /// Draw the frame we have once more (paused game, a switch changed what
 /// is drawn).
 static FORCE_REDRAW: AtomicI32 = AtomicI32::new(0);
@@ -506,10 +513,14 @@ impl FrameLoop {
                     // own picture instead switched to the upscaled original
                     // for a frame, a visible glitch when Final Fantasy's
                     // battles appear. If our last picture is old (renderer
-                    // just switched on, savestate loaded), the game's.
+                    // just switched on, savestate loaded), the game's, once
+                    // this pass copied it right after the sync (a copy
+                    // after this step can tear).
                     HELD_FOR_TEXTURES.store(true, Ordering::Relaxed);
+                    let copied_early = !HOLD_FOR_EARLY_COPY.load(Ordering::Relaxed) || crate::display_hooks::timings::copied_sony_early();
                     return targets.shown.is_some_and(|shown| {
-                        frame.frame_number.wrapping_sub(targets.targets[shown].frame_number) <= MAX_HELD_FRAMES
+                        let age = frame.frame_number.wrapping_sub(targets.targets[shown].frame_number);
+                        nativeres_core::display_loop::holds_last_picture(age, MAX_HELD_FRAMES, copied_early)
                     });
                 }
                 Outcome::Drawn => {

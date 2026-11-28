@@ -56,6 +56,17 @@ pub fn sony_copy_point(showed_sony_picture_last: bool, held_for_textures_last: b
     }
 }
 
+/// Whether a pass whose frame waits for its textures shows our last picture
+/// again (`age`: PSP frames between that picture and the frame), rather
+/// than Sony's picture of the frame. Up to `max_age` frames old ours is
+/// shown; older, Sony's, but only if this pass copied it right after the
+/// sync (`sony_copy_point`): copied now, after our render step, it can show
+/// a seam far down the screen. Then ours is held once more, and the next
+/// pass (after a held one) copies early.
+pub fn holds_last_picture(age: u32, max_age: u32, sony_copied_early: bool) -> bool {
+    age <= max_age || !sony_copied_early
+}
+
 /// The row a copy starting `copy_at_us` after the LCD sync splits Sony's
 /// picture at (0: no seam; `PSP_ROWS`: the whole old picture, no seam
 /// either).
@@ -440,6 +451,45 @@ mod tests {
         assert_eq!(sony_copy_point(false, true), CopyPoint::AfterSync);
         assert!(copy_is_clean(copy_time_us(sony_copy_point(false, true), 7_000)));
         assert!(!copy_is_clean(copy_time_us(sony_copy_point(false, false), 7_000)), "the late copy tore");
+    }
+
+    /// Kenka Bancho's train start, after the early copy above (2026-11-28,
+    /// `sonywrites` x3): 3 passes waited for textures, 3 early copies and
+    /// still one at 13 ms. The first waiting pass came right after one of
+    /// our frames (no early copy) and its frame was more than
+    /// `MAX_HELD_FRAMES` ahead of our shown picture, so it fell back to
+    /// Sony's picture at once, copied after our render step. Now such a pass
+    /// holds our picture once more; the next one copies early and falls back
+    /// cleanly.
+    #[test]
+    fn a_fallback_to_sonys_picture_waits_for_an_early_copy() {
+        const MAX_AGE: u32 = 2;
+        const RENDER_END_US: u32 = 13_000;
+        // The train: our frame shown, then three passes whose frame waits for
+        // textures with our picture too old, then our frame again.
+        let passes: [Option<u32>; 5] = [None, Some(5), Some(5), Some(6), None];
+        let (mut showed_sony, mut held) = (false, false);
+        let mut sony_passes = 0;
+        for (n, &waiting) in passes.iter().enumerate() {
+            let point = sony_copy_point(showed_sony, held);
+            let copied_early = point == CopyPoint::AfterSync;
+            let shows_ours = match waiting {
+                None => true,
+                Some(age) => holds_last_picture(age, MAX_AGE, copied_early),
+            };
+            if !shows_ours {
+                sony_passes += 1;
+                assert!(copy_is_clean(copy_time_us(point, RENDER_END_US)), "pass {n}: Sony's picture copied late, torn");
+            }
+            showed_sony = !shows_ours;
+            held = waiting.is_some();
+        }
+        assert_eq!(sony_passes, 2, "Sony's picture from the second waiting pass on");
+        // A held picture young enough is shown again whatever the copy.
+        assert!(holds_last_picture(2, MAX_AGE, true));
+        assert!(holds_last_picture(1, MAX_AGE, false));
+        // Too old and copied early: Sony's.
+        assert!(!holds_last_picture(3, MAX_AGE, true));
     }
 
     /// The model's measured shape: top rows rewritten 0-3 ms after the sync,
