@@ -41,6 +41,7 @@ pub mod display_list;
 pub mod display_loop;
 pub mod draw_stream;
 pub mod dump;
+pub mod early_palettes;
 pub mod event_ring;
 pub mod frame;
 pub mod frame_builder;

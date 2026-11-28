@@ -177,6 +177,7 @@ pub fn write_frame(out: &mut impl Write, stats: &FrameStats) -> fmt::Result {
         ("frame_full", stats.frame_overflows),
         ("inline", stats.inline_draws),
         ("inline_kb", stats.inline_words / 256),
+        ("early_pal", stats.early_palettes),
         ("masked", stats.color_masked_draws),
     ];
     for (name, count) in problems {

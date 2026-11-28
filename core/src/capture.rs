@@ -370,11 +370,13 @@ impl Capture {
         match event {
             Event::ListEnqueued { list, stall, id, context } => {
                 if id >= 0 {
+                    self.read_early_palettes(memory);
                     self.enqueue(DisplayList::with_context(id, list, stall, context), false);
                 }
             }
             Event::ListEnqueuedAtHead { list, stall, id, context } => {
                 if id >= 0 {
+                    self.read_early_palettes(memory);
                     self.enqueue(DisplayList::with_context(id, list, stall, context), true);
                 }
             }
@@ -410,6 +412,14 @@ impl Capture {
         }
         self.run_queue(memory, frame, tracer);
         None
+    }
+
+    /// The frame's first list: the palettes the game rewrites every frame
+    /// are read now, before the walk (`early_palettes`).
+    fn read_early_palettes(&mut self, memory: &mut impl PspMemory) {
+        if self.current_frame.lists_enqueued == 0 && !self.walk_only {
+            self.palette.early.read_now(memory);
+        }
     }
 
     fn enqueue(&mut self, list: DisplayList, at_head: bool) {
@@ -562,6 +572,8 @@ impl Capture {
                 stats.direct = self.builder.stats;
                 frame.merge_overflow();
                 // Every palette's words are stored now.
+                let count = frame.palettes().len();
+                self.palette.early.note_frame(frame.palettes(), &frame.palette_hashes[..count]);
                 frame.resolve_palette_hashes();
             }
             None => self.stream.clear(),
@@ -1335,5 +1347,67 @@ mod tests {
         assert_eq!(capture.ge.register(op::FOG_END), 0x44_8000);
         let stats = capture.handle(shown(), &mut memory, None).unwrap();
         assert_eq!((stats.contexts_saved, stats.contexts_restored), (1, 1));
+    }
+
+    /// The game rewrites a palette while its list is walked (Kenka Bancho's
+    /// cloud wipe: the next frame's ramp, 2-4.5 ms after the enqueue, our
+    /// walk takes ~10 ms). The GE drew with the words of the enqueue's time;
+    /// so must we, once the palette is known to change every frame.
+    #[test]
+    fn a_palette_rewritten_during_the_walk_keeps_the_words_of_the_enqueue() {
+        struct GameWritesDuringWalk {
+            memory: TestMemory,
+            at: u32,
+            writes: Vec<(u32, Vec<u32>)>,
+        }
+        impl PspMemory for GameWritesDuringWalk {
+            fn read_u32(&mut self, address: u32) -> Option<u32> {
+                if physical(address) == physical(self.at) {
+                    for (to, words) in self.writes.drain(..) {
+                        self.memory.write(to, &words);
+                    }
+                }
+                self.memory.read_u32(address)
+            }
+        }
+        let list = 0x0890_0000;
+        let palette = 0x0880_0000;
+        let mut words = vec![
+            cmd(op::BASE, 0x08_0000),
+            cmd(op::VERTEX_TYPE, (1 << 23) | (2 << 7) | (7 << 2) | 2), // through, s16, 8888, u16 texture
+            cmd(op::VERTEX_ADDRESS, 0x91_0000),
+            cmd(op::FRAMEBUFFER_POINTER, 0x08_8000),
+            cmd(op::TEXTURE_MAP_ENABLE, 1),
+            cmd(op::TEXTURE_FORMAT, 5), // CLUT8
+            cmd(op::TEXTURE_SIZE_0, 4 | (4 << 8)),
+            cmd(op::TEXTURE_ADDRESS_0, 0x95_0000),
+            cmd(op::TEXTURE_BUFFER_WIDTH_0, 0x08_0010),
+            cmd(op::CLUT_ADDRESS, 0x80_0000),
+            cmd(op::CLUT_ADDRESS_UPPER, 0x08_0000),
+            cmd(op::CLUT_FORMAT, 0x00_FF03),
+            cmd(op::CLUT_LOAD, 1),
+        ];
+        words.resize(32, cmd(op::NOP, 0)); // the PRIM in a later cache line of the list
+        words.extend([cmd(op::PRIM, (6 << 16) | 2), cmd(op::FINISH, 0), cmd(op::END, 0)]);
+        let mut memory = GameWritesDuringWalk { memory: TestMemory::default(), at: list + 4 * 32, writes: Vec::new() };
+        memory.memory.write(list, &words);
+        memory.memory.write(0x0891_0000, &[0, 0xFFFF_FFFF, 0, 0, 16 | (16 << 16), 0xFFFF_FFFF, 16 | (16 << 16), 0]);
+        memory.memory.write(0x0895_0000, &[0; 64]);
+        let mut capture = Box::new(Capture::new());
+        let mut record = |memory: &mut GameWritesDuringWalk| {
+            let mut frame = crate::frame::new_boxed_frame();
+            capture.handle(Event::ListEnqueued { list, stall: 0, id: 0, context: 0 }, memory, Some(&mut frame));
+            capture.handle(shown(), memory, Some(&mut frame)).unwrap();
+            assert_eq!(frame.palettes().len(), 1);
+            frame.palette_words[..8].to_vec()
+        };
+        for (n, value) in [(1u32, 0x1111_1111u32), (2, 0x2222_2222)] {
+            memory.memory.write(palette, &[value; 8]);
+            assert_eq!(record(&mut memory), [value; 8], "frame {n}");
+        }
+        // Frame 3: the game writes frame 4's palette when the walk reaches the PRIM.
+        memory.memory.write(palette, &[0x3333_3333; 8]);
+        memory.writes.push((palette, vec![0x4444_4444; 8]));
+        assert_eq!(record(&mut memory), [0x3333_3333; 8], "the enqueue's words, not the next frame's");
     }
 }

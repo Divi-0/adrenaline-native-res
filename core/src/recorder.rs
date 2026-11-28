@@ -274,6 +274,9 @@ pub struct LoadedPalette {
     /// A palette placed in the frame whose words no job carries yet: the
     /// next queued draw takes it (`take_unstored`).
     unstored: Option<PaletteFill>,
+    /// Palettes that change every frame, read at the walk's start
+    /// (`early_palettes`; the capture reads and notes them).
+    pub early: crate::early_palettes::EarlyPalettes,
 }
 
 /// A palette placed in the frame (`Catalog::add_palette`) and where its
@@ -286,7 +289,14 @@ pub(crate) struct PaletteFill {
 
 impl LoadedPalette {
     pub const fn new() -> Self {
-        LoadedPalette { address: 0, word_count: 0, given: [0; MAX_PALETTE_WORDS], generation: 0, unstored: None }
+        LoadedPalette {
+            address: 0,
+            word_count: 0,
+            given: [0; MAX_PALETTE_WORDS],
+            generation: 0,
+            unstored: None,
+            early: crate::early_palettes::EarlyPalettes::new(),
+        }
     }
 
     /// What tells loaded palettes apart: address and length.
@@ -306,6 +316,7 @@ impl LoadedPalette {
         self.word_count = 0;
         self.unstored = None;
         self.generation = self.generation.wrapping_add(1);
+        self.early.clear();
     }
 
     /// A new frame: a palette placed in the old one is no concern of it.
@@ -316,8 +327,39 @@ impl LoadedPalette {
 
     /// The palette placed in the frame whose words no job carries yet, if
     /// any (the queued draw that takes it carries them).
+    #[cfg(test)]
     pub(crate) fn take_unstored(&mut self) -> Option<PaletteFill> {
         self.unstored.take()
+    }
+
+    /// `take_unstored` for a draw of `frame`: a palette read at the walk's
+    /// start (`early_palettes`: one the game rewrites every frame) is
+    /// stored into the frame now, with those words, and none is left for
+    /// the job to read (later, when the game may have written the next
+    /// frame's).
+    pub(crate) fn take_unstored_in(&mut self, frame: *mut Frame, stats: &mut FrameStats) -> Option<PaletteFill> {
+        let fill = self.unstored.take()?;
+        if fill.address == 0 || frame.is_null() {
+            return Some(fill);
+        }
+        let Some(words) = self.early.words(fill.address, fill.place.word_count) else {
+            return Some(fill);
+        };
+        // Safe: `frame` is the frame being recorded; the place is this
+        // palette's own (nobody else writes it).
+        let Some((stored, hash)) = (unsafe { Frame::palette_place_raw(frame, fill.place) }) else {
+            return Some(fill);
+        };
+        let count = (fill.place.word_count as usize).min(MAX_PALETTE_WORDS);
+        // Safe: `palette_place_raw` checked that `count` words fit there.
+        let stored = unsafe { core::slice::from_raw_parts_mut(stored, count) };
+        let readable = words.len().min(count);
+        stored[..readable].copy_from_slice(&words[..readable]);
+        stored[readable..].fill(0);
+        // Safe: as above.
+        unsafe { *hash = crate::texture::hash_words(stored) };
+        stats.early_palettes += 1;
+        None
     }
 
     /// Saves where the palette is (and the words restored from an older
@@ -560,7 +602,7 @@ impl Queues<'_> {
         crate::cycles::add(crate::cycles::DIRECT, started);
         crate::phase::leave(previous);
         written?;
-        if let Some(fill) = palette.take_unstored() {
+        if let Some(fill) = palette.take_unstored_in(frame, stats) {
             // The copier stores it (and hashes it) straight into the frame,
             // as the recorder would have (`copy_tasks::Layout::Palette`):
             // one copy task instead of a job through the recorder. Words
@@ -674,7 +716,7 @@ fn queue_batch(
         hash_vertices: !raw,
         zero_copy_vertices: raw && crate::raw_arena::zero_copy_wanted(calls[0].vertex_address, vertices, format),
         index_bounds: None,
-        palette: palette.take_unstored(),
+        palette: palette.take_unstored_in(frame, stats),
         given_palette: palette.given_words(),
         segment: queues.builder.as_deref_mut().map_or(0, |builder| builder.fallback_segment()),
         refused,
@@ -794,7 +836,7 @@ fn queue_draw(
                 && crate::raw_arena::zero_copy_wanted(memory_ranges[1].0, memory_ranges[1].1, format)
         }),
         index_bounds: producer_bounds,
-        palette: palette.take_unstored(),
+        palette: palette.take_unstored_in(frame, stats),
         given_palette: palette.given_words(),
         segment: queues.builder.as_deref_mut().map_or(0, |builder| builder.fallback_segment()),
         refused,

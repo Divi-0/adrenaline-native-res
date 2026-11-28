@@ -213,6 +213,9 @@ pub struct FrameStats {
     /// side by side meanwhile), and the PSP memory words they read.
     pub inline_draws: u32,
     pub inline_words: u32,
+    /// Palettes stored with the words read at the walk's start
+    /// (`early_palettes`).
+    pub early_palettes: u32,
     /// Draws that write no colour (all RGB bits masked), not rendered.
     pub color_masked_draws: u32,
     /// Textures sampled at their first use (`recorder::sample_texture`): on
@@ -292,6 +295,7 @@ impl FrameStats {
             approx_blend_states: 0,
             frame_overflows: 0,
             inline_draws: 0,
+            early_palettes: 0,
             inline_words: 0,
             color_masked_draws: 0,
             texture_samples_taken: 0,
