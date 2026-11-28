@@ -287,6 +287,7 @@ unsafe extern "C" fn begin_scene_hooked(
         frame_loop::leave_game();
     }
     let ours = if !display_loop::ours_to_draw(screen) {
+        frame_loop::clear_held_for_textures();
         false
     } else {
         let ours = frame_loop::render_frame();
@@ -438,7 +439,7 @@ unsafe extern "C" fn lcdc_sync_hooked() -> i32 {
     let data = PSP_DATA.load(Relaxed);
     if data != 0
         && SONY_COPY_EARLY.load(Relaxed)
-        && crate::textures::copy_sony_picture_early(SHOWED_SONY.load(Relaxed))
+        && crate::textures::copy_sony_picture_early(SHOWED_SONY.load(Relaxed), frame_loop::held_for_textures())
         && !not_ours_to_draw()
     {
         note_after_sync(&SONY_COPY_AFTER_SYNC);

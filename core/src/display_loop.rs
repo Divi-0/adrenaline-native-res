@@ -44,9 +44,12 @@ pub enum CopyPoint {
 
 /// Where to copy: right after the sync while the screen shows Sony's
 /// picture (it was shown in the loop before: CPU-drawn pictures come in
-/// runs), otherwise only if `NativeResRenderFrame` falls back to it.
-pub fn sony_copy_point(showed_sony_picture_last: bool) -> CopyPoint {
-    if showed_sony_picture_last {
+/// runs) or may show it next (the last pass held our last picture while
+/// the frame's textures were not ready: past `MAX_HELD_FRAMES` the loop
+/// falls back to Sony's picture), otherwise only if `NativeResRenderFrame`
+/// falls back to it.
+pub fn sony_copy_point(showed_sony_picture_last: bool, held_for_textures_last: bool) -> CopyPoint {
+    if showed_sony_picture_last || held_for_textures_last {
         CopyPoint::AfterSync
     } else {
         CopyPoint::AfterRender
@@ -412,7 +415,7 @@ mod tests {
     /// the sync, whatever our render step does, and its seam stays hidden.
     #[test]
     fn the_early_copy_is_clean_however_long_our_render_step_takes() {
-        assert_eq!(sony_copy_point(true), CopyPoint::AfterSync);
+        assert_eq!(sony_copy_point(true, false), CopyPoint::AfterSync);
         for (bucket_ms, _) in RENDER_END_HISTOGRAM {
             assert!(copy_is_clean(copy_time_us(CopyPoint::AfterSync, bucket_ms * 1000 + 500)));
         }
@@ -424,7 +427,19 @@ mod tests {
     /// Sony's is copied late (one possibly torn picture at the run's start).
     #[test]
     fn our_frames_need_no_early_copy() {
-        assert_eq!(sony_copy_point(false), CopyPoint::AfterRender);
+        assert_eq!(sony_copy_point(false, false), CopyPoint::AfterRender);
+    }
+
+    /// Kenka Bancho's train (2026-11-28): its first frame waited for
+    /// textures, our last picture was held for 9 passes, then Sony's was
+    /// shown for 3; the first of them, copied late, could show a seam (a tear
+    /// seen once at the train's start). After a held pass the copy is early,
+    /// so a fallback that follows shows a clean picture.
+    #[test]
+    fn a_pass_held_for_textures_copies_sonys_picture_early() {
+        assert_eq!(sony_copy_point(false, true), CopyPoint::AfterSync);
+        assert!(copy_is_clean(copy_time_us(sony_copy_point(false, true), 7_000)));
+        assert!(!copy_is_clean(copy_time_us(sony_copy_point(false, false), 7_000)), "the late copy tore");
     }
 
     /// The model's measured shape: top rows rewritten 0-3 ms after the sync,

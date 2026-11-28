@@ -17,9 +17,9 @@
 //! - Textures that changed at their last re-check are re-checked at every
 //!   use; ones that changed at several re-checks in a row are *volatile* and
 //!   decoded again without hashing first (see `look_up`).
-//! - Big direct-colour textures are compared by a sample of their data at
-//!   every use ([`staging::sample_hash`]) and re-checked by a worker thread
-//!   ([`refresh`]); all others (in RAM) by a few words the capture sampled
+//! - Big textures are compared by a sample of their data at every use
+//!   ([`staging::sample_hash`]); big direct-colour ones are also re-checked
+//!   by a worker thread ([`refresh`]); all others (in RAM) by a few words the capture sampled
 //!   while the GE drew the frame (`Frame::texture_samples`), compared with
 //!   the same words of the data they were decoded from
 //!   ([`staging::quick_hash`]): a mismatch re-checks them at once.
@@ -73,6 +73,10 @@ const HINT_BUCKETS: usize = 4096;
 /// Whether cached textures are compared with the frame's capture-time
 /// samples (`Frame::texture_samples`; on by default).
 pub static QUICK_CHECKS: AtomicBool = AtomicBool::new(true);
+/// Whether big palette textures are compared by `sample_hash` at every use
+/// like big direct-colour ones (on by default; off: only the capture's
+/// samples and the regular re-checks, as before 2026-11-28).
+pub static SAMPLE_PALETTE_TEXTURES: AtomicBool = AtomicBool::new(true);
 /// Re-check budget per frame.
 pub const VERIFY_BYTES_PER_FRAME: u32 = 128 * 1024;
 /// Wide textures (`FrameStart::wide`) take 8 bytes a texel (a palette
@@ -338,7 +342,7 @@ struct Entry {
     changes: u8,
     /// Decodes in a row without hashing.
     unhashed: u8,
-    /// Big direct colour: `sample_hash` of the data it was decoded from.
+    /// Big (`is_sampled_at_every_use`): `sample_hash` of the data it was decoded from.
     sample_hash: u32,
     /// `quick_hash` of the data it was decoded from (0 = unknown: swapped
     /// in by the worker), compared with the frame's capture-time sample
@@ -962,7 +966,10 @@ impl TextureCache {
         }
 
         let vram_pending = is_in_vram(wanted) && host.vram().copy_pending();
-        let big = is_big_direct_colour(wanted);
+        // Compared by `sample_hash` at every use (palette textures too).
+        let big = is_sampled_at_every_use(wanted);
+        // Decoded on the worker, and new ones not hashed first.
+        let big_direct = is_big_direct_colour(wanted);
         let mut new_sample_hash = 0;
         // The samples showed a change: decode without a full hash.
         let mut sampled = false;
@@ -1071,7 +1078,7 @@ impl TextureCache {
             // hash (~3 ms for 512 KiB, three at once when Final Fantasy's
             // battle-start rays begin). Hash 0: the first regular re-check
             // hashes it.
-            None if big => unhashed = 1,
+            None if big_direct => unhashed = 1,
             _ => {
                 let hash_start = host.now_us();
                 data_hash = self.data_hash(host, staging, wanted, &layout, &mut staged_size, &mut hashed_quick);
@@ -1306,7 +1313,17 @@ fn is_in_vram(texture: &TextureDescriptor) -> bool {
 }
 
 fn is_big_direct_colour(texture: &TextureDescriptor) -> bool {
-    texture.format < format::CLUT4 && texture::data_size(texture).unwrap_or(0) >= BACKGROUND_MIN_BYTES
+    texture.format < format::CLUT4 && is_sampled_at_every_use(texture)
+}
+
+/// Big textures of any format are compared by `sample_hash` at every use:
+/// the capture's few sampled words miss most rewrites of big data. Kenka
+/// Bancho's whiteout after the train rewrites a 512x512 CLUT8 mask every
+/// frame; checked only by those words, 12 frames drew the first frame's
+/// mask under the current palette (the hole jumped back and forth).
+fn is_sampled_at_every_use(texture: &TextureDescriptor) -> bool {
+    (texture.format < format::CLUT4 || SAMPLE_PALETTE_TEXTURES.load(Ordering::Relaxed))
+        && texture::data_size(texture).unwrap_or(0) >= BACKGROUND_MIN_BYTES
 }
 
 /// The texture's own part of the frame's palette words.

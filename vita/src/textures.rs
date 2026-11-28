@@ -568,7 +568,7 @@ impl Host for VitaHost {
 /// Display loop (menu.c): 1 if Sony's picture is to be copied right after
 /// the LCD sync (`nativeres_core::display_loop::sony_copy_point`), 0 if only
 /// once `NativeResRenderFrame` falls back to it.
-pub fn copy_sony_picture_early(showed_sony_picture_last: bool) -> bool {
+pub fn copy_sony_picture_early(showed_sony_picture_last: bool, held_for_textures_last: bool) -> bool {
     use nativeres_core::display_loop::{sony_copy_point, CopyPoint};
-    sony_copy_point(showed_sony_picture_last) == CopyPoint::AfterSync
+    sony_copy_point(showed_sony_picture_last, held_for_textures_last) == CopyPoint::AfterSync
 }

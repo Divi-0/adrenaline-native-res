@@ -996,6 +996,51 @@ fn a_big_texture_change_shows_in_its_samples_at_the_next_use() {
     assert_eq!(test.host.shows(shown), test.host.data_hash(&rays));
 }
 
+/// 512x512 CLUT8: 256 KiB of indices, Kenka Bancho's cloud wipe mask.
+fn big_palette_texture() -> TextureDescriptor {
+    texture(RAM_START, 512, 512, format::CLUT8)
+}
+
+#[test]
+fn a_big_palette_texture_change_shows_in_its_samples_at_the_next_use() {
+    let mut test = Test::new();
+    test.host.worker = true;
+    let mask = big_palette_texture();
+    test.use_texture_captured(&mask);
+    // The first word: sampled by `sample_hash`, not by the capture's
+    // quick sample.
+    assert!(!texture::quick_sample_positions(&mask).unwrap().contains(&0));
+    test.host.write(RAM_START, 0x55);
+    let shown = test.use_texture_captured(&mask);
+    assert_eq!(test.host.shows(shown), test.host.data_hash(&mask));
+}
+
+/// Kenka Bancho's whiteout after the train (2026-11-28): the game rewrites
+/// a 512x512 CLUT8 cloud mask (and its palette) every frame. Its index
+/// data was checked only by the capture's 8 sampled words, which missed
+/// the rewrites: frames 2-13 of the wipe drew the first frame's mask under
+/// the current palette, the hole jumped back and forth, until the 8-frame
+/// re-check found it.
+#[test]
+fn a_palette_texture_rewritten_every_frame_is_never_drawn_stale() {
+    let mut test = Test::new();
+    test.host.worker = true;
+    let mask = big_palette_texture();
+    test.use_texture_captured(&mask);
+    let quick = texture::quick_sample_positions(&mask).unwrap();
+    for frame in 1..=12u32 {
+        // Words the capture's samples don't read: in each KiB the one
+        // `sample_hash` reads (its column moves 68 bytes a KiB).
+        for kib in 0..64 {
+            let offset = kib * 1024 + (kib * 68) % 1024;
+            assert!(!quick.contains(&((offset / 4) as usize)));
+            test.host.write(RAM_START + offset, frame * 0x0101_0101 + kib);
+        }
+        let shown = test.use_texture_captured(&mask);
+        assert_eq!(test.host.shows(shown), test.host.data_hash(&mask), "frame {frame} of the wipe");
+    }
+}
+
 /// FF1 reuses its font texture for the field right after the menu's last
 /// frame. A refresh copied after the change must not be swapped in for a
 /// frame captured before it (that frame showed garbage instead of text).

@@ -14,7 +14,7 @@
 use core::ffi::c_void;
 use core::ops::Range;
 use core::ptr::null;
-use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 
 use nativeres_core::black_texels::{self, BlackOutside, TargetContents};
 use nativeres_core::blend::{self, BLEND_ENABLED};
@@ -147,6 +147,20 @@ pub static CPU_PICTURE_CHECK: AtomicU8 = AtomicU8::new(1);
 /// Draw the frame we have once more (paused game, a switch changed what
 /// is drawn).
 static FORCE_REDRAW: AtomicI32 = AtomicI32::new(0);
+/// The last `render_frame` waited for the frame's textures (`Outcome::NotYet`):
+/// our last picture was held, and the next pass may fall back to Sony's
+/// (`display_loop::sony_copy_point` copies it early then).
+static HELD_FOR_TEXTURES: AtomicBool = AtomicBool::new(false);
+
+/// See `HELD_FOR_TEXTURES`.
+pub fn held_for_textures() -> bool {
+    HELD_FOR_TEXTURES.load(Ordering::Relaxed)
+}
+
+/// A pass that doesn't ask `render_frame` (not ours to draw) held nothing.
+pub fn clear_held_for_textures() {
+    HELD_FOR_TEXTURES.store(false, Ordering::Relaxed);
+}
 
 pub fn redraw_paused() {
     FORCE_REDRAW.store(1, Ordering::Relaxed);
@@ -370,7 +384,7 @@ pub fn leave_game() {
 
 impl FrameLoop {
     fn render_frame(&mut self, targets: &mut Targets) -> bool {
-
+        HELD_FOR_TEXTURES.store(false, Ordering::Relaxed);
         if ext::before_render(self, targets) {
             return false;
         }
@@ -493,6 +507,7 @@ impl FrameLoop {
                     // for a frame, a visible glitch when Final Fantasy's
                     // battles appear. If our last picture is old (renderer
                     // just switched on, savestate loaded), the game's.
+                    HELD_FOR_TEXTURES.store(true, Ordering::Relaxed);
                     return targets.shown.is_some_and(|shown| {
                         frame.frame_number.wrapping_sub(targets.targets[shown].frame_number) <= MAX_HELD_FRAMES
                     });
