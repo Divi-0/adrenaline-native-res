@@ -15,19 +15,19 @@
 window.NR = {
   repo: "https://github.com/Divi-0/adrenaline-native-res",
   games: [
-    { title: "Final Fantasy", id: "ULES00986", region: "Europe", status: "tested", fps: 60, of: 60, low: null, img: "img/ff1.jpg", note: "Title, field, battles" },
-    { title: "MTX Mototrax", id: "ULES00581", region: "Europe", status: "tested", fps: 30, of: 30, low: null, img: "img/mtx.jpg", note: "Menus and races" },
-    { title: "Kenka Bancho: Badass Rumble", id: "ULUS10442", region: "USA", status: "partial", fps: 30, of: 30, low: null, img: "img/kb.jpg", note: "Up to the first area" },
-    { title: "Monster Hunter Freedom", id: "ULES00318", region: "Europe", status: "partial", fps: 30, of: 30, low: null, img: "img/mhf.jpg", note: "House and village" },
-    { title: "God of War: Chains of Olympus", id: "UCES00842", region: "Europe", status: "broken", fps: 6, of: 30, low: null, img: "img/gow.jpg", note: "Too slow to play" },
-    { title: "Need for Speed: Underground Rivals", id: "ULES00025", region: "Europe", status: "broken", fps: null, of: 30, low: null, img: "img/nfs.jpg", note: "Main menu only" },
+    { title: "Final Fantasy", id: "ULES00986", region: "Europe", status: "tested", fps: 60, of: 60, low: 22, img: "img/ff1.jpg", note: "Title, field, battles" },
+    { title: "MTX Mototrax", id: "ULES00581", region: "Europe", status: "tested", fps: 30, of: 30, low: 12, img: "img/mtx.jpg", note: "Menus and races" },
+    { title: "Kenka Bancho: Badass Rumble", id: "ULUS10442", region: "USA", status: "partial", fps: 30, of: 30, low: 20, img: "img/kb.jpg", note: "Up to the first area" },
+    { title: "Monster Hunter Freedom", id: "ULES00318", region: "Europe", status: "partial", fps: 30, of: 30, low: 21, img: "img/mhf.jpg", note: "House and village" },
+    { title: "God of War: Chains of Olympus", id: "UCES00842", region: "Europe", status: "broken", fps: 7, of: 30, low: 2, img: "img/gow.jpg", note: "Too slow to play" },
+    { title: "Need for Speed: Underground Rivals", id: "ULES00025", region: "Europe", status: "broken", fps: 10, of: 30, low: 2, img: "img/nfs.jpg", note: "Main menu only" },
   ],
   releases: [
-    { tag: "v0.3.0", date: "2026-11-27", title: "Truer colors and effects",
+    { tag: "v0.3.0", date: "2026-11-28", title: "Truer colors and effects",
       summary: "More games match the colors of the stock image, glow and shadows are drawn in full, and two more games are on the list.",
       games: [
         { id: "ULUS10442", was: "", now: "partial", fps: 30, of: 30, scene: "first area" },
-        { id: "UCES00842", was: "", now: "broken", fps: 6, of: 30, scene: "first level" },
+        { id: "UCES00842", was: "", now: "broken", fps: 7, of: 30, scene: "first level" },
       ],
       changes: [
         "More games match the colors of the stock image",
