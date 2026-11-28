@@ -304,6 +304,9 @@ fn run(dump_path: &str, png_path: &str, trace: bool) -> Result<(), String> {
     if std::env::var_os("REPLAY_OPAQUE_SPANS").is_some() {
         print_opaque_spans(&frame);
     }
+    if std::env::var_os("REPLAY_PALETTE_USE").is_some() {
+        print_palette_use(&frame, &dump.memory);
+    }
     if std::env::args().any(|arg| arg == "--palettes") {
         // The palette tables the Vita fills for this frame (one per distinct
         // palette, as nativeres_render.c SamePalette tells them apart).
@@ -547,6 +550,48 @@ fn print_opaque_spans(frame: &nativeres_core::frame::Frame) {
     println!(
         "opaque spans: {draws} raw draws ({tested} alpha-tested), span bytes {span_bytes}, used vertices' bytes {used_bytes}, distinct bytes {union}; rules decide {decided} draws ({decided_bytes} span bytes)"
     );
+}
+
+/// Debugging (REPLAY_PALETTE_USE=1): per 4- and 8-bit index texture of the
+/// frame (level 0), how many palette entries are not opaque, and how many
+/// of those its texels really use. The Vita takes a palette texture as
+/// opaque only when the whole table is (`opaque_source::palette_texture_opaque`).
+fn print_palette_use(frame: &nativeres_core::frame::Frame, memory: &dump_file::DumpMemory) {
+    use nativeres_core::texture::{data_size, format, palette_rgba};
+    for (index, texture) in frame.textures().iter().enumerate() {
+        if texture.format != format::CLUT4 && texture.format != format::CLUT8 {
+            continue;
+        }
+        let Some(data) = data_size(texture).and_then(|size| memory.bytes(texture.address, size)) else { continue };
+        let words = &frame.palette_words[..(frame.palette_word_count as usize).min(frame.palette_words.len())];
+        let start = (texture.palette_offset as usize).min(words.len());
+        let end = (start + texture.palette_word_count as usize).min(words.len());
+        let mut table = [0u32; 256];
+        palette_rgba(texture, &words[start..end], &mut table);
+        let mut used = [false; 256];
+        for &byte in &data {
+            if texture.format == format::CLUT4 {
+                used[(byte & 15) as usize] = true;
+                used[(byte >> 4) as usize] = true;
+            } else {
+                used[byte as usize] = true;
+            }
+        }
+        let entries = if texture.format == format::CLUT4 { 16 } else { 256 };
+        let not_opaque = (0..entries).filter(|&k| table[k] >> 24 != 0xFF).count();
+        let used_not_opaque = (0..entries).filter(|&k| used[k] && table[k] >> 24 != 0xFF).count();
+        let lowest_used = (0..entries).filter(|&k| used[k]).map(|k| table[k] >> 24).min().unwrap_or(0xFF);
+        let draws = frame.draws().iter().filter(|draw| draw.texture as usize == index && draw.flags & nativeres_core::frame::draw_flags::TEXTURED != 0).count();
+        println!(
+            "palette use: texture {index:3} {:08x} {}x{} format {} levels {}: {} entries used, {not_opaque} not opaque, {used_not_opaque} of them used (lowest used alpha {lowest_used}), {draws} draws",
+            texture.address,
+            texture.width,
+            texture.height,
+            texture.format,
+            nativeres_core::frame::texture_level_count(texture),
+            used.iter().take(entries).filter(|&&u| u).count()
+        );
+    }
 }
 
 fn print_index_runs(frame: &nativeres_core::frame::Frame) {

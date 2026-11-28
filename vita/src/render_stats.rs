@@ -108,6 +108,9 @@ pub struct RenderStats {
     pub opaque_rows_draws: u32,
     /// Raw draws whose used vertices the opaque-source check read (`draw::OPAQUE_USED_ONLY`).
     pub opaque_checked_draws: u32,
+    /// Alpha-tested draws drawn without the test: it passes every alpha their
+    /// fragments can have (`draw::LOWEST_UNTESTED`).
+    pub lowest_untested_draws: u32,
     /// Draws left out: a later draw paints over them (frame_loop.rs
     /// `HIDE_DRAWS`), and the time finding them.
     pub hidden_draws: u32,
@@ -252,6 +255,7 @@ impl RenderStats {
         opaque_untested_draws: 0,
         opaque_rows_draws: 0,
         opaque_checked_draws: 0,
+        lowest_untested_draws: 0,
         hidden_draws: 0,
         depth_only_draws: 0,
         hidden_us: 0,
@@ -373,7 +377,7 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
     );
     let _ = write!(
         text,
-        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} point_light_draws={} fixed_color_draws={} fix_b_draws={} cut_draws={} cut_fast_draws={} cut_off_draws={} wide_draws={} opaque_draws={} opaque_untested_draws={} opaque_rows_draws={} opaque_checked_draws={} hidden_draws={} depth_only_draws={} hidden={}us flat_draws={} const_draws={} nodepth_draws={} slope_draws={} slope_missed={} ge_filter_draws={} ge_wide_draws={} ge_wide_missed={} ge_wide_inexact={} ge_gather_draws={} ge_gather_missed={} wide_target_textures={} wide_copies={} wide_copy_scenes={} black_draws={} black_culled={} black_kept={} black_skipped={} alpha0_draws={} alpha0_culled={} alpha0_kept={} alpha0_skipped={} alpha0_read={} alpha0={}us alpha0_fills={} alpha0_fill_bytes={} texel0_draws={} texel0_culled={} alpha0_as_list={} strip_draws={} strip_indices={} strip_corners={} opaque={}us ",
+        "begin={}us loop={}us convert={}us indices={}us pool_kb={} pool_waits={} alpha_tested={} alpha_test_skipped={} ring_draws={} plain_draws={} lit_variant_draws={} flat_light_draws={} point_light_draws={} fixed_color_draws={} fix_b_draws={} cut_draws={} cut_fast_draws={} cut_off_draws={} wide_draws={} opaque_draws={} opaque_untested_draws={} opaque_rows_draws={} opaque_checked_draws={} lowest_untested_draws={} hidden_draws={} depth_only_draws={} hidden={}us flat_draws={} const_draws={} nodepth_draws={} slope_draws={} slope_missed={} ge_filter_draws={} ge_wide_draws={} ge_wide_missed={} ge_wide_inexact={} ge_gather_draws={} ge_gather_missed={} wide_target_textures={} wide_copies={} wide_copy_scenes={} black_draws={} black_culled={} black_kept={} black_skipped={} alpha0_draws={} alpha0_culled={} alpha0_kept={} alpha0_skipped={} alpha0_read={} alpha0={}us alpha0_fills={} alpha0_fill_bytes={} texel0_draws={} texel0_culled={} alpha0_as_list={} strip_draws={} strip_indices={} strip_corners={} opaque={}us ",
         per_frame(s.begin_us),
         per_frame(s.loop_us),
         per_frame(s.convert_us),
@@ -397,6 +401,7 @@ pub unsafe fn report(out: *mut u8, size: i32) -> i32 {
         s.opaque_untested_draws / frames,
         s.opaque_rows_draws / frames,
         s.opaque_checked_draws / frames,
+        s.lowest_untested_draws / frames,
         s.hidden_draws / frames,
         s.depth_only_draws / frames,
         per_frame(s.hidden_us),

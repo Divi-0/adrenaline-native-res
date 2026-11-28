@@ -92,31 +92,46 @@ impl RawColors {
     /// as high, so the lowest one decides. Lit by the GPU's lights: only
     /// when the draw is made opaque (the lights' alpha isn't looked at).
     pub fn alpha_always_255(&self, lowest: Option<u8>) -> bool {
+        self.alpha_reaches(lowest, 0xFF)
+    }
+
+    /// True if every vertex of a raw draw with these colour rules ends up
+    /// with an alpha of at least `target` when the lowest vertex alpha is
+    /// `lowest` (None: no colour); `alpha_always_255` for 255. Lit by the
+    /// GPU's lights: only when the draw is made opaque (or for target 0).
+    pub fn alpha_reaches(&self, lowest: Option<u8>, target: u8) -> bool {
         if self.rules[0] == lighting::LIGHTS {
-            return self.rules[1] != 0.0;
+            return self.rules[1] != 0.0 || target == 0;
         }
         let vertex = lowest.map(|alpha| (alpha as u32) << 24 | 0x00FF_FFFF);
-        self.color(vertex) >> 24 == 0xFF
+        self.color(vertex) >> 24 >= target as u32
     }
 
     /// The lowest vertex alpha (8 bits) that these rules turn into 255
     /// (`alpha_always_255`), or None if not even 255 does: a draw's vertices
-    /// all end up opaque exactly when each has at least this alpha. Every
-    /// rule keeps a higher alpha at least as high (ambient lighting's
-    /// product and emission, doubling, the opaque and replace rules set it),
-    /// so the answer is a threshold, found by halving 0..255.
+    /// all end up opaque exactly when each has at least this alpha
+    /// (`least_alpha_reaching(255)`).
     pub fn least_opaque_alpha(&self) -> Option<u8> {
-        if !self.alpha_always_255(Some(0xFF)) {
+        self.least_alpha_reaching(0xFF)
+    }
+
+    /// The lowest vertex alpha (8 bits) that these rules turn into at least
+    /// `target` (`alpha_reaches`), or None if not even 255 does. Every rule
+    /// keeps a higher alpha at least as high (ambient lighting's product and
+    /// emission, doubling, the opaque and replace rules set it), so the
+    /// answer is a threshold, found by halving 0..255.
+    pub fn least_alpha_reaching(&self, target: u8) -> Option<u8> {
+        if !self.alpha_reaches(Some(0xFF), target) {
             return None;
         }
-        if self.alpha_always_255(Some(0)) {
+        if self.alpha_reaches(Some(0), target) {
             return Some(0);
         }
         // 0 fails, 255 passes: the threshold lies in (low, high].
         let (mut low, mut high) = (0u8, 0xFFu8);
         while high - low > 1 {
             let middle = low + (high - low) / 2;
-            if self.alpha_always_255(Some(middle)) {
+            if self.alpha_reaches(Some(middle), target) {
                 high = middle;
             } else {
                 low = middle;
@@ -231,6 +246,90 @@ pub fn alpha_test_lets_255_pass(uniform: [f32; 4]) -> bool {
 /// generic program.
 pub fn alpha_test_is_one_sided(uniform: [f32; 4]) -> bool {
     uniform[2] > 0.0 && uniform[1] > 255.0
+}
+
+/// The lowest alpha `l` (0..255) such that an alpha test with uniform
+/// `uniform` (as `alpha_test_lets_255_pass`) passes every alpha from `l` to
+/// 255, whole or not: a draw whose fragments all have at least that alpha
+/// passes it everywhere and can drop it, the same picture and depth. None
+/// if 255 itself doesn't pass. The test passes strictly between x and y
+/// (z > 0) or strictly outside them (z < 0); x and y lie half-way between
+/// whole numbers (draw.rs `alpha_test_uniform`), the GE's integer test.
+pub fn alpha_test_passes_from(uniform: [f32; 4]) -> Option<u8> {
+    let (x, y, z) = (uniform[0], uniform[1], uniform[2]);
+    let (low, high) = if x <= y { (x, y) } else { (y, x) };
+    // The first whole number above `bound` (0 below 0), None past 255.
+    let above = |bound: f32| -> Option<u8> {
+        if bound < 0.0 {
+            Some(0)
+        } else if bound < 255.0 {
+            Some(bound as u8 + 1)
+        } else {
+            None
+        }
+    };
+    if z > 0.0 && low < high {
+        // (low, high): all of [l, 255] when 255 < high and l > low.
+        if high > 255.0 { above(low) } else { None }
+    } else if z < 0.0 {
+        // Outside [low, high]: below it entirely, or above it.
+        if low > 255.0 { Some(0) } else { above(high) }
+    } else {
+        None
+    }
+}
+
+/// How far below the GE's product the GPU's fragment alpha may fall
+/// (`fragment_alpha_floor`): bilinear filtering between texels of at least
+/// t gives at least t up to its float rounding, and the program's product
+/// t x v rounds its own way. Two levels cover both by far.
+pub const FRAGMENT_ALPHA_SLACK: u32 = 2;
+
+/// A lower bound of a textured fragment's alpha when every texel the GPU
+/// can sample has alpha at least `texel` and every vertex at least
+/// `vertex` (both final, 8 bits): the GE's modulate ((v + 1) t) >> 8 less
+/// `FRAGMENT_ALPHA_SLACK`. It is also at most each of t and v, so it bounds
+/// the other texture functions too (replace: t, decal: v).
+pub fn fragment_alpha_floor(texel: u8, vertex: u8) -> u8 {
+    (((vertex as u32 + 1) * texel as u32) >> 8).saturating_sub(FRAGMENT_ALPHA_SLACK) as u8
+}
+
+/// The lowest vertex alpha that makes `fragment_alpha_floor(texel, v)` at
+/// least `needed`, or None if not even 255 does (it grows with v).
+pub fn vertex_alpha_needed(texel: u8, needed: u8) -> Option<u8> {
+    if fragment_alpha_floor(texel, 0xFF) < needed {
+        return None;
+    }
+    // Halving: the floor at `high` reaches `needed`.
+    let (mut low, mut high) = (0u32, 0xFFu32);
+    if fragment_alpha_floor(texel, 0) >= needed {
+        return Some(0);
+    }
+    while high - low > 1 {
+        let middle = (low + high) / 2;
+        if fragment_alpha_floor(texel, middle as u8) >= needed {
+            high = middle;
+        } else {
+            low = middle;
+        }
+    }
+    Some(high as u8)
+}
+
+/// The lowest alpha among the first 16 entries and among all 256 of a
+/// 256-colour table (RGBA, `texture::palette_rgba`): what a 4-bit and an
+/// 8-bit index texture can sample (`palette_texture_lowest_alpha`).
+pub fn table_lowest_alphas(table: &[u32; 256]) -> [u8; 2] {
+    let lowest = |entries: &[u32]| entries.iter().map(|entry| (entry >> 24) as u8).min().unwrap_or(0xFF);
+    let first = lowest(&table[..16]);
+    [first, first.min(lowest(&table[16..]))]
+}
+
+/// The lowest alpha a palette texture of PSP format `format` (as
+/// `palette_texture_opaque`) samples from a table with `table_lowest_alphas`
+/// result `lowest`.
+pub fn palette_texture_lowest_alpha(format: u8, lowest: [u8; 2]) -> u8 {
+    if format == 4 { lowest[0] } else { lowest[1] }
 }
 
 /// How far past its own value a texture coordinate may be taken as
@@ -411,6 +510,88 @@ mod tests {
             assert!(!alpha_test_lets_255_pass(uniform(0.0, r - 1.0, false)), "less {reference}");
         }
         assert!(!alpha_test_lets_255_pass(uniform(1.0, 0.0, false)), "never");
+    }
+
+    #[test]
+    fn alpha_tests_pass_everything_from_their_threshold() {
+        // As draw.rs `alpha_test_uniform(lo, hi, outside)` builds them.
+        let uniform = |lo: f32, hi: f32, outside: bool| [lo - 0.5, hi + 0.5, if outside { -1.0 } else { 1.0 }, 0.0];
+        let passes = |u: [f32; 4], a: f32| (a - u[0]) * (u[1] - a) * u[2] > 0.0;
+        let mut checked = 0;
+        for outside in [false, true] {
+            for lo in -1..=257 {
+                for hi in -1..=257 {
+                    let u = uniform(lo as f32, hi as f32, outside);
+                    let from = alpha_test_passes_from(u);
+                    match from {
+                        Some(l) => {
+                            // Every alpha from l, whole or between (filtered fragments).
+                            for quarter in (4 * l as u32)..=(4 * 255) {
+                                let a = quarter as f32 / 4.0;
+                                assert!(passes(u, a), "lo {lo} hi {hi} outside {outside}: from {l}, {a} fails");
+                            }
+                            // The lowest such whole number: from l - 1 on, some
+                            // alpha (whole or between) fails.
+                            if l > 0 {
+                                let below = (0..4).map(|q| (l - 1) as f32 + q as f32 / 4.0);
+                                assert!(below.clone().any(|a| !passes(u, a)), "lo {lo} hi {hi} outside {outside}: all from {} pass", l - 1);
+                            }
+                            checked += 1;
+                        }
+                        None => assert!(!passes(u, 255.0), "lo {lo} hi {hi} outside {outside}: 255 passes"),
+                    }
+                }
+            }
+        }
+        assert!(checked > 30_000);
+        // Kenka Bancho's walls: GREATER 1 passes from 2.
+        assert_eq!(alpha_test_passes_from(uniform(2.0, 255.0, false)), Some(2));
+        assert_eq!(alpha_test_passes_from(uniform(1.0, 0.0, false)), None, "never");
+        assert_eq!(alpha_test_passes_from([0.0, 300.0, 0.0, 0.0]), None, "z 0: never");
+    }
+
+    #[test]
+    fn the_fragment_alpha_floor_bounds_every_texture_function() {
+        for texel in 0..=255u8 {
+            for vertex in 0..=255u8 {
+                let floor = fragment_alpha_floor(texel, vertex);
+                let modulate = ((vertex as u32 + 1) * texel as u32) >> 8;
+                assert!(floor as u32 + FRAGMENT_ALPHA_SLACK <= modulate.max(FRAGMENT_ALPHA_SLACK), "t {texel} v {vertex}");
+                assert!(floor <= texel && floor <= vertex, "t {texel} v {vertex}: replace and decal");
+            }
+            for needed in 0..=255u8 {
+                let brute = (0..=255u8).find(|&v| fragment_alpha_floor(texel, v) >= needed);
+                assert_eq!(vertex_alpha_needed(texel, needed), brute, "t {texel} needed {needed}");
+            }
+        }
+        // The train: texels of 254, the test from 2: vertices of 4 or more.
+        assert_eq!(vertex_alpha_needed(254, 2), Some(4));
+        assert_eq!(fragment_alpha_floor(254, 255), 252);
+    }
+
+    #[test]
+    fn the_lowest_alpha_of_a_table() {
+        let mut table = [0xFF00_0000u32; 256];
+        assert_eq!(table_lowest_alphas(&table), [255, 255]);
+        table[200] = 0xFE12_3456;
+        assert_eq!(table_lowest_alphas(&table), [255, 254]);
+        assert_eq!(palette_texture_lowest_alpha(4, table_lowest_alphas(&table)), 255);
+        assert_eq!(palette_texture_lowest_alpha(5, table_lowest_alphas(&table)), 254);
+        table[3] = 0x1000_0000;
+        assert_eq!(table_lowest_alphas(&table), [16, 16]);
+    }
+
+    #[test]
+    fn rules_reach_a_target_from_a_threshold() {
+        for colors in rule_sets() {
+            for target in [0u8, 1, 2, 4, 128, 252, 254, 255] {
+                let least = colors.least_alpha_reaching(target);
+                for alpha in 0..=255u8 {
+                    assert_eq!(colors.alpha_reaches(Some(alpha), target), least.is_some_and(|least| alpha >= least), "rules {:?} target {target} alpha {alpha}", colors.rules);
+                }
+            }
+            assert_eq!(colors.least_alpha_reaching(255), colors.least_opaque_alpha());
+        }
     }
 
     #[test]

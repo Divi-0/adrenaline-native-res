@@ -22,7 +22,7 @@ use nativeres_core::display_loop::AfterQuit;
 use nativeres_core::frame::{draw_flags, Frame, MAX_TEXTURES};
 use nativeres_core::hidden_draws::{self, HiddenDraws};
 use nativeres_core::offscreen;
-use nativeres_core::opaque_source::palette_texture_opaque;
+use nativeres_core::opaque_source::{palette_texture_lowest_alpha, palette_texture_opaque};
 use nativeres_core::texture::ALL_ROWS_OPAQUE;
 use nativeres_core::texture::format as texture_format;
 use nativeres_core::texture_cache::MAX_RENDER_TARGETS;
@@ -223,6 +223,11 @@ pub struct FrameLoop {
     /// direct colour ones from the cache (`texture::opaque_rows`); 0 for the
     /// others.
     opaque_rows: [u16; MAX_TEXTURES],
+    /// Per texture of the frame: the lowest alpha of any texel the GPU can
+    /// sample (index textures: their table, `table_lowest_alphas`; others
+    /// 255 when `opaque_rows` is all of them, else 0). For alpha tests that
+    /// pass every alpha a draw can have (draw.rs `LOWEST_UNTESTED`).
+    lowest_alpha: [u8; MAX_TEXTURES],
     /// This frame's draws a later one paints over (`HIDE_DRAWS`), and
     /// whether they are left out (`hiding`: not in a frame drawn in runs)
     /// and depth-only ones drawn so (`depth_only`).
@@ -305,6 +310,7 @@ static FRAME_LOOP: SingleThreaded<FrameLoop> = SingleThreaded::new(FrameLoop {
     from_targets: [false; MAX_TEXTURES],
     tile_views: [const { TextureObject::view(gxm::Texture { control_words: [0; 4] }) }; TILE_VIEWS],
     opaque_rows: [0; MAX_TEXTURES],
+    lowest_alpha: [0; MAX_TEXTURES],
     hidden: HiddenDraws::new(),
     hiding: false,
     depth_only: false,
@@ -956,6 +962,7 @@ impl FrameLoop {
         for (i, descriptor) in frame.textures().iter().enumerate() {
             self.palettes[i] = null();
             self.opaque_rows[i] = 0;
+            self.lowest_alpha[i] = 0;
             // Safe: textures from the cache or targets, alive this frame.
             let Some(texture) = (unsafe { self.textures[i].as_ref() }) else {
                 continue;
@@ -967,16 +974,18 @@ impl FrameLoop {
                 // rows without transparent texels); wide palette textures
                 // from their palette (worked out when decoded).
                 self.opaque_rows[i] = textures::opaque_rows(i);
+                self.lowest_alpha[i] = if self.opaque_rows[i] == ALL_ROWS_OPAQUE { 0xFF } else { 0 };
                 continue;
             }
-            let (table, mut opaque_entries) = palettes::palette_for(frame, descriptor, render_count);
+            let (table, mut opaque_entries, mut lowest) = palettes::palette_for(frame, descriptor, render_count);
             self.palettes[i] = table;
             if table.is_null() {
                 // Safe: a palette texture of ours has its 256-word table.
                 let own = unsafe { &mut *(gxm::sceGxmTextureGetPalette(&texture.gxm) as *mut [u32; 256]) };
-                opaque_entries = palettes::fill_table(frame, descriptor, own);
+                (opaque_entries, lowest) = palettes::fill_table(frame, descriptor, own);
             }
             self.opaque_rows[i] = if palette_texture_opaque(descriptor.format, opaque_entries) { ALL_ROWS_OPAQUE } else { 0 };
+            self.lowest_alpha[i] = palette_texture_lowest_alpha(descriptor.format, lowest);
         }
     }
 
@@ -1114,7 +1123,7 @@ impl FrameLoop {
                     let black = if screen.is_null() { None } else { self.black_outside(frame, draw, t) };
                     // Safe: textures from the cache, targets or wide copies, alive this frame.
                     if let Some(texture) = unsafe { texture.as_ref() } {
-                        draw::draw_textured(frame, draw, i, texture, self.palettes[t], uv_scale, self.opaque_rows[t], self.from_targets[t], black);
+                        draw::draw_textured(frame, draw, i, texture, self.palettes[t], uv_scale, self.opaque_rows[t], self.lowest_alpha[t], self.from_targets[t], black);
                     }
                 }
             } else {

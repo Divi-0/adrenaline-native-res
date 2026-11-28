@@ -31,6 +31,7 @@ use nativeres_core::frame::{
 use nativeres_core::texture;
 use nativeres_core::opaque_source::{
     alpha_test_is_one_sided, alpha_test_lets_255_pass, for_opaque_source, lowest_vertex_alpha, raw_vertex_span, samples_only_rows, used_alphas_reach,
+    alpha_test_passes_from, vertex_alpha_needed,
 };
 use nativeres_core::texture::ALL_ROWS_OPAQUE;
 use nativeres_core::vertex::VertexFormat;
@@ -508,11 +509,18 @@ fn raw_window(frame: &Frame, draw: &Draw) -> Option<(usize, usize)> {
     }
 }
 
-/// True if every vertex of textured `draw` ends up with alpha 255: raw
-/// vertices by their lowest alpha and colour rules, screen-space ones as
-/// they are. False where that isn't known cheaply (vertices in model space
-/// or in the vertex cache, which the GPU may light).
+/// True if every vertex of textured `draw` ends up with alpha 255
+/// (`vertices_reach` 255).
 fn vertices_opaque(frame: &Frame, draw: &Draw) -> bool {
+    vertices_reach(frame, draw, 0xFF)
+}
+
+/// True if every vertex of textured `draw` ends up with an alpha of at
+/// least `target`: raw vertices by their lowest alpha and colour rules,
+/// screen-space ones as they are. False where that isn't known cheaply
+/// (vertices in model space or in the vertex cache, which the GPU may
+/// light).
+fn vertices_reach(frame: &Frame, draw: &Draw, target: u8) -> bool {
     if draw.flags & draw_flags::RAW_VERTICES == 0 {
         if draw.transform != 0 || draw.flags & draw_flags::CACHED_VERTICES != 0 {
             return false;
@@ -521,7 +529,7 @@ fn vertices_opaque(frame: &Frame, draw: &Draw) -> bool {
         return first
             .checked_add(draw.vertex_count as usize)
             .and_then(|end| frame.vertices.get(first..end))
-            .is_some_and(|vertices| vertices.iter().all(|vertex| vertex.color >> 24 == 0xFF));
+            .is_some_and(|vertices| vertices.iter().all(|vertex| vertex.color >> 24 >= target as u32));
     }
     let Some(colors) = (match draw.raw_colors {
         0 => None,
@@ -547,15 +555,15 @@ fn vertices_opaque(frame: &Frame, draw: &Draw) -> bool {
     if OPAQUE_USED_ONLY.load(Ordering::Relaxed) == 0 {
         // Safe: inside the block the GPU reads the draw from (checked above).
         let bytes = unsafe { core::slice::from_raw_parts(start as *const u8, stop - start) };
-        return colors.alpha_always_255(lowest_vertex_alpha(format, bytes));
+        return colors.alpha_reaches(lowest_vertex_alpha(format, bytes), target);
     }
     // Only the vertices the draw uses, each read once, and only as far as
-    // the first one whose alpha the rules don't make 255 (core
+    // the first one whose alpha the rules don't take to `target` (core
     // `used_alphas_reach`): the same answer for what the draw draws.
     if layout.color_offset.is_none() {
-        return colors.alpha_always_255(None);
+        return colors.alpha_reaches(None, target);
     }
-    let Some(least) = colors.least_opaque_alpha() else {
+    let Some(least) = colors.least_alpha_reaching(target) else {
         return false;
     };
     let Some(stored) = frame.indices.get(draw.first_index as usize..draw.first_index as usize + draw.index_count as usize) else {
@@ -583,6 +591,17 @@ fn vertices_opaque(frame: &Frame, draw: &Draw) -> bool {
 /// span of every draw read from uncached PSP RAM cost the display thread
 /// 88 ms a frame. 1 = on (default); 0 = the whole span, as before (A/B).
 pub static OPAQUE_USED_ONLY: AtomicI32 = AtomicI32::new(1);
+
+/// An alpha test that every alpha a draw's fragments can have passes
+/// (core `alpha_test_passes_from`) is dropped: no discard, the same picture
+/// and depth. The fragments' lowest alpha is bounded by the texture's lowest
+/// texel alpha (index textures: their table's entries) and the vertices'
+/// lowest final alpha (`fragment_alpha_floor`, two levels of slack for the
+/// GPU's filtering and rounding). Beyond `OPAQUE_UNTESTED` (alpha 255
+/// only): Kenka Bancho's palettes are alpha 254 and its walls test
+/// "greater than 1": its train paid ~7 ms of GPU for discards that drop
+/// nothing. 1 = on (default); 0 = only the alpha-255 case, as before.
+pub static LOWEST_UNTESTED: AtomicI32 = AtomicI32::new(1);
 
 /// Untextured normal alpha blends into 5551 whose vertex alphas are all 0
 /// get the "invisible" frame-read program (core frame.rs
@@ -2333,6 +2352,7 @@ impl Draws {
         palette: *const c_void,
         uv_scale: [f32; 2],
         opaque_rows: u16,
+        lowest_alpha: u8,
         from_target: bool,
         black: Option<BlackOutside>,
     ) {
@@ -2421,6 +2441,19 @@ impl Draws {
                 if untest {
                     tested = false;
                     stats().opaque_untested_draws += 1;
+                }
+            }
+            stats().opaque_us += draw_clock().wrapping_sub(start);
+        }
+        // An alpha test that passes every alpha the fragments can have:
+        // dropped (`LOWEST_UNTESTED`; the texture's lowest texel alpha and
+        // the vertices' lowest final alpha bound them).
+        if tested && !masked && OPAQUE_UNTESTED.load(Ordering::Relaxed) != 0 && LOWEST_UNTESTED.load(Ordering::Relaxed) != 0 {
+            let start = draw_clock();
+            if let Some(vertex_needed) = alpha_test_passes_from(alpha_range).and_then(|needed| vertex_alpha_needed(lowest_alpha, needed)) {
+                if vertices_reach(frame, draw, vertex_needed) {
+                    tested = false;
+                    stats().lowest_untested_draws += 1;
                 }
             }
             stats().opaque_us += draw_clock().wrapping_sub(start);
@@ -3850,10 +3883,11 @@ pub fn draw_textured(
     palette: *const c_void,
     uv_scale: [f32; 2],
     opaque_rows: u16,
+    lowest_alpha: u8,
     from_target: bool,
     black: Option<BlackOutside>,
 ) {
-    draws().draw_textured(frame, draw, draw_index, texture, palette, uv_scale, opaque_rows, from_target, black);
+    draws().draw_textured(frame, draw, draw_index, texture, palette, uv_scale, opaque_rows, lowest_alpha, from_target, black);
 }
 
 /// Untextured draw `draw_index` of `frame`. Inside a target scene.
